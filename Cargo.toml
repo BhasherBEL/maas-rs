@@ -1,0 +1,10 @@
+[package]
+name = "otpand"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+osmpbf = "0.3"
+petgraph = "0.8.3"
+kdtree = "0.8.0"
+priority-queue = "2.7.0"
