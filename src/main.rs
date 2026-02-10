@@ -1,8 +1,12 @@
 use std::time::SystemTime;
 
+use chrono::NaiveDate;
 use otpand::{
-    ingestion::{gtfs::load_gtfs, osm},
-    structures::Graph,
+    ingestion::{
+        gtfs::{date_to_days, load_gtfs},
+        osm,
+    },
+    structures::{Graph, RoutingParameters},
 };
 
 fn main() {
@@ -47,7 +51,18 @@ fn main() {
                         g.get_node(*b_id).unwrap().loc()
                     );
                     let before = SystemTime::now();
-                    g.a_star(*a_id, *b_id);
+
+                    let from = *a_id;
+                    let to = *b_id;
+                    let time = 60 * 60 * 12;
+                    let date = date_to_days(NaiveDate::from_ymd_opt(2026, 2, 10).unwrap());
+                    let weekday = 1 << 2;
+                    let params = RoutingParameters {
+                        walking_speed: 4 * 278,
+                        estimator_speed: 50 * 278,
+                    };
+
+                    g.a_star(from, to, time, date, weekday, params);
                     match before.elapsed() {
                         Ok(elapsed) => println!("Ran in {}ms", elapsed.as_millis()),
                         Err(e) => println!("Went backward ?? {}", e),

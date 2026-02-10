@@ -9,6 +9,8 @@ use crate::{
     },
 };
 
+static MAX_NEIGHBOR_DISTANCE: f64 = 1000.0;
+
 // Identifiers
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -27,23 +29,23 @@ pub struct ServiceId(pub u32);
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct TripSegment {
-    trip_id: TripId,
-    departure: u32,
-    arrival: u32,
-    service_id: ServiceId,
+    pub trip_id: TripId,
+    pub departure: u32,
+    pub arrival: u32,
+    pub service_id: ServiceId,
 }
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct RouteSegment {
-    departure: NodeID,
-    arrival: NodeID,
-    route_id: RouteId,
+    pub departure: NodeID,
+    pub arrival: NodeID,
+    pub route_id: RouteId,
 }
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct TimetableSegment {
-    start: usize,
-    len: usize,
+    pub start: usize,
+    pub len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -95,18 +97,31 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
 
     let mut gtfs_nodes_mapper = HashMap::<String, NodeID>::new();
 
+    let mut count_node_no_latlng = 0;
+    let mut count_node_no_name = 0;
+    let mut count_node_no_neighbor = 0;
+    let mut count_node_too_far_neighbor = 0;
+
+    let n_stops = gtfs.stops.len();
+
     for (stop_id, raw) in gtfs.stops {
         let loc = match (raw.latitude, raw.longitude) {
             (Some(lat), Some(lng)) => LatLng {
                 latitude: lat,
                 longitude: lng,
             },
-            _ => continue,
+            _ => {
+                count_node_no_latlng += 1;
+                continue;
+            }
         };
 
         let name = match &raw.name {
             Some(name) => name,
-            _ => continue,
+            _ => {
+                count_node_no_name += 1;
+                continue;
+            }
         };
 
         let gtfs_stop_data = TransitStopData {
@@ -122,10 +137,15 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
         let nearest_node_dist = match g.nearest_node_dist(loc.latitude, loc.longitude) {
             Some(node_dist) => node_dist,
             _ => {
-                println!("No node found");
+                count_node_no_neighbor += 1;
                 continue;
             }
         };
+
+        if nearest_node_dist.0 > MAX_NEIGHBOR_DISTANCE {
+            count_node_too_far_neighbor += 1;
+            continue;
+        }
 
         let nearest_node = nearest_node_dist.1.clone();
         let distance = nearest_node_dist.0 as usize;
@@ -155,6 +175,15 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
             }),
         );
     }
+
+    println!("{} nodes parsed", n_stops);
+    println!(" - {} nodes without geo data", count_node_no_latlng);
+    println!(" - {} nodes without name", count_node_no_name);
+    println!(" - {} nodes without neighbor", count_node_no_neighbor);
+    println!(
+        " - {} nodes without close neighbor",
+        count_node_too_far_neighbor
+    );
 
     let mut agency_mapper: IdMapper<usize> = IdMapper::new();
     let mut agencies: Vec<AgencyInfo> = Vec::new();
@@ -280,8 +309,14 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
 
     for (_, trip) in gtfs.trips {
         let trip_id = trip_mapper.get_or_insert(trip.id);
-        let service_id = service_mapper.get_or_insert(trip.service_id);
-        let route_id = route_mapper.get_or_insert(trip.route_id);
+        let service_id = match service_mapper.get(trip.service_id) {
+            Some(id) => id,
+            None => continue,
+        };
+        let route_id = match route_mapper.get(trip.route_id) {
+            Some(id) => id,
+            None => continue,
+        };
 
         while trip_infos.len() <= trip_id {
             trip_infos.push(TripInfo {
@@ -361,7 +396,7 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
     Ok(())
 }
 
-fn date_to_days(date: chrono::NaiveDate) -> u32 {
+pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
     let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
     (date - epoch).num_days().max(0) as u32
 }
