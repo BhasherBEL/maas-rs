@@ -7,11 +7,20 @@ use std::{
 use kdtree::{KdTree, distance::squared_euclidean};
 use priority_queue::PriorityQueue;
 
-use crate::structures::{EdgeData, LatLng, NodeData, NodeID};
+use crate::{
+    ingestion::gtfs::{AgencyInfo, RouteInfo, ServicePattern, TripInfo, TripSegment},
+    structures::{EdgeData, LatLng, NodeData, NodeID},
+};
 
 #[derive(Debug)]
 pub enum GraphError {
     NodeNotFoundError(NodeID),
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AStarPriority {
+    weight: usize,
+    length: usize,
 }
 
 pub struct Graph {
@@ -19,6 +28,11 @@ pub struct Graph {
     edges: Vec<Vec<EdgeData>>,
     nodes_tree: KdTree<f64, NodeID, [f64; 2]>,
     id_mapper: HashMap<String, NodeID>,
+    transit_departures: Vec<TripSegment>,
+    transit_services: Vec<ServicePattern>,
+    transit_trips: Vec<TripInfo>,
+    transit_routes: Vec<RouteInfo>,
+    transit_agencies: Vec<AgencyInfo>,
 }
 
 impl Graph {
@@ -28,29 +42,40 @@ impl Graph {
             edges: Vec::new(),
             nodes_tree: KdTree::new(2),
             id_mapper: HashMap::new(),
+            transit_departures: Vec::<TripSegment>::new(),
+            transit_services: Vec::<ServicePattern>::new(),
+            transit_trips: Vec::<TripInfo>::new(),
+            transit_routes: Vec::<RouteInfo>::new(),
+            transit_agencies: Vec::<AgencyInfo>::new(),
         }
     }
 
-    pub fn add_node(&mut self, node: NodeData) {
+    pub fn add_node(&mut self, node: NodeData) -> NodeID {
         let id = NodeID(self.nodes.len());
 
-        let lat = node.lat_lng.latitude;
-        let lon = node.lat_lng.longitude;
-        let eid = node.eid.clone();
-
-        self.nodes.push(node);
+        self.nodes.push(node.clone());
         self.edges.push(Vec::new());
-        let _ = self.nodes_tree.add([lat, lon], id);
 
-        self.id_mapper.insert(eid, id);
+        match node {
+            NodeData::OsmNode(osm_node) => {
+                let lat = osm_node.lat_lng.latitude;
+                let lon = osm_node.lat_lng.longitude;
+                let eid = osm_node.eid.clone();
+
+                let _ = self.nodes_tree.add([lat, lon], id);
+                self.id_mapper.insert(eid, id);
+            }
+            _ => {}
+        }
+        id
     }
 
     pub fn add_edge(&mut self, from: NodeID, edge: EdgeData) {
         self.edges[from.0].push(edge);
     }
 
-    pub fn get_id(&self, eid: String) -> Option<&NodeID> {
-        self.id_mapper.get(&eid)
+    pub fn get_id(&self, eid: &str) -> Option<&NodeID> {
+        self.id_mapper.get(eid)
     }
 
     pub fn get_node(&self, id: NodeID) -> Option<&NodeData> {
@@ -95,10 +120,16 @@ impl Graph {
     }
 
     pub fn a_star(&self, a: NodeID, b: NodeID) {
-        let mut pq = PriorityQueue::<NodeID, Reverse<usize>>::new();
+        let mut pq = PriorityQueue::<NodeID, Reverse<AStarPriority>>::new();
         let mut origins = HashMap::<NodeID, (NodeID, EdgeData)>::new();
         let mut visited = HashSet::<NodeID>::new();
-        pq.push(a, Reverse(0));
+        pq.push(
+            a,
+            Reverse(AStarPriority {
+                weight: 0 + self.nodes_distance(a, b),
+                length: 0,
+            }),
+        );
 
         while !pq.is_empty() {
             let (id, p) = match pq.pop() {
@@ -113,6 +144,7 @@ impl Graph {
                 let dist = path.iter().fold(0, |acc, e| {
                     acc + match e {
                         EdgeData::Street(e) => e.length,
+                        EdgeData::Transit(e) => e.length,
                     }
                 });
                 println!("Length: {}", dist);
@@ -127,18 +159,65 @@ impl Graph {
                             if visited.contains(&street.destination) {
                                 continue;
                             }
-                            let cost = p.0 + street.length;
+                            let length = p.0.length + street.length;
 
                             match pq.get_priority(&street.destination) {
                                 Some(current) => {
-                                    if current.0 > cost {
-                                        pq.change_priority(&street.destination, Reverse(cost));
+                                    if current.0.length > length {
+                                        pq.change_priority(
+                                            &street.destination,
+                                            Reverse(AStarPriority {
+                                                weight: length
+                                                    + self.nodes_distance(street.destination, b),
+                                                length,
+                                            }),
+                                        );
                                         origins.insert(street.destination, (id, neighbor.clone()));
                                     }
                                 }
                                 None => {
-                                    pq.push(street.destination, Reverse(cost));
+                                    pq.push(
+                                        street.destination,
+                                        Reverse(AStarPriority {
+                                            weight: length
+                                                + self.nodes_distance(street.destination, b),
+                                            length,
+                                        }),
+                                    );
                                     origins.insert(street.destination, (id, neighbor.clone()));
+                                }
+                            }
+                        }
+                        EdgeData::Transit(transit) => {
+                            if visited.contains(&transit.destination) {
+                                continue;
+                            }
+                            let length = p.0.length + transit.length;
+
+                            match pq.get_priority(&transit.destination) {
+                                Some(current) => {
+                                    if current.0.length > length {
+                                        pq.change_priority(
+                                            &transit.destination,
+                                            Reverse(AStarPriority {
+                                                weight: length
+                                                    + self.nodes_distance(transit.destination, b),
+                                                length,
+                                            }),
+                                        );
+                                        origins.insert(transit.destination, (id, neighbor.clone()));
+                                    }
+                                }
+                                None => {
+                                    pq.push(
+                                        transit.destination,
+                                        Reverse(AStarPriority {
+                                            weight: length
+                                                + self.nodes_distance(transit.destination, b),
+                                            length,
+                                        }),
+                                    );
+                                    origins.insert(transit.destination, (id, neighbor.clone()));
                                 }
                             }
                         }
@@ -162,5 +241,52 @@ impl Graph {
         }
 
         return path;
+    }
+
+    pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {
+        let node_a = &self.nodes[a.0];
+        let node_b = &self.nodes[b.0];
+
+        (node_a.loc().dist(node_b.loc()) * 0.99) as usize
+    }
+
+    pub fn get_transit_departures_size(&self) -> usize {
+        self.transit_departures.len()
+    }
+
+    pub fn add_transit_departures(&mut self, segments: Vec<TripSegment>) {
+        self.transit_departures.extend(segments);
+    }
+
+    pub fn get_transit_services_size(&self) -> usize {
+        self.transit_services.len()
+    }
+
+    pub fn add_transit_services(&mut self, services: Vec<ServicePattern>) {
+        self.transit_services.extend(services);
+    }
+
+    pub fn get_transit_trips_size(&self) -> usize {
+        self.transit_trips.len()
+    }
+
+    pub fn add_transit_trips(&mut self, trips: Vec<TripInfo>) {
+        self.transit_trips.extend(trips);
+    }
+
+    pub fn get_transit_routes_size(&self) -> usize {
+        self.transit_routes.len()
+    }
+
+    pub fn add_transit_routes(&mut self, routes: Vec<RouteInfo>) {
+        self.transit_routes.extend(routes);
+    }
+
+    pub fn get_transit_agencies_size(&self) -> usize {
+        self.transit_agencies.len()
+    }
+
+    pub fn add_transit_agencies(&mut self, agencies: Vec<AgencyInfo>) {
+        self.transit_agencies.extend(agencies);
     }
 }
