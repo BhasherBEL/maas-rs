@@ -8,8 +8,10 @@ use kdtree::{KdTree, distance::squared_euclidean};
 use priority_queue::PriorityQueue;
 
 use crate::{
-    ingestion::gtfs::{AgencyInfo, RouteInfo, ServicePattern, TripInfo, TripSegment},
-    structures::{EdgeData, LatLng, NodeData, NodeID},
+    ingestion::gtfs::{
+        AgencyInfo, RouteInfo, ServicePattern, TimetableSegment, TripInfo, TripSegment,
+    },
+    structures::{EdgeData, LatLng, NodeData, NodeID, RoutingParameters},
 };
 
 #[derive(Debug)]
@@ -19,8 +21,9 @@ pub enum GraphError {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AStarPriority {
+    estimated_weight: usize,
     weight: usize,
-    length: usize,
+    time: u32,
 }
 
 pub struct Graph {
@@ -119,15 +122,24 @@ impl Graph {
         }
     }
 
-    pub fn a_star(&self, a: NodeID, b: NodeID) {
+    pub fn a_star(
+        &self,
+        a: NodeID,
+        b: NodeID,
+        start_time: u32,
+        start_day: u32,
+        weekday: u8,
+        params: RoutingParameters,
+    ) {
         let mut pq = PriorityQueue::<NodeID, Reverse<AStarPriority>>::new();
         let mut origins = HashMap::<NodeID, (NodeID, EdgeData)>::new();
         let mut visited = HashSet::<NodeID>::new();
         pq.push(
             a,
             Reverse(AStarPriority {
-                weight: 0 + self.nodes_distance(a, b),
-                length: 0,
+                estimated_weight: 0 + self.nodes_distance(a, b) * 1000 / params.estimator_speed,
+                weight: 0,
+                time: start_time,
             }),
         );
 
@@ -148,6 +160,14 @@ impl Graph {
                     }
                 });
                 println!("Length: {}", dist);
+                println!("Duration: {}", p.0.time - start_time);
+                let count_transit = path.iter().fold(0, |acc, e| {
+                    acc + match e {
+                        EdgeData::Street(_) => 0,
+                        EdgeData::Transit(_) => 1,
+                    }
+                });
+                println!("Took {} transits", count_transit);
                 return;
             }
             visited.insert(id);
@@ -159,17 +179,22 @@ impl Graph {
                             if visited.contains(&street.destination) {
                                 continue;
                             }
-                            let length = p.0.length + street.length;
+                            let weight = p.0.weight + street.length * 1000 / params.walking_speed;
 
                             match pq.get_priority(&street.destination) {
                                 Some(current) => {
-                                    if current.0.length > length {
+                                    if current.0.weight > weight {
                                         pq.change_priority(
                                             &street.destination,
                                             Reverse(AStarPriority {
-                                                weight: length
-                                                    + self.nodes_distance(street.destination, b),
-                                                length,
+                                                estimated_weight: weight
+                                                    + self.nodes_distance(street.destination, b)
+                                                        * 1000
+                                                        / params.estimator_speed,
+                                                weight,
+                                                time: p.0.time
+                                                    + (street.length * 1000 / params.walking_speed)
+                                                        as u32,
                                             }),
                                         );
                                         origins.insert(street.destination, (id, neighbor.clone()));
@@ -179,9 +204,13 @@ impl Graph {
                                     pq.push(
                                         street.destination,
                                         Reverse(AStarPriority {
-                                            weight: length
-                                                + self.nodes_distance(street.destination, b),
-                                            length,
+                                            estimated_weight: weight
+                                                + self.nodes_distance(street.destination, b) * 1000
+                                                    / params.estimator_speed,
+                                            weight,
+                                            time: p.0.time
+                                                + (street.length * 1000 / params.walking_speed)
+                                                    as u32,
                                         }),
                                     );
                                     origins.insert(street.destination, (id, neighbor.clone()));
@@ -192,17 +221,33 @@ impl Graph {
                             if visited.contains(&transit.destination) {
                                 continue;
                             }
-                            let length = p.0.length + transit.length;
+
+                            let next_departure = match self.next_transit_departure(
+                                transit.timetable_segment,
+                                p.0.time,
+                                start_day,
+                                weekday,
+                            ) {
+                                Some(departure) => departure,
+                                None => continue,
+                            };
+
+                            let edge_weight = next_departure.arrival - p.0.time;
+
+                            let weight = p.0.weight + edge_weight as usize;
 
                             match pq.get_priority(&transit.destination) {
                                 Some(current) => {
-                                    if current.0.length > length {
+                                    if current.0.weight > weight {
                                         pq.change_priority(
                                             &transit.destination,
                                             Reverse(AStarPriority {
-                                                weight: length
-                                                    + self.nodes_distance(transit.destination, b),
-                                                length,
+                                                estimated_weight: weight
+                                                    + self.nodes_distance(transit.destination, b)
+                                                        * 1000
+                                                        / params.estimator_speed,
+                                                weight,
+                                                time: next_departure.arrival,
                                             }),
                                         );
                                         origins.insert(transit.destination, (id, neighbor.clone()));
@@ -212,9 +257,12 @@ impl Graph {
                                     pq.push(
                                         transit.destination,
                                         Reverse(AStarPriority {
-                                            weight: length
-                                                + self.nodes_distance(transit.destination, b),
-                                            length,
+                                            estimated_weight: weight
+                                                + self.nodes_distance(transit.destination, b)
+                                                    * 1000
+                                                    / params.estimator_speed,
+                                            weight,
+                                            time: next_departure.arrival,
                                         }),
                                     );
                                     origins.insert(transit.destination, (id, neighbor.clone()));
@@ -288,5 +336,25 @@ impl Graph {
 
     pub fn add_transit_agencies(&mut self, agencies: Vec<AgencyInfo>) {
         self.transit_agencies.extend(agencies);
+    }
+
+    pub fn next_transit_departure(
+        &self,
+        tt: TimetableSegment,
+        time: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Option<&TripSegment> {
+        let slice = &self.transit_departures[tt.start..tt.start + tt.len];
+
+        let start_idx = slice.partition_point(|d| d.departure < time);
+
+        for dep in &slice[start_idx..] {
+            if self.transit_services[dep.service_id.0 as usize].is_active(date, weekday) {
+                return Some(dep);
+            }
+        }
+
+        None
     }
 }
