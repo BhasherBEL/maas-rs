@@ -2,20 +2,18 @@ use std::{collections::HashSet, result};
 
 use osmpbf::{Element, ElementReader, Way};
 
-use crate::structures::{EdgeData, Graph, NodeData, NodeID, StreetEdgeData};
+use crate::structures::{EdgeData, Graph, NodeData, NodeID, OsmNodeData, StreetEdgeData};
 
 pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
     let mut valid_node_ids = HashSet::new();
-    let mut valid_way_ids = HashSet::<i64>::new();
 
     reader.for_each(|element| {
         if let Element::Way(w) = element {
-            if !validate_way(w.clone()) {
+            if !validate_way(&w) {
                 return;
             }
 
-            valid_way_ids.insert(w.id());
             valid_node_ids.extend(w.refs());
         }
     })?;
@@ -24,25 +22,25 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
     reader.for_each(|element| match element {
         Element::DenseNode(n) if valid_node_ids.contains(&n.id()) => {
             let eid = format!("map#osm#{}", n.id());
-            let node = NodeData {
+            let node = OsmNodeData {
                 eid,
                 lat_lng: crate::structures::LatLng {
                     latitude: n.lat(),
                     longitude: n.lon(),
                 },
             };
-            g.add_node(node);
+            g.add_node(NodeData::OsmNode(node));
         }
         Element::Node(n) if valid_node_ids.contains(&n.id()) => {
             let eid = format!("map#osm#{}", n.id());
-            let node = NodeData {
+            let node = OsmNodeData {
                 eid,
                 lat_lng: crate::structures::LatLng {
                     latitude: n.lat(),
                     longitude: n.lon(),
                 },
             };
-            g.add_node(node);
+            g.add_node(NodeData::OsmNode(node));
         }
 
         _ => {}
@@ -55,7 +53,7 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
 
     reader.for_each(|element| {
         if let Element::Way(w) = element {
-            if valid_way_ids.contains(&w.id()) {
+            if validate_way(&w) {
                 let node_ids = w.refs().collect::<Vec<_>>();
 
                 // let from = node_ids[0];
@@ -109,7 +107,7 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
     Ok(())
 }
 
-fn validate_way(way: Way) -> bool {
+fn validate_way(way: &Way) -> bool {
     let highway = way.tags().find(|tag| tag.0 == "highway").map(|tag| tag.1);
     if !matches!(
         highway,
@@ -160,13 +158,13 @@ fn insert_from_osm_ids(
 ) -> bool {
     let from_eid = format!("map#osm#{}", from);
     let to_eid = format!("map#osm#{}", to);
-    let from_id = *match g.get_id(from_eid.clone()) {
+    let from_id = *match g.get_id(from_eid.as_str()) {
         Some(x) => x,
         None => {
             return false;
         }
     };
-    let to_id = *match g.get_id(to_eid.clone()) {
+    let to_id = *match g.get_id(to_eid.as_str()) {
         Some(x) => x,
         None => {
             return false;
@@ -187,7 +185,7 @@ fn insert_from_osm_ids(
         }
     };
 
-    let distance = from_node.lat_lng.dist(to_node.lat_lng) as usize;
+    let distance = from_node.loc().dist(to_node.loc()) as usize;
 
     if from_id == NodeID(644251) || to_id == NodeID(644251) {
         println!("Inserting {} <-> {}", from_id, to_id);
@@ -211,11 +209,11 @@ fn insert_from_osm_ids(
             EdgeData::Street(StreetEdgeData {
                 origin: to_id,
                 destination: from_id,
-                partial: partial,
                 length: distance,
-                foot: true,
-                bike: true,
-                car: true,
+                partial,
+                foot,
+                bike,
+                car,
             }),
         );
     }
