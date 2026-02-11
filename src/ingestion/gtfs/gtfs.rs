@@ -17,7 +17,7 @@ static MAX_NEIGHBOR_DISTANCE: f64 = 1000.0;
 pub struct AgencyId(pub u16);
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
-pub struct TripId(u32);
+pub struct TripId(pub u32);
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct RouteId(pub u32);

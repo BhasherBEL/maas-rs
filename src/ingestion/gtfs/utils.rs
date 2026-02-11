@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use gtfs_structures::RouteType;
+
 pub struct IdMapper<T> {
     to_index: HashMap<String, T>,
     to_string: Vec<String>,
@@ -33,4 +35,29 @@ impl IdMapper<usize> {
     pub fn to_gtfs_id(&self, idx: u32) -> &str {
         &self.to_string[idx as usize]
     }
+}
+
+pub fn display_route_type(route_type: RouteType) -> &'static str {
+    match route_type {
+        RouteType::Bus => "Bus",
+        RouteType::Air => "Air",
+        RouteType::Rail => "Rail",
+        RouteType::Taxi => "Taxi",
+        RouteType::Ferry => "Ferry",
+        RouteType::Coach => "Coach",
+        RouteType::Subway => "Subway",
+        RouteType::Funicular => "Funicular",
+        RouteType::Tramway => "Tramway",
+        RouteType::Gondola => "Gondola",
+        RouteType::CableCar => "CableCar",
+        RouteType::Other(_) => "Other",
+    }
+}
+
+pub fn sec_to_time(sec: u32) -> String {
+    let hours = sec / 3600;
+    let minutes = (sec % 3600) / 60;
+    let seconds = sec % 60;
+
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
