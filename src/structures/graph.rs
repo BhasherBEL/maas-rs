@@ -10,6 +10,7 @@ use priority_queue::PriorityQueue;
 use crate::{
     ingestion::gtfs::{
         AgencyInfo, RouteInfo, ServicePattern, TimetableSegment, TripInfo, TripSegment,
+        display_route_type, sec_to_time,
     },
     structures::{EdgeData, LatLng, NodeData, NodeID, RoutingParameters},
 };
@@ -132,7 +133,7 @@ impl Graph {
         params: RoutingParameters,
     ) {
         let mut pq = PriorityQueue::<NodeID, Reverse<AStarPriority>>::new();
-        let mut origins = HashMap::<NodeID, (NodeID, EdgeData)>::new();
+        let mut origins = HashMap::<NodeID, (NodeID, EdgeData, Option<usize>)>::new();
         let mut visited = HashSet::<NodeID>::new();
         pq.push(
             a,
@@ -151,23 +152,61 @@ impl Graph {
 
             if id == b {
                 println!("Found a path after visiting {} nodes!", visited.len());
-                let path = Graph::reconstruct_path(origins, id);
+                let path = Graph::reconstruct_path(origins.clone(), id);
                 println!("Nodes: {}", path.len());
                 let dist = path.iter().fold(0, |acc, e| {
-                    acc + match e {
+                    acc + match &e.0 {
                         EdgeData::Street(e) => e.length,
                         EdgeData::Transit(e) => e.length,
                     }
                 });
                 println!("Length: {}", dist);
                 println!("Duration: {}", p.0.time - start_time);
-                let count_transit = path.iter().fold(0, |acc, e| {
-                    acc + match e {
-                        EdgeData::Street(_) => 0,
-                        EdgeData::Transit(_) => 1,
+                for (e, departure_id) in path.iter().rev() {
+                    match e {
+                        EdgeData::Street(edge) => {
+                            println!("Walk {}m", edge.length)
+                        }
+                        EdgeData::Transit(edge) => {
+                            let route = &self.transit_routes[edge.route_id.0 as usize];
+                            let agency = &self.transit_agencies[route.agency_id.0 as usize];
+                            let origin = match &self.nodes[edge.origin.0] {
+                                NodeData::OsmNode(_) => {
+                                    println!("Found an OSM ndoe in a transit edge");
+                                    continue;
+                                }
+                                NodeData::TransitStop(node) => node,
+                            };
+                            let destination = match &self.nodes[edge.destination.0] {
+                                NodeData::OsmNode(_) => {
+                                    println!("Found an OSM ndoe in a transit edge");
+                                    continue;
+                                }
+                                NodeData::TransitStop(node) => node,
+                            };
+                            let trip_segment = match departure_id {
+                                Some(departure_id) => self.transit_departures[*departure_id],
+                                None => {
+                                    println!("Found an OSM ndoe in a transit edge");
+                                    continue;
+                                }
+                            };
+                            let trip = &self.transit_trips[trip_segment.trip_id.0 as usize];
+                            println!(
+                                "Take {}: {} {}  ({}) from {}, departing at {} to {}, arriving at {}",
+                                agency.name,
+                                display_route_type(route.route_type),
+                                route.route_short_name,
+                                trip.trip_headsign.clone().unwrap_or("??".to_string()),
+                                origin.name,
+                                sec_to_time(trip_segment.departure),
+                                destination.name,
+                                sec_to_time(trip_segment.arrival),
+                            );
+                        }
                     }
-                });
-                println!("Took {} transits", count_transit);
+                }
+
                 return;
             }
             visited.insert(id);
@@ -197,7 +236,10 @@ impl Graph {
                                                         as u32,
                                             }),
                                         );
-                                        origins.insert(street.destination, (id, neighbor.clone()));
+                                        origins.insert(
+                                            street.destination,
+                                            (id, neighbor.clone(), None),
+                                        );
                                     }
                                 }
                                 None => {
@@ -213,7 +255,8 @@ impl Graph {
                                                     as u32,
                                         }),
                                     );
-                                    origins.insert(street.destination, (id, neighbor.clone()));
+                                    origins
+                                        .insert(street.destination, (id, neighbor.clone(), None));
                                 }
                             }
                         }
@@ -222,12 +265,13 @@ impl Graph {
                                 continue;
                             }
 
-                            let next_departure = match self.next_transit_departure(
-                                transit.timetable_segment,
-                                p.0.time,
-                                start_day,
-                                weekday,
-                            ) {
+                            let (next_departure_index, next_departure) = match self
+                                .next_transit_departure(
+                                    transit.timetable_segment,
+                                    p.0.time,
+                                    start_day,
+                                    weekday,
+                                ) {
                                 Some(departure) => departure,
                                 None => continue,
                             };
@@ -250,7 +294,10 @@ impl Graph {
                                                 time: next_departure.arrival,
                                             }),
                                         );
-                                        origins.insert(transit.destination, (id, neighbor.clone()));
+                                        origins.insert(
+                                            transit.destination,
+                                            (id, neighbor.clone(), Some(next_departure_index)),
+                                        );
                                     }
                                 }
                                 None => {
@@ -265,7 +312,10 @@ impl Graph {
                                             time: next_departure.arrival,
                                         }),
                                     );
-                                    origins.insert(transit.destination, (id, neighbor.clone()));
+                                    origins.insert(
+                                        transit.destination,
+                                        (id, neighbor.clone(), Some(next_departure_index)),
+                                    );
                                 }
                             }
                         }
@@ -278,17 +328,17 @@ impl Graph {
     }
 
     fn reconstruct_path(
-        origins: HashMap<NodeID, (NodeID, EdgeData)>,
+        origins: HashMap<NodeID, (NodeID, EdgeData, Option<usize>)>,
         mut current: NodeID,
-    ) -> Vec<EdgeData> {
-        let mut path = Vec::<EdgeData>::new();
+    ) -> Vec<(EdgeData, Option<usize>)> {
+        let mut path = Vec::new();
 
         while let Some(next) = origins.get(&current) {
-            path.push(next.1.clone());
+            path.push((next.1.clone(), next.2));
             current = next.0;
         }
 
-        return path;
+        path
     }
 
     pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {
@@ -344,14 +394,14 @@ impl Graph {
         time: u32,
         date: u32,
         weekday: u8,
-    ) -> Option<&TripSegment> {
+    ) -> Option<(usize, &TripSegment)> {
         let slice = &self.transit_departures[tt.start..tt.start + tt.len];
 
         let start_idx = slice.partition_point(|d| d.departure < time);
 
-        for dep in &slice[start_idx..] {
+        for (i, dep) in slice[start_idx..].iter().enumerate() {
             if self.transit_services[dep.service_id.0 as usize].is_active(date, weekday) {
-                return Some(dep);
+                return Some((tt.start + start_idx + i, dep));
             }
         }
 

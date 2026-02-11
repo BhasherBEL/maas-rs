@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{env, time::SystemTime};
 
 use chrono::NaiveDate;
 use otpand::{
@@ -10,6 +10,18 @@ use otpand::{
 };
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() < 5 {
+        eprintln!("Usage: {} <from_lat> <from_lng> <to_lat> <to_lng>", args[0]);
+        return;
+    }
+
+    let from_lat: f64 = args[1].parse().expect("Invalid from_lat");
+    let from_lng: f64 = args[2].parse().expect("Invalid from_lng");
+    let to_lat: f64 = args[3].parse().expect("Invalid to_lat");
+    let to_lng: f64 = args[4].parse().expect("Invalid to_lng");
+
     let mut g = Graph::new();
 
     let before = SystemTime::now();
@@ -33,7 +45,7 @@ fn main() {
         }
     }
 
-    match g.nearest_node_dist(0.0, 0.0) {
+    match g.nearest_node_dist(from_lat, from_lng) {
         Some((a_dist, a_id)) => {
             println!(
                 "Nearest node a: {} at {:.2}m (geo: {})",
@@ -41,8 +53,7 @@ fn main() {
                 a_dist,
                 g.get_node(*a_id).unwrap().loc()
             );
-            match g.nearest_node_dist(0.0, 0.0) {
-                // match g.nearest_node_dist(0.0, 0.0) {
+            match g.nearest_node_dist(to_lat, to_lng) {
                 Some((b_dist, b_id)) => {
                     println!(
                         "Nearest node b: {} at {:.2}m (geo: {})",
@@ -58,7 +69,7 @@ fn main() {
                     let date = date_to_days(NaiveDate::from_ymd_opt(2026, 2, 10).unwrap());
                     let weekday = 1 << 2;
                     let params = RoutingParameters {
-                        walking_speed: 4 * 278,
+                        walking_speed: 5 * 278,
                         estimator_speed: 50 * 278,
                     };
 
