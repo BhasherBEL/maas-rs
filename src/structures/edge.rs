@@ -1,15 +1,17 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     ingestion::gtfs::{RouteId, TimetableSegment},
     structures::NodeID,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EdgeData {
     Street(StreetEdgeData),
     Transit(TransitEdgeData),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StreetEdgeData {
     pub origin: NodeID,
     pub destination: NodeID,
@@ -20,7 +22,7 @@ pub struct StreetEdgeData {
     pub car: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitEdgeData {
     pub origin: NodeID,
     pub destination: NodeID,

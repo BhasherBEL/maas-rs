@@ -1,4 +1,4 @@
-use std::{env, time::SystemTime};
+use std::{env, fs, time::SystemTime};
 
 use chrono::NaiveDate;
 use otpand::{
@@ -8,12 +8,66 @@ use otpand::{
     },
     structures::{Graph, RoutingParameters},
 };
+use postcard::to_allocvec;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 5 {
-        eprintln!("Usage: {} <from_lat> <from_lng> <to_lat> <to_lng>", args[0]);
+    let build_mode = args.contains(&"--build".to_string());
+    let save_mode = args.contains(&"--save".to_string());
+    let restore_mode = args.contains(&"--restore".to_string());
+    let serve_mode = args.contains(&"--serve".to_string());
+
+    if build_mode && restore_mode || !build_mode && !restore_mode {
+        println!("One of --build or --restore must be enabled. Only one of them can be used");
+        return;
+    }
+    if save_mode && !build_mode {
+        println!("--save cannot be used without --build");
+        return;
+    }
+    if serve_mode && args.len() < 6 {
+        eprintln!(
+            "Usage: {} <from_lat> <from_lng> <to_lat> <to_lng> --serve",
+            args[0]
+        );
+        return;
+    }
+
+    let g: Graph;
+
+    if build_mode {
+        g = match build() {
+            Some(g) => g,
+            None => {
+                println!("Failed to build graph");
+                return;
+            }
+        };
+
+        if save_mode {
+            let bytes = match to_allocvec(&g) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    println!("Failed to serialize graph: {}", e);
+                    return;
+                }
+            };
+
+            match fs::write("graph.bin", &bytes) {
+                Ok(_) => (),
+                Err(e) => {
+                    println!("Failed to save graph: {}", e);
+                    return;
+                }
+            }
+        }
+    } else {
+        return;
+    }
+
+    if !serve_mode {
+        println!("Done!");
         return;
     }
 
@@ -21,29 +75,6 @@ fn main() {
     let from_lng: f64 = args[2].parse().expect("Invalid from_lng");
     let to_lat: f64 = args[3].parse().expect("Invalid to_lat");
     let to_lng: f64 = args[4].parse().expect("Invalid to_lng");
-
-    let mut g = Graph::new();
-
-    let before = SystemTime::now();
-    match osm::load_pbf_file("data/brussels_capital_region-2026_01_24.osm.pbf", &mut g) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Failed to read file: {e}");
-            return;
-        }
-    }
-    match before.elapsed() {
-        Ok(elapsed) => println!("Data loaded in in {}ms", elapsed.as_millis()),
-        Err(e) => println!("Went backward ?? {}", e),
-    }
-
-    match load_gtfs("data/stib.zip", &mut g) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Faield to read GTFS: {}", e);
-            return;
-        }
-    }
 
     match g.nearest_node_dist(from_lat, from_lng) {
         Some((a_dist, a_id)) => {
@@ -84,4 +115,31 @@ fn main() {
         }
         None => println!("No close node found"),
     }
+}
+
+fn build() -> Option<Graph> {
+    let mut g = Graph::new();
+
+    let before = SystemTime::now();
+    match osm::load_pbf_file("data/brussels_capital_region-2026_01_24.osm.pbf", &mut g) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Failed to read file: {e}");
+            return None;
+        }
+    }
+    match before.elapsed() {
+        Ok(elapsed) => println!("Data loaded in in {}ms", elapsed.as_millis()),
+        Err(e) => println!("Went backward ?? {}", e),
+    }
+
+    match load_gtfs("data/stib.zip", &mut g) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Faield to read GTFS: {}", e);
+            return None;
+        }
+    }
+
+    Some(g)
 }

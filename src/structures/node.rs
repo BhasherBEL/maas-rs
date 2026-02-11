@@ -1,10 +1,11 @@
 use std::fmt::Display;
 
 use gtfs_structures::Availability;
+use serde::{Deserialize, Serialize};
 
 use crate::structures::LatLng;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeID(pub usize);
 
 impl Display for NodeID {
@@ -13,7 +14,7 @@ impl Display for NodeID {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeData {
     OsmNode(OsmNodeData),
     TransitStop(TransitStopData),
@@ -28,13 +29,13 @@ impl NodeData {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OsmNodeData {
     pub eid: String,
     pub lat_lng: LatLng,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitStopData {
     pub name: String,
     pub lat_lng: LatLng,

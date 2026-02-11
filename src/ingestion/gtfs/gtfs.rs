@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use gtfs_structures::RouteType;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::IdMapper,
@@ -13,21 +14,21 @@ static MAX_NEIGHBOR_DISTANCE: f64 = 1000.0;
 
 // Identifiers
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgencyId(pub u16);
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TripId(pub u32);
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteId(pub u32);
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceId(pub u32);
 
 // Structures
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TripSegment {
     pub trip_id: TripId,
     pub departure: u32,
@@ -35,20 +36,20 @@ pub struct TripSegment {
     pub service_id: ServiceId,
 }
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteSegment {
     pub departure: NodeID,
     pub arrival: NodeID,
     pub route_id: RouteId,
 }
 
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TimetableSegment {
     pub start: usize,
     pub len: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteInfo {
     pub route_short_name: String,
     pub route_long_name: String,
@@ -56,20 +57,20 @@ pub struct RouteInfo {
     pub agency_id: AgencyId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripInfo {
     pub trip_headsign: Option<String>,
     pub route_id: RouteId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgencyInfo {
     pub name: String,
     pub url: String,
     pub timezone: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServicePattern {
     pub days_of_week: u8,
     pub start_date: u32,
