@@ -1,6 +1,8 @@
 use std::fmt::Display;
 
-#[derive(Debug, Copy, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct LatLng {
     pub latitude: f64,
     pub longitude: f64,

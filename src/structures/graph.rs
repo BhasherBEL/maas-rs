@@ -6,6 +6,7 @@ use std::{
 
 use kdtree::{KdTree, distance::squared_euclidean};
 use priority_queue::PriorityQueue;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::{
@@ -15,18 +16,19 @@ use crate::{
     structures::{EdgeData, LatLng, NodeData, NodeID, RoutingParameters},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum GraphError {
     NodeNotFoundError(NodeID),
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct AStarPriority {
     estimated_weight: usize,
     weight: usize,
     time: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Graph {
     nodes: Vec<NodeData>,
     edges: Vec<Vec<EdgeData>>,
