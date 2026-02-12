@@ -1,0 +1,22 @@
+build:
+  inputs:
+    - ingestor: gtfs/generic
+      name: STIB
+      url: path:data/stib.zip
+
+    # - name: SNCB
+    #   ingestor: gtfs/generic
+    #   url: https://sncb.be/gtfs.zip
+
+    - ingestor: osm/pbf
+      url: path:data/brussels_capital_region-2026_01_24.osm.pbf
+
+  output: graph.bin
+
+default_routing:
+  walking_speed: 1390 # mm/s => 5 km/h
+  estimator_speed: 13900 # mm/s => 50 km/h
+
+server:
+  host: 127.0.0.1
+  port: 8000
