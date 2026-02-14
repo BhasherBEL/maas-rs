@@ -10,10 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::{
-        AgencyInfo, RouteInfo, ServicePattern, TimetableSegment, TripInfo, TripSegment,
-        display_route_type, sec_to_time,
+        AgencyId, AgencyInfo, RouteId, RouteInfo, ServicePattern, TimetableSegment, TripId,
+        TripInfo, TripSegment,
     },
-    structures::{EdgeData, LatLng, NodeData, NodeID, RoutingParameters},
+    structures::{
+        EdgeData, LatLng, NodeData, NodeID, RoutingParameters,
+        plan::{Plan, PlanLeg, PlanPlace},
+    },
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,6 +95,18 @@ impl Graph {
         self.nodes.len()
     }
 
+    pub fn get_trip(&self, id: TripId) -> Option<&TripInfo> {
+        self.transit_trips.get(id.0 as usize)
+    }
+
+    pub fn get_route(&self, id: RouteId) -> Option<&RouteInfo> {
+        self.transit_routes.get(id.0 as usize)
+    }
+
+    pub fn get_agency(&self, id: AgencyId) -> Option<&AgencyInfo> {
+        self.transit_agencies.get(id.0 as usize)
+    }
+
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
@@ -133,7 +148,7 @@ impl Graph {
         start_day: u32,
         weekday: u8,
         params: RoutingParameters,
-    ) {
+    ) -> Result<Plan, async_graphql::Error> {
         let mut pq = PriorityQueue::<NodeID, Reverse<AStarPriority>>::new();
         let mut origins = HashMap::<NodeID, (NodeID, EdgeData, Option<usize>)>::new();
         let mut visited = HashSet::<NodeID>::new();
@@ -149,67 +164,74 @@ impl Graph {
         while !pq.is_empty() {
             let (id, p) = match pq.pop() {
                 Some(x) => x,
-                None => return,
+                None => return Err(async_graphql::Error::new("No plan found")),
             };
 
             if id == b {
-                println!("Found a path after visiting {} nodes!", visited.len());
                 let path = Graph::reconstruct_path(origins.clone(), id);
-                println!("Nodes: {}", path.len());
-                let dist = path.iter().fold(0, |acc, e| {
-                    acc + match &e.0 {
-                        EdgeData::Street(e) => e.length,
-                        EdgeData::Transit(e) => e.length,
-                    }
-                });
-                println!("Length: {}", dist);
-                println!("Duration: {}", p.0.time - start_time);
+                let mut legs = Vec::<PlanLeg>::new();
+
                 for (e, departure_id) in path.iter().rev() {
                     match e {
                         EdgeData::Street(edge) => {
-                            println!("Walk {}m", edge.length)
+                            legs.push(PlanLeg {
+                                mode: "WALK".to_string(),
+                                length: edge.length,
+                                start: 0,
+                                end: 0,
+                                duration: 0,
+                                trip_id: None,
+                                from: PlanPlace {
+                                    departure: None,
+                                    arrival: None,
+                                    stop_position: None,
+                                    node_id: edge.origin,
+                                },
+                                to: PlanPlace {
+                                    departure: None,
+                                    arrival: None,
+                                    stop_position: None,
+                                    node_id: edge.destination,
+                                },
+                            });
                         }
                         EdgeData::Transit(edge) => {
-                            let route = &self.transit_routes[edge.route_id.0 as usize];
-                            let agency = &self.transit_agencies[route.agency_id.0 as usize];
-                            let origin = match &self.nodes[edge.origin.0] {
-                                NodeData::OsmNode(_) => {
-                                    println!("Found an OSM ndoe in a transit edge");
-                                    continue;
-                                }
-                                NodeData::TransitStop(node) => node,
-                            };
-                            let destination = match &self.nodes[edge.destination.0] {
-                                NodeData::OsmNode(_) => {
-                                    println!("Found an OSM ndoe in a transit edge");
-                                    continue;
-                                }
-                                NodeData::TransitStop(node) => node,
-                            };
                             let trip_segment = match departure_id {
                                 Some(departure_id) => self.transit_departures[*departure_id],
                                 None => {
-                                    println!("Found an OSM ndoe in a transit edge");
-                                    continue;
+                                    return Err(async_graphql::Error::new(
+                                        "Found an OSM ndoe in a transit edge",
+                                    ));
                                 }
                             };
-                            let trip = &self.transit_trips[trip_segment.trip_id.0 as usize];
-                            println!(
-                                "Take {}: {} {}  ({}) from {}, departing at {} to {}, arriving at {}",
-                                agency.name,
-                                display_route_type(route.route_type),
-                                route.route_short_name,
-                                trip.trip_headsign.clone().unwrap_or("??".to_string()),
-                                origin.name,
-                                sec_to_time(trip_segment.departure),
-                                destination.name,
-                                sec_to_time(trip_segment.arrival),
-                            );
+                            legs.push(PlanLeg {
+                                mode: "TRANSIT".to_string(),
+                                length: edge.length,
+                                start: trip_segment.departure,
+                                end: trip_segment.arrival,
+                                duration: trip_segment.arrival - trip_segment.departure,
+                                trip_id: Some(trip_segment.trip_id),
+                                from: PlanPlace {
+                                    stop_position: None,
+                                    arrival: None,
+                                    departure: Some(trip_segment.departure),
+                                    node_id: edge.origin,
+                                },
+                                to: PlanPlace {
+                                    stop_position: None,
+                                    arrival: Some(trip_segment.arrival),
+                                    departure: None,
+                                    node_id: edge.destination,
+                                },
+                            });
                         }
                     }
                 }
-
-                return;
+                return Ok(Plan {
+                    legs,
+                    start: start_time,
+                    end: p.0.time,
+                });
             }
             visited.insert(id);
 
@@ -326,7 +348,7 @@ impl Graph {
             }
         }
 
-        println!("Didn't found a path after visiting {} nodes", visited.len());
+        return Err(async_graphql::Error::new("No plan found"));
     }
 
     fn reconstruct_path(
