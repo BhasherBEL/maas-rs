@@ -1,15 +1,16 @@
-use std::env;
+use std::{env, sync::Arc};
 
 use otpand::{
-    routing::routing::{RouteQuery, route},
     services::{
         build::build_graph,
         persistence::{load_graph, save_graph},
     },
     structures::Config,
+    web::app,
 };
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = match Config::load("config.yaml") {
         Ok(c) => c,
         Err(e) => {
@@ -33,13 +34,13 @@ fn main() {
         println!("--save cannot be used without --build");
         return;
     }
-    if serve_mode && args.len() < 6 {
-        eprintln!(
-            "Usage: {} <from_lat> <from_lng> <to_lat> <to_lng> --serve",
-            args[0]
-        );
-        return;
-    }
+    // if serve_mode && args.len() < 6 {
+    //     eprintln!(
+    //         "Usage: {} <from_lat> <from_lng> <to_lat> <to_lng> --serve",
+    //         args[0]
+    //     );
+    //     return;
+    // }
 
     let g = if build_mode {
         let graph = match build_graph(config.build) {
@@ -72,18 +73,5 @@ fn main() {
         return;
     }
 
-    let from_lat: f64 = args[1].parse().expect("Invalid from_lat");
-    let from_lng: f64 = args[2].parse().expect("Invalid from_lng");
-    let to_lat: f64 = args[3].parse().expect("Invalid to_lat");
-    let to_lng: f64 = args[4].parse().expect("Invalid to_lng");
-
-    route(
-        &g,
-        &RouteQuery {
-            from_lat,
-            from_lng,
-            to_lat,
-            to_lng,
-        },
-    );
+    let _ = app::server(Arc::new(g)).await;
 }

@@ -3,6 +3,7 @@ mod edge;
 mod geo;
 mod graph;
 mod node;
+pub mod plan;
 mod routingparameters;
 
 pub use config::*;

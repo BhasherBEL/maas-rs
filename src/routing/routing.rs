@@ -1,8 +1,7 @@
-use std::time::SystemTime;
-
 use chrono::NaiveDate;
 
 use crate::ingestion::gtfs::date_to_days;
+use crate::structures::plan::Plan;
 use crate::structures::{Graph, RoutingParameters};
 
 pub struct RouteQuery {
@@ -12,7 +11,7 @@ pub struct RouteQuery {
     pub to_lng: f64,
 }
 
-pub fn route(graph: &Graph, query: &RouteQuery) {
+pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::Error> {
     let (_, a_id) = match graph.nearest_node_dist(query.from_lat, query.from_lng) {
         Some((a_dist, a_id)) => {
             println!(
@@ -24,8 +23,9 @@ pub fn route(graph: &Graph, query: &RouteQuery) {
             (a_dist, a_id)
         }
         None => {
-            println!("No close node found");
-            return;
+            return Err(async_graphql::Error::new(
+                "No node close to departure found",
+            ));
         }
     };
 
@@ -40,12 +40,9 @@ pub fn route(graph: &Graph, query: &RouteQuery) {
             (b_dist, b_id)
         }
         None => {
-            println!("No close node found");
-            return;
+            return Err(async_graphql::Error::new("No node close to arrival found"));
         }
     };
-
-    let before = SystemTime::now();
 
     let from = *a_id;
     let to = *b_id;
@@ -57,9 +54,5 @@ pub fn route(graph: &Graph, query: &RouteQuery) {
         estimator_speed: 50 * 278,
     };
 
-    graph.a_star(from, to, time, date, weekday, params);
-    match before.elapsed() {
-        Ok(elapsed) => println!("Ran in {}ms", elapsed.as_millis()),
-        Err(e) => println!("Went backward ?? {}", e),
-    }
+    graph.a_star(from, to, time, date, weekday, params)
 }
