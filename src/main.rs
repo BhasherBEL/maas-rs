@@ -1,6 +1,6 @@
 use std::{env, sync::Arc};
 
-use otpand::{
+use maas_rs::{
     services::{
         build::build_graph,
         persistence::{load_graph, save_graph},
