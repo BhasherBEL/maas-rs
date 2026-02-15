@@ -4,7 +4,7 @@ use async_graphql::{ComplexObject, Context, Result, SimpleObject};
 
 use crate::structures::{Graph, NodeID, plan::PlanNode};
 
-#[derive(Debug, SimpleObject)]
+#[derive(Debug, SimpleObject, Clone, Copy)]
 #[graphql(complex)]
 pub struct PlanPlace {
     pub stop_position: Option<usize>,

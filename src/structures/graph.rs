@@ -4,6 +4,7 @@ use std::{
     usize,
 };
 
+use async_graphql::Result;
 use kdtree::{KdTree, distance::squared_euclidean};
 use priority_queue::PriorityQueue;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use crate::{
     },
     structures::{
         EdgeData, LatLng, NodeData, NodeID, RoutingParameters,
-        plan::{Plan, PlanLeg, PlanPlace},
+        plan::{Plan, PlanLeg, PlanLegStep, PlanLegType, PlanPlace},
     },
 };
 
@@ -28,6 +29,14 @@ pub enum GraphError {
 struct AStarPriority {
     estimated_weight: usize,
     weight: usize,
+    time: u32,
+}
+
+#[derive(Debug, Serialize, Copy, Deserialize, Clone)]
+struct AStarOrigins {
+    destination: NodeID,
+    edge: EdgeData,
+    next_departure_index: Option<usize>,
     time: u32,
 }
 
@@ -150,7 +159,7 @@ impl Graph {
         params: RoutingParameters,
     ) -> Result<Plan, async_graphql::Error> {
         let mut pq = PriorityQueue::<NodeID, Reverse<AStarPriority>>::new();
-        let mut origins = HashMap::<NodeID, (NodeID, EdgeData, Option<usize>)>::new();
+        let mut origins = HashMap::<NodeID, AStarOrigins>::new();
         let mut visited = HashSet::<NodeID>::new();
         pq.push(
             a,
@@ -168,69 +177,10 @@ impl Graph {
             };
 
             if id == b {
-                let path = Graph::reconstruct_path(origins.clone(), id);
-                let mut legs = Vec::<PlanLeg>::new();
-
-                for (e, departure_id) in path.iter().rev() {
-                    match e {
-                        EdgeData::Street(edge) => {
-                            legs.push(PlanLeg {
-                                mode: "WALK".to_string(),
-                                length: edge.length,
-                                start: 0,
-                                end: 0,
-                                duration: 0,
-                                trip_id: None,
-                                from: PlanPlace {
-                                    departure: None,
-                                    arrival: None,
-                                    stop_position: None,
-                                    node_id: edge.origin,
-                                },
-                                to: PlanPlace {
-                                    departure: None,
-                                    arrival: None,
-                                    stop_position: None,
-                                    node_id: edge.destination,
-                                },
-                            });
-                        }
-                        EdgeData::Transit(edge) => {
-                            let trip_segment = match departure_id {
-                                Some(departure_id) => self.transit_departures[*departure_id],
-                                None => {
-                                    return Err(async_graphql::Error::new(
-                                        "Found an OSM ndoe in a transit edge",
-                                    ));
-                                }
-                            };
-                            legs.push(PlanLeg {
-                                mode: "TRANSIT".to_string(),
-                                length: edge.length,
-                                start: trip_segment.departure,
-                                end: trip_segment.arrival,
-                                duration: trip_segment.arrival - trip_segment.departure,
-                                trip_id: Some(trip_segment.trip_id),
-                                from: PlanPlace {
-                                    stop_position: None,
-                                    arrival: None,
-                                    departure: Some(trip_segment.departure),
-                                    node_id: edge.origin,
-                                },
-                                to: PlanPlace {
-                                    stop_position: None,
-                                    arrival: Some(trip_segment.arrival),
-                                    departure: None,
-                                    node_id: edge.destination,
-                                },
-                            });
-                        }
-                    }
-                }
                 return Ok(Plan {
-                    legs,
                     start: start_time,
                     end: p.0.time,
+                    legs: self.reconstruct_path(start_time, &origins, id)?,
                 });
             }
             visited.insert(id);
@@ -247,6 +197,8 @@ impl Graph {
                             match pq.get_priority(&street.destination) {
                                 Some(current) => {
                                     if current.0.weight > weight {
+                                        let time = p.0.time
+                                            + (street.length * 1000 / params.walking_speed) as u32;
                                         pq.change_priority(
                                             &street.destination,
                                             Reverse(AStarPriority {
@@ -255,18 +207,23 @@ impl Graph {
                                                         * 1000
                                                         / params.estimator_speed,
                                                 weight,
-                                                time: p.0.time
-                                                    + (street.length * 1000 / params.walking_speed)
-                                                        as u32,
+                                                time,
                                             }),
                                         );
                                         origins.insert(
                                             street.destination,
-                                            (id, neighbor.clone(), None),
+                                            AStarOrigins {
+                                                destination: id,
+                                                edge: neighbor.clone(),
+                                                next_departure_index: None,
+                                                time,
+                                            },
                                         );
                                     }
                                 }
                                 None => {
+                                    let time = p.0.time
+                                        + (street.length * 1000 / params.walking_speed) as u32;
                                     pq.push(
                                         street.destination,
                                         Reverse(AStarPriority {
@@ -274,13 +231,18 @@ impl Graph {
                                                 + self.nodes_distance(street.destination, b) * 1000
                                                     / params.estimator_speed,
                                             weight,
-                                            time: p.0.time
-                                                + (street.length * 1000 / params.walking_speed)
-                                                    as u32,
+                                            time,
                                         }),
                                     );
-                                    origins
-                                        .insert(street.destination, (id, neighbor.clone(), None));
+                                    origins.insert(
+                                        street.destination,
+                                        AStarOrigins {
+                                            destination: id,
+                                            edge: neighbor.clone(),
+                                            next_departure_index: None,
+                                            time,
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -320,7 +282,12 @@ impl Graph {
                                         );
                                         origins.insert(
                                             transit.destination,
-                                            (id, neighbor.clone(), Some(next_departure_index)),
+                                            AStarOrigins {
+                                                destination: id,
+                                                edge: neighbor.clone(),
+                                                next_departure_index: Some(next_departure_index),
+                                                time: next_departure.arrival,
+                                            },
                                         );
                                     }
                                 }
@@ -338,7 +305,12 @@ impl Graph {
                                     );
                                     origins.insert(
                                         transit.destination,
-                                        (id, neighbor.clone(), Some(next_departure_index)),
+                                        AStarOrigins {
+                                            destination: id,
+                                            edge: neighbor.clone(),
+                                            next_departure_index: Some(next_departure_index),
+                                            time: next_departure.arrival,
+                                        },
                                     );
                                 }
                             }
@@ -352,17 +324,249 @@ impl Graph {
     }
 
     fn reconstruct_path(
-        origins: HashMap<NodeID, (NodeID, EdgeData, Option<usize>)>,
+        &self,
+        start_time: u32,
+        origins: &HashMap<NodeID, AStarOrigins>,
         mut current: NodeID,
-    ) -> Vec<(EdgeData, Option<usize>)> {
-        let mut path = Vec::new();
+    ) -> Result<Vec<PlanLeg>> {
+        let mut path: Vec<&AStarOrigins> = Vec::new();
 
         while let Some(next) = origins.get(&current) {
-            path.push((next.1.clone(), next.2));
-            current = next.0;
+            path.push(next);
+            current = next.destination;
         }
 
-        path
+        path.reverse();
+
+        if path.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut legs = Vec::<PlanLeg>::new();
+        let mut current: Option<PlanLeg> = None;
+
+        for origin in path {
+            match &origin.edge {
+                EdgeData::Street(edge) => {
+                    let from = PlanPlace {
+                        node_id: edge.origin,
+                        arrival: None,
+                        departure: None,
+                        stop_position: None,
+                    };
+                    let to = PlanPlace {
+                        node_id: edge.destination,
+                        arrival: Some(origin.time),
+                        departure: Some(origin.time),
+                        stop_position: None,
+                    };
+
+                    let step = PlanLegStep {
+                        length: edge.length,
+                        time: 0,
+                        place: to,
+                    };
+
+                    match current {
+                        None => {
+                            let mut steps = Vec::<PlanLegStep>::new();
+                            steps.push(step);
+                            current = Some(PlanLeg {
+                                mode: PlanLegType::WALK,
+                                steps,
+                                from,
+                                to,
+                                length: edge.length,
+                                start: start_time,
+                                end: origin.time,
+                                duration: origin.time - start_time,
+                                trip_id: None,
+                            })
+                        }
+                        Some(ref mut c) => {
+                            if c.mode != PlanLegType::WALK {
+                                legs.push(c.clone());
+                                let mut steps = Vec::<PlanLegStep>::new();
+                                steps.push(step);
+                                current = Some(PlanLeg {
+                                    mode: PlanLegType::WALK,
+                                    steps,
+                                    from,
+                                    to,
+                                    length: edge.length,
+                                    start: start_time,
+                                    end: origin.time,
+                                    duration: origin.time - start_time,
+                                    trip_id: None,
+                                });
+                            } else {
+                                c.steps.push(step);
+                                c.to = to;
+                                c.end += step.time;
+                                c.length += step.length;
+                            }
+                        }
+                    }
+                }
+                EdgeData::Transit(edge) => {
+                    let trip_segment = match origin.next_departure_index {
+                        Some(departure_id) => self.transit_departures[departure_id],
+                        None => {
+                            return Err(async_graphql::Error::new(
+                                "Found a transit edge without departure",
+                            ));
+                        }
+                    };
+                    let from = PlanPlace {
+                        node_id: edge.origin,
+                        arrival: None,
+                        departure: Some(trip_segment.departure),
+                        stop_position: None,
+                    };
+                    let to = PlanPlace {
+                        node_id: edge.destination,
+                        arrival: Some(trip_segment.arrival),
+                        departure: None,
+                        stop_position: None,
+                    };
+
+                    let step = PlanLegStep {
+                        length: edge.length,
+                        time: trip_segment.arrival - trip_segment.departure,
+                        place: to,
+                    };
+
+                    match current {
+                        None => {
+                            let mut steps = Vec::<PlanLegStep>::new();
+                            steps.push(step);
+                            current = Some(PlanLeg {
+                                mode: PlanLegType::TRANSIT,
+                                steps,
+                                from,
+                                to,
+                                length: edge.length,
+                                start: trip_segment.departure,
+                                end: trip_segment.arrival,
+                                duration: trip_segment.arrival - trip_segment.departure,
+                                trip_id: Some(trip_segment.trip_id),
+                            })
+                        }
+                        Some(ref mut c) => {
+                            if c.mode != PlanLegType::TRANSIT
+                                || c.trip_id != Some(trip_segment.trip_id)
+                            {
+                                legs.push(c.clone());
+                                let mut steps = Vec::<PlanLegStep>::new();
+                                steps.push(step);
+                                current = Some(PlanLeg {
+                                    mode: PlanLegType::TRANSIT,
+                                    steps,
+                                    from,
+                                    to,
+                                    length: edge.length,
+                                    start: trip_segment.departure,
+                                    end: trip_segment.arrival,
+                                    duration: trip_segment.arrival - trip_segment.departure,
+                                    trip_id: Some(trip_segment.trip_id),
+                                });
+                            } else {
+                                c.steps.push(step);
+                                c.to = to;
+                                c.end = trip_segment.arrival;
+                                c.length += edge.length;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match current {
+            Some(current) => legs.push(current),
+            None => {}
+        }
+
+        Ok(legs)
+
+        // let mut path = Vec::new();
+        //
+        // while let Some(next) = origins.get(&current) {
+        //     path.push((next.1.clone(), next.2));
+        //     current = next.0;
+        // }
+        //
+        // let mut steps = Vec::<PlanLegStep>::new();
+        // let mut legs = Vec::<PlanLeg>::new();
+        //
+        // for (e, departure_id) in path.iter().rev() {
+        //     let step = match e {
+        //         EdgeData::Street(edge) => {
+        //             PlanLegStep {
+        //                 length: edge.length,
+        //                 place: PlanPlace {
+        //                     stop_position: None,
+        //                     arrival: None,
+        //                     departure: None,
+        //                     node_id: edge.destination,
+        //                 },
+        //             }
+        //
+        //             legs.push(PlanLeg {
+        //                 mode: "WALK".to_string(),
+        //                 length: edge.length,
+        //                 start: 0,
+        //                 end: 0,
+        //                 duration: 0,
+        //                 trip_id: None,
+        //                 from: PlanPlace {
+        //                     departure: None,
+        //                     arrival: None,
+        //                     stop_position: None,
+        //                     node_id: edge.origin,
+        //                 },
+        //                 to: PlanPlace {
+        //                     departure: None,
+        //                     arrival: None,
+        //                     stop_position: None,
+        //                     node_id: edge.destination,
+        //                 },
+        //             });
+        //         }
+        //         EdgeData::Transit(edge) => {
+        //             let trip_segment = match departure_id {
+        //                 Some(departure_id) => self.transit_departures[*departure_id],
+        //                 None => {
+        //                     return Err(async_graphql::Error::new(
+        //                         "Found an OSM ndoe in a transit edge",
+        //                     ));
+        //                 }
+        //             };
+        //             legs.push(PlanLeg {
+        //                 mode: "TRANSIT".to_string(),
+        //                 length: edge.length,
+        //                 start: trip_segment.departure,
+        //                 end: trip_segment.arrival,
+        //                 duration: trip_segment.arrival - trip_segment.departure,
+        //                 trip_id: Some(trip_segment.trip_id),
+        //                 from: PlanPlace {
+        //                     stop_position: None,
+        //                     arrival: None,
+        //                     departure: Some(trip_segment.departure),
+        //                     node_id: edge.origin,
+        //                 },
+        //                 to: PlanPlace {
+        //                     stop_position: None,
+        //                     arrival: Some(trip_segment.arrival),
+        //                     departure: None,
+        //                     node_id: edge.destination,
+        //                 },
+        //             });
+        //         }
+        //     }
+        // }
+        //
+        // legs
     }
 
     pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {

@@ -13,15 +13,7 @@ pub struct RouteQuery {
 
 pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::Error> {
     let (_, a_id) = match graph.nearest_node_dist(query.from_lat, query.from_lng) {
-        Some((a_dist, a_id)) => {
-            println!(
-                "Nearest node a: {} at {:.2}m (geo: {})",
-                a_id.0,
-                a_dist,
-                graph.get_node(*a_id).unwrap().loc()
-            );
-            (a_dist, a_id)
-        }
+        Some((a_dist, a_id)) => (a_dist, a_id),
         None => {
             return Err(async_graphql::Error::new(
                 "No node close to departure found",
@@ -30,15 +22,7 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::E
     };
 
     let (_, b_id) = match graph.nearest_node_dist(query.to_lat, query.to_lng) {
-        Some((b_dist, b_id)) => {
-            println!(
-                "Nearest node b: {} at {:.2}m (geo: {})",
-                b_id.0,
-                b_dist,
-                graph.get_node(*b_id).unwrap().loc()
-            );
-            (b_dist, b_id)
-        }
+        Some((b_dist, b_id)) => (b_dist, b_id),
         None => {
             return Err(async_graphql::Error::new("No node close to arrival found"));
         }

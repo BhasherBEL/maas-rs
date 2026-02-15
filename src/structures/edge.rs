@@ -5,7 +5,7 @@ use crate::{
     structures::NodeID,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
 pub enum EdgeData {
     Street(StreetEdgeData),
     Transit(TransitEdgeData),
@@ -22,7 +22,7 @@ pub struct StreetEdgeData {
     pub car: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TransitEdgeData {
     pub origin: NodeID,
     pub destination: NodeID,
