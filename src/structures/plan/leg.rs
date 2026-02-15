@@ -1,19 +1,26 @@
 use std::sync::Arc;
 
-use async_graphql::{ComplexObject, Context, Result, SimpleObject};
+use async_graphql::{ComplexObject, Context, Enum, Result, SimpleObject};
 
 use crate::{
     ingestion::gtfs::TripId,
     structures::{
         Graph,
-        plan::{PlanPlace, PlanTrip},
+        plan::{PlanLegStep, PlanPlace, PlanTrip},
     },
 };
 
-#[derive(Debug, SimpleObject)]
+#[derive(Debug, Enum, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum PlanLegType {
+    WALK,
+    TRANSIT,
+    OTHER,
+}
+
+#[derive(Debug, SimpleObject, Clone)]
 #[graphql(complex)]
 pub struct PlanLeg {
-    pub mode: String,
+    pub mode: PlanLegType,
     pub length: usize,
     pub start: u32,
     pub end: u32,
@@ -21,6 +28,8 @@ pub struct PlanLeg {
 
     pub from: PlanPlace,
     pub to: PlanPlace,
+
+    pub steps: Vec<PlanLegStep>,
 
     #[graphql(skip)]
     pub trip_id: Option<TripId>,
