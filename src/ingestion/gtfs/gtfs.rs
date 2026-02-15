@@ -31,6 +31,8 @@ pub struct ServiceId(pub u32);
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TripSegment {
     pub trip_id: TripId,
+    pub origin_stop_sequence: u32,
+    pub destination_stop_sequence: u32,
     pub departure: u32,
     pub arrival: u32,
     pub service_id: ServiceId,
@@ -360,6 +362,8 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
                 .or_insert(Vec::<TripSegment>::new())
                 .push(TripSegment {
                     trip_id: TripId((trip_id + trips_offset) as u32),
+                    origin_stop_sequence: st1.stop_sequence,
+                    destination_stop_sequence: st2.stop_sequence,
                     departure,
                     arrival,
                     service_id: ServiceId((service_id + services_offset) as u32),

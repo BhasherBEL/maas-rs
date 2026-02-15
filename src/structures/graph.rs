@@ -16,7 +16,10 @@ use crate::{
     },
     structures::{
         EdgeData, LatLng, NodeData, NodeID, RoutingParameters,
-        plan::{Plan, PlanLeg, PlanLegStep, PlanLegType, PlanPlace},
+        plan::{
+            Plan, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg,
+            PlanWalkLegStep,
+        },
     },
 };
 
@@ -177,10 +180,11 @@ impl Graph {
             };
 
             if id == b {
+                let legs = self.reconstruct_path(start_time, start_day, weekday, &origins, id)?;
                 return Ok(Plan {
                     start: start_time,
                     end: p.0.time,
-                    legs: self.reconstruct_path(start_time, &origins, id)?,
+                    legs,
                 });
             }
             visited.insert(id);
@@ -326,9 +330,11 @@ impl Graph {
     fn reconstruct_path(
         &self,
         start_time: u32,
+        start_day: u32,
+        weekday: u8,
         origins: &HashMap<NodeID, AStarOrigins>,
         mut current: NodeID,
-    ) -> Result<Vec<PlanLeg>> {
+    ) -> async_graphql::Result<Vec<PlanLeg>> {
         let mut path: Vec<&AStarOrigins> = Vec::new();
 
         while let Some(next) = origins.get(&current) {
@@ -361,7 +367,7 @@ impl Graph {
                         stop_position: None,
                     };
 
-                    let step = PlanLegStep {
+                    let step = PlanWalkLegStep {
                         length: edge.length,
                         time: 0,
                         place: to,
@@ -370,9 +376,8 @@ impl Graph {
                     match current {
                         None => {
                             let mut steps = Vec::<PlanLegStep>::new();
-                            steps.push(step);
-                            current = Some(PlanLeg {
-                                mode: PlanLegType::WALK,
+                            steps.push(PlanLegStep::Walk(step));
+                            current = Some(PlanLeg::Walk(PlanWalkLeg {
                                 steps,
                                 from,
                                 to,
@@ -380,16 +385,20 @@ impl Graph {
                                 start: start_time,
                                 end: origin.time,
                                 duration: origin.time - start_time,
-                                trip_id: None,
-                            })
+                            }));
                         }
-                        Some(ref mut c) => {
-                            if c.mode != PlanLegType::WALK {
+                        Some(ref mut c) => match c {
+                            PlanLeg::Walk(cw) => {
+                                cw.steps.push(PlanLegStep::Walk(step));
+                                cw.to = to;
+                                cw.end += step.time;
+                                cw.length += step.length;
+                            }
+                            PlanLeg::Transit(_) => {
                                 legs.push(c.clone());
                                 let mut steps = Vec::<PlanLegStep>::new();
-                                steps.push(step);
-                                current = Some(PlanLeg {
-                                    mode: PlanLegType::WALK,
+                                steps.push(PlanLegStep::Walk(step));
+                                current = Some(PlanLeg::Walk(PlanWalkLeg {
                                     steps,
                                     from,
                                     to,
@@ -397,51 +406,48 @@ impl Graph {
                                     start: start_time,
                                     end: origin.time,
                                     duration: origin.time - start_time,
-                                    trip_id: None,
-                                });
-                            } else {
-                                c.steps.push(step);
-                                c.to = to;
-                                c.end += step.time;
-                                c.length += step.length;
+                                }));
                             }
-                        }
+                        },
                     }
                 }
                 EdgeData::Transit(edge) => {
-                    let trip_segment = match origin.next_departure_index {
-                        Some(departure_id) => self.transit_departures[departure_id],
-                        None => {
-                            return Err(async_graphql::Error::new(
+                    let departure_index =
+                        origin
+                            .next_departure_index
+                            .ok_or(async_graphql::Error::new(
                                 "Found a transit edge without departure",
-                            ));
-                        }
-                    };
+                            ))?;
+                    let trip_segment = self.transit_departures[departure_index];
+
                     let from = PlanPlace {
                         node_id: edge.origin,
                         arrival: None,
                         departure: Some(trip_segment.departure),
-                        stop_position: None,
+                        stop_position: Some(trip_segment.origin_stop_sequence),
                     };
                     let to = PlanPlace {
                         node_id: edge.destination,
                         arrival: Some(trip_segment.arrival),
                         departure: None,
-                        stop_position: None,
+                        stop_position: Some(trip_segment.destination_stop_sequence),
                     };
 
-                    let step = PlanLegStep {
+                    let step = PlanTransitLegStep {
                         length: edge.length,
                         time: trip_segment.arrival - trip_segment.departure,
                         place: to,
+                        date: start_day,
+                        weekday,
+                        timetable_segment: edge.timetable_segment,
+                        departure_index,
                     };
 
                     match current {
                         None => {
                             let mut steps = Vec::<PlanLegStep>::new();
-                            steps.push(step);
-                            current = Some(PlanLeg {
-                                mode: PlanLegType::TRANSIT,
+                            steps.push(PlanLegStep::Transit(step));
+                            current = Some(PlanLeg::Transit(PlanTransitLeg {
                                 steps,
                                 from,
                                 to,
@@ -449,18 +455,37 @@ impl Graph {
                                 start: trip_segment.departure,
                                 end: trip_segment.arrival,
                                 duration: trip_segment.arrival - trip_segment.departure,
-                                trip_id: Some(trip_segment.trip_id),
-                            })
+                                trip_id: trip_segment.trip_id,
+                            }));
                         }
-                        Some(ref mut c) => {
-                            if c.mode != PlanLegType::TRANSIT
-                                || c.trip_id != Some(trip_segment.trip_id)
-                            {
+                        Some(ref mut c) => match c {
+                            PlanLeg::Transit(ct) => {
+                                if ct.trip_id == trip_segment.trip_id {
+                                    ct.steps.push(PlanLegStep::Transit(step));
+                                    ct.to = to;
+                                    ct.end = trip_segment.arrival;
+                                    ct.length += edge.length;
+                                } else {
+                                    legs.push(c.clone());
+                                    let mut steps = Vec::<PlanLegStep>::new();
+                                    steps.push(PlanLegStep::Transit(step));
+                                    current = Some(PlanLeg::Transit(PlanTransitLeg {
+                                        steps,
+                                        from,
+                                        to,
+                                        length: edge.length,
+                                        start: trip_segment.departure,
+                                        end: trip_segment.arrival,
+                                        duration: trip_segment.arrival - trip_segment.departure,
+                                        trip_id: trip_segment.trip_id,
+                                    }));
+                                }
+                            }
+                            PlanLeg::Walk(_) => {
                                 legs.push(c.clone());
                                 let mut steps = Vec::<PlanLegStep>::new();
-                                steps.push(step);
-                                current = Some(PlanLeg {
-                                    mode: PlanLegType::TRANSIT,
+                                steps.push(PlanLegStep::Transit(step));
+                                current = Some(PlanLeg::Transit(PlanTransitLeg {
                                     steps,
                                     from,
                                     to,
@@ -468,15 +493,10 @@ impl Graph {
                                     start: trip_segment.departure,
                                     end: trip_segment.arrival,
                                     duration: trip_segment.arrival - trip_segment.departure,
-                                    trip_id: Some(trip_segment.trip_id),
-                                });
-                            } else {
-                                c.steps.push(step);
-                                c.to = to;
-                                c.end = trip_segment.arrival;
-                                c.length += edge.length;
+                                    trip_id: trip_segment.trip_id,
+                                }));
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -488,85 +508,6 @@ impl Graph {
         }
 
         Ok(legs)
-
-        // let mut path = Vec::new();
-        //
-        // while let Some(next) = origins.get(&current) {
-        //     path.push((next.1.clone(), next.2));
-        //     current = next.0;
-        // }
-        //
-        // let mut steps = Vec::<PlanLegStep>::new();
-        // let mut legs = Vec::<PlanLeg>::new();
-        //
-        // for (e, departure_id) in path.iter().rev() {
-        //     let step = match e {
-        //         EdgeData::Street(edge) => {
-        //             PlanLegStep {
-        //                 length: edge.length,
-        //                 place: PlanPlace {
-        //                     stop_position: None,
-        //                     arrival: None,
-        //                     departure: None,
-        //                     node_id: edge.destination,
-        //                 },
-        //             }
-        //
-        //             legs.push(PlanLeg {
-        //                 mode: "WALK".to_string(),
-        //                 length: edge.length,
-        //                 start: 0,
-        //                 end: 0,
-        //                 duration: 0,
-        //                 trip_id: None,
-        //                 from: PlanPlace {
-        //                     departure: None,
-        //                     arrival: None,
-        //                     stop_position: None,
-        //                     node_id: edge.origin,
-        //                 },
-        //                 to: PlanPlace {
-        //                     departure: None,
-        //                     arrival: None,
-        //                     stop_position: None,
-        //                     node_id: edge.destination,
-        //                 },
-        //             });
-        //         }
-        //         EdgeData::Transit(edge) => {
-        //             let trip_segment = match departure_id {
-        //                 Some(departure_id) => self.transit_departures[*departure_id],
-        //                 None => {
-        //                     return Err(async_graphql::Error::new(
-        //                         "Found an OSM ndoe in a transit edge",
-        //                     ));
-        //                 }
-        //             };
-        //             legs.push(PlanLeg {
-        //                 mode: "TRANSIT".to_string(),
-        //                 length: edge.length,
-        //                 start: trip_segment.departure,
-        //                 end: trip_segment.arrival,
-        //                 duration: trip_segment.arrival - trip_segment.departure,
-        //                 trip_id: Some(trip_segment.trip_id),
-        //                 from: PlanPlace {
-        //                     stop_position: None,
-        //                     arrival: None,
-        //                     departure: Some(trip_segment.departure),
-        //                     node_id: edge.origin,
-        //                 },
-        //                 to: PlanPlace {
-        //                     stop_position: None,
-        //                     arrival: Some(trip_segment.arrival),
-        //                     departure: None,
-        //                     node_id: edge.destination,
-        //                 },
-        //             });
-        //         }
-        //     }
-        // }
-        //
-        // legs
     }
 
     pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {
@@ -634,5 +575,64 @@ impl Graph {
         }
 
         None
+    }
+
+    pub fn get_transit_departure_slice(&self, tt: TimetableSegment) -> &[TripSegment] {
+        &self.transit_departures[tt.start..tt.start + tt.len]
+    }
+
+    pub fn previous_departures(
+        &self,
+        tt: TimetableSegment,
+        date: u32,
+        weekday: u8,
+        initial_index: usize,
+    ) -> impl Iterator<Item = (usize, &TripSegment)> {
+        let slice = &self.transit_departures[tt.start..tt.start + tt.len];
+        let relative_index = initial_index - tt.start;
+
+        debug_assert!(
+            initial_index >= tt.start && initial_index < tt.start + tt.len,
+            "initial_index {} out of timetable segment [{}, {}]",
+            initial_index,
+            tt.start,
+            tt.start + tt.len
+        );
+
+        slice[..relative_index]
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(move |(_, dep)| {
+                self.transit_services[dep.service_id.0 as usize].is_active(date, weekday)
+            })
+            .map(move |(i, dep)| (initial_index - 1 - i, dep))
+    }
+
+    pub fn next_departures(
+        &self,
+        tt: TimetableSegment,
+        date: u32,
+        weekday: u8,
+        initial_index: usize,
+    ) -> impl Iterator<Item = (usize, &TripSegment)> {
+        let slice = &self.transit_departures[tt.start..tt.start + tt.len];
+        let relative_index = initial_index - tt.start;
+
+        debug_assert!(
+            initial_index >= tt.start && initial_index < tt.start + tt.len,
+            "initial_index {} out of timetable segment [{}, {}]",
+            initial_index,
+            tt.start,
+            tt.start + tt.len
+        );
+
+        slice[relative_index + 1..]
+            .iter()
+            .enumerate()
+            .filter(move |(_, dep)| {
+                self.transit_services[dep.service_id.0 as usize].is_active(date, weekday)
+            })
+            .map(move |(i, dep)| (initial_index + 1 + i, dep))
     }
 }

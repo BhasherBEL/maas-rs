@@ -7,7 +7,7 @@ use crate::structures::{Graph, NodeID, plan::PlanNode};
 #[derive(Debug, SimpleObject, Clone, Copy)]
 #[graphql(complex)]
 pub struct PlanPlace {
-    pub stop_position: Option<usize>,
+    pub stop_position: Option<u32>,
     pub arrival: Option<u32>,
     pub departure: Option<u32>,
 

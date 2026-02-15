@@ -26,8 +26,8 @@ impl PlanTrip {
 }
 
 impl PlanTrip {
-    pub fn from_trip_id(g: &Graph, id: Option<TripId>) -> Option<PlanTrip> {
-        let trip = g.get_trip(id?)?;
+    pub fn from_trip_id(g: &Graph, id: TripId) -> Option<PlanTrip> {
+        let trip = g.get_trip(id)?;
 
         Some(PlanTrip {
             headsign: trip.trip_headsign.clone(),
