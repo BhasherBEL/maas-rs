@@ -41,5 +41,9 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
         }
     }
 
+    println!("Building raptor index...");
+    g.build_raptor_index();
+
+    println!("Building done.");
     Some(g)
 }

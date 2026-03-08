@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::Hash};
 
 use gtfs_structures::RouteType;
 
-pub struct IdMapper<T> {
-    to_index: HashMap<String, T>,
-    to_string: Vec<String>,
+pub struct IdMapper<T, U> {
+    to_index: HashMap<T, U>,
+    to_string: Vec<T>,
 }
 
-impl IdMapper<usize> {
+impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
     pub fn new() -> Self {
         Self {
             to_index: HashMap::new(),
@@ -15,7 +15,7 @@ impl IdMapper<usize> {
         }
     }
 
-    pub fn get_or_insert(&mut self, gtfs_id: String) -> usize {
+    pub fn get_or_insert(&mut self, gtfs_id: T) -> usize {
         if let Some(&idx) = self.to_index.get(&gtfs_id) {
             return idx;
         }
@@ -25,15 +25,19 @@ impl IdMapper<usize> {
         idx
     }
 
-    pub fn get(&mut self, gtfs_id: String) -> Option<usize> {
+    pub fn get(&mut self, gtfs_id: T) -> Option<usize> {
         if let Some(&idx) = self.to_index.get(&gtfs_id) {
             return Some(idx);
         }
         None
     }
 
-    pub fn to_gtfs_id(&self, idx: u32) -> &str {
+    pub fn to_gtfs_id(&self, idx: u32) -> &T {
         &self.to_string[idx as usize]
+    }
+
+    pub fn get_reversed(&self) -> &Vec<T> {
+        &self.to_string
     }
 }
 

@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 
 use crate::ingestion::gtfs::date_to_days;
 use crate::structures::plan::Plan;
@@ -9,6 +9,8 @@ pub struct RouteQuery {
     pub from_lng: f64,
     pub to_lat: f64,
     pub to_lng: f64,
+    pub date: NaiveDate,
+    pub time: NaiveTime,
 }
 
 pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::Error> {
@@ -30,9 +32,11 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::E
 
     let from = *a_id;
     let to = *b_id;
-    let time = 60 * 60 * 12;
-    let date = date_to_days(NaiveDate::from_ymd_opt(2026, 2, 10).unwrap());
-    let weekday = 1 << 2;
+
+    let time = query.time.num_seconds_from_midnight();
+    let date = date_to_days(query.date);
+    let weekday = 1u8 << query.date.weekday().num_days_from_monday();
+
     let params = RoutingParameters {
         walking_speed: 5 * 278,
         estimator_speed: 50 * 278,
