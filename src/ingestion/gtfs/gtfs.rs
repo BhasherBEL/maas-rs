@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ingestion::gtfs::IdMapper,
     structures::{
-        EdgeData, Graph, LatLng, NodeData, NodeID, StreetEdgeData, TransitEdgeData, TransitStopData,
+        EdgeData, Graph, LatLng, NodeData, NodeID, StreetEdgeData, TransitEdgeData,
+        TransitStopData,
+        raptor::{Lookup, PatternInfo},
     },
 };
 
@@ -27,6 +29,12 @@ pub struct RouteId(pub u32);
 pub struct ServiceId(pub u32);
 
 // Structures
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StopTime {
+    pub arrival: u32,
+    pub departure: u32,
+}
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TripSegment {
@@ -63,6 +71,7 @@ pub struct RouteInfo {
 pub struct TripInfo {
     pub trip_headsign: Option<String>,
     pub route_id: RouteId,
+    pub service_id: ServiceId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,9 +98,7 @@ impl ServicePattern {
         if self.added_dates.binary_search(&date).is_ok() {
             return true;
         }
-        date >= self.start_date
-            && date <= self.end_date
-            && (self.days_of_week & (1 << weekday)) != 0
+        date >= self.start_date && date <= self.end_date && (self.days_of_week & weekday) != 0
     }
 }
 
@@ -188,7 +195,7 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
         count_node_too_far_neighbor
     );
 
-    let mut agency_mapper: IdMapper<usize> = IdMapper::new();
+    let mut agency_mapper: IdMapper<String, usize> = IdMapper::new();
     let mut agencies: Vec<AgencyInfo> = Vec::new();
     let agencies_offset = g.get_transit_agencies_size();
 
@@ -210,7 +217,7 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
         };
     }
 
-    let mut service_mapper: IdMapper<usize> = IdMapper::new();
+    let mut service_mapper: IdMapper<String, usize> = IdMapper::new();
     let mut services: Vec<ServicePattern> = Vec::new();
     let services_offset = g.get_transit_services_size();
 
@@ -275,7 +282,7 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
         services[service_id].removed_dates.sort();
     }
 
-    let mut route_mapper: IdMapper<usize> = IdMapper::new();
+    let mut route_mapper: IdMapper<String, usize> = IdMapper::new();
     let mut route_infos: Vec<RouteInfo> = Vec::new();
     let routes_offset = g.get_transit_routes_size();
 
@@ -304,11 +311,16 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
         };
     }
 
-    let mut trip_mapper: IdMapper<usize> = IdMapper::new();
+    let mut trip_mapper: IdMapper<String, usize> = IdMapper::new();
     let mut trip_infos: Vec<TripInfo> = Vec::new();
     let trips_offset = g.get_transit_trips_size();
 
     let mut route_hops = HashMap::<RouteSegment, Vec<TripSegment>>::new();
+
+    let mut pattern_mapper: IdMapper<Vec<NodeID>, usize> = IdMapper::new();
+    let mut pattern_sequences: Vec<Vec<NodeID>> = Vec::new();
+    let mut pattern_route_ids: Vec<RouteId> = Vec::new();
+    let mut pattern_trip_data: Vec<Vec<(TripId, Vec<StopTime>)>> = Vec::new();
 
     for (_, trip) in gtfs.trips {
         let trip_id = trip_mapper.get_or_insert(trip.id);
@@ -325,50 +337,123 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
             trip_infos.push(TripInfo {
                 trip_headsign: Some(String::new()),
                 route_id: RouteId(0),
+                service_id: ServiceId(0),
             });
         }
 
         trip_infos[trip_id] = TripInfo {
             trip_headsign: trip.trip_headsign.clone(),
             route_id: RouteId((route_id + routes_offset) as u32),
+            service_id: ServiceId((service_id + services_offset) as u32),
         };
 
         let mut indices: Vec<usize> = (0..trip.stop_times.len()).collect();
         indices.sort_unstable_by_key(|&i| trip.stop_times[i].stop_sequence);
 
-        for pair in indices.windows(2) {
-            let st1 = &trip.stop_times[pair[0]];
-            let st2 = &trip.stop_times[pair[1]];
+        let mut trip_nodes: Vec<NodeID> = Vec::new();
+        let mut trip_stop_times: Vec<StopTime> = Vec::new();
 
-            let (origin, destination) = match (
-                gtfs_nodes_mapper.get(&st1.stop.id),
-                gtfs_nodes_mapper.get(&st2.stop.id),
-            ) {
-                (Some(origin), Some(destination)) => (origin, destination),
+        for &i in &indices {
+            let st = &trip.stop_times[i];
+            let node_id = match gtfs_nodes_mapper.get(&st.stop.id) {
+                Some(id) => *id,
+                None => continue,
+            };
+            let (dep, arr) = match (st.departure_time, st.arrival_time) {
+                (Some(d), Some(a)) => (d, a),
+                (Some(d), None) => (d, d),
+                (None, Some(a)) => (a, a),
                 _ => continue,
             };
+            trip_nodes.push(node_id);
+            trip_stop_times.push(StopTime {
+                departure: dep,
+                arrival: arr,
+            });
+        }
 
-            let (departure, arrival) = match (st1.departure_time, st2.arrival_time) {
-                (Some(departure_time), Some(arrival_time)) => (departure_time, arrival_time),
-                _ => continue,
-            };
+        if trip_nodes.len() < 2 {
+            continue;
+        }
 
+        let global_trip_id = TripId((trip_id + trips_offset) as u32);
+        let global_route_id = RouteId((route_id + routes_offset) as u32);
+        let global_service_id = ServiceId((service_id + services_offset) as u32);
+
+        for i in 0..trip_nodes.len() - 1 {
             route_hops
                 .entry(RouteSegment {
-                    departure: *origin,
-                    arrival: *destination,
-                    route_id: RouteId((route_id + routes_offset) as u32),
+                    departure: trip_nodes[i],
+                    arrival: trip_nodes[i + 1],
+                    route_id: global_route_id,
                 })
-                .or_insert(Vec::<TripSegment>::new())
+                .or_default()
                 .push(TripSegment {
-                    trip_id: TripId((trip_id + trips_offset) as u32),
-                    origin_stop_sequence: st1.stop_sequence,
-                    destination_stop_sequence: st2.stop_sequence,
-                    departure,
-                    arrival,
-                    service_id: ServiceId((service_id + services_offset) as u32),
+                    trip_id: global_trip_id,
+                    origin_stop_sequence: i as u32,
+                    destination_stop_sequence: (i + 1) as u32,
+                    departure: trip_stop_times[i].departure,
+                    arrival: trip_stop_times[i + 1].arrival,
+                    service_id: global_service_id,
                 });
         }
+
+        let pattern_id = pattern_mapper.get_or_insert(trip_nodes.clone());
+        while pattern_trip_data.len() <= pattern_id {
+            pattern_trip_data.push(Vec::new());
+            pattern_sequences.push(Vec::new());
+            pattern_route_ids.push(RouteId(0));
+        }
+        if pattern_sequences[pattern_id].is_empty() {
+            pattern_sequences[pattern_id] = trip_nodes;
+            pattern_route_ids[pattern_id] = global_route_id;
+        }
+        pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
+    }
+
+    for pattern_id in 0..pattern_sequences.len() {
+        let sequence = &pattern_sequences[pattern_id];
+        let trips = &mut pattern_trip_data[pattern_id];
+        if sequence.len() < 2 || trips.is_empty() {
+            continue;
+        }
+
+        trips.sort_unstable_by_key(|(_, times)| times[0].departure);
+
+        let n_stops = sequence.len();
+        let n_trips = trips.len();
+
+        g.push_transit_pattern(PatternInfo {
+            route: pattern_route_ids[pattern_id],
+            num_trips: n_trips as u32,
+        });
+
+        let ps_start = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(sequence);
+        g.push_transit_idx_pattern_stops(Lookup {
+            start: ps_start,
+            len: n_stops,
+        });
+
+        let pt_start = g.transit_pattern_trips_len();
+        for (trip_id, _) in trips.iter() {
+            g.push_transit_pattern_trip(*trip_id);
+        }
+        g.push_transit_idx_pattern_trips(Lookup {
+            start: pt_start,
+            len: n_trips,
+        });
+
+        let st_start = g.transit_pattern_stop_times_len();
+        for stop_idx in 0..n_stops {
+            for (_, times) in trips.iter() {
+                g.push_transit_pattern_stop_time(times[stop_idx]);
+            }
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup {
+            start: st_start,
+            len: n_stops * n_trips,
+        });
     }
 
     for (route_segment, mut trip_segments) in route_hops {

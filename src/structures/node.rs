@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::structures::LatLng;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct NodeID(pub usize);
 
 impl Display for NodeID {

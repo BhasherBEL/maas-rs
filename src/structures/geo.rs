@@ -43,3 +43,13 @@ impl LatLng {
         return 6365396.0_f64 * central_angle;
     }
 }
+
+pub fn meters_to_degrees(meters: f64) -> f64 {
+    let deg = meters / 111_320.0;
+    deg * deg
+}
+
+pub fn degrees_to_meters(sq_deg: f64, lat: f64) -> f64 {
+    let deg = sq_deg.sqrt();
+    deg * 111_320.0 * lat.to_radians().cos().max(0.5)
+}
