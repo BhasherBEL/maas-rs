@@ -17,7 +17,7 @@ use crate::{
     },
     structures::{
         DelayCDF, EdgeData, LatLng, NodeData, NodeID, RoutingParameters, ScenarioBag,
-        meters_to_degrees,
+        degrees_to_meters, meters_to_degrees,
         plan::{
             Plan, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg,
             PlanWalkLegStep,
@@ -83,7 +83,6 @@ static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
 static WALKING_SPEED_MS: f64 = 1.2;
 pub const MAX_SCENARIOS: usize = 1;
 pub const MAX_ROUNDS: usize = 6;
-static MAX_ACCESS_DISTANCE_M: f64 = 5000.0;
 
 impl Graph {
     pub fn new() -> Graph {
@@ -824,11 +823,79 @@ impl Graph {
         }
     }
 
+    fn nearest_stop_secs(&self, node: NodeID, straight_line_secs: u32) -> u32 {
+        let loc = self.nodes[node.0].loc();
+        self.transit_stops_tree
+            .nearest(&[loc.latitude, loc.longitude], 1, &squared_euclidean)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map(|(dist_sq, _)| {
+                let dist_m = degrees_to_meters(dist_sq.sqrt(), loc.latitude);
+                (dist_m / WALKING_SPEED_MS) as u32
+            })
+            .unwrap_or(straight_line_secs)
+    }
+
     pub fn raptor(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Vec<Plan> {
+        let straight_line_secs =
+            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
+
+        let mut walk_only_secs: Option<u32> = None;
+        let mut access_secs = self.nearest_stop_secs(origin, straight_line_secs).max(1);
+
+        loop {
+            let sources: Vec<(usize, u32)> = self
+                .nearby_stops(origin, access_secs)
+                .into_iter()
+                .map(|(s, w)| (s, start_time + w))
+                .collect();
+
+            let targets = self.nearby_stops(destination, access_secs);
+
+            if !sources.is_empty() && !targets.is_empty() {
+                let results =
+                    self.raptor_inner(&sources, &targets, start_time, access_secs, date, weekday);
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+
+            access_secs = access_secs.saturating_mul(2);
+
+            if access_secs >= straight_line_secs && walk_only_secs.is_none() {
+                walk_only_secs = Some(
+                    self.walk_dijkstra(origin, u32::MAX)
+                        .get(&destination)
+                        .copied()
+                        .unwrap_or(u32::MAX),
+                );
+            }
+
+            if let Some(actual) = walk_only_secs {
+                if access_secs >= actual {
+                    return if actual < u32::MAX {
+                        vec![self.build_walk_plan(origin, destination, start_time, actual)]
+                    } else {
+                        vec![]
+                    };
+                }
+            }
+        }
+    }
+
+    pub fn raptor_inner(
         &self,
         sources: &[(usize, u32)],
         targets: &[(usize, u32)],
         start_time: u32,
+        access_secs: u32,
         date: u32,
         weekday: u8,
     ) -> Vec<Plan> {
@@ -857,6 +924,7 @@ impl Graph {
             &mut traces[0],
             &mut marked,
             &mut is_marked,
+            start_time + access_secs,
         );
 
         for k in 1..=MAX_ROUNDS {
@@ -908,6 +976,7 @@ impl Graph {
                 &mut traces[k],
                 &mut marked,
                 &mut is_marked,
+                cutoff,
             );
 
             if marked.is_empty() {
@@ -918,6 +987,47 @@ impl Graph {
         self.extract(
             sources, targets, start_time, date, weekday, &labels, &traces,
         )
+    }
+
+    fn build_walk_plan(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        walk_secs: u32,
+    ) -> Plan {
+        let end = start_time + walk_secs;
+        let length = (walk_secs as f64 * WALKING_SPEED_MS) as usize;
+
+        let to_place = PlanPlace {
+            node_id: destination,
+            stop_position: None,
+            arrival: Some(end),
+            departure: None,
+        };
+
+        Plan {
+            legs: vec![PlanLeg::Walk(PlanWalkLeg {
+                from: PlanPlace {
+                    node_id: origin,
+                    stop_position: None,
+                    arrival: None,
+                    departure: Some(start_time),
+                },
+                to: to_place,
+                start: start_time,
+                end,
+                duration: walk_secs,
+                length,
+                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
+                    length,
+                    time: walk_secs,
+                    place: to_place,
+                })],
+            })],
+            start: start_time,
+            end,
+        }
     }
 
     fn collect_routes(&self, marked: &[usize], queue: &mut Vec<usize>, queue_pos: &mut [u32]) {
@@ -1004,20 +1114,24 @@ impl Graph {
         traces: &mut [Trace],
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
+        cutoff: u32,
     ) {
         let n = marked.len();
         for i in 0..n {
             let stop = marked[i];
             let time = labels[stop].earliest();
-            if time == u32::MAX {
+            if time >= cutoff {
                 continue;
             }
 
             let transfers = self.transit_idx_stop_transfers[stop].of(&self.transit_stop_transfers);
             for &(target_node, walk) in transfers {
                 let target = self.transit_node_to_stop[target_node.0] as usize;
-                let bag = ScenarioBag::single(time + walk);
-
+                let arr = time + walk;
+                if arr >= cutoff {
+                    continue;
+                }
+                let bag = ScenarioBag::single(arr);
                 if bag.improves_on(&best[target]) {
                     labels[target].try_improve(&bag);
                     best[target].try_improve(&bag);
@@ -1354,33 +1468,14 @@ impl Graph {
         dist
     }
 
-    pub fn nearby_stops(&self, lat: f64, lng: f64) -> Vec<(usize, u32)> {
-        let nearby = self
-            .transit_stops_tree
-            .within(
-                &[lat, lng],
-                meters_to_degrees(MAX_ACCESS_DISTANCE_M),
-                &squared_euclidean,
-            )
-            .unwrap_or_default();
-
-        if nearby.is_empty() {
-            return Vec::new();
-        }
-
-        let origin_node = match self.nearest_node(lat, lng) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-
-        let max_walk_secs = (MAX_ACCESS_DISTANCE_M / WALKING_SPEED_MS) as u32;
-        let walk_times = self.walk_dijkstra(origin_node, max_walk_secs);
+    pub fn nearby_stops(&self, origin: NodeID, max_walk_secs: u32) -> Vec<(usize, u32)> {
+        let walk_times = self.walk_dijkstra(origin, max_walk_secs);
 
         let mut stops = Vec::new();
-        for &(_, &compact) in &nearby {
-            let stop_node = self.transit_stop_to_node[compact];
-            if let Some(&walk_secs) = walk_times.get(&stop_node) {
-                stops.push((compact, walk_secs));
+        for (&node, &walk_secs) in &walk_times {
+            let compact = self.transit_node_to_stop[node.0];
+            if compact != u32::MAX {
+                stops.push((compact as usize, walk_secs));
             }
         }
         stops
