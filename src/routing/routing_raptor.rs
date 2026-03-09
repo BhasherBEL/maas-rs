@@ -18,23 +18,15 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graph
     let date = date_to_days(query.date);
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
 
-    let sources: Vec<(usize, u32)> = graph
-        .nearby_stops(query.from_lat, query.from_lng)
-        .into_iter()
-        .map(|(stop, walk)| (stop, time + walk))
-        .collect();
+    let origin = graph
+        .nearest_node(query.from_lat, query.from_lng)
+        .ok_or_else(|| async_graphql::Error::new("No node near departure"))?;
 
-    if sources.is_empty() {
-        return Err(async_graphql::Error::new("No transit stop near departure"));
-    }
+    let destination = graph
+        .nearest_node(query.to_lat, query.to_lng)
+        .ok_or_else(|| async_graphql::Error::new("No node near arrival"))?;
 
-    let targets = graph.nearby_stops(query.to_lat, query.to_lng);
-
-    if targets.is_empty() {
-        return Err(async_graphql::Error::new("No transit stop near arrival"));
-    }
-
-    let plans = graph.raptor(&sources, &targets, time, date, weekday);
+    let plans = graph.raptor(origin, destination, time, date, weekday);
 
     if plans.is_empty() {
         return Err(async_graphql::Error::new("No plan found"));
