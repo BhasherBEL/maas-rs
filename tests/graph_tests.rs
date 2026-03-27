@@ -245,6 +245,8 @@ fn get_route_returns_inserted_route() {
         route_long_name: "Line One".to_string(),
         route_type: gtfs_structures::RouteType::Bus,
         agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
     }]);
     let route = g.get_route(RouteId(0)).expect("route should exist");
     assert_eq!(route.route_short_name, "1");
