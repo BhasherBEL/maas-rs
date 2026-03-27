@@ -5,10 +5,10 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{
         AgencyInfo, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId, TripInfo,
-        TripSegment,
+        TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, NodeID,
+        DelayCDF, NodeData, NodeID,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -54,6 +54,79 @@ impl Graph {
 
     pub fn add_transit_agencies(&mut self, agencies: Vec<AgencyInfo>) {
         self.transit_agencies.extend(agencies);
+    }
+
+    /// Returns all transit stops as (stop_index, name, lat, lon, mode) tuples.
+    /// Mode is derived from the RAPTOR pattern index: each stop is assigned the
+    /// route type of the first pattern that serves it.
+    pub fn gtfs_stops(&self) -> Vec<(usize, String, f64, f64, String)> {
+        // Build compact_stop_idx → RouteType from the pattern index.
+        let mut stop_mode: Vec<Option<RouteType>> =
+            vec![None; self.transit_stop_to_node.len()];
+        for (pattern_idx, lookup) in self.transit_idx_pattern_stops.iter().enumerate() {
+            let route_type =
+                self.transit_routes[self.transit_patterns[pattern_idx].route.0 as usize]
+                    .route_type;
+            for &node_id in lookup.of(&self.transit_pattern_stops) {
+                let compact = self.transit_node_to_stop[node_id.0];
+                if compact != u32::MAX {
+                    stop_mode[compact as usize].get_or_insert(route_type);
+                }
+            }
+        }
+
+        self.transit_stop_to_node
+            .iter()
+            .enumerate()
+            .filter_map(|(stop_idx, &node_id)| match &self.nodes[node_id.0] {
+                NodeData::TransitStop(stop) => Some((
+                    stop_idx,
+                    stop.name.clone(),
+                    stop.lat_lng.latitude,
+                    stop.lat_lng.longitude,
+                    display_route_type(
+                        stop_mode[stop_idx].unwrap_or(RouteType::Bus),
+                    )
+                    .to_string(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns all agencies with their routes as owned data.
+    /// Each entry: (agency_idx, name, url, routes)
+    /// Each route: (route_idx, short_name, long_name, mode_string)
+    pub fn gtfs_agencies_with_routes(
+        &self,
+    ) -> Vec<(usize, String, String, Vec<(usize, String, String, String)>)> {
+        let mut agency_routes: Vec<Vec<(usize, String, String, String)>> =
+            vec![vec![]; self.transit_agencies.len()];
+
+        for (route_idx, route) in self.transit_routes.iter().enumerate() {
+            let agency_idx = route.agency_id.0 as usize;
+            if agency_idx < agency_routes.len() {
+                agency_routes[agency_idx].push((
+                    route_idx,
+                    route.route_short_name.clone(),
+                    route.route_long_name.clone(),
+                    display_route_type(route.route_type).to_string(),
+                ));
+            }
+        }
+
+        self.transit_agencies
+            .iter()
+            .enumerate()
+            .map(|(i, agency)| {
+                (
+                    i,
+                    agency.name.clone(),
+                    agency.url.clone(),
+                    agency_routes[i].clone(),
+                )
+            })
+            .collect()
     }
 
     pub fn next_transit_departure(
@@ -126,7 +199,9 @@ impl Graph {
             tt.start + tt.len
         );
 
-        slice[relative_index + 1..]
+        slice
+            .get(relative_index + 1..)
+            .unwrap_or(&[])
             .iter()
             .enumerate()
             .filter(move |(_, dep)| {
