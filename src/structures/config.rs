@@ -1,5 +1,6 @@
 use std::fs;
 
+use gtfs_structures::RouteType;
 use serde::Deserialize;
 
 use crate::ingestion::cache::SourceLocation;
@@ -14,6 +15,30 @@ pub struct Config {
 pub struct BuildConfig {
     pub inputs: Vec<Ingestor>,
     pub output: String,
+    #[serde(default)]
+    pub delay_models: Vec<DelayModelConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DelayModelConfig {
+    pub mode: String,
+    pub bins: Vec<(u32, f32)>,
+}
+
+impl DelayModelConfig {
+    pub fn route_type(&self) -> Option<RouteType> {
+        match self.mode.as_str() {
+            "tram" => Some(RouteType::Tramway),
+            "subway" | "metro" => Some(RouteType::Subway),
+            "rail" | "train" => Some(RouteType::Rail),
+            "bus" => Some(RouteType::Bus),
+            "ferry" => Some(RouteType::Ferry),
+            "cable_car" | "cablecar" => Some(RouteType::CableCar),
+            "gondola" => Some(RouteType::Gondola),
+            "funicular" => Some(RouteType::Funicular),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

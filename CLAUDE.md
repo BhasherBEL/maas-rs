@@ -1,0 +1,79 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+**maas-rs** is a Rust-based Mobility-as-a-Service (MaaS) multi-modal routing engine. It ingests OpenStreetMap (OSM) and GTFS transit data, builds an in-memory graph, and exposes routing via a GraphQL API. Two routing algorithms are implemented: **A\*** (for street/walking routes) and **RAPTOR** (for public transit).
+
+## Commands
+
+```bash
+# Build the project
+cargo build --release
+
+# Build graph from config + save to graph.bin
+cargo run -- --build --save
+
+# Load pre-built graph and start API server
+cargo run -- --restore --serve
+
+# Build in-memory (no save) and serve
+cargo run -- --build --serve
+
+# Run tests
+cargo test
+
+# Run a single test
+cargo test <test_name>
+
+# Lint
+cargo clippy
+```
+
+The GraphQL playground is available at `http://127.0.0.1:3000/graphiql` when the server is running.
+
+## Architecture
+
+### Data Flow
+
+```
+config.yaml → Ingestion (OSM phase 0, then GTFS phase 1) → Graph build
+           → (optional) graph.bin serialization via postcard
+           → GraphQL server (Poem + async-graphql) on port 3000
+```
+
+### Module Structure
+
+- **`src/structures/`** — Core data types: `graph.rs` is the central file (~1500 lines) containing the graph data structure, A\* and RAPTOR algorithm implementations. Key constants: `MAX_TRANSFER_DISTANCE_M`, `MAX_ROUNDS`, `WALKING_SPEED_MS`.
+- **`src/ingestion/`** — Parses OSM PBF and GTFS zip files into nodes/edges. Phase ordering matters: OSM runs first (phase 0) so transit stops (phase 1) can snap to street nodes.
+- **`src/routing/`** — `routing_astar.rs` and `routing_raptor.rs` wrap the graph methods into callable routing services.
+- **`src/services/`** — `build.rs` orchestrates ingestion + RAPTOR index construction; `persistence.rs` handles `postcard` binary serialization of the graph.
+- **`src/web/`** — Poem HTTP + async-graphql server. Exposes `astar` and `raptor` GraphQL queries. GraphQL types use `#[graphql(complex)]` with async resolvers for nested objects.
+
+### Graph Model
+
+- **Nodes**: `NodeData::OsmNode` (street intersections) or `NodeData::TransitStop` (GTFS stops)
+- **Edges**: `EdgeData::Street` (foot/bike/car) or `EdgeData::Transit` (GTFS trip segments)
+- **Spatial index**: KD-tree for nearest-node lookup from lat/lng coordinates
+- **RAPTOR index**: Preprocessed transit patterns stored in `src/structures/raptor.rs`
+
+### Output Structure
+
+Routes return as `Plan → PlanLeg (Walk|Transit) → PlanLegStep`, with rich metadata including trip/route/agency info and previous/next departure alternatives.
+
+## Configuration
+
+**`config.yaml`** specifies:
+- Input sources (`ingestor: gtfs/generic` or `osm/pbf`, with `url: path:data/...`)
+- Output path for serialized graph (`output: graph.bin`)
+- Default routing parameters (`walking_speed`, `estimator_speed` in mm/s)
+- Server host/port (note: port in `app.rs` is currently hardcoded to 3000)
+
+## Key Implementation Notes
+
+- The graph is a **custom adjacency list** (not petgraph's Graph type, despite petgraph being a dependency).
+- `DelayCDF` in `structures/delay.rs` models delay probability distributions for future multi-scenario routing.
+- `MAX_ROUNDS` in `graph.rs` controls RAPTOR transit rounds (higher = more transfers explored).
+- The `.envrc` sets up a Nix environment for OpenSSL; run `direnv allow` if using Nix.
+- `graph.bin` (~63MB for Brussels) is the serialized graph cache — commit-ignored, regenerated with `--build --save`.

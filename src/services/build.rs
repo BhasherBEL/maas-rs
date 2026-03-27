@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::{
     ingestion::{cache::resolve_path, gtfs::load_gtfs, osm},
-    structures::{BuildConfig, Graph, Ingestor},
+    structures::{BuildConfig, DelayCDF, Graph, Ingestor},
 };
 
 pub fn build_graph(config: BuildConfig) -> Option<Graph> {
@@ -43,6 +44,13 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
 
     println!("Building raptor index...");
     g.build_raptor_index();
+
+    let models = config
+        .delay_models
+        .iter()
+        .filter_map(|m| m.route_type().map(|rt| (rt, DelayCDF { bins: m.bins.clone() })))
+        .collect::<HashMap<_, _>>();
+    g.set_transit_delay_models(models);
 
     println!("Building done.");
     Some(g)
