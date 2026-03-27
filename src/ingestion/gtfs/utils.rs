@@ -65,3 +65,116 @@ pub fn sec_to_time(sec: u32) -> String {
 
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtfs_structures::RouteType;
+
+    // ── IdMapper ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn idmapper_first_insert_returns_zero() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        assert_eq!(m.get_or_insert("alpha".to_string()), 0);
+    }
+
+    #[test]
+    fn idmapper_second_insert_returns_one() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        m.get_or_insert("a".to_string());
+        assert_eq!(m.get_or_insert("b".to_string()), 1);
+    }
+
+    #[test]
+    fn idmapper_insert_is_idempotent() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        let id1 = m.get_or_insert("dup".to_string());
+        let id2 = m.get_or_insert("dup".to_string());
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn idmapper_get_existing_key() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        m.get_or_insert("x".to_string());
+        assert_eq!(m.get("x".to_string()), Some(0));
+    }
+
+    #[test]
+    fn idmapper_get_missing_key_returns_none() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        assert_eq!(m.get("missing".to_string()), None);
+    }
+
+    #[test]
+    fn idmapper_to_gtfs_id_roundtrip() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        m.get_or_insert("route_1".to_string());
+        m.get_or_insert("route_2".to_string());
+        assert_eq!(m.to_gtfs_id(0), "route_1");
+        assert_eq!(m.to_gtfs_id(1), "route_2");
+    }
+
+    #[test]
+    fn idmapper_get_reversed_returns_insertion_order() {
+        let mut m: IdMapper<String, usize> = IdMapper::new();
+        m.get_or_insert("first".to_string());
+        m.get_or_insert("second".to_string());
+        m.get_or_insert("third".to_string());
+        assert_eq!(m.get_reversed(), &vec!["first".to_string(), "second".to_string(), "third".to_string()]);
+    }
+
+    // ── display_route_type ────────────────────────────────────────────────────
+
+    #[test]
+    fn display_route_type_all_variants() {
+        assert_eq!(display_route_type(RouteType::Bus), "Bus");
+        assert_eq!(display_route_type(RouteType::Air), "Air");
+        assert_eq!(display_route_type(RouteType::Rail), "Rail");
+        assert_eq!(display_route_type(RouteType::Taxi), "Taxi");
+        assert_eq!(display_route_type(RouteType::Ferry), "Ferry");
+        assert_eq!(display_route_type(RouteType::Coach), "Coach");
+        assert_eq!(display_route_type(RouteType::Subway), "Subway");
+        assert_eq!(display_route_type(RouteType::Funicular), "Funicular");
+        assert_eq!(display_route_type(RouteType::Tramway), "Tramway");
+        assert_eq!(display_route_type(RouteType::Gondola), "Gondola");
+        assert_eq!(display_route_type(RouteType::CableCar), "CableCar");
+        assert_eq!(display_route_type(RouteType::Other(-1)), "Other");
+        assert_eq!(display_route_type(RouteType::Other(999)), "Other");
+    }
+
+    // ── sec_to_time ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sec_to_time_midnight() {
+        assert_eq!(sec_to_time(0), "00:00:00");
+    }
+
+    #[test]
+    fn sec_to_time_noon() {
+        assert_eq!(sec_to_time(43200), "12:00:00");
+    }
+
+    #[test]
+    fn sec_to_time_end_of_day() {
+        assert_eq!(sec_to_time(86399), "23:59:59");
+    }
+
+    #[test]
+    fn sec_to_time_one_hour() {
+        assert_eq!(sec_to_time(3600), "01:00:00");
+    }
+
+    #[test]
+    fn sec_to_time_mixed() {
+        assert_eq!(sec_to_time(3661), "01:01:01");
+    }
+
+    #[test]
+    fn sec_to_time_after_midnight_gtfs() {
+        // GTFS allows times > 24h for trips after midnight
+        assert_eq!(sec_to_time(86400), "24:00:00");
+        assert_eq!(sec_to_time(90000), "25:00:00");
+    }
+}

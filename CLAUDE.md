@@ -21,11 +21,20 @@ cargo run -- --restore --serve
 # Build in-memory (no save) and serve
 cargo run -- --build --serve
 
-# Run tests
+# Run all tests (unit + integration)
 cargo test
 
-# Run a single test
+# Run a single test by name (substring match)
 cargo test <test_name>
+
+# Run only the inline unit tests
+cargo test --lib
+
+# Run only the graph integration tests
+cargo test --test graph_tests
+
+# Run tests with output visible (useful for debugging)
+cargo test -- --nocapture
 
 # Lint
 cargo clippy
@@ -69,6 +78,27 @@ Routes return as `Plan → PlanLeg (Walk|Transit) → PlanLegStep`, with rich me
 - Output path for serialized graph (`output: graph.bin`)
 - Default routing parameters (`walking_speed`, `estimator_speed` in mm/s)
 - Server host/port (note: port in `app.rs` is currently hardcoded to 3000)
+
+## Testing
+
+### Test layout
+
+| Location | What it covers |
+|---|---|
+| `src/structures/geo.rs` | `LatLng` Haversine distance, `meters_to_degrees` / `degrees_to_meters` |
+| `src/structures/delay.rs` | `DelayCDF::prob_on_time`, all `ScenarioBag` methods |
+| `src/structures/raptor.rs` | `Lookup::of`, `Trace::is_transit` / `is_transfer` |
+| `src/ingestion/gtfs/gtfs.rs` | `ServicePattern::is_active`, `date_to_days` |
+| `src/ingestion/gtfs/utils.rs` | `IdMapper`, `display_route_type`, `sec_to_time` |
+| `tests/graph_tests.rs` | `Graph` construction, KD-tree lookup, `nodes_distance`, transit accessors, `next_transit_departure`, `previous/next_departures`, `build_raptor_index`, `walk_dijkstra`, `nearby_stops` |
+
+### Important test invariants
+
+- **`walk_dijkstra` / `nearby_stops`**: `build_raptor_index()` **must** be called first — the function reads `transit_node_to_stop[node.0]` on every iteration and will panic if the vector is empty.
+- **Weekday bitmask**: Mon = `0x01`, Tue = `0x02`, Wed = `0x04`, Thu = `0x08`, Fri = `0x10`, Sat = `0x20`, Sun = `0x40`.
+- **Time and date units**: times are **seconds since midnight** (`u32`), dates are **days since 2000-01-01** (`u32`).
+- **`RoutingParameters` speeds** are in **mm/s** (e.g. 5 km/h = 1389 mm/s).
+- Transit stops are **not** added to the OSM KD-tree (`nodes_tree`), so `nearest_node` only returns `OsmNode` results.
 
 ## Key Implementation Notes
 

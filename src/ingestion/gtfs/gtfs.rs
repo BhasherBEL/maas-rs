@@ -490,3 +490,154 @@ pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
     let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
     (date - epoch).num_days().max(0) as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    // Weekday bit encoding (matches ingestion code):
+    //   Mon=0x01, Tue=0x02, Wed=0x04, Thu=0x08, Fri=0x10, Sat=0x20, Sun=0x40
+    const MON: u8 = 0x01;
+    const TUE: u8 = 0x02;
+    const WED: u8 = 0x04;
+    const FRI: u8 = 0x10;
+    const SAT: u8 = 0x20;
+    const SUN: u8 = 0x40;
+    const WEEKDAYS: u8 = MON | TUE | WED | 0x08 | FRI; // Mon–Fri = 0x1F
+
+    // ── date_to_days ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn date_to_days_epoch_is_zero() {
+        let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+        assert_eq!(date_to_days(epoch), 0);
+    }
+
+    #[test]
+    fn date_to_days_one_day_later() {
+        let d = NaiveDate::from_ymd_opt(2000, 1, 2).unwrap();
+        assert_eq!(date_to_days(d), 1);
+    }
+
+    #[test]
+    fn date_to_days_leap_year_2000() {
+        // 2000 is a leap year (366 days); 2001-01-01 is day 366 from epoch
+        let d = NaiveDate::from_ymd_opt(2001, 1, 1).unwrap();
+        assert_eq!(date_to_days(d), 366);
+    }
+
+    #[test]
+    fn date_to_days_before_epoch_clamps_to_zero() {
+        let d = NaiveDate::from_ymd_opt(1999, 12, 31).unwrap();
+        assert_eq!(date_to_days(d), 0);
+    }
+
+    #[test]
+    fn date_to_days_known_value() {
+        // 2026-03-27 = 9582 days after 2000-01-01
+        let d = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
+        let days = date_to_days(d);
+        // Rough sanity check: 26 years × 365 ≈ 9490, accounting for leap years
+        assert!(days > 9400 && days < 9700, "Unexpected value: {days}");
+    }
+
+    // ── ServicePattern::is_active ─────────────────────────────────────────────
+
+    fn weekday_service() -> ServicePattern {
+        ServicePattern {
+            days_of_week: WEEKDAYS,
+            start_date: 100,
+            end_date: 200,
+            added_dates: vec![],
+            removed_dates: vec![],
+        }
+    }
+
+    #[test]
+    fn service_active_on_matching_weekday_and_date() {
+        let sp = weekday_service();
+        assert!(sp.is_active(150, MON));
+        assert!(sp.is_active(150, FRI));
+    }
+
+    #[test]
+    fn service_inactive_on_non_matching_weekday() {
+        let sp = weekday_service();
+        assert!(!sp.is_active(150, SAT));
+        assert!(!sp.is_active(150, SUN));
+    }
+
+    #[test]
+    fn service_inactive_before_start_date() {
+        let sp = weekday_service();
+        assert!(!sp.is_active(99, MON));
+    }
+
+    #[test]
+    fn service_inactive_after_end_date() {
+        let sp = weekday_service();
+        assert!(!sp.is_active(201, MON));
+    }
+
+    #[test]
+    fn service_active_on_boundary_dates() {
+        let sp = weekday_service();
+        assert!(sp.is_active(100, MON));
+        assert!(sp.is_active(200, MON));
+    }
+
+    #[test]
+    fn service_overridden_by_added_date() {
+        let sp = ServicePattern {
+            days_of_week: 0x00, // no regular service days
+            start_date: 100,
+            end_date: 200,
+            added_dates: vec![50, 150],
+            removed_dates: vec![],
+        };
+        assert!(sp.is_active(50, MON));
+        assert!(sp.is_active(150, SUN)); // weekday doesn't matter for added dates
+        assert!(!sp.is_active(100, MON)); // not in added_dates, weekday mask is 0
+    }
+
+    #[test]
+    fn service_overridden_by_removed_date() {
+        let sp = ServicePattern {
+            days_of_week: WEEKDAYS,
+            start_date: 100,
+            end_date: 200,
+            added_dates: vec![],
+            removed_dates: vec![150],
+        };
+        assert!(!sp.is_active(150, MON)); // explicitly removed
+        assert!(sp.is_active(151, MON));  // adjacent date still active
+    }
+
+    #[test]
+    fn service_removed_takes_priority_over_added() {
+        // A date in both added and removed: removed wins (checked first in is_active)
+        let sp = ServicePattern {
+            days_of_week: 0,
+            start_date: 0,
+            end_date: 1000,
+            added_dates: vec![200],
+            removed_dates: vec![200],
+        };
+        assert!(!sp.is_active(200, MON));
+    }
+
+    #[test]
+    fn service_added_date_outside_regular_range() {
+        // Exceptional service on a date outside the normal window
+        let sp = ServicePattern {
+            days_of_week: WEEKDAYS,
+            start_date: 100,
+            end_date: 200,
+            added_dates: vec![300],
+            removed_dates: vec![],
+        };
+        assert!(sp.is_active(300, SUN)); // added beats out-of-range check
+        assert!(!sp.is_active(250, MON)); // in-range but between end_date and added date
+    }
+}
