@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_graphql::{
-    Context, EmptyMutation, EmptySubscription, Error, Schema, http::GraphiQLSource,
+    Context, EmptyMutation, EmptySubscription, Error, Schema, SimpleObject,
+    http::GraphiQLSource,
 };
 use async_graphql_poem::{GraphQL, GraphQLSubscription};
 use chrono::{Local, NaiveDate, NaiveTime};
@@ -11,6 +12,35 @@ use crate::{
     routing::{routing_astar, routing_raptor},
     structures::{Graph, plan::Plan},
 };
+
+// ---------------------------------------------------------------------------
+// GTFS catalogue types — used for initial data sync by the Flutter client
+// ---------------------------------------------------------------------------
+
+#[derive(SimpleObject)]
+struct GtfsStop {
+    id: String,
+    name: String,
+    lat: f64,
+    lon: f64,
+    mode: String,
+}
+
+#[derive(SimpleObject)]
+struct GtfsRoute {
+    id: String,
+    short_name: String,
+    long_name: String,
+    mode: String,
+}
+
+#[derive(SimpleObject)]
+struct GtfsAgency {
+    id: String,
+    name: String,
+    url: String,
+    routes: Vec<GtfsRoute>,
+}
 
 struct QueryRoot;
 
@@ -96,6 +126,47 @@ impl QueryRoot {
         };
 
         routing_raptor::route(graph.as_ref(), &query)
+    }
+
+    /// Returns every transit stop loaded from GTFS.
+    /// Used by the Flutter client for the initial data sync (stop search).
+    async fn gtfs_stops(&self, ctx: &Context<'_>) -> Result<Vec<GtfsStop>, Error> {
+        let graph = ctx.data::<Arc<Graph>>()?;
+        Ok(graph
+            .gtfs_stops()
+            .into_iter()
+            .map(|(idx, name, lat, lon, mode)| GtfsStop {
+                id: format!("maas:stop:{}", idx),
+                name,
+                lat,
+                lon,
+                mode,
+            })
+            .collect())
+    }
+
+    /// Returns every transit agency with its routes loaded from GTFS.
+    /// Used by the Flutter client for the initial data sync (agency/route filter).
+    async fn gtfs_agencies(&self, ctx: &Context<'_>) -> Result<Vec<GtfsAgency>, Error> {
+        let graph = ctx.data::<Arc<Graph>>()?;
+        Ok(graph
+            .gtfs_agencies_with_routes()
+            .into_iter()
+            .map(|(agency_idx, name, url, routes)| GtfsAgency {
+                id: format!("maas:agency:{}", agency_idx),
+                name,
+                url,
+                routes: routes
+                    .into_iter()
+                    .map(|(route_idx, short_name, long_name, mode)| GtfsRoute {
+                        id: format!("maas:route:{}", route_idx),
+                        short_name,
+                        long_name,
+                        mode,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 }
 
