@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+Rust/Cargo commands run directly — no `devenv shell` wrapper needed.
+
 ```bash
 # Build the project
 cargo build --release

@@ -11,6 +11,8 @@ pub struct RouteQuery {
     pub to_lng: f64,
     pub date: NaiveDate,
     pub time: NaiveTime,
+    /// When `> 0`, run Range-RAPTOR over this window (seconds).
+    pub window_minutes: Option<u32>,
 }
 
 pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graphql::Error> {
@@ -26,7 +28,12 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graph
         .nearest_node(query.to_lat, query.to_lng)
         .ok_or_else(|| async_graphql::Error::new("No node near arrival"))?;
 
-    let plans = graph.raptor(origin, destination, time, date, weekday);
+    let plans = match query.window_minutes {
+        Some(w) if w > 0 => {
+            graph.raptor_range(origin, destination, time, w * 60, date, weekday)
+        }
+        _ => graph.raptor(origin, destination, time, date, weekday),
+    };
 
     if plans.is_empty() {
         return Err(async_graphql::Error::new("No plan found"));
