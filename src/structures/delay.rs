@@ -140,3 +140,170 @@ impl ScenarioBag {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DelayCDF ──────────────────────────────────────────────────────────────
+
+    fn make_cdf() -> DelayCDF {
+        DelayCDF {
+            bins: vec![(0, 0.1), (60, 0.5), (120, 0.9), (300, 1.0)],
+        }
+    }
+
+    #[test]
+    fn cdf_empty_returns_zero() {
+        let cdf = DelayCDF { bins: vec![] };
+        assert_eq!(cdf.prob_on_time(100), 0.0);
+    }
+
+    #[test]
+    fn cdf_budget_zero_returns_first_bin() {
+        let cdf = make_cdf();
+        assert_eq!(cdf.prob_on_time(0), 0.1);
+    }
+
+    #[test]
+    fn cdf_budget_between_bins() {
+        let cdf = make_cdf();
+        // 30s budget: only the 0s bin qualifies → cumprob 0.1
+        assert_eq!(cdf.prob_on_time(30), 0.1);
+    }
+
+    #[test]
+    fn cdf_budget_exact_bin_boundary() {
+        let cdf = make_cdf();
+        assert_eq!(cdf.prob_on_time(60), 0.5);
+        assert_eq!(cdf.prob_on_time(120), 0.9);
+    }
+
+    #[test]
+    fn cdf_budget_exceeds_all_bins() {
+        let cdf = make_cdf();
+        assert_eq!(cdf.prob_on_time(1000), 1.0);
+        assert_eq!(cdf.prob_on_time(300), 1.0);
+    }
+
+    #[test]
+    fn cdf_single_bin() {
+        let cdf = DelayCDF { bins: vec![(120, 0.85)] };
+        assert_eq!(cdf.prob_on_time(119), 0.0);
+        assert_eq!(cdf.prob_on_time(120), 0.85);
+        assert_eq!(cdf.prob_on_time(121), 0.85);
+    }
+
+    // ── ScenarioBag ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_bag_is_not_reached() {
+        assert!(!ScenarioBag::EMPTY.is_reached());
+        assert_eq!(ScenarioBag::EMPTY.earliest(), u32::MAX);
+        assert_eq!(ScenarioBag::EMPTY.hit_prob(), 0.0);
+        assert_eq!(ScenarioBag::EMPTY.expected(), f32::MAX);
+        assert_eq!(ScenarioBag::EMPTY.scenarios().len(), 0);
+    }
+
+    #[test]
+    fn single_bag_properties() {
+        let bag = ScenarioBag::single(1000);
+        assert!(bag.is_reached());
+        assert_eq!(bag.earliest(), 1000);
+        assert_eq!(bag.hit_prob(), 1.0);
+        assert!((bag.expected() - 1000.0).abs() < 1e-3);
+        assert_eq!(bag.scenarios().len(), 1);
+        assert_eq!(bag.scenarios()[0].time, 1000);
+        assert!((bag.scenarios()[0].prob - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn with_scenarios_hit_before_miss() {
+        // hit=500 (on-time), miss=700 (delayed)
+        let bag = ScenarioBag::with_scenarios(500, 0.7, 700, 0.3);
+        assert!(bag.is_reached());
+        assert_eq!(bag.earliest(), 500);
+        assert_eq!(bag.hit_prob(), 0.7);
+        assert!((bag.expected() - 560.0).abs() < 1e-3, "expected 560.0, got {}", bag.expected());
+        assert_eq!(bag.scenarios().len(), 2);
+    }
+
+    #[test]
+    fn with_scenarios_miss_before_hit_sorts_by_time() {
+        // hit=700, miss=500 → sorted: first=500 (miss), second=700 (hit)
+        let bag = ScenarioBag::with_scenarios(700, 0.3, 500, 0.7);
+        assert_eq!(bag.earliest(), 500);
+        // data[0].prob is miss_prob = 0.7 (the earlier time)
+        assert_eq!(bag.scenarios().len(), 2);
+        assert_eq!(bag.scenarios()[0].time, 500);
+        assert_eq!(bag.scenarios()[1].time, 700);
+    }
+
+    #[test]
+    fn with_scenarios_hit_prob_one_returns_single() {
+        let bag = ScenarioBag::with_scenarios(1000, 1.0, 1200, 0.0);
+        assert_eq!(bag.scenarios().len(), 1);
+        assert_eq!(bag.earliest(), 1000);
+    }
+
+    #[test]
+    fn shifted_by_adjusts_all_times() {
+        let bag = ScenarioBag::with_scenarios(500, 0.7, 700, 0.3);
+        let shifted = bag.shifted_by(100);
+        assert_eq!(shifted.earliest(), 600);
+        let scenarios = shifted.scenarios();
+        assert_eq!(scenarios[0].time, 600);
+        assert_eq!(scenarios[1].time, 800);
+        // Probabilities unchanged
+        assert!((scenarios[0].prob - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shifted_by_saturates_at_max() {
+        let bag = ScenarioBag::single(u32::MAX - 10);
+        let shifted = bag.shifted_by(100);
+        assert_eq!(shifted.earliest(), u32::MAX);
+    }
+
+    #[test]
+    fn improves_on_lower_expected_wins() {
+        let better = ScenarioBag::single(400);
+        let worse = ScenarioBag::single(600);
+        assert!(better.improves_on(&worse));
+        assert!(!worse.improves_on(&better));
+    }
+
+    #[test]
+    fn improves_on_empty_never_beats_reached() {
+        assert!(!ScenarioBag::EMPTY.improves_on(&ScenarioBag::single(9999)));
+    }
+
+    #[test]
+    fn improves_on_any_beats_empty() {
+        assert!(ScenarioBag::single(9999).improves_on(&ScenarioBag::EMPTY));
+    }
+
+    #[test]
+    fn try_improve_updates_when_better() {
+        let mut bag = ScenarioBag::single(600);
+        let candidate = ScenarioBag::single(500);
+        assert!(bag.try_improve(&candidate));
+        assert_eq!(bag.earliest(), 500);
+    }
+
+    #[test]
+    fn try_improve_no_change_when_worse() {
+        let mut bag = ScenarioBag::single(400);
+        let candidate = ScenarioBag::single(500);
+        assert!(!bag.try_improve(&candidate));
+        assert_eq!(bag.earliest(), 400);
+    }
+
+    #[test]
+    fn try_improve_empty_accepts_any() {
+        let mut bag = ScenarioBag::EMPTY;
+        let candidate = ScenarioBag::single(100);
+        assert!(bag.try_improve(&candidate));
+        assert_eq!(bag.earliest(), 100);
+    }
+}
