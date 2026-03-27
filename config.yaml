@@ -13,6 +13,16 @@ build:
 
   output: graph.bin
 
+  delay_models:
+    - mode: subway
+      bins: [[0, 0.80], [60, 0.92], [120, 0.97], [180, 0.99]]
+    - mode: tram
+      bins: [[0, 0.70], [60, 0.85], [180, 0.95], [300, 0.99]]
+    - mode: bus
+      bins: [[0, 0.55], [60, 0.70], [180, 0.85], [300, 0.92], [600, 0.99]]
+    - mode: rail
+      bins: [[0, 0.75], [60, 0.87], [180, 0.95], [300, 0.99]]
+
 default_routing:
   walking_speed: 1390 # mm/s => 5 km/h
   estimator_speed: 13900 # mm/s => 50 km/h
