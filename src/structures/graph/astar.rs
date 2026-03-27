@@ -272,6 +272,7 @@ impl Graph {
                                 start: start_time,
                                 end: origin.time,
                                 duration: origin.time - start_time,
+                                geometry: vec![],
                             }));
                         }
                         Some(ref mut c) => match c {
@@ -293,6 +294,7 @@ impl Graph {
                                     start: start_time,
                                     end: origin.time,
                                     duration: origin.time - start_time,
+                                    geometry: vec![],
                                 }));
                             }
                         },
@@ -343,6 +345,7 @@ impl Graph {
                                 end: trip_segment.arrival,
                                 duration: trip_segment.arrival - trip_segment.departure,
                                 trip_id: trip_segment.trip_id,
+                                geometry: vec![],
                             }));
                         }
                         Some(ref mut c) => match c {
@@ -365,6 +368,7 @@ impl Graph {
                                         end: trip_segment.arrival,
                                         duration: trip_segment.arrival - trip_segment.departure,
                                         trip_id: trip_segment.trip_id,
+                                        geometry: vec![],
                                     }));
                                 }
                             }
@@ -381,6 +385,7 @@ impl Graph {
                                     end: trip_segment.arrival,
                                     duration: trip_segment.arrival - trip_segment.departure,
                                     trip_id: trip_segment.trip_id,
+                                    geometry: vec![],
                                 }));
                             }
                         },

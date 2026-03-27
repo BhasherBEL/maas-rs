@@ -17,6 +17,13 @@ pub enum PlanLegType {
     OTHER,
 }
 
+/// A single lat/lon coordinate point in a leg's geometry.
+#[derive(Debug, SimpleObject, Clone, Copy)]
+pub struct PlanCoordinate {
+    pub lat: f64,
+    pub lon: f64,
+}
+
 #[derive(Debug, Interface, Clone)]
 #[graphql(field(name = "length", ty = "&usize"))]
 #[graphql(field(name = "start", ty = "&u32"))]
@@ -25,6 +32,7 @@ pub enum PlanLegType {
 #[graphql(field(name = "from", ty = "&PlanPlace"))]
 #[graphql(field(name = "to", ty = "&PlanPlace"))]
 #[graphql(field(name = "steps", ty = "&Vec<PlanLegStep>"))]
+#[graphql(field(name = "geometry", ty = "&Vec<PlanCoordinate>"))]
 pub enum PlanLeg {
     Transit(PlanTransitLeg),
     Walk(PlanWalkLeg),
@@ -41,6 +49,9 @@ pub struct PlanWalkLeg {
     pub to: PlanPlace,
 
     pub steps: Vec<PlanLegStep>,
+
+    /// Ordered sequence of coordinates tracing the walking path.
+    pub geometry: Vec<PlanCoordinate>,
 }
 
 #[derive(Debug, SimpleObject, Clone)]
@@ -55,6 +66,9 @@ pub struct PlanTransitLeg {
     pub to: PlanPlace,
 
     pub steps: Vec<PlanLegStep>,
+
+    /// Ordered sequence of stop coordinates along the transit route.
+    pub geometry: Vec<PlanCoordinate>,
 
     #[graphql(skip)]
     pub trip_id: TripId,
@@ -194,6 +208,7 @@ impl PlanTransitLeg {
                     to: self.to,
                     from: self.from,
                     duration: current_arrival - segment.departure,
+                    geometry: self.geometry.clone(),
                 })
             })
             .take(count)
