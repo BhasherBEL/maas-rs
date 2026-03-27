@@ -11,7 +11,7 @@ use crate::{
     structures::{
         EdgeData, NodeID, ScenarioBag, degrees_to_meters,
         plan::{
-            ArrivalScenario, Plan, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg,
+            ArrivalScenario, Plan, PlanCoordinate, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg,
             PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep,
         },
         raptor::Trace,
@@ -46,7 +46,7 @@ impl Graph {
 
             if !sources.is_empty() && !targets.is_empty() {
                 let results =
-                    self.raptor_inner(&sources, &targets, start_time, access_secs, date, weekday);
+                    self.raptor_inner(&sources, &targets, start_time, access_secs, date, weekday, origin, destination);
                 if !results.is_empty() {
                     return results;
                 }
@@ -83,6 +83,8 @@ impl Graph {
         access_secs: u32,
         date: u32,
         weekday: u8,
+        origin: NodeID,
+        destination: NodeID,
     ) -> Vec<Plan> {
         let n_stops = self.transit_stop_to_node.len();
         let n_patterns = self.transit_patterns.len();
@@ -184,7 +186,8 @@ impl Graph {
         }
 
         self.extract(
-            sources, targets, start_time, date, weekday, &labels, &labels_rt, &traces,
+            sources, targets, start_time, date, weekday, &labels, &labels_rt, &traces, origin,
+            destination,
         )
     }
 
@@ -223,6 +226,7 @@ impl Graph {
                     time: walk_secs,
                     place: to_place,
                 })],
+                geometry: self.walk_path(origin, destination),
             })],
             start: start_time,
             end,
@@ -417,6 +421,8 @@ impl Graph {
         labels: &[Vec<ScenarioBag>],
         labels_rt: &[Vec<Option<RouteType>>],
         traces: &[Vec<Trace>],
+        origin: NodeID,
+        destination: NodeID,
     ) -> Vec<Plan> {
         let mut results = Vec::new();
         let mut pareto_best = u32::MAX;
@@ -463,7 +469,7 @@ impl Graph {
                         0,
                         PlanLeg::Walk(PlanWalkLeg {
                             from: PlanPlace {
-                                node_id: stop_node,
+                                node_id: origin,
                                 stop_position: None,
                                 arrival: None,
                                 departure: Some(start_time),
@@ -478,6 +484,7 @@ impl Graph {
                                 time: first_walk,
                                 place: to_place,
                             })],
+                            geometry: self.walk_path(origin, stop_node),
                         }),
                     );
                 }
@@ -488,7 +495,7 @@ impl Graph {
                 let stop_node = self.transit_stop_to_node[best_stop];
                 let length = (best_walk as f64 * WALKING_SPEED_MS) as usize;
                 let to_place = PlanPlace {
-                    node_id: stop_node,
+                    node_id: destination,
                     stop_position: None,
                     arrival: Some(best_arr),
                     departure: None,
@@ -510,6 +517,7 @@ impl Graph {
                         time: best_walk,
                         place: to_place,
                     })],
+                    geometry: self.walk_path(stop_node, destination),
                 }));
             }
 
@@ -616,6 +624,7 @@ impl Graph {
                         time: duration,
                         place: to_place,
                     })],
+                    geometry: self.walk_path(from_node, to_node),
                 }));
                 stop = from;
                 continue;
@@ -663,6 +672,10 @@ impl Graph {
                 }));
             }
 
+            let transit_geometry: Vec<PlanCoordinate> = (bp..=ap)
+                .map(|s| self.node_coord(pat_stops[s]))
+                .collect();
+
             legs.push(PlanLeg::Transit(PlanTransitLeg {
                 from: PlanPlace {
                     stop_position: Some(bp as u32),
@@ -682,6 +695,7 @@ impl Graph {
                 length: total_length,
                 duration: alight_arr - board_dep,
                 steps,
+                geometry: transit_geometry,
             }));
 
             stop = self.transit_node_to_stop[pat_stops[bp].0] as usize;
@@ -720,6 +734,87 @@ impl Graph {
             is_marked[stop] = true;
             marked.push(stop);
         }
+    }
+
+    fn node_coord(&self, id: NodeID) -> PlanCoordinate {
+        let loc = self.nodes[id.0].loc();
+        PlanCoordinate { lat: loc.latitude, lon: loc.longitude }
+    }
+
+    /// Returns the sequence of OSM nodes forming the shortest walking path
+    /// from `origin` to `destination`, converted to lat/lon coordinates.
+    ///
+    /// Falls back to a two-point straight line if no path is found.
+    fn walk_path(&self, origin: NodeID, destination: NodeID) -> Vec<PlanCoordinate> {
+        if origin == destination {
+            let c = self.node_coord(origin);
+            return vec![c];
+        }
+
+        const WALK_MMS: u32 = (WALKING_SPEED_MS * 1000.0) as u32;
+
+        let mut dist: HashMap<NodeID, u32> = HashMap::new();
+        let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
+        let mut pq: BinaryHeap<Reverse<(u32, NodeID)>> = BinaryHeap::new();
+
+        dist.insert(origin, 0);
+        pq.push(Reverse((0, origin)));
+
+        'outer: while let Some(Reverse((d, node))) = pq.pop() {
+            if d > *dist.get(&node).unwrap_or(&u32::MAX) {
+                continue;
+            }
+            if node == destination {
+                break 'outer;
+            }
+            // Do not expand through transit stop nodes (except the origin which
+            // may itself be a transit-stop-snapped OSM node).
+            if node != origin && self.transit_node_to_stop[node.0] != u32::MAX {
+                continue;
+            }
+            if let Some(neighbors) = self.edges.get(node.0) {
+                for edge in neighbors {
+                    match edge {
+                        EdgeData::Street(street) => {
+                            let t = (street.length as u64 * 1000 / WALK_MMS as u64) as u32;
+                            let nd = d.saturating_add(t);
+                            let entry = dist.entry(street.destination).or_insert(u32::MAX);
+                            if nd < *entry {
+                                *entry = nd;
+                                parent.insert(street.destination, node);
+                                pq.push(Reverse((nd, street.destination)));
+                            }
+                        }
+                        EdgeData::Transit(transit) => {
+                            let entry = dist.entry(transit.destination).or_insert(u32::MAX);
+                            if d < *entry {
+                                *entry = d;
+                                parent.entry(transit.destination).or_insert(node);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !dist.contains_key(&destination) {
+            return vec![self.node_coord(origin), self.node_coord(destination)];
+        }
+
+        // Backtrack from destination to origin.
+        let mut path_nodes = vec![destination];
+        let mut current = destination;
+        while current != origin {
+            match parent.get(&current) {
+                Some(&p) => {
+                    path_nodes.push(p);
+                    current = p;
+                }
+                None => break,
+            }
+        }
+        path_nodes.reverse();
+        path_nodes.iter().map(|&n| self.node_coord(n)).collect()
     }
 
     pub fn walk_dijkstra(&self, origin: NodeID, max_seconds: u32) -> HashMap<NodeID, u32> {
