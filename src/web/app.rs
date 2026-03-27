@@ -32,6 +32,10 @@ struct GtfsRoute {
     short_name: String,
     long_name: String,
     mode: String,
+    /// GTFS route colour as a 6-character hex string, or `null` if not defined.
+    color: Option<String>,
+    /// GTFS route text colour as a 6-character hex string, or `null` if not defined.
+    text_color: Option<String>,
 }
 
 #[derive(SimpleObject)]
@@ -158,11 +162,13 @@ impl QueryRoot {
                 url,
                 routes: routes
                     .into_iter()
-                    .map(|(route_idx, short_name, long_name, mode)| GtfsRoute {
+                    .map(|(route_idx, short_name, long_name, mode, color, text_color)| GtfsRoute {
                         id: format!("maas:route:{}", route_idx),
                         short_name,
                         long_name,
                         mode,
+                        color,
+                        text_color,
                     })
                     .collect(),
             })

@@ -65,6 +65,10 @@ pub struct RouteInfo {
     pub route_long_name: String,
     pub route_type: RouteType,
     pub agency_id: AgencyId,
+    /// GTFS `route_color` as (R, G, B), `None` if absent or black (#000000).
+    pub route_color: Option<(u8, u8, u8)>,
+    /// GTFS `route_text_color` as (R, G, B), `None` if absent or white (#FFFFFF).
+    pub route_text_color: Option<(u8, u8, u8)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,14 +304,36 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
                 route_type: RouteType::Other(-1),
                 route_short_name: String::new(),
                 route_long_name: String::new(),
+                route_color: None,
+                route_text_color: None,
             });
         }
+
+        // Treat black (#000000) as "no color" since it is the GTFS default for
+        // routes that do not define a colour.
+        let route_color = route.color.and_then(|c| {
+            if c.r == 0 && c.g == 0 && c.b == 0 {
+                None
+            } else {
+                Some((c.r, c.g, c.b))
+            }
+        });
+        // Treat white (#FFFFFF) as "no text color" (GTFS default).
+        let route_text_color = route.text_color.and_then(|c| {
+            if c.r == 255 && c.g == 255 && c.b == 255 {
+                None
+            } else {
+                Some((c.r, c.g, c.b))
+            }
+        });
 
         route_infos[route_id] = RouteInfo {
             route_short_name: route.short_name.unwrap_or("??".to_string()),
             route_long_name: route.long_name.unwrap_or("Unknown".to_string()),
             route_type: route.route_type,
             agency_id,
+            route_color,
+            route_text_color,
         };
     }
 

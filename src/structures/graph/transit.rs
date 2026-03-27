@@ -96,21 +96,25 @@ impl Graph {
 
     /// Returns all agencies with their routes as owned data.
     /// Each entry: (agency_idx, name, url, routes)
-    /// Each route: (route_idx, short_name, long_name, mode_string)
+    /// Each route: (route_idx, short_name, long_name, mode_string, color_hex, text_color_hex)
     pub fn gtfs_agencies_with_routes(
         &self,
-    ) -> Vec<(usize, String, String, Vec<(usize, String, String, String)>)> {
-        let mut agency_routes: Vec<Vec<(usize, String, String, String)>> =
+    ) -> Vec<(usize, String, String, Vec<(usize, String, String, String, Option<String>, Option<String>)>)> {
+        let mut agency_routes: Vec<Vec<(usize, String, String, String, Option<String>, Option<String>)>> =
             vec![vec![]; self.transit_agencies.len()];
 
         for (route_idx, route) in self.transit_routes.iter().enumerate() {
             let agency_idx = route.agency_id.0 as usize;
             if agency_idx < agency_routes.len() {
+                let color = route.route_color.map(|(r, g, b)| format!("{:02X}{:02X}{:02X}", r, g, b));
+                let text_color = route.route_text_color.map(|(r, g, b)| format!("{:02X}{:02X}{:02X}", r, g, b));
                 agency_routes[agency_idx].push((
                     route_idx,
                     route.route_short_name.clone(),
                     route.route_long_name.clone(),
                     display_route_type(route.route_type).to_string(),
+                    color,
+                    text_color,
                 ));
             }
         }

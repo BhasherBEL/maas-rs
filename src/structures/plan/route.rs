@@ -49,6 +49,11 @@ pub struct PlanRoute {
     pub short_name: String,
     pub long_name: String,
     pub mode: PlanRouteType,
+    /// GTFS route colour as a 6-character hex string (e.g. `"ADD8E6"`), or
+    /// `null` when the GTFS feed does not define a colour for this route.
+    pub color: Option<String>,
+    /// GTFS route text colour as a 6-character hex string, or `null`.
+    pub text_color: Option<String>,
 
     #[graphql(skip)]
     pub agency_id: AgencyId,
@@ -63,6 +68,10 @@ impl PlanRoute {
     }
 }
 
+fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
+    format!("{:02X}{:02X}{:02X}", r, g, b)
+}
+
 impl PlanRoute {
     pub fn from_route_id(g: &Graph, id: Option<RouteId>) -> Option<PlanRoute> {
         let route = g.get_route(id?)?;
@@ -71,6 +80,8 @@ impl PlanRoute {
             short_name: route.route_short_name.clone(),
             long_name: route.route_long_name.clone(),
             mode: PlanRouteType::from_gtfs_route_type(route.route_type),
+            color: route.route_color.map(|(r, g, b)| rgb_to_hex(r, g, b)),
+            text_color: route.route_text_color.map(|(r, g, b)| rgb_to_hex(r, g, b)),
             agency_id: route.agency_id,
         })
     }
