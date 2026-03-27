@@ -102,6 +102,9 @@ impl QueryRoot {
         to_lng: f64,
         date: Option<String>,
         time: Option<String>,
+        // When provided and > 0, return all Pareto-optimal plans departing
+        // within this many minutes after `time` (Range-RAPTOR).
+        window_minutes: Option<i32>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
 
@@ -127,6 +130,7 @@ impl QueryRoot {
             to_lng,
             date: parsed_date,
             time: parsed_time,
+            window_minutes: window_minutes.map(|w| w.max(0) as u32),
         };
 
         routing_raptor::route(graph.as_ref(), &query)

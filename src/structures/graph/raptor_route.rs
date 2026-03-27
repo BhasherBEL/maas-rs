@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BTreeSet, BinaryHeap, HashMap},
 };
 
 use gtfs_structures::RouteType;
@@ -459,10 +459,22 @@ impl Graph {
                 if first_walk > 0 {
                     let stop_node = self.transit_stop_to_node[origin_stop];
                     let length = (first_walk as f64 * WALKING_SPEED_MS) as usize;
+                    // Depart at the latest possible moment so the user arrives at the
+                    // stop exactly when the first transit vehicle boards, not at query
+                    // time (which would leave them waiting invisibly on the platform).
+                    let walk_start = legs
+                        .first()
+                        .map(|l| match l {
+                            PlanLeg::Transit(t) => t.start.saturating_sub(first_walk),
+                            PlanLeg::Walk(w) => w.start.saturating_sub(first_walk),
+                        })
+                        .unwrap_or(start_time)
+                        .max(start_time); // can never depart before query time
+                    let walk_end = walk_start + first_walk;
                     let to_place = PlanPlace {
                         node_id: stop_node,
                         stop_position: None,
-                        arrival: Some(stop_arrival),
+                        arrival: Some(walk_end),
                         departure: None,
                     };
                     legs.insert(
@@ -472,11 +484,11 @@ impl Graph {
                                 node_id: origin,
                                 stop_position: None,
                                 arrival: None,
-                                departure: Some(start_time),
+                                departure: Some(walk_start),
                             },
                             to: to_place,
-                            start: start_time,
-                            end: stop_arrival,
+                            start: walk_start,
+                            end: walk_end,
                             duration: first_walk,
                             length,
                             steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
@@ -887,5 +899,194 @@ impl Graph {
             }
         }
         stops
+    }
+
+    /// Collect every origin-departure time `T` in `[earliest, latest]` such that
+    /// a transit vehicle departs from some access stop at `T + walk_secs`.
+    ///
+    /// Returns times sorted **descending** (latest first) so a Range-RAPTOR loop
+    /// can progressively tighten the `target_cutoff` on each iteration.
+    fn collect_interesting_times(
+        &self,
+        raw_stops: &[(usize, u32)], // (compact_stop_idx, walk_secs_from_origin)
+        earliest_origin_departure: u32,
+        latest_origin_departure: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Vec<u32> {
+        let mut departure_times: BTreeSet<u32> = BTreeSet::new();
+
+        for &(stop, walk_secs) in raw_stops {
+            let earliest_at_stop = earliest_origin_departure.saturating_add(walk_secs);
+            let latest_at_stop = latest_origin_departure.saturating_add(walk_secs);
+
+            let pats = self.transit_idx_stop_patterns[stop].of(&self.transit_stop_patterns);
+            for &(pat_id, stop_pos) in pats {
+                let p = pat_id.0 as usize;
+                let n_trips = self.transit_patterns[p].num_trips as usize;
+                if n_trips == 0 {
+                    continue;
+                }
+
+                let stop_times =
+                    self.transit_idx_pattern_stop_times[p].of(&self.transit_pattern_stop_times);
+                let trip_ids =
+                    self.transit_idx_pattern_trips[p].of(&self.transit_pattern_trips);
+
+                // Column-major layout: times for stop_pos are at [stop_pos*n_trips .. (stop_pos+1)*n_trips]
+                let col = &stop_times[stop_pos as usize * n_trips..(stop_pos as usize + 1) * n_trips];
+
+                // Binary search for the window [earliest_at_stop, latest_at_stop]
+                let lo = col.partition_point(|st| st.departure < earliest_at_stop);
+                let hi = col.partition_point(|st| st.departure <= latest_at_stop);
+
+                for t in lo..hi {
+                    if self.is_trip_active(trip_ids[t], date, weekday) {
+                        departure_times.insert(col[t].departure - walk_secs);
+                    }
+                }
+            }
+        }
+
+        // Keep at most the next 5 departure opportunities (earliest first).
+        // Capping here avoids O(N * RAPTOR_cost) blowup on frequent corridors.
+        let result: Vec<u32> = departure_times.into_iter().take(5).collect();
+        result
+    }
+
+    /// Range-RAPTOR: run RAPTOR for every interesting departure within
+    /// `[start_time, start_time + window_secs]` and return the Pareto-optimal set
+    /// of plans (transfer count × arrival time × departure time).
+    pub fn raptor_range(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Vec<Plan> {
+        let straight_line_secs =
+            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
+
+        let mut walk_only_secs: Option<u32> = None;
+        let mut access_secs = self.nearest_stop_secs(origin, straight_line_secs).max(1);
+
+        loop {
+            let raw_stops = self.nearby_stops(origin, access_secs);
+            let targets = self.nearby_stops(destination, access_secs);
+
+            if !raw_stops.is_empty() && !targets.is_empty() {
+                let sources: Vec<(usize, u32)> = raw_stops
+                    .iter()
+                    .map(|&(s, w)| (s, start_time + w))
+                    .collect();
+                // Probe at start_time to confirm this access_secs is valid.
+                let probe = self.raptor_inner(
+                    &sources,
+                    &targets,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                );
+                if !probe.is_empty() {
+                    let departure_times = self.collect_interesting_times(
+                        &raw_stops,
+                        start_time,
+                        start_time.saturating_add(window_secs),
+                        date,
+                        weekday,
+                    );
+
+                    if departure_times.is_empty() {
+                        return probe;
+                    }
+
+                    let mut all_plans = Vec::new();
+                    for t in departure_times {
+                        let sources_t: Vec<(usize, u32)> = raw_stops
+                            .iter()
+                            .map(|&(s, w)| (s, t + w))
+                            .collect();
+                        let plans = self.raptor_inner(
+                            &sources_t,
+                            &targets,
+                            t,
+                            access_secs,
+                            date,
+                            weekday,
+                            origin,
+                            destination,
+                        );
+                        all_plans.extend(plans);
+                    }
+                    return Self::pareto_filter(all_plans);
+                }
+            }
+
+            access_secs = access_secs.saturating_mul(2);
+
+            if access_secs >= straight_line_secs && walk_only_secs.is_none() {
+                walk_only_secs = Some(
+                    self.walk_dijkstra(origin, u32::MAX)
+                        .get(&destination)
+                        .copied()
+                        .unwrap_or(u32::MAX),
+                );
+            }
+
+            if let Some(actual) = walk_only_secs {
+                if access_secs >= actual {
+                    return if actual < u32::MAX {
+                        vec![self.build_walk_plan(origin, destination, start_time, actual)]
+                    } else {
+                        vec![]
+                    };
+                }
+            }
+        }
+    }
+
+    /// Remove dominated plans from `plans`.
+    ///
+    /// Plan A dominates plan B when A is at least as good in all three dimensions
+    /// (departure time, arrival time, transfer count) and strictly better in at
+    /// least one.
+    fn pareto_filter(plans: Vec<Plan>) -> Vec<Plan> {
+        fn transfer_count(plan: &Plan) -> usize {
+            plan.legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count()
+                .saturating_sub(1)
+        }
+
+        let mut result: Vec<Plan> = Vec::new();
+
+        'outer: for plan in plans {
+            let tc_p = transfer_count(&plan);
+            // Skip plan if any existing plan is at least as good in every dimension
+            // (handles both dominated plans and exact duplicates).
+            for existing in &result {
+                let tc_e = transfer_count(existing);
+                if tc_e <= tc_p && existing.end <= plan.end && existing.start >= plan.start {
+                    continue 'outer;
+                }
+            }
+            // Remove any plans in `result` that `plan` dominates.
+            result.retain(|existing| {
+                let tc_e = transfer_count(existing);
+                !(tc_p <= tc_e
+                    && plan.end <= existing.end
+                    && plan.start >= existing.start
+                    && (tc_p < tc_e || plan.end < existing.end || plan.start > existing.start))
+            });
+            result.push(plan);
+        }
+
+        result
     }
 }
