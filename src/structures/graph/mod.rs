@@ -56,6 +56,12 @@ pub struct Graph {
     transit_stop_to_node: Vec<NodeID>,
 
     transit_stops_tree: KdTree<f64, usize, [f64; 2]>,
+
+    /// Minimum walk-radius for access/egress stop discovery (seconds).
+    /// Stored in the graph so config.yaml changes take effect after a rebuild.
+    /// Defaults to 600 (10 min) when absent from a serialized graph.
+    #[serde(default = "Graph::default_min_access_secs")]
+    pub min_access_secs: u32,
 }
 
 static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
@@ -95,7 +101,17 @@ impl Graph {
             transit_stop_to_node: Vec::new(),
 
             transit_stops_tree: KdTree::new(2),
+
+            min_access_secs: Self::default_min_access_secs(),
         }
+    }
+
+    fn default_min_access_secs() -> u32 {
+        10 * 60
+    }
+
+    pub fn set_min_access_secs(&mut self, secs: u32) {
+        self.min_access_secs = secs;
     }
 
     pub fn add_node(&mut self, node: NodeData) -> NodeID {

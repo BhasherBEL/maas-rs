@@ -105,6 +105,9 @@ impl QueryRoot {
         // When provided and > 0, return all Pareto-optimal plans departing
         // within this many minutes after `time` (Range-RAPTOR).
         window_minutes: Option<i32>,
+        // Override the default walk-radius (seconds) for access/egress stop
+        // search.  Falls back to the value in config.yaml (default 600 s).
+        walk_radius_secs: Option<i32>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
 
@@ -131,6 +134,7 @@ impl QueryRoot {
             date: parsed_date,
             time: parsed_time,
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
+            min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
         };
 
         routing_raptor::route(graph.as_ref(), &query)
