@@ -12,7 +12,7 @@ use crate::{
         EdgeData, NodeID, ScenarioBag, degrees_to_meters,
         plan::{
             ArrivalScenario, Plan, PlanCoordinate, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg,
-            PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep,
+            PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep, TransferRisk,
         },
         raptor::Trace,
     },
@@ -368,6 +368,21 @@ impl Graph {
             .map(|t| col[t].arrival)
     }
 
+    /// Find the departure time of the next active trip after `after_trip` at `boarding_col`
+    /// (the stop-times column for the boarding stop position).
+    fn next_active_trip_departure(
+        &self,
+        trip_ids: &[TripId],
+        after_trip: usize,
+        boarding_col: &[StopTime],
+        date: u32,
+        weekday: u8,
+    ) -> Option<u32> {
+        (after_trip..trip_ids.len())
+            .find(|&t| self.is_trip_active(trip_ids[t], date, weekday))
+            .map(|t| boarding_col[t].departure)
+    }
+
     fn apply_transfers(
         &self,
         labels: &mut [ScenarioBag],
@@ -411,6 +426,26 @@ impl Graph {
         }
     }
 
+    const EXTREME_RISK_RELIABILITY: f32 = 0.10;
+    const EXTREME_RISK_WAIT_SECS: u32 = 7200;
+
+    fn is_extreme_risk(plan: &Plan) -> bool {
+        plan.legs.iter().any(|leg| {
+            if let PlanLeg::Transit(t) = leg {
+                if let Some(ref risk) = t.transfer_risk {
+                    if risk.reliability < Self::EXTREME_RISK_RELIABILITY {
+                        let wait = risk
+                            .next_departure
+                            .map(|nd| nd.saturating_sub(risk.scheduled_departure))
+                            .unwrap_or(u32::MAX);
+                        return wait > Self::EXTREME_RISK_WAIT_SECS;
+                    }
+                }
+            }
+            false
+        })
+    }
+
     fn extract(
         &self,
         sources: &[(usize, u32)],
@@ -424,7 +459,7 @@ impl Graph {
         origin: NodeID,
         destination: NodeID,
     ) -> Vec<Plan> {
-        let mut results = Vec::new();
+        let mut candidates = Vec::new();
         let mut pareto_best = u32::MAX;
 
         for k in 0..=MAX_ROUNDS {
@@ -448,7 +483,7 @@ impl Graph {
             pareto_best = best_arr;
 
             let (mut legs, origin_stop) =
-                self.reconstruct(k, best_stop, date, weekday, labels, traces);
+                self.reconstruct(k, best_stop, date, weekday, labels, labels_rt, traces);
 
             if legs.is_empty() {
                 continue;
@@ -573,7 +608,7 @@ impl Graph {
                         .collect(),
                 };
 
-            results.push(Plan {
+            candidates.push(Plan {
                 legs,
                 start: departure,
                 end: best_arr,
@@ -581,7 +616,11 @@ impl Graph {
             });
         }
 
-        results
+        // Safety net: only apply filter if at least one candidate passes.
+        if candidates.iter().any(|p| !Self::is_extreme_risk(p)) {
+            candidates.retain(|p| !Self::is_extreme_risk(p));
+        }
+        candidates
     }
 
     fn reconstruct(
@@ -591,6 +630,7 @@ impl Graph {
         date: u32,
         weekday: u8,
         labels: &[Vec<ScenarioBag>],
+        labels_rt: &[Vec<Option<RouteType>>],
         traces: &[Vec<Trace>],
     ) -> (Vec<PlanLeg>, usize) {
         let mut legs = Vec::new();
@@ -655,6 +695,27 @@ impl Graph {
             let board_dep = times[bp * n_trips + t].departure;
             let alight_arr = times[ap * n_trips + t].arrival;
 
+            let bs = self.transit_node_to_stop[pat_stops[bp].0] as usize;
+            let boarding_col = &times[bp * n_trips..(bp + 1) * n_trips];
+
+            let transfer_risk = if k == 0 || labels_rt[k - 1][bs].is_none() {
+                None // first transit leg — walked directly from origin, no transfer uncertainty
+            } else {
+                let rt = labels_rt[k - 1][bs].unwrap();
+                let arrival_at_bs = labels[k - 1][bs].earliest();
+                let margin = board_dep.saturating_sub(arrival_at_bs);
+                let reliability = self
+                    .transit_delay_models
+                    .get(&rt)
+                    .map(|cdf| cdf.prob_on_time(margin))
+                    .unwrap_or(1.0);
+                let next_departure =
+                    self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
+                Some(TransferRisk { reliability, scheduled_departure: board_dep, next_departure })
+            };
+
+            let route_id = self.transit_patterns[p].route;
+
             let mut steps = Vec::with_capacity(ap - bp);
             let mut total_length = 0usize;
             for s in (bp + 1)..=ap {
@@ -663,6 +724,33 @@ impl Graph {
 
                 let arr = times[s * n_trips + t].arrival;
                 let prev_dep = times[(s - 1) * n_trips + t].departure;
+
+                // Look up the TimetableSegment for this hop from the transit edge.
+                let timetable_segment = self.edges[pat_stops[s - 1].0]
+                    .iter()
+                    .find_map(|e| match e {
+                        EdgeData::Transit(te)
+                            if te.destination == pat_stops[s] && te.route_id == route_id =>
+                        {
+                            Some(te.timetable_segment)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(TimetableSegment { start: 0, len: 0 });
+
+                // For the boarding step, find the absolute departure_index
+                // so previousDepartures / nextDepartures can locate alternatives.
+                // For subsequent steps, find_alternatives recomputes it by trip_id.
+                let departure_index = if s == bp + 1 {
+                    self.transit_departures
+                        [timetable_segment.start..timetable_segment.start + timetable_segment.len]
+                        .iter()
+                        .position(|ts| ts.trip_id == trip_ids[t])
+                        .map(|i| timetable_segment.start + i)
+                        .unwrap_or(timetable_segment.start)
+                } else {
+                    0
+                };
 
                 steps.push(PlanLegStep::Transit(PlanTransitLegStep {
                     length: seg_len,
@@ -679,8 +767,8 @@ impl Graph {
                     },
                     date,
                     weekday,
-                    timetable_segment: TimetableSegment { start: 0, len: 0 },
-                    departure_index: 0,
+                    timetable_segment,
+                    departure_index,
                 }));
             }
 
@@ -708,6 +796,7 @@ impl Graph {
                 duration: alight_arr - board_dep,
                 steps,
                 geometry: transit_geometry,
+                transfer_risk,
             }));
 
             stop = self.transit_node_to_stop[pat_stops[bp].0] as usize;
