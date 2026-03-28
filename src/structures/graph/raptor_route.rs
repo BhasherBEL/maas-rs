@@ -332,7 +332,7 @@ impl Graph {
                                 .scenarios()
                                 .iter()
                                 .map(|s| {
-                                    let buf = trip_dep.saturating_sub(s.time);
+                                    let buf = trip_dep as i32 - s.time as i32;
                                     let p_make = match prev_rt[stop] {
                                         Some(rt) => self
                                             .transit_delay_models
@@ -591,7 +591,7 @@ impl Graph {
                             if bin_mass > 0.0 {
                                 for s in arrival_bag.scenarios() {
                                     dist.push(ArrivalScenario {
-                                        time: s.time.saturating_add(delay),
+                                        time: s.time.saturating_add_signed(delay),
                                         probability: s.prob * bin_mass,
                                     });
                                 }
@@ -703,7 +703,7 @@ impl Graph {
             } else {
                 let rt = labels_rt[k - 1][bs].unwrap();
                 let arrival_at_bs = labels[k - 1][bs].earliest();
-                let margin = board_dep.saturating_sub(arrival_at_bs);
+                let margin = board_dep as i32 - arrival_at_bs as i32;
                 let reliability = self
                     .transit_delay_models
                     .get(&rt)

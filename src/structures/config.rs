@@ -22,7 +22,7 @@ pub struct BuildConfig {
 #[derive(Debug, Deserialize)]
 pub struct DelayModelConfig {
     pub mode: String,
-    pub bins: Vec<(u32, f32)>,
+    pub bins: Vec<(i32, f32)>,
 }
 
 impl DelayModelConfig {
