@@ -4,13 +4,15 @@ use crate::structures::MAX_SCENARIOS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DelayCDF {
-    /// Sorted bins: (delay_seconds, cumulative_probability)
-    pub bins: Vec<(u32, f32)>,
+    /// Sorted bins: (delay_seconds, cumulative_probability).
+    /// Delay is signed: negative values represent early departures.
+    pub bins: Vec<(i32, f32)>,
 }
 
 impl DelayCDF {
     /// Returns P(delay ≤ budget_secs) using a step-CDF lookup.
-    pub fn prob_on_time(&self, budget_secs: u32) -> f32 {
+    /// `budget_secs` is the transfer margin (negative if you arrive after schedule).
+    pub fn prob_on_time(&self, budget_secs: i32) -> f32 {
         let pos = self.bins.partition_point(|&(delay, _)| delay <= budget_secs);
         if pos == 0 {
             0.0
@@ -153,6 +155,16 @@ mod tests {
         }
     }
 
+    fn make_cdf_with_early() -> DelayCDF {
+        // Mirrors the subway model from config.yaml
+        DelayCDF {
+            bins: vec![
+                (-120, 0.01), (-60, 0.02), (0, 0.08), (60, 0.22),
+                (120, 0.50), (180, 0.80), (300, 0.96), (900, 1.00),
+            ],
+        }
+    }
+
     #[test]
     fn cdf_empty_returns_zero() {
         let cdf = DelayCDF { bins: vec![] };
@@ -192,6 +204,44 @@ mod tests {
         assert_eq!(cdf.prob_on_time(119), 0.0);
         assert_eq!(cdf.prob_on_time(120), 0.85);
         assert_eq!(cdf.prob_on_time(121), 0.85);
+    }
+
+    #[test]
+    fn cdf_negative_bins_below_leftmost_returns_zero() {
+        let cdf = make_cdf_with_early();
+        assert_eq!(cdf.prob_on_time(-180), 0.0); // below first bin
+    }
+
+    #[test]
+    fn cdf_negative_bins_exact_early_bin() {
+        let cdf = make_cdf_with_early();
+        assert_eq!(cdf.prob_on_time(-120), 0.01);
+        assert_eq!(cdf.prob_on_time(-60), 0.02);
+    }
+
+    #[test]
+    fn cdf_negative_bins_between_early_bins() {
+        let cdf = make_cdf_with_early();
+        // Between -120 and -60 → step stays at 0.01
+        assert_eq!(cdf.prob_on_time(-90), 0.01);
+    }
+
+    #[test]
+    fn cdf_negative_budget_means_late_arrival() {
+        // margin < 0: you arrive after scheduled departure → very low probability
+        let cdf = make_cdf_with_early();
+        assert_eq!(cdf.prob_on_time(-1), 0.02);  // between -60 and 0 → -60 bin
+        assert_eq!(cdf.prob_on_time(-59), 0.02); // -60 ≤ -59, so -60 bin still applies
+        assert_eq!(cdf.prob_on_time(-61), 0.01); // -60 > -61, so only -120 bin applies
+    }
+
+    #[test]
+    fn cdf_positive_bins_unchanged_with_signed_type() {
+        let cdf = make_cdf_with_early();
+        assert_eq!(cdf.prob_on_time(0), 0.08);
+        assert_eq!(cdf.prob_on_time(120), 0.50);
+        assert_eq!(cdf.prob_on_time(180), 0.80);
+        assert_eq!(cdf.prob_on_time(1000), 1.0);
     }
 
     // ── ScenarioBag ───────────────────────────────────────────────────────────
