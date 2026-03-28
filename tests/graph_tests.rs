@@ -677,7 +677,7 @@ fn raptor_second_transit_leg_has_transfer_risk() {
 
     // Depart at 08:00 on a Monday (date=0 = 2000-01-01 which is a Saturday, but
     // all_days_service has days_of_week=0x7F so every weekday mask passes)
-    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F);
+    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
 
     assert!(!plans.is_empty(), "Expected at least one plan");
 
@@ -708,7 +708,7 @@ fn raptor_second_transit_leg_has_transfer_risk() {
 #[test]
 fn raptor_transfer_risk_reliability_is_one_without_delay_model() {
     let (g, origin, dest) = two_route_raptor_graph();
-    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F);
+    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
 
     let two_leg = plans.iter().find(|p| {
         p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2

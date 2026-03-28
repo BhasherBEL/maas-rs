@@ -67,6 +67,10 @@ pub struct GtfsGenericIngestor {
 pub struct RoutingDefaultConfig {
     pub walking_speed: u32,
     pub estimator_speed: u32,
+    /// Minimum walk-radius (seconds) used for access/egress stop search.
+    /// When absent, the compiled-in default (600 s = 10 min) is used.
+    #[serde(default)]
+    pub min_access_secs: Option<u32>,
 }
 
 impl Ingestor {

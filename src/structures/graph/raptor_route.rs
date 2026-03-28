@@ -28,12 +28,15 @@ impl Graph {
         start_time: u32,
         date: u32,
         weekday: u8,
+        min_access_secs: u32,
     ) -> Vec<Plan> {
         let straight_line_secs =
             (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
-        let mut access_secs = self.nearest_stop_secs(origin, straight_line_secs).max(1);
+        let mut access_secs = self
+            .nearest_stop_secs(origin, straight_line_secs)
+            .max(min_access_secs);
 
         loop {
             let sources: Vec<(usize, u32)> = self
@@ -426,6 +429,22 @@ impl Graph {
         }
     }
 
+    /// Returns `true` if any transit leg in the plan moves the user farther from the
+    /// destination than where that leg started (backward detour).
+    /// A 150 m slack is allowed to tolerate minor alignment bends.
+    fn has_backward_transit_leg(&self, plan: &Plan, destination: NodeID) -> bool {
+        const BACKWARD_SLACK_M: usize = 150;
+        plan.legs.iter().any(|leg| {
+            if let PlanLeg::Transit(t) = leg {
+                let from_dist = self.nodes_distance(t.from.node_id, destination);
+                let to_dist = self.nodes_distance(t.to.node_id, destination);
+                to_dist > from_dist.saturating_add(BACKWARD_SLACK_M)
+            } else {
+                false
+            }
+        })
+    }
+
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
     const EXTREME_RISK_WAIT_SECS: u32 = 7200;
 
@@ -609,7 +628,7 @@ impl Graph {
                 };
 
             candidates.push(Plan {
-                legs,
+                legs: Self::merge_consecutive_walks(legs),
                 start: departure,
                 end: best_arr,
                 arrival_distribution,
@@ -620,7 +639,55 @@ impl Graph {
         if candidates.iter().any(|p| !Self::is_extreme_risk(p)) {
             candidates.retain(|p| !Self::is_extreme_risk(p));
         }
+        // Filter plans where a transit leg moves the user away from the destination
+        // (i.e. a "backward" leg). Allow up to 150 m of regression to tolerate
+        // slightly curved alignments; anything more is a wrong-direction detour.
+        if candidates.iter().any(|p| !self.has_backward_transit_leg(p, destination)) {
+            candidates.retain(|p| !self.has_backward_transit_leg(p, destination));
+        }
         candidates
+    }
+
+    /// Merge any two consecutive `PlanLeg::Walk` segments into one.
+    /// This collapses a transfer-walk + last-mile-walk that share no boarding in between.
+    fn merge_consecutive_walks(legs: Vec<PlanLeg>) -> Vec<PlanLeg> {
+        let mut out: Vec<PlanLeg> = Vec::with_capacity(legs.len());
+        for leg in legs {
+            match (out.last_mut(), &leg) {
+                (Some(PlanLeg::Walk(prev)), PlanLeg::Walk(next)) => {
+                    let mut merged_geo = prev.geometry.clone();
+                    // Avoid duplicating the shared waypoint coordinate.
+                    if merged_geo.last().map(|c| (c.lat, c.lon))
+                        == next.geometry.first().map(|c| (c.lat, c.lon))
+                    {
+                        merged_geo.extend_from_slice(&next.geometry[1..]);
+                    } else {
+                        merged_geo.extend_from_slice(&next.geometry);
+                    }
+                    let new_duration = prev.duration + next.duration;
+                    let new_length = prev.length + next.length;
+                    let new_end = next.end;
+                    let to = next.to;
+                    let step = PlanLegStep::Walk(PlanWalkLegStep {
+                        length: new_length,
+                        time: new_duration,
+                        place: to,
+                    });
+                    *prev = PlanWalkLeg {
+                        from: prev.from,
+                        to,
+                        start: prev.start,
+                        end: new_end,
+                        duration: new_duration,
+                        length: new_length,
+                        steps: vec![step],
+                        geometry: merged_geo,
+                    };
+                }
+                _ => out.push(leg),
+            }
+        }
+        out
     }
 
     fn reconstruct(
@@ -704,14 +771,24 @@ impl Graph {
                 let rt = labels_rt[k - 1][bs].unwrap();
                 let arrival_at_bs = labels[k - 1][bs].earliest();
                 let margin = board_dep as i32 - arrival_at_bs as i32;
-                let reliability = self
-                    .transit_delay_models
-                    .get(&rt)
-                    .map(|cdf| cdf.prob_on_time(margin))
-                    .unwrap_or(1.0);
                 let next_departure =
                     self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
-                Some(TransferRisk { reliability, scheduled_departure: board_dep, next_departure })
+                let (reliability, next_reliability) =
+                    match self.transit_delay_models.get(&rt) {
+                        Some(cdf) => (
+                            cdf.prob_on_time(margin),
+                            next_departure.map(|nd| {
+                                cdf.prob_on_time(nd as i32 - arrival_at_bs as i32)
+                            }),
+                        ),
+                        None => (1.0, None),
+                    };
+                Some(TransferRisk {
+                    reliability,
+                    scheduled_departure: board_dep,
+                    next_departure,
+                    next_reliability,
+                })
             };
 
             let route_id = self.transit_patterns[p].route;
@@ -971,7 +1048,7 @@ impl Graph {
             .ok()
             .and_then(|v| v.into_iter().next())
             .map(|(dist_sq, _)| {
-                let dist_m = degrees_to_meters(dist_sq.sqrt(), loc.latitude);
+                let dist_m = degrees_to_meters(dist_sq, loc.latitude);
                 (dist_m / WALKING_SPEED_MS) as u32
             })
             .unwrap_or(straight_line_secs)
@@ -1054,12 +1131,23 @@ impl Graph {
         window_secs: u32,
         date: u32,
         weekday: u8,
+        min_access_secs: u32,
     ) -> Vec<Plan> {
         let straight_line_secs =
             (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
-        let mut access_secs = self.nearest_stop_secs(origin, straight_line_secs).max(1);
+        // Always search within at least min_access_secs walk so that stops in
+        // the forward direction are included alongside the geometrically-nearest
+        // stop (which may be behind the origin relative to the destination).
+        // Without this minimum, RAPTOR can receive only a single "backward" stop
+        // as a source, produce a detour plan, and the has_backward_transit_leg
+        // safety net refuses to filter it because no non-backward candidate
+        // exists.  Configurable via config.yaml or the walk_radius_secs query
+        // parameter; defaults to 10 min (600 s).
+        let mut access_secs = self
+            .nearest_stop_secs(origin, straight_line_secs)
+            .max(min_access_secs);
 
         loop {
             let raw_stops = self.nearby_stops(origin, access_secs);

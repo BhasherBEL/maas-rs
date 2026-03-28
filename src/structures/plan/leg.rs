@@ -64,6 +64,11 @@ pub struct TransferRisk {
     /// Departure time of the next available trip at the boarding stop, if any.
     /// The client computes `wait_if_missed = next_departure - scheduled_departure`.
     pub next_departure: Option<u32>,
+    /// Probability (0.0–1.0) of boarding the *next* trip (if the scheduled one
+    /// is missed).  Computed as `cdf.prob_on_time(next_departure −
+    /// arrival_at_boarding_stop)`.  `None` when there is no next departure or
+    /// no delay model for this route type.
+    pub next_reliability: Option<f32>,
 }
 
 #[derive(Debug, SimpleObject, Clone)]

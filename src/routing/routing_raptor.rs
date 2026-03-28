@@ -13,6 +13,9 @@ pub struct RouteQuery {
     pub time: NaiveTime,
     /// When `> 0`, run Range-RAPTOR over this window (seconds).
     pub window_minutes: Option<u32>,
+    /// Per-query override for the minimum walk-radius used for access/egress
+    /// stop discovery (seconds).  `None` → use the graph's configured default.
+    pub min_access_secs: Option<u32>,
 }
 
 pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graphql::Error> {
@@ -28,11 +31,13 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graph
         .nearest_node(query.to_lat, query.to_lng)
         .ok_or_else(|| async_graphql::Error::new("No node near arrival"))?;
 
+    let min_access = query.min_access_secs.unwrap_or(graph.min_access_secs);
+
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range(origin, destination, time, w * 60, date, weekday)
+            graph.raptor_range(origin, destination, time, w * 60, date, weekday, min_access)
         }
-        _ => graph.raptor(origin, destination, time, date, weekday),
+        _ => graph.raptor(origin, destination, time, date, weekday, min_access),
     };
 
     if plans.is_empty() {

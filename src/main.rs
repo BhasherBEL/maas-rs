@@ -42,7 +42,7 @@ async fn main() {
     //     return;
     // }
 
-    let g = if build_mode {
+    let mut g = if build_mode {
         let graph = match build_graph(config.build) {
             Some(g) => g,
             None => {
@@ -68,6 +68,11 @@ async fn main() {
             }
         }
     };
+
+    // Apply config.yaml routing defaults (works for both --build and --restore).
+    if let Some(s) = config.default_routing.min_access_secs {
+        g.set_min_access_secs(s);
+    }
 
     if !serve_mode {
         return;
