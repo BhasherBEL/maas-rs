@@ -5,7 +5,7 @@ use async_graphql::{ComplexObject, Context, Enum, Interface, Result, SimpleObjec
 use crate::{
     ingestion::gtfs::{TripId, TripSegment},
     structures::{
-        Graph,
+        Graph, NodeID,
         plan::{PlanLegStep, PlanPlace, PlanTransitLegStep, PlanTrip},
     },
 };
@@ -119,7 +119,7 @@ impl PlanTransitLeg {
             }
             PlanLegStep::Transit(first) => first,
         };
-        self.find_alternatives(
+        let mut results = self.find_alternatives(
             &graph,
             graph.previous_departures(
                 first.timetable_segment,
@@ -128,7 +128,22 @@ impl PlanTransitLeg {
                 first.departure_index,
             ),
             count,
-        )
+        )?;
+        let cross = graph.cross_route_departures(
+            self.from.node_id,
+            self.to.node_id,
+            first.timetable_segment,
+            self.start,
+            first.date,
+            first.weekday,
+            false,
+            count,
+        );
+        results.extend(self.build_cross_route_legs(cross, self.from.node_id, self.to.node_id));
+        results.sort_by_key(|l| l.start);
+        results.reverse();
+        results.truncate(count);
+        Ok(results)
     }
 
     async fn next_departures(
@@ -148,7 +163,7 @@ impl PlanTransitLeg {
             }
             PlanLegStep::Transit(first) => first,
         };
-        self.find_alternatives(
+        let mut results = self.find_alternatives(
             &graph,
             graph.next_departures(
                 first.timetable_segment,
@@ -157,11 +172,58 @@ impl PlanTransitLeg {
                 first.departure_index,
             ),
             count,
-        )
+        )?;
+        let cross = graph.cross_route_departures(
+            self.from.node_id,
+            self.to.node_id,
+            first.timetable_segment,
+            self.start,
+            first.date,
+            first.weekday,
+            true,
+            count,
+        );
+        results.extend(self.build_cross_route_legs(cross, self.from.node_id, self.to.node_id));
+        results.sort_by_key(|l| l.start);
+        results.truncate(count);
+        Ok(results)
     }
 }
 
 impl PlanTransitLeg {
+    fn build_cross_route_legs(
+        &self,
+        candidates: Vec<(TripId, u32, u32)>,
+        boarding_node: NodeID,
+        alighting_node: NodeID,
+    ) -> Vec<PlanTransitLeg> {
+        candidates
+            .into_iter()
+            .map(|(trip_id, dep, arr)| PlanTransitLeg {
+                steps: vec![],
+                trip_id,
+                start: dep,
+                end: arr,
+                length: 0,
+                from: PlanPlace {
+                    departure: Some(dep),
+                    arrival: self.from.arrival,
+                    stop_position: self.from.stop_position,
+                    node_id: boarding_node,
+                },
+                to: PlanPlace {
+                    arrival: Some(arr),
+                    departure: self.to.departure,
+                    stop_position: self.to.stop_position,
+                    node_id: alighting_node,
+                },
+                duration: arr - dep,
+                geometry: vec![],
+                transfer_risk: None,
+            })
+            .collect()
+    }
+
     fn find_alternatives<'a>(
         &self,
         graph: &'a Graph,
@@ -226,8 +288,18 @@ impl PlanTransitLeg {
                     start: segment.departure,
                     end: current_arrival,
                     length: 0,
-                    to: self.to,
-                    from: self.from,
+                    from: PlanPlace {
+                        departure: Some(segment.departure),
+                        arrival: self.from.arrival,
+                        stop_position: self.from.stop_position,
+                        node_id: self.from.node_id,
+                    },
+                    to: PlanPlace {
+                        arrival: Some(current_arrival),
+                        departure: self.to.departure,
+                        stop_position: self.to.stop_position,
+                        node_id: self.to.node_id,
+                    },
                     duration: current_arrival - segment.departure,
                     geometry: self.geometry.clone(),
                     transfer_risk: None,
