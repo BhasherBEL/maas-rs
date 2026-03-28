@@ -55,6 +55,18 @@ pub struct PlanWalkLeg {
 }
 
 #[derive(Debug, SimpleObject, Clone)]
+pub struct TransferRisk {
+    /// Probability (0.0–1.0) that the user boards this vehicle on time.
+    /// 1.0 = deterministic (no delay model for this route type).
+    pub reliability: f32,
+    /// Scheduled departure time of the boarded trip (seconds since midnight).
+    pub scheduled_departure: u32,
+    /// Departure time of the next available trip at the boarding stop, if any.
+    /// The client computes `wait_if_missed = next_departure - scheduled_departure`.
+    pub next_departure: Option<u32>,
+}
+
+#[derive(Debug, SimpleObject, Clone)]
 #[graphql(complex)]
 pub struct PlanTransitLeg {
     pub length: usize,
@@ -69,6 +81,10 @@ pub struct PlanTransitLeg {
 
     /// Ordered sequence of stop coordinates along the transit route.
     pub geometry: Vec<PlanCoordinate>,
+
+    /// Transfer risk for boarding this vehicle on time.
+    /// `None` for the first transit leg (walked directly from journey origin).
+    pub transfer_risk: Option<TransferRisk>,
 
     #[graphql(skip)]
     pub trip_id: TripId,
@@ -209,6 +225,7 @@ impl PlanTransitLeg {
                     from: self.from,
                     duration: current_arrival - segment.departure,
                     geometry: self.geometry.clone(),
+                    transfer_risk: None,
                 })
             })
             .take(count)
