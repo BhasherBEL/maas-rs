@@ -508,6 +508,10 @@ impl Graph {
                 continue;
             }
 
+            // Slide intermediate transit legs to the latest feasible departure so
+            // the initial-walk computation below uses the tightened departure time.
+            self.tighten_transit_legs(&mut legs, date, weekday);
+
             if let Some(&(_, stop_arrival)) = sources.iter().find(|&&(s, _)| s == origin_stop) {
                 let first_walk = stop_arrival.saturating_sub(start_time);
                 if first_walk > 0 {
@@ -874,6 +878,12 @@ impl Graph {
                 steps,
                 geometry: transit_geometry,
                 transfer_risk,
+                preceding_arrival: if k == 0 || labels_rt[k - 1][bs].is_none() {
+                    None
+                } else {
+                    Some(labels[k - 1][bs].earliest())
+                },
+                preceding_route_type: if k == 0 { None } else { labels_rt[k - 1][bs] },
             }));
 
             stop = self.transit_node_to_stop[pat_stops[bp].0] as usize;
@@ -883,6 +893,125 @@ impl Graph {
         legs.reverse();
 
         (legs, stop)
+    }
+
+    /// Slides each intermediate transit leg to the **latest** feasible departure
+    /// that still arrives before the next connection departs.  Called after
+    /// `reconstruct()` so the initial-walk computation automatically picks up the
+    /// updated first-leg departure time.
+    fn tighten_transit_legs(&self, legs: &mut Vec<PlanLeg>, date: u32, weekday: u8) {
+        let transit_indices: Vec<usize> = legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| if matches!(l, PlanLeg::Transit(_)) { Some(i) } else { None })
+            .collect();
+
+        for pair in transit_indices.windows(2) {
+            let ti = pair[0];
+            let ni = pair[1];
+
+            // Walk time between the two transit legs.
+            let walk_between: u32 = legs[ti + 1..ni]
+                .iter()
+                .map(|l| match l {
+                    PlanLeg::Walk(w) => w.duration,
+                    _ => 0,
+                })
+                .sum();
+
+            let (boarding_node, alighting_node, current_dep) = match &legs[ti] {
+                PlanLeg::Transit(t) => (t.from.node_id, t.to.node_id, t.start),
+                _ => unreachable!(),
+            };
+
+            let next_transit_start = match &legs[ni] {
+                PlanLeg::Transit(t) => t.start,
+                _ => unreachable!(),
+            };
+
+            let max_alighting = next_transit_start.saturating_sub(walk_between);
+
+            if let Some((dep_idx, new_dep, _)) = self.latest_departure_before_arrival(
+                boarding_node,
+                alighting_node,
+                current_dep,
+                max_alighting,
+                date,
+                weekday,
+            ) {
+                if new_dep > current_dep {
+                    let cloned = match &legs[ti] {
+                        PlanLeg::Transit(t) => t.clone(),
+                        _ => unreachable!(),
+                    };
+                    if let Ok(mut alternatives) = cloned.find_alternatives(
+                        self,
+                        std::iter::once((dep_idx, &self.transit_departures[dep_idx])),
+                        1,
+                    ) {
+                        if let Some(new_leg) = alternatives.pop() {
+                            legs[ti] = PlanLeg::Transit(new_leg);
+
+                            // Shift the walk legs between the tightened transit leg
+                            // and the next transit leg so their times stay consistent.
+                            let new_metro_end = match &legs[ti] {
+                                PlanLeg::Transit(t) => t.end,
+                                _ => unreachable!(),
+                            };
+                            let mut cursor = new_metro_end;
+                            for l in legs[ti + 1..ni].iter_mut() {
+                                if let PlanLeg::Walk(w) = l {
+                                    let new_start = cursor;
+                                    let new_end = new_start + w.duration;
+                                    w.start = new_start;
+                                    w.end = new_end;
+                                    w.from.departure = Some(new_start);
+                                    w.to.arrival = Some(new_end);
+                                    // Keep the single walk step's place in sync.
+                                    for step in w.steps.iter_mut() {
+                                        if let PlanLegStep::Walk(ws) = step {
+                                            ws.place.arrival = Some(new_end);
+                                        }
+                                    }
+                                    cursor = new_end;
+                                }
+                            }
+
+                            // Update the next transit leg's preceding context and
+                            // recompute its transfer_risk with the corrected margin.
+                            if let PlanLeg::Transit(next_t) = &mut legs[ni] {
+                                next_t.preceding_arrival = Some(cursor);
+                                if let Some(prt) = next_t.preceding_route_type {
+                                    let margin = next_t.start as i32 - cursor as i32;
+                                    let next_dep = next_t
+                                        .transfer_risk
+                                        .as_ref()
+                                        .and_then(|r| r.next_departure);
+                                    let (rel, next_rel) =
+                                        match self.transit_delay_models.get(&prt) {
+                                            Some(cdf) => (
+                                                cdf.prob_on_time(margin),
+                                                next_dep.map(|nd| {
+                                                    cdf.prob_on_time(nd as i32 - cursor as i32)
+                                                }),
+                                            ),
+                                            None => (1.0, None),
+                                        };
+                                    next_t.transfer_risk = Some(TransferRisk {
+                                        reliability: rel,
+                                        scheduled_departure: next_t.start,
+                                        next_departure: next_dep,
+                                        next_reliability: next_rel,
+                                    });
+                                } else {
+                                    next_t.transfer_risk = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[inline]

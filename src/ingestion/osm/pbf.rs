@@ -2,7 +2,7 @@ use std::{collections::HashSet, result};
 
 use osmpbf::{Element, ElementReader, Way};
 
-use crate::structures::{EdgeData, Graph, NodeData, NodeID, OsmNodeData, StreetEdgeData};
+use crate::structures::{EdgeData, Graph, NodeData, OsmNodeData, StreetEdgeData};
 
 pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
@@ -186,10 +186,6 @@ fn insert_from_osm_ids(
     };
 
     let distance = from_node.loc().dist(to_node.loc()) as usize;
-
-    if from_id == NodeID(644251) || to_id == NodeID(644251) {
-        println!("Inserting {} <-> {}", from_id, to_id);
-    }
 
     g.add_edge(
         from_id,

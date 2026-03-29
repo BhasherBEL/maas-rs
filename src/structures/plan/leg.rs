@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_graphql::{ComplexObject, Context, Enum, Interface, Result, SimpleObject};
+use gtfs_structures::RouteType;
 
 use crate::{
     ingestion::gtfs::{TripId, TripSegment},
@@ -93,6 +94,18 @@ pub struct PlanTransitLeg {
 
     #[graphql(skip)]
     pub trip_id: TripId,
+
+    /// Arrival time (seconds since midnight) of the preceding transit vehicle at
+    /// this leg's boarding stop.  Used to compute `transfer_risk` for alternative
+    /// departures returned by `previousDepartures`/`nextDepartures`.
+    #[graphql(skip)]
+    pub preceding_arrival: Option<u32>,
+
+    /// Route type of the preceding transit vehicle (the one that delivered the
+    /// user to this leg's boarding stop).  Combined with `preceding_arrival` to
+    /// select the correct delay-CDF when populating `transfer_risk` on alternatives.
+    #[graphql(skip)]
+    pub preceding_route_type: Option<RouteType>,
 }
 
 #[ComplexObject]
@@ -139,7 +152,7 @@ impl PlanTransitLeg {
             false,
             count,
         );
-        results.extend(self.build_cross_route_legs(cross, self.from.node_id, self.to.node_id));
+        results.extend(self.build_cross_route_legs(&graph, cross, self.from.node_id, self.to.node_id));
         results.sort_by_key(|l| l.start);
         results.reverse();
         results.truncate(count);
@@ -183,7 +196,7 @@ impl PlanTransitLeg {
             true,
             count,
         );
-        results.extend(self.build_cross_route_legs(cross, self.from.node_id, self.to.node_id));
+        results.extend(self.build_cross_route_legs(&graph, cross, self.from.node_id, self.to.node_id));
         results.sort_by_key(|l| l.start);
         results.truncate(count);
         Ok(results)
@@ -193,38 +206,61 @@ impl PlanTransitLeg {
 impl PlanTransitLeg {
     fn build_cross_route_legs(
         &self,
+        graph: &Graph,
         candidates: Vec<(TripId, u32, u32)>,
         boarding_node: NodeID,
         alighting_node: NodeID,
     ) -> Vec<PlanTransitLeg> {
         candidates
             .into_iter()
-            .map(|(trip_id, dep, arr)| PlanTransitLeg {
-                steps: vec![],
-                trip_id,
-                start: dep,
-                end: arr,
-                length: 0,
-                from: PlanPlace {
-                    departure: Some(dep),
-                    arrival: self.from.arrival,
-                    stop_position: self.from.stop_position,
-                    node_id: boarding_node,
-                },
-                to: PlanPlace {
-                    arrival: Some(arr),
-                    departure: self.to.departure,
-                    stop_position: self.to.stop_position,
-                    node_id: alighting_node,
-                },
-                duration: arr - dep,
-                geometry: vec![],
-                transfer_risk: None,
+            .map(|(trip_id, dep, arr)| {
+                let transfer_risk =
+                    if let (Some(pa), Some(prt)) =
+                        (self.preceding_arrival, self.preceding_route_type)
+                    {
+                        let margin = dep as i32 - pa as i32;
+                        let rel = match graph.get_delay_model(prt) {
+                            Some(cdf) => cdf.prob_on_time(margin),
+                            None => 1.0,
+                        };
+                        Some(TransferRisk {
+                            reliability: rel,
+                            scheduled_departure: dep,
+                            next_departure: None,
+                            next_reliability: None,
+                        })
+                    } else {
+                        None
+                    };
+                PlanTransitLeg {
+                    steps: vec![],
+                    trip_id,
+                    start: dep,
+                    end: arr,
+                    length: 0,
+                    from: PlanPlace {
+                        departure: Some(dep),
+                        arrival: self.from.arrival,
+                        stop_position: self.from.stop_position,
+                        node_id: boarding_node,
+                    },
+                    to: PlanPlace {
+                        arrival: Some(arr),
+                        departure: self.to.departure,
+                        stop_position: self.to.stop_position,
+                        node_id: alighting_node,
+                    },
+                    duration: arr - dep,
+                    geometry: vec![],
+                    transfer_risk,
+                    preceding_arrival: self.preceding_arrival,
+                    preceding_route_type: self.preceding_route_type,
+                }
             })
             .collect()
     }
 
-    fn find_alternatives<'a>(
+    pub(crate) fn find_alternatives<'a>(
         &self,
         graph: &'a Graph,
         candidates: impl Iterator<Item = (usize, &'a TripSegment)>,
@@ -282,6 +318,37 @@ impl PlanTransitLeg {
                     }));
                 }
 
+                let transfer_risk =
+                    if let (Some(pa), Some(prt)) =
+                        (self.preceding_arrival, self.preceding_route_type)
+                    {
+                        let margin = segment.departure as i32 - pa as i32;
+                        let next_dep = graph
+                            .next_departures(
+                                first.timetable_segment,
+                                first.date,
+                                first.weekday,
+                                idx,
+                            )
+                            .next()
+                            .map(|(_, seg)| seg.departure);
+                        let (rel, next_rel) = match graph.get_delay_model(prt) {
+                            Some(cdf) => (
+                                cdf.prob_on_time(margin),
+                                next_dep.map(|nd| cdf.prob_on_time(nd as i32 - pa as i32)),
+                            ),
+                            None => (1.0, None),
+                        };
+                        Some(TransferRisk {
+                            reliability: rel,
+                            scheduled_departure: segment.departure,
+                            next_departure: next_dep,
+                            next_reliability: next_rel,
+                        })
+                    } else {
+                        None
+                    };
+
                 Some(PlanTransitLeg {
                     steps: new_steps,
                     trip_id,
@@ -302,7 +369,9 @@ impl PlanTransitLeg {
                     },
                     duration: current_arrival - segment.departure,
                     geometry: self.geometry.clone(),
-                    transfer_risk: None,
+                    transfer_risk,
+                    preceding_arrival: self.preceding_arrival,
+                    preceding_route_type: self.preceding_route_type,
                 })
             })
             .take(count)

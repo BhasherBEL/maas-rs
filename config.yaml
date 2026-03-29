@@ -4,12 +4,19 @@ build:
       name: STIB
       url: path:data/stib.zip
 
+    - ingestor: gtfs/generic
+      name: SNCB
+      url: path:data/sncb.zip
+
     # - name: SNCB
     #   ingestor: gtfs/generic
     #   url: https://sncb.be/gtfs.zip
 
+    # - ingestor: osm/pbf
+    #   url: path:data/brussels_capital_region-2026_01_24.osm.pbf
+    #
     - ingestor: osm/pbf
-      url: path:data/brussels_capital_region-2026_01_24.osm.pbf
+      url: path:data/belgium-latest.osm.pbf
 
   output: graph.bin
 
