@@ -347,6 +347,8 @@ impl Graph {
                                 trip_id: trip_segment.trip_id,
                                 geometry: vec![],
                                 transfer_risk: None,
+                                preceding_arrival: None,
+                                preceding_route_type: None,
                             }));
                         }
                         Some(ref mut c) => match c {
@@ -371,6 +373,8 @@ impl Graph {
                                         trip_id: trip_segment.trip_id,
                                         geometry: vec![],
                                         transfer_risk: None,
+                                        preceding_arrival: None,
+                                        preceding_route_type: None,
                                     }));
                                 }
                             }
@@ -389,6 +393,8 @@ impl Graph {
                                     trip_id: trip_segment.trip_id,
                                     geometry: vec![],
                                     transfer_risk: None,
+                                    preceding_arrival: None,
+                                    preceding_route_type: None,
                                 }));
                             }
                         },

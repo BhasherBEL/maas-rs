@@ -4,11 +4,11 @@ use gtfs_structures::RouteType;
 
 use crate::{
     ingestion::gtfs::{
-        AgencyInfo, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId, TripInfo,
-        TripSegment, display_route_type,
+        AgencyInfo, RouteId, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId,
+        TripInfo, TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, NodeData, NodeID,
+        DelayCDF, EdgeData, NodeData, NodeID,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -374,5 +374,115 @@ impl Graph {
 
     pub fn set_transit_delay_models(&mut self, models: HashMap<RouteType, DelayCDF>) {
         self.transit_delay_models = models;
+    }
+
+    pub fn get_delay_model(&self, route_type: RouteType) -> Option<&DelayCDF> {
+        self.transit_delay_models.get(&route_type)
+    }
+
+    /// Returns the latest trip across all RAPTOR patterns serving both
+    /// `boarding_node` → `alighting_node` (in that order) where:
+    ///   - boarding departure ≥ min_boarding
+    ///   - alighting arrival  ≤ max_alighting
+    ///   - trip is active on date/weekday
+    ///
+    /// Returns (dep_abs_idx_in_transit_departures, boarding_dep, alighting_arr).
+    pub fn latest_departure_before_arrival(
+        &self,
+        boarding_node: NodeID,
+        alighting_node: NodeID,
+        min_boarding: u32,
+        max_alighting: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Option<(usize, u32, u32)> {
+        let boarding_compact = self.transit_node_to_stop[boarding_node.0];
+        if boarding_compact == u32::MAX {
+            return None;
+        }
+
+        let pats = self.transit_idx_stop_patterns[boarding_compact as usize]
+            .of(&self.transit_stop_patterns);
+
+        let mut best: Option<(usize, u32, u32)> = None;
+
+        for &(pattern_id, boarding_pos) in pats {
+            let n_trips = self.transit_patterns[pattern_id.0 as usize].num_trips as usize;
+            if n_trips == 0 {
+                continue;
+            }
+            let pat_stops = self.transit_idx_pattern_stops[pattern_id.0 as usize]
+                .of(&self.transit_pattern_stops);
+
+            // Find alighting_node after boarding_pos.
+            let alighting_offset = match pat_stops[boarding_pos as usize + 1..]
+                .iter()
+                .position(|&n| n == alighting_node)
+            {
+                Some(off) => off,
+                None => continue,
+            };
+            let alighting_pos = boarding_pos as usize + 1 + alighting_offset;
+
+            let all_times = self.transit_idx_pattern_stop_times[pattern_id.0 as usize]
+                .of(&self.transit_pattern_stop_times);
+            let trip_ids = self.transit_idx_pattern_trips[pattern_id.0 as usize]
+                .of(&self.transit_pattern_trips);
+
+            let boarding_col = &all_times
+                [boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
+            let alighting_col =
+                &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
+
+            let start_t = boarding_col.partition_point(|st| st.departure < min_boarding);
+
+            // Locate the timetable_segment for the first hop of this pattern so we
+            // can translate trip_id → absolute dep_idx in transit_departures.
+            let boarding_stop_node = pat_stops[boarding_pos as usize];
+            let next_stop_node = pat_stops[boarding_pos as usize + 1];
+            let route_id: RouteId = self.transit_patterns[pattern_id.0 as usize].route;
+            let ts = match self.edges[boarding_stop_node.0].iter().find_map(|e| match e {
+                EdgeData::Transit(te)
+                    if te.destination == next_stop_node && te.route_id == route_id =>
+                {
+                    Some(te.timetable_segment)
+                }
+                _ => None,
+            }) {
+                Some(ts) => ts,
+                None => continue,
+            };
+
+            // Scan backwards from the latest trip to find the latest feasible one.
+            for t in (start_t..n_trips).rev() {
+                let arr = alighting_col[t].arrival;
+                if arr > max_alighting {
+                    continue;
+                }
+
+                let trip_id = trip_ids[t];
+                let svc = self.transit_trips[trip_id.0 as usize].service_id;
+                if !self.transit_services[svc.0 as usize].is_active(date, weekday) {
+                    continue;
+                }
+
+                let dep = boarding_col[t].departure;
+                let dep_abs_idx =
+                    match self.transit_departures[ts.start..ts.start + ts.len]
+                        .iter()
+                        .position(|seg| seg.trip_id == trip_id)
+                    {
+                        Some(i) => ts.start + i,
+                        None => continue,
+                    };
+
+                if best.map_or(true, |(_, best_dep, _)| dep > best_dep) {
+                    best = Some((dep_abs_idx, dep, arr));
+                }
+                break; // Latest feasible trip for this pattern found.
+            }
+        }
+
+        best
     }
 }
