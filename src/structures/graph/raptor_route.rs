@@ -508,9 +508,21 @@ impl Graph {
                 continue;
             }
 
-            // Slide intermediate transit legs to the latest feasible departure so
-            // the initial-walk computation below uses the tightened departure time.
-            self.tighten_transit_legs(&mut legs, date, weekday);
+            // Three-pass tightening: compute backward labels then slide every
+            // transit leg (including the last) to the latest feasible departure.
+            // This maximises waiting at the origin instead of at intermediate stops.
+            let transit_count =
+                legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count();
+            if transit_count > 0 {
+                let lambda = self.raptor_backward(
+                    best_stop,
+                    best_arr.saturating_sub(best_walk),
+                    transit_count,
+                    date,
+                    weekday,
+                );
+                self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday);
+            }
 
             if let Some(&(_, stop_arrival)) = sources.iter().find(|&&(s, _)| s == origin_stop) {
                 let first_walk = stop_arrival.saturating_sub(start_time);
@@ -884,6 +896,7 @@ impl Graph {
                     Some(labels[k - 1][bs].earliest())
                 },
                 preceding_route_type: if k == 0 { None } else { labels_rt[k - 1][bs] },
+                bikes_allowed: self.get_trip(trip_ids[t]).and_then(|t| t.bikes_allowed),
             }));
 
             stop = self.transit_node_to_stop[pat_stops[bp].0] as usize;
@@ -895,121 +908,336 @@ impl Graph {
         (legs, stop)
     }
 
-    /// Slides each intermediate transit leg to the **latest** feasible departure
-    /// that still arrives before the next connection departs.  Called after
-    /// `reconstruct()` so the initial-walk computation automatically picks up the
-    /// updated first-leg departure time.
-    fn tighten_transit_legs(&self, legs: &mut Vec<PlanLeg>, date: u32, weekday: u8) {
-        let transit_indices: Vec<usize> = legs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| if matches!(l, PlanLeg::Transit(_)) { Some(i) } else { None })
-            .collect();
+    /// Find the latest trip (by index) in `col` whose arrival is ≤ `max_arrival`
+    /// and that is active on the given date/weekday.
+    /// Returns the trip index within the pattern (not an absolute index).
+    fn latest_trip_arriving_at_stop_before(
+        &self,
+        col: &[StopTime],
+        trip_ids: &[TripId],
+        max_arrival: u32,
+        date: u32,
+        weekday: u8,
+    ) -> Option<usize> {
+        // Scan backward: trips are sorted by departure but arrival ordering is
+        // not strictly guaranteed across all GTFS feeds, so avoid partition_point.
+        // We want the latest-indexed active trip whose arrival ≤ max_arrival.
+        for t in (0..col.len()).rev() {
+            if col[t].arrival <= max_arrival {
+                let svc = self.transit_trips[trip_ids[t].0 as usize].service_id;
+                if self.transit_services[svc.0 as usize].is_active(date, weekday) {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
 
-        for pair in transit_indices.windows(2) {
-            let ti = pair[0];
-            let ni = pair[1];
+    /// Pass 2 of three-pass RAPTOR: backward label computation.
+    ///
+    /// Computes `lambda[remaining][stop]` = latest time you can be ready at
+    /// `stop` with `remaining` transit legs still available and still reach
+    /// the destination by `target_latest_arr`.  0 = unreachable (sentinel).
+    ///
+    /// `num_transit_legs` is the number of transit legs K reconstructed from
+    /// the forward pass.  `lambda` has dimensions `[0..=K][0..n_stops]`.
+    fn raptor_backward(
+        &self,
+        target_compact_stop: usize,
+        target_latest_arr: u32,
+        num_transit_legs: usize,
+        date: u32,
+        weekday: u8,
+    ) -> Vec<Vec<u32>> {
+        let n_stops = self.transit_stop_to_node.len();
+        let n_patterns = self.transit_patterns.len();
 
-            // Walk time between the two transit legs.
-            let walk_between: u32 = legs[ti + 1..ni]
-                .iter()
-                .map(|l| match l {
-                    PlanLeg::Walk(w) => w.duration,
-                    _ => 0,
-                })
-                .sum();
+        // lambda[remaining][stop]: 0 = unreachable (sentinel value)
+        let mut lambda: Vec<Vec<u32>> = vec![vec![0u32; n_stops]; num_transit_legs + 1];
 
-            let (boarding_node, alighting_node, current_dep) = match &legs[ti] {
-                PlanLeg::Transit(t) => (t.from.node_id, t.to.node_id, t.start),
-                _ => unreachable!(),
-            };
+        let mut marked: Vec<usize> = Vec::new();
+        let mut is_marked: Vec<bool> = vec![false; n_stops];
 
-            let next_transit_start = match &legs[ni] {
-                PlanLeg::Transit(t) => t.start,
-                _ => unreachable!(),
-            };
+        // ── Seed: remaining = 0 ──────────────────────────────────────────────
+        if target_latest_arr > 0 {
+            lambda[0][target_compact_stop] = target_latest_arr;
+            Self::mark(target_compact_stop, &mut marked, &mut is_marked);
+        }
 
-            let max_alighting = next_transit_start.saturating_sub(walk_between);
+        // Reverse footpath relaxation from the seeded stop (one hop)
+        self.apply_reverse_footpaths(&mut lambda[0], &mut marked, &mut is_marked);
 
-            if let Some((dep_idx, new_dep, _)) = self.latest_departure_before_arrival(
-                boarding_node,
-                alighting_node,
-                current_dep,
-                max_alighting,
-                date,
-                weekday,
-            ) {
-                if new_dep > current_dep {
-                    let cloned = match &legs[ti] {
-                        PlanLeg::Transit(t) => t.clone(),
-                        _ => unreachable!(),
-                    };
-                    if let Ok(mut alternatives) = cloned.find_alternatives(
-                        self,
-                        std::iter::once((dep_idx, &self.transit_departures[dep_idx])),
-                        1,
-                    ) {
-                        if let Some(new_leg) = alternatives.pop() {
-                            legs[ti] = PlanLeg::Transit(new_leg);
+        // ── Rounds 1..=K ─────────────────────────────────────────────────────
+        for round in 1..=num_transit_legs {
+            if marked.is_empty() {
+                break;
+            }
 
-                            // Shift the walk legs between the tightened transit leg
-                            // and the next transit leg so their times stay consistent.
-                            let new_metro_end = match &legs[ti] {
-                                PlanLeg::Transit(t) => t.end,
-                                _ => unreachable!(),
+            // Collect patterns that serve any marked stop (no position restriction:
+            // backward scan always goes from last stop to first).
+            let mut queue: Vec<usize> = Vec::new();
+            let mut in_queue: Vec<bool> = vec![false; n_patterns];
+
+            for &stop in &marked {
+                let pats =
+                    self.transit_idx_stop_patterns[stop].of(&self.transit_stop_patterns);
+                for &(pat_id, _pos) in pats {
+                    let p = pat_id.0 as usize;
+                    if !in_queue[p] {
+                        in_queue[p] = true;
+                        queue.push(p);
+                    }
+                }
+            }
+
+            marked.clear();
+            is_marked.fill(false);
+
+            // Backward scan for each queued pattern
+            for &pat in &queue {
+                let pat_stops =
+                    self.transit_idx_pattern_stops[pat].of(&self.transit_pattern_stops);
+                let n_trips = self.transit_patterns[pat].num_trips as usize;
+                if n_trips == 0 {
+                    continue;
+                }
+                let all_times = self.transit_idx_pattern_stop_times[pat]
+                    .of(&self.transit_pattern_stop_times);
+                let trip_ids =
+                    self.transit_idx_pattern_trips[pat].of(&self.transit_pattern_trips);
+
+                // t_star: trip index (within pattern) that can alight at a stop
+                // where lambda[round-1] is set, and gives the latest departure
+                // from stops earlier in the pattern.
+                let mut t_star: Option<usize> = None;
+
+                for pos in (0..pat_stops.len()).rev() {
+                    let compact = self.transit_node_to_stop[pat_stops[pos].0];
+                    if compact == u32::MAX {
+                        continue;
+                    }
+                    let stop = compact as usize;
+                    let col = &all_times[pos * n_trips..(pos + 1) * n_trips];
+
+                    // Step A: propagate t_star — label this (earlier) stop with
+                    // t_star's departure time from this position.
+                    if let Some(t) = t_star {
+                        let dep = col[t].departure;
+                        if dep > 0 && dep > lambda[round][stop] {
+                            lambda[round][stop] = dep;
+                            Self::mark(stop, &mut marked, &mut is_marked);
+                        }
+                    }
+
+                    // Step B: update t_star — if this stop has a backward label
+                    // (lambda[round-1][stop] > 0), find the latest trip whose
+                    // arrival here is ≤ that label.  If it gives a later departure
+                    // at this position than the current t_star, adopt it.
+                    if lambda[round - 1][stop] > 0 {
+                        if let Some(t) = self.latest_trip_arriving_at_stop_before(
+                            col,
+                            trip_ids,
+                            lambda[round - 1][stop],
+                            date,
+                            weekday,
+                        ) {
+                            let update = match t_star {
+                                None => true,
+                                Some(ct) => col[t].departure > col[ct].departure,
                             };
-                            let mut cursor = new_metro_end;
-                            for l in legs[ti + 1..ni].iter_mut() {
-                                if let PlanLeg::Walk(w) = l {
-                                    let new_start = cursor;
-                                    let new_end = new_start + w.duration;
-                                    w.start = new_start;
-                                    w.end = new_end;
-                                    w.from.departure = Some(new_start);
-                                    w.to.arrival = Some(new_end);
-                                    // Keep the single walk step's place in sync.
-                                    for step in w.steps.iter_mut() {
-                                        if let PlanLegStep::Walk(ws) = step {
-                                            ws.place.arrival = Some(new_end);
-                                        }
-                                    }
-                                    cursor = new_end;
-                                }
-                            }
-
-                            // Update the next transit leg's preceding context and
-                            // recompute its transfer_risk with the corrected margin.
-                            if let PlanLeg::Transit(next_t) = &mut legs[ni] {
-                                next_t.preceding_arrival = Some(cursor);
-                                if let Some(prt) = next_t.preceding_route_type {
-                                    let margin = next_t.start as i32 - cursor as i32;
-                                    let next_dep = next_t
-                                        .transfer_risk
-                                        .as_ref()
-                                        .and_then(|r| r.next_departure);
-                                    let (rel, next_rel) =
-                                        match self.transit_delay_models.get(&prt) {
-                                            Some(cdf) => (
-                                                cdf.prob_on_time(margin),
-                                                next_dep.map(|nd| {
-                                                    cdf.prob_on_time(nd as i32 - cursor as i32)
-                                                }),
-                                            ),
-                                            None => (1.0, None),
-                                        };
-                                    next_t.transfer_risk = Some(TransferRisk {
-                                        reliability: rel,
-                                        scheduled_departure: next_t.start,
-                                        next_departure: next_dep,
-                                        next_reliability: next_rel,
-                                    });
-                                } else {
-                                    next_t.transfer_risk = None;
-                                }
+                            if update {
+                                t_star = Some(t);
                             }
                         }
                     }
                 }
+            }
+
+            // Reverse footpath relaxation from newly-marked stops (one hop)
+            self.apply_reverse_footpaths(&mut lambda[round], &mut marked, &mut is_marked);
+        }
+
+        lambda
+    }
+
+    /// One-hop reverse footpath relaxation for backward RAPTOR.
+    ///
+    /// For each currently-marked stop `s`, propagates its backward label to
+    /// every stop `src` that can walk TO `s`: `lambda[src] = lambda[s] - walk`.
+    /// Only iterates the stops present in `marked` at call time (one hop).
+    fn apply_reverse_footpaths(
+        &self,
+        lambda_k: &mut Vec<u32>,
+        marked: &mut Vec<usize>,
+        is_marked: &mut Vec<bool>,
+    ) {
+        let n = marked.len(); // snapshot: only process original entries
+        for i in 0..n {
+            let stop = marked[i];
+            if stop >= self.transit_idx_stop_reverse_transfers.len() {
+                continue;
+            }
+            let rev = self.transit_idx_stop_reverse_transfers[stop]
+                .of(&self.transit_stop_reverse_transfers);
+            for &(source, walk_time) in rev {
+                let t = lambda_k[stop].saturating_sub(walk_time);
+                if t > 0 && t > lambda_k[source] {
+                    lambda_k[source] = t;
+                    Self::mark(source, marked, is_marked);
+                }
+            }
+        }
+    }
+
+    /// Pass 3 of three-pass RAPTOR: tighten transit legs using backward labels.
+    ///
+    /// Replaces `tighten_transit_legs`.  Unlike the old function:
+    /// - Uses `lambda[remaining][alighting_compact]` as the deadline for each leg
+    ///   instead of the next leg's original departure.  This makes left-to-right
+    ///   processing correct because the labels already encode all future constraints.
+    /// - Also tightens the **last** transit leg (not just pairs).
+    fn tighten_with_backward_labels(
+        &self,
+        legs: &mut Vec<PlanLeg>,
+        lambda: &[Vec<u32>],
+        date: u32,
+        weekday: u8,
+    ) {
+        let transit_indices: Vec<usize> = legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if matches!(l, PlanLeg::Transit(_)) { Some(i) } else { None }
+            })
+            .collect();
+
+        let k = transit_indices.len();
+        if k == 0 {
+            return;
+        }
+
+        // Tracks earliest valid boarding time for the next leg (arrival of this
+        // leg + intermediate walk).
+        let mut current_time: u32 = 0;
+
+        for i in 0..k {
+            let ti = transit_indices[i];
+            // `remaining` = number of transit legs after this one.
+            let remaining = k - i - 1;
+
+            let (boarding_node, alighting_node, leg_start) = match &legs[ti] {
+                PlanLeg::Transit(t) => (t.from.node_id, t.to.node_id, t.start),
+                _ => unreachable!(),
+            };
+
+            let alighting_compact = self.transit_node_to_stop[alighting_node.0];
+
+            // Use backward label as the alighting deadline.
+            let max_alighting = if alighting_compact != u32::MAX && remaining < lambda.len() {
+                lambda[remaining][alighting_compact as usize]
+            } else {
+                0
+            };
+
+            // Compute walk time between this leg and the next transit leg (for
+            // advancing current_time after this leg, regardless of tightening).
+            let walk_to_next: u32 = if i < k - 1 {
+                let next_ti = transit_indices[i + 1];
+                legs[ti + 1..next_ti]
+                    .iter()
+                    .map(|l| match l { PlanLeg::Walk(w) => w.duration, _ => 0 })
+                    .sum()
+            } else {
+                0
+            };
+
+            if max_alighting > 0 {
+                let min_dep = if i == 0 { leg_start } else { current_time };
+
+                if let Some((dep_idx, new_dep, _)) = self.latest_departure_before_arrival(
+                    boarding_node,
+                    alighting_node,
+                    min_dep,
+                    max_alighting,
+                    date,
+                    weekday,
+                ) {
+                    if new_dep > leg_start {
+                        let cloned = match &legs[ti] {
+                            PlanLeg::Transit(t) => t.clone(),
+                            _ => unreachable!(),
+                        };
+                        if let Ok(mut alts) = cloned.find_alternatives(
+                            self,
+                            std::iter::once((dep_idx, &self.transit_departures[dep_idx])),
+                            1,
+                        ) {
+                            if let Some(new_leg) = alts.pop() {
+                                legs[ti] = PlanLeg::Transit(new_leg);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Advance current_time and, if there is a next transit leg, shift
+            // intermediate walk legs forward and recompute transfer risk.
+            let new_leg_end =
+                match &legs[ti] { PlanLeg::Transit(t) => t.end, _ => unreachable!() };
+
+            if i < k - 1 {
+                let next_ti = transit_indices[i + 1];
+
+                // Shift every walk leg between ti and next_ti.
+                let mut cursor = new_leg_end;
+                for l in legs[ti + 1..next_ti].iter_mut() {
+                    if let PlanLeg::Walk(w) = l {
+                        let new_start = cursor;
+                        let new_end = new_start + w.duration;
+                        w.start = new_start;
+                        w.end = new_end;
+                        w.from.departure = Some(new_start);
+                        w.to.arrival = Some(new_end);
+                        for step in w.steps.iter_mut() {
+                            if let PlanLegStep::Walk(ws) = step {
+                                ws.place.arrival = Some(new_end);
+                            }
+                        }
+                        cursor = new_end;
+                    }
+                }
+                current_time = cursor; // = new_leg_end + walk_to_next
+
+                // Update the next transit leg's preceding-arrival context and
+                // recompute transfer_risk with the updated margin.
+                if let PlanLeg::Transit(next_t) = &mut legs[next_ti] {
+                    next_t.preceding_arrival = Some(cursor);
+                    if let Some(prt) = next_t.preceding_route_type {
+                        let margin = next_t.start as i32 - cursor as i32;
+                        let next_dep =
+                            next_t.transfer_risk.as_ref().and_then(|r| r.next_departure);
+                        let (rel, next_rel) = match self.transit_delay_models.get(&prt) {
+                            Some(cdf) => (
+                                cdf.prob_on_time(margin),
+                                next_dep.map(|nd| {
+                                    cdf.prob_on_time(nd as i32 - cursor as i32)
+                                }),
+                            ),
+                            None => (1.0, None),
+                        };
+                        next_t.transfer_risk = Some(TransferRisk {
+                            reliability: rel,
+                            scheduled_departure: next_t.start,
+                            next_departure: next_dep,
+                            next_reliability: next_rel,
+                        });
+                    } else {
+                        next_t.transfer_risk = None;
+                    }
+                }
+            } else {
+                // Last leg: no following leg to update; current_time not needed.
+                let _ = walk_to_next; // suppress unused-variable warning
             }
         }
     }

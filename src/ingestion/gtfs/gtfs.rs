@@ -76,6 +76,7 @@ pub struct TripInfo {
     pub trip_headsign: Option<String>,
     pub route_id: RouteId,
     pub service_id: ServiceId,
+    pub bikes_allowed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +108,17 @@ impl ServicePattern {
 }
 
 pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::Error> {
+    load_gtfs_with_hook(gtfs_path, g, |_, _| None)
+}
+
+pub(crate) fn load_gtfs_with_hook<F>(
+    gtfs_path: &str,
+    g: &mut Graph,
+    bikes_fn: F,
+) -> Result<(), gtfs_structures::Error>
+where
+    F: Fn(&gtfs_structures::Trip, RouteType) -> Option<bool>,
+{
     let gtfs = gtfs_structures::Gtfs::new(gtfs_path)?;
 
     let mut gtfs_nodes_mapper = HashMap::<String, NodeID>::new();
@@ -349,12 +361,12 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
     let mut pattern_trip_data: Vec<Vec<(TripId, Vec<StopTime>)>> = Vec::new();
 
     for (_, trip) in gtfs.trips {
-        let trip_id = trip_mapper.get_or_insert(trip.id);
-        let service_id = match service_mapper.get(trip.service_id) {
+        let trip_id = trip_mapper.get_or_insert(trip.id.clone());
+        let service_id = match service_mapper.get(trip.service_id.clone()) {
             Some(id) => id,
             None => continue,
         };
-        let route_id = match route_mapper.get(trip.route_id) {
+        let route_id = match route_mapper.get(trip.route_id.clone()) {
             Some(id) => id,
             None => continue,
         };
@@ -364,13 +376,16 @@ pub fn load_gtfs(gtfs_path: &str, g: &mut Graph) -> Result<(), gtfs_structures::
                 trip_headsign: Some(String::new()),
                 route_id: RouteId(0),
                 service_id: ServiceId(0),
+                bikes_allowed: None,
             });
         }
 
+        let route_type = route_infos[route_id].route_type;
         trip_infos[trip_id] = TripInfo {
             trip_headsign: trip.trip_headsign.clone(),
             route_id: RouteId((route_id + routes_offset) as u32),
             service_id: ServiceId((service_id + services_offset) as u32),
+            bikes_allowed: bikes_fn(&trip, route_type),
         };
 
         let mut indices: Vec<usize> = (0..trip.stop_times.len()).collect();

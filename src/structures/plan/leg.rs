@@ -106,6 +106,10 @@ pub struct PlanTransitLeg {
     /// select the correct delay-CDF when populating `transfer_risk` on alternatives.
     #[graphql(skip)]
     pub preceding_route_type: Option<RouteType>,
+
+    /// Whether bikes are allowed on this transit leg.
+    /// `None` = no information available.
+    pub bikes_allowed: Option<bool>,
 }
 
 #[ComplexObject]
@@ -255,6 +259,7 @@ impl PlanTransitLeg {
                     transfer_risk,
                     preceding_arrival: self.preceding_arrival,
                     preceding_route_type: self.preceding_route_type,
+                    bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
                 }
             })
             .collect()
@@ -372,6 +377,7 @@ impl PlanTransitLeg {
                     transfer_risk,
                     preceding_arrival: self.preceding_arrival,
                     preceding_route_type: self.preceding_route_type,
+                    bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
                 })
             })
             .take(count)
