@@ -12,6 +12,7 @@ impl Graph {
         self.build_compact_stop_index();
         self.build_stop_patterns();
         self.build_stop_transfers();
+        self.build_reverse_transfers();
     }
 
     fn build_compact_stop_index(&mut self) {
@@ -54,6 +55,38 @@ impl Graph {
             let start = self.transit_stop_patterns.len();
             self.transit_stop_patterns.extend_from_slice(pairs);
             self.transit_idx_stop_patterns.push(Lookup {
+                start,
+                len: pairs.len(),
+            });
+        }
+    }
+
+    /// Inverts `transit_stop_transfers` to produce `transit_stop_reverse_transfers`:
+    /// for each compact target stop `t`, the list of `(source_compact, walk_secs)`
+    /// pairs such that walking from `source` reaches `t` in `walk_secs` seconds.
+    /// Used by the backward RAPTOR pass for reverse footpath relaxation.
+    fn build_reverse_transfers(&mut self) {
+        let n_stops = self.transit_stop_to_node.len();
+        let mut reverse_map: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n_stops];
+
+        for source in 0..n_stops {
+            let transfers =
+                self.transit_idx_stop_transfers[source].of(&self.transit_stop_transfers);
+            for &(target_node, walk) in transfers {
+                let target = self.transit_node_to_stop[target_node.0];
+                if target != u32::MAX {
+                    reverse_map[target as usize].push((source, walk));
+                }
+            }
+        }
+
+        self.transit_stop_reverse_transfers.clear();
+        self.transit_idx_stop_reverse_transfers = Vec::with_capacity(n_stops);
+
+        for pairs in &reverse_map {
+            let start = self.transit_stop_reverse_transfers.len();
+            self.transit_stop_reverse_transfers.extend_from_slice(pairs);
+            self.transit_idx_stop_reverse_transfers.push(Lookup {
                 start,
                 len: pairs.len(),
             });

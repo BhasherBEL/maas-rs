@@ -62,6 +62,16 @@ pub struct Graph {
     /// Defaults to 600 (10 min) when absent from a serialized graph.
     #[serde(default = "Graph::default_min_access_secs")]
     pub min_access_secs: u32,
+
+    /// Reverse transfer index: for each compact target stop, the list of
+    /// (source_compact_idx, walk_time_secs) pairs that walk **to** it.
+    /// Built by `build_reverse_transfers()` as the inverse of `transit_stop_transfers`.
+    /// Absent from old serialised graphs → defaults to empty (backward RAPTOR
+    /// footpath relaxation is skipped, degrading gracefully).
+    #[serde(default)]
+    transit_stop_reverse_transfers: Vec<(usize, u32)>,
+    #[serde(default)]
+    transit_idx_stop_reverse_transfers: Vec<Lookup>,
 }
 
 static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
@@ -103,6 +113,9 @@ impl Graph {
             transit_stops_tree: KdTree::new(2),
 
             min_access_secs: Self::default_min_access_secs(),
+
+            transit_stop_reverse_transfers: Vec::new(),
+            transit_idx_stop_reverse_transfers: Vec::new(),
         }
     }
 

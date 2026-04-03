@@ -349,6 +349,7 @@ impl Graph {
                                 transfer_risk: None,
                                 preceding_arrival: None,
                                 preceding_route_type: None,
+                                bikes_allowed: None,
                             }));
                         }
                         Some(ref mut c) => match c {
@@ -375,6 +376,7 @@ impl Graph {
                                         transfer_risk: None,
                                         preceding_arrival: None,
                                         preceding_route_type: None,
+                                        bikes_allowed: None,
                                     }));
                                 }
                             }
@@ -395,6 +397,7 @@ impl Graph {
                                     transfer_risk: None,
                                     preceding_arrival: None,
                                     preceding_route_type: None,
+                                    bikes_allowed: None,
                                 }));
                             }
                         },

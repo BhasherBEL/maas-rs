@@ -1,6 +1,6 @@
 build:
   inputs:
-    - ingestor: gtfs/generic
+    - ingestor: gtfs/stib
       name: STIB
       url: path:data/stib.zip
 

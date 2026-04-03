@@ -48,6 +48,8 @@ pub enum Ingestor {
     OsmPbf(OsmPbfIngestor),
     #[serde(rename = "gtfs/generic")]
     GtfsGeneric(GtfsGenericIngestor),
+    #[serde(rename = "gtfs/stib")]
+    GtfsStib(GtfsGenericIngestor),
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,14 +79,14 @@ impl Ingestor {
     pub fn label(&self) -> &str {
         match self {
             Ingestor::OsmPbf(_) => "osm/pbf",
-            Ingestor::GtfsGeneric(c) => &c.name,
+            Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.name,
         }
     }
 
     pub fn url(&self) -> &str {
         match self {
             Ingestor::OsmPbf(c) => &c.url,
-            Ingestor::GtfsGeneric(c) => &c.url,
+            Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.url,
         }
     }
 
@@ -102,7 +104,7 @@ impl Ingestor {
     pub fn phase(&self) -> u8 {
         match self {
             Ingestor::OsmPbf(i) => i.phase.unwrap_or(0),
-            Ingestor::GtfsGeneric(i) => i.phase.unwrap_or(1),
+            Ingestor::GtfsGeneric(i) | Ingestor::GtfsStib(i) => i.phase.unwrap_or(1),
         }
     }
 }

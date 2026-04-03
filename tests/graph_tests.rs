@@ -243,6 +243,7 @@ fn get_trip_returns_inserted_trip() {
         trip_headsign: Some("North".to_string()),
         route_id: RouteId(0),
         service_id: ServiceId(0),
+        bikes_allowed: None,
     }]);
     let trip = g.get_trip(TripId(0)).expect("trip should exist");
     assert_eq!(trip.trip_headsign.as_deref(), Some("North"));
@@ -713,11 +714,13 @@ fn two_route_raptor_graph() -> (Graph, NodeID, NodeID) {
             trip_headsign: None,
             route_id: RouteId(0),
             service_id: ServiceId(0),
+            bikes_allowed: None,
         }, // TripId(0) = bus
         TripInfo {
             trip_headsign: None,
             route_id: RouteId(1),
             service_id: ServiceId(0),
+            bikes_allowed: None,
         }, // TripId(1) = tram
     ]);
 
@@ -900,4 +903,209 @@ fn raptor_transfer_risk_reliability_is_one_without_delay_model() {
         9 * 3600 + 1800,
         "scheduled_departure should be tram departure time"
     );
+}
+
+// ── Three-pass RAPTOR: backward tightening ────────────────────────────────────
+
+/// Like `two_route_raptor_graph` but the Bus has TWO trips:
+///   Trip 0: dep stop_A 08:00, arr stop_B 08:15  (early, unnecessary)
+///   Trip 1: dep stop_A 09:00, arr stop_B 09:15  (later, still connects to tram)
+/// The Tram still has one trip: dep stop_C 09:30, arr stop_D 09:45.
+///
+/// With forward-only RAPTOR the first transit leg boards at 08:00.
+/// After three-pass backward tightening it should board at 09:00 instead,
+/// so the user can depart home 1h later.
+fn two_route_multi_trip_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_ab = g.add_node(osm_node("ab", 50.000, 4.010));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.019));
+    let osm_cd = g.add_node(osm_node("cd", 50.000, 4.030));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.041));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.020));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.022));
+    let stop_d = g.add_node(transit_stop("Stop D", 50.000, 4.040));
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m,
+            partial: false, foot: true, bike: true, car: true,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m,
+            partial: false, foot: true, bike: true, car: true,
+        }));
+    };
+    add_street(&mut g, osm_origin, osm_ab, 718);
+    add_street(&mut g, osm_ab, osm_b, 645);
+    add_street(&mut g, osm_b, osm_cd, 789);
+    add_street(&mut g, osm_cd, osm_dest, 789);
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        g.add_edge(stop, EdgeData::Street(StreetEdgeData {
+            origin: stop, destination: osm, length: m,
+            partial: true, foot: true, bike: false, car: false,
+        }));
+        g.add_edge(osm, EdgeData::Street(StreetEdgeData {
+            origin: osm, destination: stop, length: m,
+            partial: true, foot: true, bike: false, car: false,
+        }));
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_b, osm_b, 72);
+    add_snap(&mut g, stop_c, osm_b, 215);
+    add_snap(&mut g, stop_d, osm_dest, 72);
+
+    // Bus edge: timetable_segment has len=2 (two bus trips)
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 2 },
+        length: 1362,
+    }));
+    // Tram edge: timetable_segment has len=1
+    g.add_edge(stop_c, EdgeData::Transit(TransitEdgeData {
+        origin: stop_c, destination: stop_d, route_id: RouteId(1),
+        timetable_segment: TimetableSegment { start: 2, len: 1 },
+        length: 1290,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "1".into(), route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "T".into(), route_long_name: "Tram T".into(),
+            route_type: RouteType::Tramway, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None,
+        },
+    ]);
+
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None }, // TripId(0) = bus 08:00
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None }, // TripId(1) = bus 09:00
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None }, // TripId(2) = tram
+    ]);
+
+    // Timetable departures (absolute indices used by transit edges)
+    // idx 0: bus trip 0 dep 08:00
+    // idx 1: bus trip 1 dep 09:00
+    // idx 2: tram dep 09:30
+    g.add_transit_departures(vec![
+        TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 8 * 3600, arrival: 8 * 3600 + 900, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 9 * 3600, arrival: 9 * 3600 + 900, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(2), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 9 * 3600 + 1800, arrival: 9 * 3600 + 2700, service_id: ServiceId(0) },
+    ]);
+
+    // Pattern 0: Bus, stops [stop_A, stop_B], 2 trips (sorted by departure)
+    // Column-major: col 0 = stop_A times for trips 0,1; col 1 = stop_B times for trips 0,1
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 2 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        // stop_A col (2 entries): trip0 dep 08:00, trip1 dep 09:00
+        g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600, departure: 8 * 3600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600 });
+        // stop_B col (2 entries): trip0 arr 08:15, trip1 arr 09:15
+        g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600 + 900, departure: 8 * 3600 + 900 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 900, departure: 9 * 3600 + 900 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
+
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 2 });
+    }
+
+    // Pattern 1: Tram, stops [stop_C, stop_D], 1 trip
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_c, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(2));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1800, departure: 9 * 3600 + 1800 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 2700, departure: 9 * 3600 + 2700 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 1 });
+    }
+
+    g.build_raptor_index();
+
+    (g, osm_origin, osm_dest)
+}
+
+/// Verifies that three-pass RAPTOR tightens the first transit leg when a later
+/// trip is available and still connects to the downstream leg.
+///
+/// Setup: Bus has two trips (08:00 and 09:00). Tram departs at 09:30.
+/// User departs at 07:00.
+/// Forward RAPTOR boards the bus at 08:00 (first available).
+/// After backward tightening, the plan should use the 09:00 bus because it
+/// still connects to the 09:30 tram (arrives stop_B at 09:15, ~179s walk to
+/// stop_C, boards tram at 09:30).
+#[test]
+fn raptor_backward_tightening_shifts_first_leg_to_later_trip() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+
+    // Depart at 07:00 — both bus trips are reachable from forward pass
+    let plans = g.raptor(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60);
+
+    assert!(!plans.is_empty(), "Expected at least one plan");
+
+    // Find the two-leg plan (Bus + Tram)
+    let two_leg_plan = plans.iter().find(|p| {
+        p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2
+    }).expect("Expected a Bus+Tram plan");
+
+    let bus_leg = two_leg_plan.legs.iter().find_map(|l| {
+        if let PlanLeg::Transit(t) = l { Some(t) } else { None }
+    }).unwrap();
+
+    assert_eq!(
+        bus_leg.start,
+        9 * 3600,
+        "Backward tightening should shift bus boarding to 09:00 (not 08:00); got {}s",
+        bus_leg.start
+    );
+}
+
+/// Verifies that tightening still preserves a valid transfer: the bus arrives
+/// at stop_B before the tram departs from stop_C (accounting for walk time).
+#[test]
+fn raptor_backward_tightening_preserves_valid_connection() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+    let plans = g.raptor(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60);
+
+    let two_leg_plan = plans.iter().find(|p| {
+        p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2
+    }).expect("Expected a Bus+Tram plan");
+
+    let transit_legs: Vec<_> = two_leg_plan.legs.iter().filter_map(|l| {
+        if let PlanLeg::Transit(t) = l { Some(t) } else { None }
+    }).collect();
+
+    assert_eq!(transit_legs.len(), 2);
+    // Bus arrives at 09:15, tram departs at 09:30 — connection is valid
+    assert!(
+        transit_legs[0].end <= transit_legs[1].start,
+        "Bus end ({}) must be ≤ tram start ({})",
+        transit_legs[0].end, transit_legs[1].start
+    );
+    assert_eq!(transit_legs[1].start, 9 * 3600 + 1800, "Tram should still depart at 09:30");
 }
