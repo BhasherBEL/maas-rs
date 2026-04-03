@@ -72,6 +72,20 @@ pub struct Graph {
     transit_stop_reverse_transfers: Vec<(usize, u32)>,
     #[serde(default)]
     transit_idx_stop_reverse_transfers: Vec<Lookup>,
+
+    /// Flattened shape-point sequences for each transit pattern.
+    /// `transit_pattern_shapes[p]` is the full ordered list of LatLng points
+    /// covering the route from the first to the last stop of pattern p.
+    /// Empty vec when no shape data is available for that pattern.
+    #[serde(default)]
+    transit_pattern_shapes: Vec<Vec<LatLng>>,
+
+    /// For each stop index `s` within pattern `p`,
+    /// `transit_pattern_shape_stop_idx[p][s]` is the index into
+    /// `transit_pattern_shapes[p]` where stop s's position begins.
+    /// Empty vec when no shape data is available.
+    #[serde(default)]
+    transit_pattern_shape_stop_idx: Vec<Vec<u32>>,
 }
 
 static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
@@ -116,6 +130,9 @@ impl Graph {
 
             transit_stop_reverse_transfers: Vec::new(),
             transit_idx_stop_reverse_transfers: Vec::new(),
+
+            transit_pattern_shapes: Vec::new(),
+            transit_pattern_shape_stop_idx: Vec::new(),
         }
     }
 

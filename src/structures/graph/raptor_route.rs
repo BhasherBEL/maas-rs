@@ -865,9 +865,17 @@ impl Graph {
                 }));
             }
 
-            let transit_geometry: Vec<PlanCoordinate> = (bp..=ap)
-                .map(|s| self.node_coord(pat_stops[s]))
-                .collect();
+            let transit_geometry: Vec<PlanCoordinate> = match self.get_pattern_shape(p) {
+                Some((shape_pts, stop_idx)) => {
+                    let from = stop_idx[bp] as usize;
+                    let to = stop_idx[ap] as usize;
+                    shape_pts[from..=to]
+                        .iter()
+                        .map(|coord| PlanCoordinate { lat: coord.latitude, lon: coord.longitude })
+                        .collect()
+                }
+                None => (bp..=ap).map(|s| self.node_coord(pat_stops[s])).collect(),
+            };
 
             legs.push(PlanLeg::Transit(PlanTransitLeg {
                 from: PlanPlace {

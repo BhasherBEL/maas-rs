@@ -1109,3 +1109,34 @@ fn raptor_backward_tightening_preserves_valid_connection() {
     );
     assert_eq!(transit_legs[1].start, 9 * 3600 + 1800, "Tram should still depart at 09:30");
 }
+
+// ── Pattern shape storage ─────────────────────────────────────────────────────
+
+#[test]
+fn test_pattern_shape_stored_and_retrieved() {
+    let mut g = Graph::new();
+    let pts = vec![
+        LatLng { latitude: 1.0, longitude: 1.0 },
+        LatLng { latitude: 2.0, longitude: 2.0 },
+        LatLng { latitude: 3.0, longitude: 3.0 },
+        LatLng { latitude: 4.0, longitude: 4.0 },
+        LatLng { latitude: 5.0, longitude: 5.0 },
+    ];
+    g.push_transit_pattern_shape(pts, vec![0u32, 4u32]);
+    let (shape, idx) = g.get_pattern_shape(0).expect("should have shape for pattern 0");
+    assert_eq!(shape.len(), 5);
+    assert_eq!(idx, &[0u32, 4u32]);
+}
+
+#[test]
+fn test_pattern_shape_empty_returns_none() {
+    let mut g = Graph::new();
+    g.push_transit_pattern_shape(vec![], vec![]);
+    assert!(g.get_pattern_shape(0).is_none());
+}
+
+#[test]
+fn test_pattern_shape_out_of_bounds_returns_none() {
+    let g = Graph::new();
+    assert!(g.get_pattern_shape(99).is_none());
+}
