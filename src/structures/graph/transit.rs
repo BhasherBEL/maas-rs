@@ -8,7 +8,7 @@ use crate::{
         TripInfo, TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, EdgeData, NodeData, NodeID,
+        DelayCDF, EdgeData, LatLng, NodeData, NodeID,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -484,5 +484,20 @@ impl Graph {
         }
 
         best
+    }
+
+    /// Push shape data for the next pattern (call once per pattern, in order).
+    pub fn push_transit_pattern_shape(&mut self, points: Vec<LatLng>, stop_idx: Vec<u32>) {
+        self.transit_pattern_shapes.push(points);
+        self.transit_pattern_shape_stop_idx.push(stop_idx);
+    }
+
+    /// Returns `(shape_points, stop_indices)` for pattern `p`, or `None` if
+    /// no shape data was stored (pattern was pushed without a shape, or vecs are
+    /// shorter than `p` for backward-compat reasons).
+    pub fn get_pattern_shape(&self, p: usize) -> Option<(&[LatLng], &[u32])> {
+        let pts = self.transit_pattern_shapes.get(p)?;
+        let idx = self.transit_pattern_shape_stop_idx.get(p)?;
+        if pts.is_empty() { None } else { Some((pts, idx)) }
     }
 }

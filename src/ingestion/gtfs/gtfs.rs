@@ -359,6 +359,8 @@ where
     let mut pattern_sequences: Vec<Vec<NodeID>> = Vec::new();
     let mut pattern_route_ids: Vec<RouteId> = Vec::new();
     let mut pattern_trip_data: Vec<Vec<(TripId, Vec<StopTime>)>> = Vec::new();
+    // For each pattern: the shape_id and per-stop shape_dist_traveled values (from the first trip).
+    let mut pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = Vec::new();
 
     for (_, trip) in gtfs.trips {
         let trip_id = trip_mapper.get_or_insert(trip.id.clone());
@@ -393,6 +395,7 @@ where
 
         let mut trip_nodes: Vec<NodeID> = Vec::new();
         let mut trip_stop_times: Vec<StopTime> = Vec::new();
+        let mut trip_shape_dists: Vec<Option<f32>> = Vec::new();
 
         for &i in &indices {
             let st = &trip.stop_times[i];
@@ -411,6 +414,7 @@ where
                 departure: dep,
                 arrival: arr,
             });
+            trip_shape_dists.push(st.shape_dist_traveled);
         }
 
         if trip_nodes.len() < 2 {
@@ -450,6 +454,15 @@ where
             pattern_route_ids[pattern_id] = global_route_id;
         }
         pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
+
+        while pattern_shape_data.len() <= pattern_id {
+            pattern_shape_data.push(None);
+        }
+        if pattern_shape_data[pattern_id].is_none() {
+            if let Some(ref shape_id) = trip.shape_id {
+                pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));
+            }
+        }
     }
 
     for pattern_id in 0..pattern_sequences.len() {
@@ -495,6 +508,19 @@ where
             start: st_start,
             len: n_stops * n_trips,
         });
+
+        // ── Shape geometry ────────────────────────────────────────────────────
+        let stop_coords: Vec<LatLng> = sequence
+            .iter()
+            .map(|&node_id| {
+                g.get_node(node_id)
+                    .map(|n| n.loc())
+                    .unwrap_or(LatLng { latitude: 0.0, longitude: 0.0 })
+            })
+            .collect();
+        let (shape_pts, stop_idx) =
+            compute_pattern_shape(pattern_id, &stop_coords, &pattern_shape_data, &gtfs.shapes);
+        g.push_transit_pattern_shape(shape_pts, stop_idx);
     }
 
     for (route_segment, mut trip_segments) in route_hops {
@@ -527,6 +553,97 @@ where
     Ok(())
 }
 
+fn haversine_sq(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    dlat * dlat + dlon * dlon
+}
+
+fn compute_pattern_shape(
+    pattern_id: usize,
+    stop_coords: &[LatLng],
+    pattern_shape_data: &[Option<(String, Vec<Option<f32>>)>],
+    gtfs_shapes: &HashMap<String, Vec<gtfs_structures::Shape>>,
+) -> (Vec<LatLng>, Vec<u32>) {
+    let Some((shape_id, stop_dists)) =
+        pattern_shape_data.get(pattern_id).and_then(|x| x.as_ref())
+    else {
+        return (vec![], vec![]);
+    };
+
+    let Some(raw_shapes) = gtfs_shapes.get(shape_id) else {
+        return (vec![], vec![]);
+    };
+
+    let mut sorted: Vec<&gtfs_structures::Shape> = raw_shapes.iter().collect();
+    sorted.sort_unstable_by_key(|s| s.sequence);
+    if sorted.is_empty() {
+        return (vec![], vec![]);
+    }
+
+    let n_stops = stop_coords.len();
+
+    let has_dist = stop_dists.iter().any(|d| d.is_some())
+        && sorted.iter().all(|s| s.dist_traveled.is_some());
+
+    let stop_shape_indices: Vec<usize> = if has_dist {
+        // Case A: use shape_dist_traveled
+        stop_dists
+            .iter()
+            .map(|d| {
+                let d = d.unwrap_or(0.0) as f64;
+                let pos = sorted.partition_point(|s| s.dist_traveled.unwrap() as f64 <= d);
+                pos.saturating_sub(1).min(sorted.len() - 1)
+            })
+            .collect()
+    } else {
+        // Case B: nearest-neighbor with monotonic forward scan
+        let mut cursor = 0usize;
+        stop_coords
+            .iter()
+            .map(|coord| {
+                let best = (cursor..sorted.len())
+                    .min_by(|&a, &b| {
+                        let da = haversine_sq(
+                            coord.latitude,
+                            coord.longitude,
+                            sorted[a].latitude,
+                            sorted[a].longitude,
+                        );
+                        let db = haversine_sq(
+                            coord.latitude,
+                            coord.longitude,
+                            sorted[b].latitude,
+                            sorted[b].longitude,
+                        );
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .unwrap_or(cursor);
+                cursor = best;
+                best
+            })
+            .collect()
+    };
+
+    let from_idx = stop_shape_indices[0];
+    let to_idx = stop_shape_indices[n_stops - 1];
+    if to_idx < from_idx {
+        return (vec![], vec![]);
+    }
+
+    let all_pts: Vec<LatLng> = sorted[from_idx..=to_idx]
+        .iter()
+        .map(|s| LatLng { latitude: s.latitude, longitude: s.longitude })
+        .collect();
+
+    let stop_idx: Vec<u32> = stop_shape_indices
+        .iter()
+        .map(|&i| (i - from_idx) as u32)
+        .collect();
+
+    (all_pts, stop_idx)
+}
+
 pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
     let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
     (date - epoch).num_days().max(0) as u32
@@ -536,6 +653,115 @@ pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    // ── compute_pattern_shape ─────────────────────────────────────────────────
+
+    fn shape_pt(seq: usize, lat: f64, lon: f64, dist: Option<f32>) -> gtfs_structures::Shape {
+        gtfs_structures::Shape {
+            id: "s1".into(),
+            latitude: lat,
+            longitude: lon,
+            sequence: seq,
+            dist_traveled: dist,
+        }
+    }
+
+    fn dummy_coord(lat: f64, lon: f64) -> LatLng {
+        LatLng { latitude: lat, longitude: lon }
+    }
+
+    #[test]
+    fn test_compute_shape_with_dist_traveled() {
+        // 3 stops, shape has 7 points at dists 0..=6
+        // stop 0 → dist 0.0, stop 1 → dist 3.0, stop 2 → dist 6.0
+        let shape_pts: Vec<gtfs_structures::Shape> = (0usize..7)
+            .map(|i| shape_pt(i, i as f64, 0.0, Some(i as f32)))
+            .collect();
+        let mut gtfs_shapes = HashMap::new();
+        gtfs_shapes.insert("s1".to_string(), shape_pts);
+
+        let stop_coords = vec![
+            dummy_coord(0.0, 0.0),
+            dummy_coord(3.0, 0.0),
+            dummy_coord(6.0, 0.0),
+        ];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![Some((
+            "s1".to_string(),
+            vec![Some(0.0), Some(3.0), Some(6.0)],
+        ))];
+
+        let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
+        assert_eq!(pts.len(), 7);
+        assert_eq!(idx, vec![0u32, 3u32, 6u32]);
+    }
+
+    #[test]
+    fn test_compute_shape_without_dist_traveled_proximity() {
+        // 2 stops, 5 shape points, no dist_traveled
+        // stop 0 is near shape_pt[0], stop 1 is near shape_pt[4]
+        let shape_pts: Vec<gtfs_structures::Shape> = (0usize..5)
+            .map(|i| shape_pt(i, i as f64 * 0.01, 0.0, None))
+            .collect();
+        let mut gtfs_shapes = HashMap::new();
+        gtfs_shapes.insert("s1".to_string(), shape_pts);
+
+        let stop_coords = vec![
+            dummy_coord(0.0, 0.0),       // near shape_pt[0] at (0.0, 0.0)
+            dummy_coord(0.04, 0.0),      // near shape_pt[4] at (0.04, 0.0)
+        ];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![Some((
+            "s1".to_string(),
+            vec![None, None],
+        ))];
+
+        let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
+        assert_eq!(pts.len(), 5);
+        assert_eq!(idx, vec![0u32, 4u32]);
+    }
+
+    #[test]
+    fn test_compute_shape_missing_shape_id() {
+        let gtfs_shapes = HashMap::new();
+        let stop_coords = vec![dummy_coord(0.0, 0.0), dummy_coord(1.0, 0.0)];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![None];
+
+        let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
+        assert!(pts.is_empty());
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_compute_shape_shape_id_not_in_gtfs_shapes() {
+        let gtfs_shapes: HashMap<String, Vec<gtfs_structures::Shape>> = HashMap::new();
+        let stop_coords = vec![dummy_coord(0.0, 0.0), dummy_coord(1.0, 0.0)];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> =
+            vec![Some(("missing_id".to_string(), vec![Some(0.0), Some(1.0)]))];
+
+        let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
+        assert!(pts.is_empty());
+        assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn test_compute_shape_monotonicity_guard() {
+        // stop 0 maps to shape index 5, stop 1 maps to index 1 → to_idx < from_idx
+        let shape_pts: Vec<gtfs_structures::Shape> = (0usize..6)
+            .map(|i| shape_pt(i, 0.0, 0.0, Some(i as f32)))
+            .collect();
+        let mut gtfs_shapes = HashMap::new();
+        gtfs_shapes.insert("s1".to_string(), shape_pts);
+
+        let stop_coords = vec![dummy_coord(0.0, 0.0), dummy_coord(0.0, 0.0)];
+        // stop 0 has dist 5.0 → index 5; stop 1 has dist 1.0 → index 1
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![Some((
+            "s1".to_string(),
+            vec![Some(5.0), Some(1.0)],
+        ))];
+
+        let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
+        assert!(pts.is_empty());
+        assert!(idx.is_empty());
+    }
 
     // Weekday bit encoding (matches ingestion code):
     //   Mon=0x01, Tue=0x02, Wed=0x04, Thu=0x08, Fri=0x10, Sat=0x20, Sun=0x40
