@@ -44,6 +44,19 @@ struct RailwayGraph {
 }
 
 impl RailwayGraph {
+    fn from_raw(node_coords: Vec<(f64, f64)>, adj: Vec<Vec<(usize, u32)>>) -> Self {
+        let nodes: Vec<RailwayNode> = node_coords
+            .into_iter()
+            .map(|(lat, lon)| RailwayNode { lat, lon })
+            .collect();
+        let mut tree: KdTree<f64, usize, [f64; 2]> = KdTree::new(2);
+        for (i, n) in nodes.iter().enumerate() {
+            let _ = tree.add([n.lat, n.lon], i);
+        }
+        // id_map is only needed for OSM parsing, not for routing
+        RailwayGraph { nodes, id_map: HashMap::new(), adj, tree }
+    }
+
     fn build(osm_path: &str) -> Result<Self, osmpbf::Error> {
         // Pass 1: collect all node IDs referenced by railway ways
         let mut valid_ids: HashSet<i64> = HashSet::new();
@@ -274,19 +287,37 @@ fn compute_railway_shape(
     Some((all_pts, stop_idx, fallback_segments > 0))
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public entry points ───────────────────────────────────────────────────────
+
+/// Called during the OSM snapshot phase to cache railway topology into the graph.
+/// The stored data is serialized into osm.bin and reused by `load_gtfs_sncb`
+/// during --update-gtfs, avoiding a re-parse of the OSM PBF.
+pub fn prepare_sncb(osm_path: &str, g: &mut Graph) -> Result<(), osmpbf::Error> {
+    tracing::info!("caching railway graph from {osm_path}...");
+    let railway = RailwayGraph::build(osm_path)?;
+    let nodes: Vec<(f64, f64)> = railway.nodes.iter().map(|n| (n.lat, n.lon)).collect();
+    let node_count = nodes.len();
+    g.store_railway_graph(nodes, railway.adj);
+    tracing::info!("railway graph cached ({node_count} nodes)");
+    Ok(())
+}
 
 pub fn load_gtfs_sncb(
     gtfs_path: &str,
     osm_path: &str,
     g: &mut Graph,
 ) -> Result<(), gtfs_structures::Error> {
-    tracing::info!("building railway graph from {osm_path}...");
-    let railway = match RailwayGraph::build(osm_path) {
-        Ok(rg) => rg,
-        Err(e) => {
-            tracing::warn!("failed to build railway graph: {e} — falling back to straight-line shapes");
-            return load_gtfs_with_hook(gtfs_path, g, |_, _| None);
+    let railway = if let Some((nodes, adj)) = g.get_railway_graph_data() {
+        tracing::info!("using cached railway graph ({} nodes)", nodes.len());
+        RailwayGraph::from_raw(nodes, adj)
+    } else {
+        tracing::info!("building railway graph from {osm_path}...");
+        match RailwayGraph::build(osm_path) {
+            Ok(rg) => rg,
+            Err(e) => {
+                tracing::error!("failed to build railway graph: {e} — falling back to generic GTFS load");
+                return load_gtfs_with_hook(gtfs_path, g, |_, _| None);
+            }
         }
     };
 

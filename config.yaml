@@ -20,6 +20,7 @@ build:
       url: path:data/belgium-latest.osm.pbf
 
   output: graph.bin
+  osm_output: osm.bin
 
   delay_models:
     - mode: subway
