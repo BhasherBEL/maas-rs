@@ -4,9 +4,10 @@ build:
       name: STIB
       url: path:data/stib.zip
 
-    - ingestor: gtfs/generic
+    - ingestor: gtfs/sncb
       name: SNCB
       url: path:data/sncb.zip
+      osm_url: path:data/belgium-latest.osm.pbf
 
     # - name: SNCB
     #   ingestor: gtfs/generic

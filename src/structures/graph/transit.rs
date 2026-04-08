@@ -500,4 +500,23 @@ impl Graph {
         let idx = self.transit_pattern_shape_stop_idx.get(p)?;
         if pts.is_empty() { None } else { Some((pts, idx)) }
     }
+
+    /// Number of transit patterns currently in the graph.
+    pub fn transit_pattern_count(&self) -> usize {
+        self.transit_patterns.len()
+    }
+
+    /// Returns the ordered stop-node sequence for pattern `p`.
+    pub fn get_pattern_stop_nodes(&self, p: usize) -> &[NodeID] {
+        self.transit_idx_pattern_stops[p].of(&self.transit_pattern_stops)
+    }
+
+    /// Overwrites the shape for pattern `p` (must already exist — generic loader
+    /// always pushes an empty shape, so this is safe for any pattern it loaded).
+    pub fn set_pattern_shape(&mut self, p: usize, pts: Vec<LatLng>, stop_idx: Vec<u32>) {
+        if p < self.transit_pattern_shapes.len() {
+            self.transit_pattern_shapes[p] = pts;
+            self.transit_pattern_shape_stop_idx[p] = stop_idx;
+        }
+    }
 }

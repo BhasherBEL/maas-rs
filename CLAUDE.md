@@ -83,6 +83,8 @@ Routes return as `Plan → PlanLeg (Walk|Transit) → PlanLegStep`, with rich me
 
 ## Testing
 
+> **Mandatory:** Every bug fix, new feature, or change to existing behaviour **must** include tests that validate it. Do not consider a task done until the relevant tests are written and passing (`cargo test --lib` + `cargo test --test graph_tests`).
+
 ### Test layout
 
 | Location | What it covers |
