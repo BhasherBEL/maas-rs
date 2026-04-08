@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::{
-    ingestion::{cache::resolve_path, gtfs::{load_gtfs, load_gtfs_stib}, osm},
+    ingestion::{cache::resolve_path, gtfs::{load_gtfs, load_gtfs_sncb, load_gtfs_stib}, osm},
     structures::{BuildConfig, DelayCDF, Graph, Ingestor},
 };
 
@@ -28,6 +28,13 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
             Ingestor::OsmPbf(_) => osm::load_pbf_file(&path, &mut g).map_err(|e| e.to_string()),
             Ingestor::GtfsGeneric(_) => load_gtfs(&path, &mut g).map_err(|e| e.to_string()),
             Ingestor::GtfsStib(_) => load_gtfs_stib(&path, &mut g).map_err(|e| e.to_string()),
+            Ingestor::GtfsSncb(c) => {
+                let osm_path = c.osm_url
+                    .strip_prefix("path:")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| c.osm_url.clone());
+                load_gtfs_sncb(&path, &osm_path, &mut g).map_err(|e| e.to_string())
+            }
         };
 
         match result {
