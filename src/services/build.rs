@@ -13,13 +13,13 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
     ordered.sort_by_key(|i| i.phase());
 
     for input in ordered {
-        println!("Loading '{}'...", input.label());
+        tracing::info!("loading '{}'...", input.label());
         let before = SystemTime::now();
 
         let path = match resolve_path(input) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Failed to resolve '{}': {e}", input.label());
+                tracing::error!("failed to resolve '{}': {e}", input.label());
                 return None;
             }
         };
@@ -40,17 +40,17 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
         match result {
             Ok(_) => {
                 if let Ok(elapsed) = before.elapsed() {
-                    println!("Loaded '{}' in {}ms", input.label(), elapsed.as_millis());
+                    tracing::info!("loaded '{}' in {}ms", input.label(), elapsed.as_millis());
                 }
             }
             Err(e) => {
-                eprintln!("Failed to ingest '{}': {e}", input.label());
+                tracing::error!("failed to ingest '{}': {e}", input.label());
                 return None;
             }
         }
     }
 
-    println!("Building raptor index...");
+    tracing::info!("building RAPTOR index...");
     g.build_raptor_index();
 
     let models = config
@@ -60,6 +60,6 @@ pub fn build_graph(config: BuildConfig) -> Option<Graph> {
         .collect::<HashMap<_, _>>();
     g.set_transit_delay_models(models);
 
-    println!("Building done.");
+    tracing::info!("build complete");
     Some(g)
 }

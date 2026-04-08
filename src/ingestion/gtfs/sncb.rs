@@ -96,8 +96,8 @@ impl RailwayGraph {
             let _ = tree.add([n.lat, n.lon], i);
         }
 
-        println!(
-            "  Railway graph: {} nodes, {} adjacency entries",
+        tracing::info!(
+            "railway graph built: {} nodes, {} edges",
             nodes.len(),
             adj.iter().map(|v| v.len()).sum::<usize>()
         );
@@ -208,11 +208,14 @@ fn best_dijkstra(
     None
 }
 
+/// Returns `Some((pts, stop_idx, had_fallback))` or `None` if no segment could
+/// be routed at all. `had_fallback` is `true` when at least one segment used a
+/// straight-line fallback instead of an on-track path.
 fn compute_railway_shape(
     stops: &[NodeID],
     g: &Graph,
     railway: &RailwayGraph,
-) -> Option<(Vec<LatLng>, Vec<u32>)> {
+) -> Option<(Vec<LatLng>, Vec<u32>, bool)> {
     if stops.len() < 2 {
         return None;
     }
@@ -267,14 +270,8 @@ fn compute_railway_shape(
         return None;
     }
 
-    if fallback_segments > 0 {
-        println!(
-            "    Pattern: {routed_segments} segments routed, \
-             {fallback_segments} straight-line fallback"
-        );
-    }
-
-    Some((all_pts, stop_idx))
+    // Return whether any segment had to fall back, so the caller can aggregate.
+    Some((all_pts, stop_idx, fallback_segments > 0))
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -284,11 +281,11 @@ pub fn load_gtfs_sncb(
     osm_path: &str,
     g: &mut Graph,
 ) -> Result<(), gtfs_structures::Error> {
-    println!("  Building railway graph from {}...", osm_path);
+    tracing::info!("building railway graph from {osm_path}...");
     let railway = match RailwayGraph::build(osm_path) {
         Ok(rg) => rg,
         Err(e) => {
-            eprintln!("Failed to build railway graph: {e} — falling back to generic GTFS load");
+            tracing::warn!("failed to build railway graph: {e} — falling back to straight-line shapes");
             return load_gtfs_with_hook(gtfs_path, g, |_, _| None);
         }
     };
@@ -298,6 +295,7 @@ pub fn load_gtfs_sncb(
     let patterns_after = g.transit_pattern_count();
 
     let mut n_computed = 0usize;
+    let mut n_partial = 0usize;
     let mut n_failed = 0usize;
     for p in patterns_before..patterns_after {
         if g.get_pattern_shape(p).is_some() {
@@ -306,16 +304,20 @@ pub fn load_gtfs_sncb(
         }
         let stops = g.get_pattern_stop_nodes(p).to_vec();
         match compute_railway_shape(&stops, g, &railway) {
-            Some((pts, idx)) => {
+            Some((pts, idx, had_fallback)) => {
                 g.set_pattern_shape(p, pts, idx);
                 n_computed += 1;
+                if had_fallback { n_partial += 1; }
             }
             None => n_failed += 1,
         }
     }
-    println!(
-        "  Railway shapes: {n_computed} synthesised, {n_failed} failed (straight-line fallback)"
-    );
+    tracing::info!("{n_computed} shapes synthesised, {n_failed} fully unmapped");
+    if n_partial > 0 {
+        tracing::warn!(
+            "{n_partial} patterns partially mapped — some segments fell back to straight lines"
+        );
+    }
     Ok(())
 }
 

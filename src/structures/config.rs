@@ -9,6 +9,13 @@ use crate::ingestion::cache::SourceLocation;
 pub struct Config {
     pub build: BuildConfig,
     pub default_routing: RoutingDefaultConfig,
+    /// Minimum log level: trace | debug | info | warn | error  (default: info)
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 #[derive(Debug, Deserialize)]

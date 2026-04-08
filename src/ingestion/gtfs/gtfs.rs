@@ -202,14 +202,11 @@ where
         );
     }
 
-    println!("{} nodes parsed", n_stops);
-    println!(" - {} nodes without geo data", count_node_no_latlng);
-    println!(" - {} nodes without name", count_node_no_name);
-    println!(" - {} nodes without neighbor", count_node_no_neighbor);
-    println!(
-        " - {} nodes without close neighbor",
-        count_node_too_far_neighbor
-    );
+    tracing::info!("{n_stops} stops loaded");
+    tracing::debug!(" - {count_node_no_latlng} without coordinates");
+    tracing::debug!(" - {count_node_no_name} without name");
+    tracing::debug!(" - {count_node_no_neighbor} without street neighbour");
+    tracing::debug!(" - {count_node_too_far_neighbor} too far from any street node");
 
     let mut agency_mapper: IdMapper<String, usize> = IdMapper::new();
     let mut agencies: Vec<AgencyInfo> = Vec::new();
