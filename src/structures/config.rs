@@ -22,8 +22,14 @@ fn default_log_level() -> String {
 pub struct BuildConfig {
     pub inputs: Vec<Ingestor>,
     pub output: String,
+    #[serde(default = "default_osm_output")]
+    pub osm_output: String,
     #[serde(default)]
     pub delay_models: Vec<DelayModelConfig>,
+}
+
+fn default_osm_output() -> String {
+    "osm.bin".to_string()
 }
 
 #[derive(Debug, Deserialize)]

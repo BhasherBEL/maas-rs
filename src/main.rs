@@ -3,7 +3,7 @@ use std::{env, sync::Arc};
 use maas_rs::{
     logging,
     services::{
-        build::build_graph,
+        build::{build_gtfs_phase, build_osm_phase},
         persistence::{load_graph, save_graph},
     },
     structures::Config,
@@ -29,35 +29,66 @@ async fn main() {
     let save_mode = args.contains(&"--save".to_string());
     let restore_mode = args.contains(&"--restore".to_string());
     let serve_mode = args.contains(&"--serve".to_string());
+    let update_gtfs_mode = args.contains(&"--update-gtfs".to_string());
 
-    if build_mode && restore_mode || !build_mode && !restore_mode {
-        tracing::error!("one of --build or --restore must be set (not both)");
+    let mode_count = [build_mode, restore_mode, update_gtfs_mode]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+    if mode_count != 1 {
+        tracing::error!("exactly one of --build, --restore, or --update-gtfs must be set");
         return;
     }
-    if save_mode && !build_mode {
-        tracing::error!("--save requires --build");
+    if save_mode && restore_mode {
+        tracing::error!("--save requires --build or --update-gtfs");
         return;
     }
 
     let mut g = if build_mode {
-        let graph = match build_graph(config.build) {
+        let osm_graph = match build_osm_phase(&config.build) {
             Some(g) => g,
             None => {
-                tracing::error!("graph build failed");
+                tracing::error!("OSM phase failed");
                 return;
             }
         };
 
         if save_mode {
-            if let Err(e) = save_graph(&graph, "graph.bin") {
+            if let Err(e) = save_graph(&osm_graph, &config.build.osm_output) {
                 tracing::error!("{e}");
                 return;
             }
         }
 
-        graph
+        match build_gtfs_phase(osm_graph, &config.build) {
+            Some(g) => g,
+            None => {
+                tracing::error!("GTFS phase failed");
+                return;
+            }
+        }
+    } else if update_gtfs_mode {
+        let osm_graph = match load_graph(&config.build.osm_output) {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!(
+                    "'{}' not found — run '--build --save' first",
+                    config.build.osm_output
+                );
+                return;
+            }
+        };
+
+        match build_gtfs_phase(osm_graph, &config.build) {
+            Some(g) => g,
+            None => {
+                tracing::error!("GTFS phase failed");
+                return;
+            }
+        }
     } else {
-        match load_graph("graph.bin") {
+        // --restore
+        match load_graph(&config.build.output) {
             Ok(g) => g,
             Err(e) => {
                 tracing::error!("{e}");
@@ -66,7 +97,14 @@ async fn main() {
         }
     };
 
-    // Apply config.yaml routing defaults (works for both --build and --restore).
+    if save_mode && (build_mode || update_gtfs_mode) {
+        if let Err(e) = save_graph(&g, &config.build.output) {
+            tracing::error!("{e}");
+            return;
+        }
+    }
+
+    // Apply config.yaml routing defaults (works for all modes).
     if let Some(s) = config.default_routing.min_access_secs {
         g.set_min_access_secs(s);
     }

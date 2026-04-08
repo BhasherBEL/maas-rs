@@ -18,6 +18,7 @@ use crate::{
 mod astar;
 mod raptor_build;
 mod raptor_route;
+mod railway;
 mod transit;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +87,14 @@ pub struct Graph {
     /// Empty vec when no shape data is available.
     #[serde(default)]
     transit_pattern_shape_stop_idx: Vec<Vec<u32>>,
+
+    /// Cached railway topology for SNCB shape synthesis (build-time only).
+    /// Stored in osm.bin so --update-gtfs skips re-parsing the OSM PBF.
+    #[serde(default)]
+    railway_nodes: Vec<(f64, f64)>,
+
+    #[serde(default)]
+    railway_adj: Vec<Vec<(usize, u32)>>,
 }
 
 static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
@@ -133,6 +142,9 @@ impl Graph {
 
             transit_pattern_shapes: Vec::new(),
             transit_pattern_shape_stop_idx: Vec::new(),
+
+            railway_nodes: Vec::new(),
+            railway_adj: Vec::new(),
         }
     }
 
