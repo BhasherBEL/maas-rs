@@ -206,7 +206,7 @@ impl Graph {
                 None => None,
             },
             Err(_) => {
-                eprintln!("Failed to find a close node");
+                tracing::warn!("KD-tree query failed (empty tree?)");
                 None
             }
         }
@@ -219,7 +219,7 @@ impl Graph {
                 None => None,
             },
             Err(_) => {
-                eprintln!("Failed to find a close node");
+                tracing::warn!("KD-tree query failed (empty tree?)");
                 None
             }
         }

@@ -97,8 +97,8 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
         }
     })?;
 
-    println!(
-        "Sucessfully imported {} edges out of {} ({}%)",
+    tracing::info!(
+        "imported {} / {} edges ({}%)",
         n - failed,
         n,
         (n - failed) * 100 / n

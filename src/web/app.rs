@@ -203,7 +203,7 @@ pub async fn server(graph: Arc<Graph>) -> std::io::Result<()> {
         .at("/ws", GraphQLSubscription::new(schema))
         .at("/graphiql", get(graphiql));
 
-    println!("Serving on 0.0.0.0:3000");
+    tracing::info!("serving on 0.0.0.0:3000");
     Server::new(TcpListener::bind("0.0.0.0:3000"))
         .run(app)
         .await

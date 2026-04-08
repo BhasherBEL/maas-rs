@@ -3,6 +3,7 @@ use gtfs_structures::RouteType;
 use crate::structures::Graph;
 
 pub fn load_gtfs_stib(path: &str, g: &mut Graph) -> Result<(), gtfs_structures::Error> {
+    tracing::info!("applying STIB bike-allowance rules");
     super::load_gtfs_with_hook(path, g, bikes_allowed_stib)
 }
 
