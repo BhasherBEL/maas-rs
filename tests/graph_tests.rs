@@ -1140,3 +1140,365 @@ fn test_pattern_shape_out_of_bounds_returns_none() {
     let g = Graph::new();
     assert!(g.get_pattern_shape(99).is_none());
 }
+
+// ── raptor_range ──────────────────────────────────────────────────────────────
+
+/// Builds a single-route graph with N trips at 30-minute intervals.
+///
+/// Layout:
+///   osm_origin (50.000, 4.000)   ─72 m─  stop_A (50.000, 4.001)
+///                                          │  (bus, 6 trips every 30 min)
+///   osm_dest   (50.000, 4.100)   ─72 m─  stop_B (50.000, 4.099)
+///
+/// Trip i departs stop_A at (09:00 + i*30 min), arrives stop_B 30 min later.
+fn single_route_many_trips_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest   = g.add_node(osm_node("dest",   50.000, 4.100));
+    let stop_a     = g.add_node(transit_stop("Stop A", 50.000, 4.001)); // ~72 m from origin
+    let stop_b     = g.add_node(transit_stop("Stop B", 50.000, 4.099)); // ~72 m from dest
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: false, foot: true, bike: true, car: true,
+            }));
+        }
+    };
+    // Connect origin ↔ dest via a long street (so walk-only is expensive)
+    add_street(&mut g, osm_origin, osm_dest, 7200); // 7 200 m ≈ 1 h walk
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (o, d) in [(stop, osm), (osm, stop)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: true, foot: true, bike: false, car: false,
+            }));
+        }
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72); // 72 m / 1.2 m/s = 60 s walk
+    add_snap(&mut g, stop_b, osm_dest,   72);
+
+    // Transit edge (needed by reconstruct for timetable_segment lookup)
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b,
+        route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 6 },
+        length: 7000,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "42".into(),
+        route_long_name: "Bus 42".into(),
+        route_type: RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+
+    // 6 trips: TripId 0..5
+    g.add_transit_trips(
+        (0..6u32).map(|_| TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }).collect(),
+    );
+
+    // TripSegments (one per trip, single A→B hop)
+    let base = 9 * 3600u32; // 09:00
+    g.add_transit_departures(
+        (0..6u32).map(|i| TripSegment {
+            trip_id: TripId(i),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: base + i * 1800,        // 09:00, 09:30, 10:00 …
+            arrival:   base + i * 1800 + 1800, // arrives 30 min later
+            service_id: ServiceId(0),
+        }).collect(),
+    );
+
+    // Pattern 0: 2 stops × 6 trips, column-major stop times.
+    // Column for stop_A (pos 0): indices 0..6 (trips 0..5 at stop_A)
+    // Column for stop_B (pos 1): indices 6..12 (trips 0..5 at stop_B)
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        for i in 0..6u32 {
+            g.push_transit_pattern_trip(TripId(i));
+        }
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 6 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        // Stop A column (pos 0, 6 trips)
+        for i in 0..6u32 {
+            let t = base + i * 1800;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        // Stop B column (pos 1, 6 trips)
+        for i in 0..6u32 {
+            let t = base + i * 1800 + 1800;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 12 });
+
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 6 });
+    }
+
+    g.build_raptor_index();
+    (g, osm_origin, osm_dest)
+}
+
+#[test]
+fn raptor_range_returns_multiple_plans_across_window() {
+    let (g, origin, dest) = single_route_many_trips_graph();
+
+    // Query at 09:00, 3-hour window — buses every 30 min → should get multiple plans.
+    // collect_interesting_times caps at 5, so expect exactly 5.
+    let plans = g.raptor_range(origin, dest, 9 * 3600, 180 * 60, 0, 0x7F, 10 * 60);
+
+    assert!(
+        plans.len() > 1,
+        "raptor_range should return multiple Pareto-optimal plans for a 3-hour window \
+         with buses every 30 min, but got {} plan(s)",
+        plans.len(),
+    );
+
+    // Each plan should have a different departure time (Pareto-distinct)
+    let mut starts: Vec<u32> = plans.iter().map(|p| p.start).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    assert_eq!(
+        starts.len(), plans.len(),
+        "All plans should have distinct departure times; got starts={:?}",
+        starts,
+    );
+
+    // Plans should be sorted by departure (ascending) or at least all within the window
+    for p in &plans {
+        assert!(
+            p.start >= 9 * 3600,
+            "Plan departs before query time: start={}",
+            p.start
+        );
+        assert!(
+            p.start < (9 + 3) * 3600,
+            "Plan departs outside 3-hour window: start={}",
+            p.start
+        );
+    }
+}
+
+#[test]
+fn raptor_range_plans_are_pareto_optimal() {
+    let (g, origin, dest) = single_route_many_trips_graph();
+    let plans = g.raptor_range(origin, dest, 9 * 3600, 180 * 60, 0, 0x7F, 10 * 60);
+
+    // No plan should be dominated by another:
+    // A dominates B iff tc_A <= tc_B && end_A <= end_B && start_A >= start_B (strict in ≥1)
+    for (i, a) in plans.iter().enumerate() {
+        let tc_a = a.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count().saturating_sub(1);
+        for (j, b) in plans.iter().enumerate() {
+            if i == j { continue; }
+            let tc_b = b.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count().saturating_sub(1);
+            let a_dominates_b = tc_a <= tc_b && a.end <= b.end && a.start >= b.start
+                && (tc_a < tc_b || a.end < b.end || a.start > b.start);
+            assert!(
+                !a_dominates_b,
+                "Plan {} (start={}, end={}, tc={}) dominates plan {} (start={}, end={}, tc={}) — Pareto filter is broken",
+                i, a.start, a.end, tc_a, j, b.start, b.end, tc_b,
+            );
+        }
+    }
+}
+
+/// Regression test: raptor_range must not discard the probe plan when
+/// high-frequency dead-end patterns at the origin stop fill the entire
+/// `collect_interesting_times` cap before the connecting pattern appears.
+///
+/// Layout:
+///   osm_origin (50.000, 4.000) ─72m─ stop_A (50.000, 4.001)
+///   osm_dest   (50.000, 4.100) ─72m─ stop_B (50.000, 4.099)
+///                                     stop_C (50.000, 5.000)  ← dead-end, far from dest
+///
+/// Pattern 0 (dead-end): stop_A → stop_C, 5 trips every 5 min from 09:00.
+///   These fill the first 5 slots in collect_interesting_times.
+/// Pattern 1 (connecting): stop_A → stop_B, 3 trips at 09:30, 10:30, 11:30.
+///   Without the fix, these are never tried (cap exhausted by pattern 0).
+///
+/// Expected: raptor_range returns ≥ 1 plan (connecting trips found).
+#[test]
+fn raptor_range_connecting_pattern_not_starved_by_dead_end_pattern() {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest   = g.add_node(osm_node("dest",   50.000, 4.100));
+    let stop_a     = g.add_node(transit_stop("Stop A", 50.000, 4.001)); // 72m / 60s from origin
+    let stop_b     = g.add_node(transit_stop("Stop B", 50.000, 4.099)); // 72m / 60s from dest
+    let stop_c     = g.add_node(transit_stop("Stop C", 50.000, 5.000)); // far from dest
+
+    // Streets
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: false, foot: true, bike: true, car: true,
+            }));
+        }
+    };
+    add_street(&mut g, osm_origin, osm_dest, 7200); // long direct walk (1 h)
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (o, d) in [(stop, osm), (osm, stop)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: true, foot: true, bike: false, car: false,
+            }));
+        }
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72); // 60s walk
+    add_snap(&mut g, stop_b, osm_dest,   72); // 60s walk
+    // stop_c has no snap edge to osm nodes (it's remote)
+
+    // Transit edges (needed by reconstruct)
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_c,
+        route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 5 },
+        length: 80_000,
+    }));
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b,
+        route_id: RouteId(1),
+        timetable_segment: TimetableSegment { start: 5, len: 3 },
+        length: 7000,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo { route_short_name: "99".into(), route_long_name: "Dead-end".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None },
+        RouteInfo { route_short_name: "42".into(), route_long_name: "Connecting".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None },
+    ]);
+
+    // 5 dead-end trips (pattern 0) + 3 connecting trips (pattern 1)
+    g.add_transit_trips(
+        (0..8u32).map(|i| TripInfo {
+            trip_headsign: None,
+            route_id: if i < 5 { RouteId(0) } else { RouteId(1) },
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }).collect(),
+    );
+
+    // TripSegments (one per trip)
+    let base = 9 * 3600u32;
+    // Dead-end: 5 trips departing stop_A at 09:01, 09:02, 09:03, 09:04, 09:05.
+    // earliest_at_stop = 09:00 + 60s walk = 09:01, so all 5 are within range.
+    // Origin departure times = stop_A dep - 60s = 09:00, 09:01, 09:02, 09:03, 09:04.
+    // These 5 fill collect_interesting_times' cap of 5 entirely, leaving no room
+    // for the connecting pattern's trips (first at 09:30 → origin dep 09:29).
+    let mut segs: Vec<TripSegment> = (0..5u32).map(|i| TripSegment {
+        trip_id: TripId(i),
+        origin_stop_sequence: 0, destination_stop_sequence: 1,
+        departure: base + 60 + i * 60,         // 09:01, 09:02, 09:03, 09:04, 09:05
+        arrival:   base + 60 + i * 60 + 3600,  // 60 min later at stop_C
+        service_id: ServiceId(0),
+    }).collect();
+    // Connecting: 3 trips at 09:30, 10:30, 11:30 (stop_A → stop_B, 30 min)
+    segs.extend((0..3u32).map(|i| TripSegment {
+        trip_id: TripId(5 + i),
+        origin_stop_sequence: 0, destination_stop_sequence: 1,
+        departure: base + 1800 + i * 3600,        // 09:30, 10:30, 11:30
+        arrival:   base + 1800 + i * 3600 + 1800, // 30 min later at stop_B
+        service_id: ServiceId(0),
+    }));
+    g.add_transit_departures(segs);
+
+    // Pattern 0 (dead-end): stop_A × stop_C, 5 trips, column-major
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_c]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        for i in 0..5u32 { g.push_transit_pattern_trip(TripId(i)); }
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 5 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        // stop_A column (pos 0): departures at 09:01, 09:02, 09:03, 09:04, 09:05
+        for i in 0..5u32 {
+            let t = base + 60 + i * 60;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        // stop_C column (pos 1)
+        for i in 0..5u32 {
+            let t = base + 60 + i * 60 + 3600;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 10 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 5 });
+    }
+
+    // Pattern 1 (connecting): stop_A × stop_B, 3 trips, column-major
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        for i in 5..8u32 { g.push_transit_pattern_trip(TripId(i)); }
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 3 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        // stop_A column (pos 0)
+        for i in 0..3u32 {
+            let t = base + 1800 + i * 3600;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        // stop_B column (pos 1)
+        for i in 0..3u32 {
+            let t = base + 1800 + i * 3600 + 1800;
+            g.push_transit_pattern_stop_time(StopTime { arrival: t, departure: t });
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 6 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 3 });
+    }
+
+    g.build_raptor_index();
+
+    // 180-min window from 09:00, min_access=10 min.
+    // Dead-end pattern fills all 5 departure slots (09:00..09:04 origin departure).
+    // Connecting pattern's first trip (origin dep 09:29) is the 6th → currently missed.
+    // The bug: all 5 RAPTOR runs return empty (dead-end), probe result is discarded,
+    // raptor_range returns [] even though a valid connecting plan exists.
+    let plans = g.raptor_range(osm_origin, osm_dest, base, 180 * 60, 0, 0x7F, 600);
+
+    // The connecting pattern has trips at 09:30, 10:30, 11:30 from stop_A.
+    // With only 5 interesting-time slots, all filled by dead-end departures
+    // (09:01–09:05), RAPTOR never queries origin-departure times 10:29 or 11:29.
+    // It accidentally finds the 09:30 connecting trip as the "first available"
+    // in all 5 iterations, giving 1 deduplicated plan instead of 3.
+    assert_eq!(
+        plans.len(), 3,
+        "raptor_range should return all 3 connecting trips (09:30, 10:30, 11:30) \
+         from a 180-min window, but got {} plan(s). \
+         Likely the dead-end pattern starved the interesting-times cap (bug).",
+        plans.len(),
+    );
+
+    // All returned plans must actually reach the destination (end > start).
+    for p in &plans {
+        assert!(p.end > p.start, "plan end <= start: start={} end={}", p.start, p.end);
+    }
+}

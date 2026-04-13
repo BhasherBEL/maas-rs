@@ -10,7 +10,7 @@ use tracing_subscriber::{
 /// Custom event formatter.
 ///
 /// Output (plain):
-/// ```
+/// ```text
 /// 10:00:00  INFO  services::build               Loading 'STIB'...
 /// 10:00:01 DEBUG  ingestion::gtfs::gtfs          - 0 nodes without geo data
 /// 10:00:05  WARN  ingestion::gtfs::sncb         Pattern: 3 routed, 1 fallback

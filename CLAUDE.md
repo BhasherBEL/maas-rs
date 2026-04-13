@@ -44,6 +44,8 @@ cargo clippy
 
 The GraphQL playground is available at `http://127.0.0.1:3000/graphiql` when the server is running.
 
+> **Never run the server directly** (`cargo run -- --serve`). Starting the server is the user's responsibility. Only write and run tests, or build the binary.
+
 ## Architecture
 
 ### Data Flow

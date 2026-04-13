@@ -1445,9 +1445,16 @@ impl Graph {
         date: u32,
         weekday: u8,
     ) -> Vec<u32> {
+        // Collect up to MAX_PER_PATTERN departure times per (stop, pattern) pair so
+        // that high-frequency dead-end patterns cannot starve lower-frequency patterns
+        // that actually connect origin to destination.  A global cap of MAX_TOTAL
+        // bounds the number of RAPTOR iterations to keep query latency predictable.
+        const MAX_PER_PATTERN: usize = 5;
+        const MAX_TOTAL: usize = 20;
+
         let mut departure_times: BTreeSet<u32> = BTreeSet::new();
 
-        for &(stop, walk_secs) in raw_stops {
+        'outer: for &(stop, walk_secs) in raw_stops {
             let earliest_at_stop = earliest_origin_departure.saturating_add(walk_secs);
             let latest_at_stop = latest_origin_departure.saturating_add(walk_secs);
 
@@ -1471,18 +1478,27 @@ impl Graph {
                 let lo = col.partition_point(|st| st.departure < earliest_at_stop);
                 let hi = col.partition_point(|st| st.departure <= latest_at_stop);
 
+                let mut per_pattern_count = 0usize;
                 for t in lo..hi {
                     if self.is_trip_active(trip_ids[t], date, weekday) {
                         departure_times.insert(col[t].departure - walk_secs);
+                        per_pattern_count += 1;
+                        if per_pattern_count >= MAX_PER_PATTERN {
+                            break; // enough trips sampled from this pattern
+                        }
+                        if departure_times.len() >= MAX_TOTAL {
+                            break 'outer; // global cap reached
+                        }
                     }
+                }
+
+                if departure_times.len() >= MAX_TOTAL {
+                    break 'outer;
                 }
             }
         }
 
-        // Keep at most the next 5 departure opportunities (earliest first).
-        // Capping here avoids O(N * RAPTOR_cost) blowup on frequent corridors.
-        let result: Vec<u32> = departure_times.into_iter().take(5).collect();
-        result
+        departure_times.into_iter().collect()
     }
 
     /// Range-RAPTOR: run RAPTOR for every interesting departure within
