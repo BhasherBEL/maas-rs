@@ -98,7 +98,7 @@ pub struct Graph {
 }
 
 static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
-static WALKING_SPEED_MS: f64 = 1.2;
+static WALKING_SPEED_M_PER_SEC: f64 = 1.2;
 pub const MAX_SCENARIOS: usize = 2;
 pub const MAX_ROUNDS: usize = 20;
 
@@ -159,20 +159,13 @@ impl Graph {
     pub fn add_node(&mut self, node: NodeData) -> NodeID {
         let id = NodeID(self.nodes.len());
 
-        self.nodes.push(node.clone());
-        self.edges.push(Vec::new());
-
-        match node {
-            NodeData::OsmNode(osm_node) => {
-                let lat = osm_node.lat_lng.latitude;
-                let lon = osm_node.lat_lng.longitude;
-                let eid = osm_node.eid.clone();
-
-                let _ = self.nodes_tree.add([lat, lon], id);
-                self.id_mapper.insert(eid, id);
-            }
-            _ => {}
+        if let NodeData::OsmNode(ref osm_node) = node {
+            let _ = self.nodes_tree.add([osm_node.lat_lng.latitude, osm_node.lat_lng.longitude], id);
+            self.id_mapper.insert(osm_node.eid.clone(), id);
         }
+
+        self.nodes.push(node);
+        self.edges.push(Vec::new());
         id
     }
 
@@ -208,6 +201,10 @@ impl Graph {
         self.edges.len()
     }
 
+    /// Finds the nearest OSM node using squared Euclidean distance in the
+    /// lat/lon plane. Fast but not metrically accurate — suitable for finding
+    /// the closest node when the exact distance doesn't matter.
+    /// See also: `nearest_node_dist` which returns the Haversine distance in meters.
     pub fn nearest_node(&self, lat: f64, lon: f64) -> Option<NodeID> {
         match self
             .nodes_tree
@@ -224,10 +221,13 @@ impl Graph {
         }
     }
 
+    /// Finds the nearest OSM node and returns the Haversine distance in meters.
+    /// More expensive than `nearest_node` but gives an accurate metric distance,
+    /// needed when the actual distance matters (e.g. GTFS stop snapping).
     pub fn nearest_node_dist(&self, lat: f64, lon: f64) -> Option<(f64, &NodeID)> {
         match self.nodes_tree.iter_nearest(&[lat, lon], &LatLng::distance) {
             Ok(mut it) => match it.next() {
-                Some(v) => return Some(v),
+                Some(v) => Some(v),
                 None => None,
             },
             Err(_) => {

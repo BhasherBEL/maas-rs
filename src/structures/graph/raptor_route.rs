@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::{Graph, MAX_ROUNDS, WALKING_SPEED_MS};
+use super::{Graph, MAX_ROUNDS, WALKING_SPEED_M_PER_SEC};
 
 impl Graph {
     pub fn raptor(
@@ -31,7 +31,7 @@ impl Graph {
         min_access_secs: u32,
     ) -> Vec<Plan> {
         let straight_line_secs =
-            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
+            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_M_PER_SEC) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
@@ -202,7 +202,7 @@ impl Graph {
         walk_secs: u32,
     ) -> Plan {
         let end = start_time + walk_secs;
-        let length = (walk_secs as f64 * WALKING_SPEED_MS) as usize;
+        let length = (walk_secs as f64 * WALKING_SPEED_M_PER_SEC) as usize;
 
         let to_place = PlanPlace {
             node_id: destination,
@@ -528,7 +528,7 @@ impl Graph {
                 let first_walk = stop_arrival.saturating_sub(start_time);
                 if first_walk > 0 {
                     let stop_node = self.transit_stop_to_node[origin_stop];
-                    let length = (first_walk as f64 * WALKING_SPEED_MS) as usize;
+                    let length = (first_walk as f64 * WALKING_SPEED_M_PER_SEC) as usize;
                     // Depart at the latest possible moment so the user arrives at the
                     // stop exactly when the first transit vehicle boards, not at query
                     // time (which would leave them waiting invisibly on the platform).
@@ -575,7 +575,7 @@ impl Graph {
             if best_walk > 0 {
                 let walk_start = labels[k][best_stop].earliest();
                 let stop_node = self.transit_stop_to_node[best_stop];
-                let length = (best_walk as f64 * WALKING_SPEED_MS) as usize;
+                let length = (best_walk as f64 * WALKING_SPEED_M_PER_SEC) as usize;
                 let to_place = PlanPlace {
                     node_id: destination,
                     stop_position: None,
@@ -733,7 +733,7 @@ impl Graph {
                 let duration = end - start;
                 let from_node = self.transit_stop_to_node[from];
                 let to_node = self.transit_stop_to_node[stop];
-                let length = (duration as f64 * WALKING_SPEED_MS) as usize;
+                let length = (duration as f64 * WALKING_SPEED_M_PER_SEC) as usize;
 
                 let to_place = PlanPlace {
                     stop_position: None,
@@ -1294,7 +1294,7 @@ impl Graph {
             return vec![c];
         }
 
-        const WALK_MMS: u32 = (WALKING_SPEED_MS * 1000.0) as u32;
+        const WALK_MMS: u32 = (WALKING_SPEED_M_PER_SEC * 1000.0) as u32;
 
         let mut dist: HashMap<NodeID, u32> = HashMap::new();
         let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
@@ -1361,7 +1361,7 @@ impl Graph {
     }
 
     pub fn walk_dijkstra(&self, origin: NodeID, max_seconds: u32) -> HashMap<NodeID, u32> {
-        const WALK_MMS: u32 = (WALKING_SPEED_MS * 1000.0) as u32;
+        const WALK_MMS: u32 = (WALKING_SPEED_M_PER_SEC * 1000.0) as u32;
 
         let mut dist: HashMap<NodeID, u32> = HashMap::new();
         let mut pq: BinaryHeap<Reverse<(u32, NodeID)>> = BinaryHeap::new();
@@ -1414,7 +1414,7 @@ impl Graph {
             .and_then(|v| v.into_iter().next())
             .map(|(dist_sq, _)| {
                 let dist_m = degrees_to_meters(dist_sq, loc.latitude);
-                (dist_m / WALKING_SPEED_MS) as u32
+                (dist_m / WALKING_SPEED_M_PER_SEC) as u32
             })
             .unwrap_or(straight_line_secs)
     }
@@ -1515,7 +1515,7 @@ impl Graph {
         min_access_secs: u32,
     ) -> Vec<Plan> {
         let straight_line_secs =
-            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_MS) as u32;
+            (self.nodes_distance(origin, destination) as f64 / WALKING_SPEED_M_PER_SEC) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         // Always search within at least min_access_secs walk so that stops in

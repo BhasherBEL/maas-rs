@@ -27,20 +27,14 @@ impl LatLng {
                 * (delta_longitude / 2.0).sin().powi(2);
         let central_angle = 2.0 * central_angle_inner.sqrt().asin();
 
-        return 6365396.0_f64 * central_angle;
+        6365396.0_f64 * central_angle
     }
 
     pub fn dist(&self, other: Self) -> f64 {
-        let delta_latitude = (self.latitude - other.latitude).to_radians();
-        let delta_longitude = (self.longitude - other.longitude).to_radians();
-
-        let central_angle_inner = (delta_latitude / 2.0).sin().powi(2)
-            + self.latitude.to_radians().cos()
-                * other.latitude.to_radians().cos()
-                * (delta_longitude / 2.0).sin().powi(2);
-        let central_angle = 2.0 * central_angle_inner.sqrt().asin();
-
-        return 6365396.0_f64 * central_angle;
+        Self::distance(
+            &[self.latitude, self.longitude],
+            &[other.latitude, other.longitude],
+        )
     }
 }
 

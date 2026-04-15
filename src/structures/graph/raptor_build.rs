@@ -5,7 +5,7 @@ use crate::structures::{
     raptor::{Lookup, PatternID},
 };
 
-use super::{Graph, MAX_TRANSFER_DISTANCE_M, WALKING_SPEED_MS};
+use super::{Graph, MAX_TRANSFER_DISTANCE_M, WALKING_SPEED_M_PER_SEC};
 
 impl Graph {
     pub fn build_raptor_index(&mut self) {
@@ -98,7 +98,7 @@ impl Graph {
         self.transit_stop_transfers.clear();
         self.transit_idx_stop_transfers = Vec::with_capacity(n_stops);
 
-        let max_walk_secs = (MAX_TRANSFER_DISTANCE_M / WALKING_SPEED_MS) as u32;
+        let max_walk_secs = (MAX_TRANSFER_DISTANCE_M / WALKING_SPEED_M_PER_SEC) as u32;
 
         for i in 0..n_stops {
             let start = self.transit_stop_transfers.len();

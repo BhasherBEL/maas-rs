@@ -25,19 +25,8 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
         idx
     }
 
-    pub fn get(&mut self, gtfs_id: T) -> Option<usize> {
-        if let Some(&idx) = self.to_index.get(&gtfs_id) {
-            return Some(idx);
-        }
-        None
-    }
-
-    pub fn to_gtfs_id(&self, idx: u32) -> &T {
-        &self.to_string[idx as usize]
-    }
-
-    pub fn get_reversed(&self) -> &Vec<T> {
-        &self.to_string
+    pub fn get(&self, gtfs_id: &T) -> Option<usize> {
+        self.to_index.get(gtfs_id).copied()
     }
 }
 
@@ -98,31 +87,22 @@ mod tests {
     fn idmapper_get_existing_key() {
         let mut m: IdMapper<String, usize> = IdMapper::new();
         m.get_or_insert("x".to_string());
-        assert_eq!(m.get("x".to_string()), Some(0));
+        assert_eq!(m.get(&"x".to_string()), Some(0));
     }
 
     #[test]
     fn idmapper_get_missing_key_returns_none() {
-        let mut m: IdMapper<String, usize> = IdMapper::new();
-        assert_eq!(m.get("missing".to_string()), None);
+        let m: IdMapper<String, usize> = IdMapper::new();
+        assert_eq!(m.get(&"missing".to_string()), None);
     }
 
     #[test]
-    fn idmapper_to_gtfs_id_roundtrip() {
+    fn idmapper_get_does_not_require_mut() {
         let mut m: IdMapper<String, usize> = IdMapper::new();
-        m.get_or_insert("route_1".to_string());
-        m.get_or_insert("route_2".to_string());
-        assert_eq!(m.to_gtfs_id(0), "route_1");
-        assert_eq!(m.to_gtfs_id(1), "route_2");
-    }
-
-    #[test]
-    fn idmapper_get_reversed_returns_insertion_order() {
-        let mut m: IdMapper<String, usize> = IdMapper::new();
-        m.get_or_insert("first".to_string());
-        m.get_or_insert("second".to_string());
-        m.get_or_insert("third".to_string());
-        assert_eq!(m.get_reversed(), &vec!["first".to_string(), "second".to_string(), "third".to_string()]);
+        m.get_or_insert("a".to_string());
+        // get() takes &self, not &mut self — this should compile with an immutable ref
+        let r: &IdMapper<String, usize> = &m;
+        assert_eq!(r.get(&"a".to_string()), Some(0));
     }
 
     // ── display_route_type ────────────────────────────────────────────────────
