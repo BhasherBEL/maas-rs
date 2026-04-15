@@ -19,30 +19,24 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
     })?;
 
     let reader = ElementReader::from_path(pbf_path)?;
+    let mut add_osm_node = |id: i64, lat: f64, lon: f64| {
+        let eid = format!("map#osm#{}", id);
+        let node = OsmNodeData {
+            eid,
+            lat_lng: crate::structures::LatLng {
+                latitude: lat,
+                longitude: lon,
+            },
+        };
+        g.add_node(NodeData::OsmNode(node));
+    };
     reader.for_each(|element| match element {
         Element::DenseNode(n) if valid_node_ids.contains(&n.id()) => {
-            let eid = format!("map#osm#{}", n.id());
-            let node = OsmNodeData {
-                eid,
-                lat_lng: crate::structures::LatLng {
-                    latitude: n.lat(),
-                    longitude: n.lon(),
-                },
-            };
-            g.add_node(NodeData::OsmNode(node));
+            add_osm_node(n.id(), n.lat(), n.lon());
         }
         Element::Node(n) if valid_node_ids.contains(&n.id()) => {
-            let eid = format!("map#osm#{}", n.id());
-            let node = OsmNodeData {
-                eid,
-                lat_lng: crate::structures::LatLng {
-                    latitude: n.lat(),
-                    longitude: n.lon(),
-                },
-            };
-            g.add_node(NodeData::OsmNode(node));
+            add_osm_node(n.id(), n.lat(), n.lon());
         }
-
         _ => {}
     })?;
 
@@ -55,14 +49,6 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
         if let Element::Way(w) = element {
             if validate_way(&w) {
                 let node_ids = w.refs().collect::<Vec<_>>();
-
-                // let from = node_ids[0];
-                // let to = node_ids[node_ids.len() - 1];
-                //
-                // n += 1;
-                // if !insert_from_osm_ids(g, from, to, true, false) {
-                //     failed += 1;
-                // }
 
                 let foot = w
                     .tags()

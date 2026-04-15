@@ -10,7 +10,7 @@ pub struct NodeID(pub usize);
 
 impl Display for NodeID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        return self.0.fmt(f);
+        self.0.fmt(f)
     }
 }
 

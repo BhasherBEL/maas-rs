@@ -113,5 +113,10 @@ async fn main() {
         return;
     }
 
-    let _ = app::server(Arc::new(g)).await;
+    let _ = app::server(
+        Arc::new(g),
+        &config.server,
+        config.default_routing.clone(),
+    )
+    .await;
 }

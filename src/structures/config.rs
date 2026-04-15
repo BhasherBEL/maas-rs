@@ -9,9 +9,36 @@ use crate::ingestion::cache::SourceLocation;
 pub struct Config {
     pub build: BuildConfig,
     pub default_routing: RoutingDefaultConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
     /// Minimum log level: trace | debug | info | warn | error  (default: info)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            host: default_host(),
+            port: default_port(),
+        }
+    }
+}
+
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_port() -> u16 {
+    3000
 }
 
 fn default_log_level() -> String {
@@ -88,7 +115,7 @@ pub struct GtfsSncbIngestor {
     pub phase: Option<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RoutingDefaultConfig {
     pub walking_speed: u32,
     pub estimator_speed: u32,
@@ -140,5 +167,64 @@ impl Config {
         let content =
             fs::read_to_string(path).map_err(|e| format!("Failed to read config: {e}"))?;
         serde_yml::from_str(&content).map_err(|e| format!("Failed to parse config: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_defaults() {
+        let cfg: ServerConfig = serde_yml::from_str("{}").unwrap();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 3000);
+    }
+
+    #[test]
+    fn server_config_custom_values() {
+        let yaml = "host: 127.0.0.1\nport: 8080";
+        let cfg: ServerConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn config_without_server_section_uses_defaults() {
+        // A minimal Config YAML without a `server:` key should parse
+        // and fill in ServerConfig defaults.
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+  output: graph.bin
+default_routing:
+  walking_speed: 1390
+  estimator_speed: 13900
+"#;
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 3000);
+    }
+
+    #[test]
+    fn config_with_server_section_overrides_defaults() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+  output: graph.bin
+default_routing:
+  walking_speed: 1390
+  estimator_speed: 13900
+server:
+  host: "127.0.0.1"
+  port: 9090
+"#;
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.server.port, 9090);
     }
 }

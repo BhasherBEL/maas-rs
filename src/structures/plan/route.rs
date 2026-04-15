@@ -68,7 +68,7 @@ impl PlanRoute {
     }
 }
 
-fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
+pub(crate) fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
     format!("{:02X}{:02X}{:02X}", r, g, b)
 }
 
@@ -84,5 +84,28 @@ impl PlanRoute {
             text_color: route.route_text_color.map(|(r, g, b)| rgb_to_hex(r, g, b)),
             agency_id: route.agency_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgb_to_hex_primary_colors() {
+        assert_eq!(rgb_to_hex(255, 0, 0), "FF0000");
+        assert_eq!(rgb_to_hex(0, 255, 0), "00FF00");
+        assert_eq!(rgb_to_hex(0, 0, 255), "0000FF");
+    }
+
+    #[test]
+    fn rgb_to_hex_black_and_white() {
+        assert_eq!(rgb_to_hex(0, 0, 0), "000000");
+        assert_eq!(rgb_to_hex(255, 255, 255), "FFFFFF");
+    }
+
+    #[test]
+    fn rgb_to_hex_mixed_color() {
+        assert_eq!(rgb_to_hex(173, 216, 230), "ADD8E6");
     }
 }

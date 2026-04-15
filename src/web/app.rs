@@ -4,13 +4,13 @@ use async_graphql::{
     Context, EmptyMutation, EmptySubscription, Error, Schema, SimpleObject,
     http::GraphiQLSource,
 };
-use async_graphql_poem::{GraphQL, GraphQLSubscription};
+use async_graphql_poem::GraphQL;
 use chrono::{Local, NaiveDate, NaiveTime};
 use poem::{Result, Route, Server, get, handler, listener::TcpListener, web::Html};
 
 use crate::{
     routing::{routing_astar, routing_raptor},
-    structures::{Graph, plan::Plan},
+    structures::{Graph, RoutingDefaultConfig, RoutingParameters, ServerConfig, plan::Plan},
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,28 @@ struct GtfsAgency {
     routes: Vec<GtfsRoute>,
 }
 
+fn parse_date_time(
+    date: &Option<String>,
+    time: &Option<String>,
+) -> std::result::Result<(NaiveDate, NaiveTime), Error> {
+    let now = Local::now().naive_local();
+
+    let parsed_date = match date {
+        Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|e| Error::new(format!("Invalid date '{}': {}", d, e)))?,
+        None => now.date(),
+    };
+
+    let parsed_time = match time {
+        Some(t) => NaiveTime::parse_from_str(t, "%H:%M:%S")
+            .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"))
+            .map_err(|e| Error::new(format!("Invalid time '{}': {}", t, e)))?,
+        None => now.time(),
+    };
+
+    Ok((parsed_date, parsed_time))
+}
+
 struct QueryRoot;
 
 #[async_graphql::Object]
@@ -65,20 +87,12 @@ impl QueryRoot {
         time: Option<String>,
     ) -> Result<Plan, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
+        let routing_defaults = ctx.data::<RoutingDefaultConfig>()?;
+        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
 
-        let now = Local::now().naive_local();
-
-        let parsed_date = match date {
-            Some(ref d) => NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                .map_err(|e| Error::new(format!("Invalid date '{}': {}", d, e)))?,
-            None => now.date(),
-        };
-
-        let parsed_time = match time {
-            Some(ref t) => NaiveTime::parse_from_str(t, "%H:%M:%S")
-                .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"))
-                .map_err(|e| Error::new(format!("Invalid time '{}': {}", t, e)))?,
-            None => now.time(),
+        let params = RoutingParameters {
+            walking_speed: routing_defaults.walking_speed as usize,
+            estimator_speed: routing_defaults.estimator_speed as usize,
         };
 
         let query = routing_astar::RouteQuery {
@@ -90,7 +104,7 @@ impl QueryRoot {
             time: parsed_time,
         };
 
-        routing_astar::route(graph.as_ref(), &query)
+        routing_astar::route(graph.as_ref(), &query, params)
     }
 
     async fn raptor(
@@ -110,21 +124,7 @@ impl QueryRoot {
         walk_radius_secs: Option<i32>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
-
-        let now = Local::now().naive_local();
-
-        let parsed_date = match date {
-            Some(ref d) => NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                .map_err(|e| Error::new(format!("Invalid date '{}': {}", d, e)))?,
-            None => now.date(),
-        };
-
-        let parsed_time = match time {
-            Some(ref t) => NaiveTime::parse_from_str(t, "%H:%M:%S")
-                .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"))
-                .map_err(|e| Error::new(format!("Invalid time '{}': {}", t, e)))?,
-            None => now.time(),
-        };
+        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
 
         let query = routing_raptor::RouteQuery {
             from_lat,
@@ -186,25 +186,73 @@ impl QueryRoot {
 
 #[handler]
 async fn graphiql() -> Html<String> {
-    Html(
-        GraphiQLSource::build()
-            .endpoint("/graphql")
-            .subscription_endpoint("/ws")
-            .finish(),
-    )
+    Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-pub async fn server(graph: Arc<Graph>) -> std::io::Result<()> {
+pub async fn server(
+    graph: Arc<Graph>,
+    server_config: &ServerConfig,
+    routing_defaults: RoutingDefaultConfig,
+) -> std::io::Result<()> {
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(graph)
+        .data(routing_defaults)
         .finish();
     let app = Route::new()
-        .at("/graphql", GraphQL::new(schema.clone()))
-        .at("/ws", GraphQLSubscription::new(schema))
+        .at("/graphql", GraphQL::new(schema))
         .at("/graphiql", get(graphiql));
 
-    tracing::info!("serving on 0.0.0.0:3000");
-    Server::new(TcpListener::bind("0.0.0.0:3000"))
-        .run(app)
-        .await
+    let bind = format!("{}:{}", server_config.host, server_config.port);
+    tracing::info!("serving on {bind}");
+    Server::new(TcpListener::bind(&bind)).run(app).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_date_time_valid_date_and_time() {
+        let (d, t) = parse_date_time(
+            &Some("2025-03-15".to_string()),
+            &Some("08:30:00".to_string()),
+        )
+        .unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2025, 3, 15).unwrap());
+        assert_eq!(t, NaiveTime::from_hms_opt(8, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_date_time_short_time_format() {
+        let (_, t) = parse_date_time(
+            &Some("2025-01-01".to_string()),
+            &Some("14:05".to_string()),
+        )
+        .unwrap();
+        assert_eq!(t, NaiveTime::from_hms_opt(14, 5, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_date_time_none_defaults_to_now() {
+        let (d, t) = parse_date_time(&None, &None).unwrap();
+        let now = Local::now().naive_local();
+        assert_eq!(d, now.date());
+        // Time should be within a second of now
+        let diff = (t - now.time()).num_seconds().abs();
+        assert!(diff < 2, "time diff {diff}s too large");
+    }
+
+    #[test]
+    fn parse_date_time_invalid_date_returns_error() {
+        let result = parse_date_time(&Some("not-a-date".to_string()), &None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Invalid date"));
+    }
+
+    #[test]
+    fn parse_date_time_invalid_time_returns_error() {
+        let result = parse_date_time(&None, &Some("99:99:99".to_string()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("Invalid time"));
+    }
 }

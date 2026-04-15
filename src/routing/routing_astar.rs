@@ -13,22 +13,18 @@ pub struct RouteQuery {
     pub time: NaiveTime,
 }
 
-pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::Error> {
-    let (_, a_id) = match graph.nearest_node_dist(query.from_lat, query.from_lng) {
-        Some((a_dist, a_id)) => (a_dist, a_id),
-        None => {
-            return Err(async_graphql::Error::new(
-                "No node close to departure found",
-            ));
-        }
-    };
+pub fn route(
+    graph: &Graph,
+    query: &RouteQuery,
+    params: RoutingParameters,
+) -> Result<Plan, async_graphql::Error> {
+    let (_, a_id) = graph
+        .nearest_node_dist(query.from_lat, query.from_lng)
+        .ok_or_else(|| async_graphql::Error::new("No node near departure"))?;
 
-    let (_, b_id) = match graph.nearest_node_dist(query.to_lat, query.to_lng) {
-        Some((b_dist, b_id)) => (b_dist, b_id),
-        None => {
-            return Err(async_graphql::Error::new("No node close to arrival found"));
-        }
-    };
+    let (_, b_id) = graph
+        .nearest_node_dist(query.to_lat, query.to_lng)
+        .ok_or_else(|| async_graphql::Error::new("No node near arrival"))?;
 
     let from = *a_id;
     let to = *b_id;
@@ -36,11 +32,6 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Plan, async_graphql::E
     let time = query.time.num_seconds_from_midnight();
     let date = date_to_days(query.date);
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
-
-    let params = RoutingParameters {
-        walking_speed: 5 * 278,
-        estimator_speed: 50 * 278,
-    };
 
     graph.a_star(from, to, time, date, weekday, params)
 }

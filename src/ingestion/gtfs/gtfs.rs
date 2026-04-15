@@ -47,7 +47,7 @@ pub struct TripSegment {
 }
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RouteSegment {
+struct RouteSegment {
     pub departure: NodeID,
     pub arrival: NodeID,
     pub route_id: RouteId,
@@ -215,13 +215,11 @@ where
     for agency in gtfs.agencies {
         let agency_id = agency_mapper.get_or_insert(agency.id.unwrap_or("default".to_string()));
 
-        while agencies.len() <= agency_id {
-            agencies.push(AgencyInfo {
-                name: String::new(),
-                url: String::new(),
-                timezone: String::new(),
-            });
-        }
+        agencies.resize_with(agency_id + 1, || AgencyInfo {
+            name: String::new(),
+            url: String::new(),
+            timezone: String::new(),
+        });
 
         agencies[agency_id] = AgencyInfo {
             name: agency.name,
@@ -248,15 +246,13 @@ where
         let start_date = date_to_days(cal.start_date);
         let end_date = date_to_days(cal.end_date);
 
-        while services.len() <= service_id {
-            services.push(ServicePattern {
-                days_of_week: 0,
-                start_date: 0,
-                end_date: 0,
-                added_dates: Vec::new(),
-                removed_dates: Vec::new(),
-            });
-        }
+        services.resize_with(service_id + 1, || ServicePattern {
+            days_of_week: 0,
+            start_date: 0,
+            end_date: 0,
+            added_dates: Vec::new(),
+            removed_dates: Vec::new(),
+        });
 
         services[service_id] = ServicePattern {
             days_of_week: udays,
@@ -270,15 +266,13 @@ where
     for (service_id_str, cal_dates) in gtfs.calendar_dates {
         let service_id = service_mapper.get_or_insert(service_id_str.clone());
 
-        while services.len() <= service_id {
-            services.push(ServicePattern {
-                days_of_week: 0,
-                start_date: 0,
-                end_date: u32::MAX,
-                added_dates: Vec::new(),
-                removed_dates: Vec::new(),
-            });
-        }
+        services.resize_with(service_id + 1, || ServicePattern {
+            days_of_week: 0,
+            start_date: 0,
+            end_date: u32::MAX,
+            added_dates: Vec::new(),
+            removed_dates: Vec::new(),
+        });
 
         services[service_id].added_dates = cal_dates
             .iter()
@@ -302,21 +296,20 @@ where
     for (_, route) in gtfs.routes {
         let route_id = route_mapper.get_or_insert(route.id);
 
-        let agency_id = match agency_mapper.get(route.agency_id.unwrap_or("default".to_string())) {
+        let agency_id_str = route.agency_id.unwrap_or("default".to_string());
+        let agency_id = match agency_mapper.get(&agency_id_str) {
             Some(v) => AgencyId((v + agencies_offset) as u16),
             None => continue,
         };
 
-        while route_infos.len() <= route_id as usize {
-            route_infos.push(RouteInfo {
-                agency_id: AgencyId(0),
-                route_type: RouteType::Other(-1),
-                route_short_name: String::new(),
-                route_long_name: String::new(),
-                route_color: None,
-                route_text_color: None,
-            });
-        }
+        route_infos.resize_with(route_id as usize + 1, || RouteInfo {
+            agency_id: AgencyId(0),
+            route_type: RouteType::Other(-1),
+            route_short_name: String::new(),
+            route_long_name: String::new(),
+            route_color: None,
+            route_text_color: None,
+        });
 
         // Treat black (#000000) as "no color" since it is the GTFS default for
         // routes that do not define a colour.
@@ -361,23 +354,21 @@ where
 
     for (_, trip) in gtfs.trips {
         let trip_id = trip_mapper.get_or_insert(trip.id.clone());
-        let service_id = match service_mapper.get(trip.service_id.clone()) {
+        let service_id = match service_mapper.get(&trip.service_id) {
             Some(id) => id,
             None => continue,
         };
-        let route_id = match route_mapper.get(trip.route_id.clone()) {
+        let route_id = match route_mapper.get(&trip.route_id) {
             Some(id) => id,
             None => continue,
         };
 
-        while trip_infos.len() <= trip_id {
-            trip_infos.push(TripInfo {
-                trip_headsign: Some(String::new()),
-                route_id: RouteId(0),
-                service_id: ServiceId(0),
-                bikes_allowed: None,
-            });
-        }
+        trip_infos.resize_with(trip_id + 1, || TripInfo {
+            trip_headsign: Some(String::new()),
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        });
 
         let route_type = route_infos[route_id].route_type;
         trip_infos[trip_id] = TripInfo {
@@ -441,20 +432,16 @@ where
         }
 
         let pattern_id = pattern_mapper.get_or_insert(trip_nodes.clone());
-        while pattern_trip_data.len() <= pattern_id {
-            pattern_trip_data.push(Vec::new());
-            pattern_sequences.push(Vec::new());
-            pattern_route_ids.push(RouteId(0));
-        }
+        pattern_trip_data.resize_with(pattern_id + 1, Vec::new);
+        pattern_sequences.resize_with(pattern_id + 1, Vec::new);
+        pattern_route_ids.resize(pattern_id + 1, RouteId(0));
         if pattern_sequences[pattern_id].is_empty() {
             pattern_sequences[pattern_id] = trip_nodes;
             pattern_route_ids[pattern_id] = global_route_id;
         }
         pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
 
-        while pattern_shape_data.len() <= pattern_id {
-            pattern_shape_data.push(None);
-        }
+        pattern_shape_data.resize_with(pattern_id + 1, || None);
         if pattern_shape_data[pattern_id].is_none() {
             if let Some(ref shape_id) = trip.shape_id {
                 pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));

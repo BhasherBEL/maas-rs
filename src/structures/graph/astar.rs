@@ -7,11 +7,14 @@ use async_graphql::Result;
 use priority_queue::PriorityQueue;
 use serde::{Deserialize, Serialize};
 
-use crate::structures::{
-    EdgeData, NodeID, RoutingParameters,
-    plan::{
-        ArrivalScenario, Plan, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep,
-        PlanWalkLeg, PlanWalkLegStep,
+use crate::{
+    ingestion::gtfs::TripSegment,
+    structures::{
+        EdgeData, NodeID, RoutingParameters,
+        plan::{
+            ArrivalScenario, Plan, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg,
+            PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep,
+        },
     },
 };
 
@@ -32,6 +35,69 @@ struct AStarOrigins {
     time: u32,
 }
 
+/// Try to insert or update `dest` in the priority queue. If `dest` is already
+/// in the queue with a higher weight, update it; if absent, insert it.
+fn pq_update(
+    pq: &mut PriorityQueue<NodeID, Reverse<AStarPriority>>,
+    origins: &mut HashMap<NodeID, AStarOrigins>,
+    dest: NodeID,
+    weight: usize,
+    estimated_weight: usize,
+    time: u32,
+    from: NodeID,
+    edge: EdgeData,
+    departure_index: Option<usize>,
+) {
+    match pq.get_priority(&dest) {
+        Some(current) if current.0.weight <= weight => {}
+        Some(_) => {
+            pq.change_priority(
+                &dest,
+                Reverse(AStarPriority { estimated_weight, weight, time }),
+            );
+            origins.insert(dest, AStarOrigins {
+                destination: from,
+                edge,
+                next_departure_index: departure_index,
+                time,
+            });
+        }
+        None => {
+            pq.push(dest, Reverse(AStarPriority { estimated_weight, weight, time }));
+            origins.insert(dest, AStarOrigins {
+                destination: from,
+                edge,
+                next_departure_index: departure_index,
+                time,
+            });
+        }
+    }
+}
+
+fn new_transit_leg(
+    step: PlanTransitLegStep,
+    from: PlanPlace,
+    to: PlanPlace,
+    trip_segment: &TripSegment,
+    edge_length: usize,
+) -> PlanLeg {
+    PlanLeg::Transit(PlanTransitLeg {
+        steps: vec![PlanLegStep::Transit(step)],
+        from,
+        to,
+        length: edge_length,
+        start: trip_segment.departure,
+        end: trip_segment.arrival,
+        duration: trip_segment.arrival - trip_segment.departure,
+        trip_id: trip_segment.trip_id,
+        geometry: vec![],
+        transfer_risk: None,
+        preceding_arrival: None,
+        preceding_route_type: None,
+        bikes_allowed: None,
+    })
+}
+
 impl Graph {
     pub fn a_star(
         &self,
@@ -48,7 +114,7 @@ impl Graph {
         pq.push(
             a,
             Reverse(AStarPriority {
-                estimated_weight: 0 + self.nodes_distance(a, b) * 1000 / params.estimator_speed,
+                estimated_weight: self.nodes_distance(a, b) * 1000 / params.estimator_speed,
                 weight: 0,
                 time: start_time,
             }),
@@ -83,58 +149,23 @@ impl Graph {
                                 continue;
                             }
                             let weight = p.0.weight + street.length * 1000 / params.walking_speed;
+                            let time =
+                                p.0.time + (street.length * 1000 / params.walking_speed) as u32;
+                            let estimated = weight
+                                + self.nodes_distance(street.destination, b) * 1000
+                                    / params.estimator_speed;
 
-                            match pq.get_priority(&street.destination) {
-                                Some(current) => {
-                                    if current.0.weight > weight {
-                                        let time = p.0.time
-                                            + (street.length * 1000 / params.walking_speed) as u32;
-                                        pq.change_priority(
-                                            &street.destination,
-                                            Reverse(AStarPriority {
-                                                estimated_weight: weight
-                                                    + self.nodes_distance(street.destination, b)
-                                                        * 1000
-                                                        / params.estimator_speed,
-                                                weight,
-                                                time,
-                                            }),
-                                        );
-                                        origins.insert(
-                                            street.destination,
-                                            AStarOrigins {
-                                                destination: id,
-                                                edge: neighbor.clone(),
-                                                next_departure_index: None,
-                                                time,
-                                            },
-                                        );
-                                    }
-                                }
-                                None => {
-                                    let time = p.0.time
-                                        + (street.length * 1000 / params.walking_speed) as u32;
-                                    pq.push(
-                                        street.destination,
-                                        Reverse(AStarPriority {
-                                            estimated_weight: weight
-                                                + self.nodes_distance(street.destination, b) * 1000
-                                                    / params.estimator_speed,
-                                            weight,
-                                            time,
-                                        }),
-                                    );
-                                    origins.insert(
-                                        street.destination,
-                                        AStarOrigins {
-                                            destination: id,
-                                            edge: neighbor.clone(),
-                                            next_departure_index: None,
-                                            time,
-                                        },
-                                    );
-                                }
-                            }
+                            pq_update(
+                                &mut pq,
+                                &mut origins,
+                                street.destination,
+                                weight,
+                                estimated,
+                                time,
+                                id,
+                                *neighbor,
+                                None,
+                            );
                         }
                         EdgeData::Transit(transit) => {
                             if visited.contains(&transit.destination) {
@@ -152,65 +183,30 @@ impl Graph {
                                 None => continue,
                             };
 
-                            let edge_weight = next_departure.arrival - p.0.time;
+                            let weight =
+                                p.0.weight + (next_departure.arrival - p.0.time) as usize;
+                            let estimated = weight
+                                + self.nodes_distance(transit.destination, b) * 1000
+                                    / params.estimator_speed;
 
-                            let weight = p.0.weight + edge_weight as usize;
-
-                            match pq.get_priority(&transit.destination) {
-                                Some(current) => {
-                                    if current.0.weight > weight {
-                                        pq.change_priority(
-                                            &transit.destination,
-                                            Reverse(AStarPriority {
-                                                estimated_weight: weight
-                                                    + self.nodes_distance(transit.destination, b)
-                                                        * 1000
-                                                        / params.estimator_speed,
-                                                weight,
-                                                time: next_departure.arrival,
-                                            }),
-                                        );
-                                        origins.insert(
-                                            transit.destination,
-                                            AStarOrigins {
-                                                destination: id,
-                                                edge: neighbor.clone(),
-                                                next_departure_index: Some(next_departure_index),
-                                                time: next_departure.arrival,
-                                            },
-                                        );
-                                    }
-                                }
-                                None => {
-                                    pq.push(
-                                        transit.destination,
-                                        Reverse(AStarPriority {
-                                            estimated_weight: weight
-                                                + self.nodes_distance(transit.destination, b)
-                                                    * 1000
-                                                    / params.estimator_speed,
-                                            weight,
-                                            time: next_departure.arrival,
-                                        }),
-                                    );
-                                    origins.insert(
-                                        transit.destination,
-                                        AStarOrigins {
-                                            destination: id,
-                                            edge: neighbor.clone(),
-                                            next_departure_index: Some(next_departure_index),
-                                            time: next_departure.arrival,
-                                        },
-                                    );
-                                }
-                            }
+                            pq_update(
+                                &mut pq,
+                                &mut origins,
+                                transit.destination,
+                                weight,
+                                estimated,
+                                next_departure.arrival,
+                                id,
+                                *neighbor,
+                                Some(next_departure_index),
+                            );
                         }
                     }
                 }
             }
         }
 
-        return Err(async_graphql::Error::new("No plan found"));
+        Err(async_graphql::Error::new("No plan found"))
     }
 
     fn reconstruct_path(
@@ -262,10 +258,8 @@ impl Graph {
 
                     match current {
                         None => {
-                            let mut steps = Vec::<PlanLegStep>::new();
-                            steps.push(PlanLegStep::Walk(step));
                             current = Some(PlanLeg::Walk(PlanWalkLeg {
-                                steps,
+                                steps: vec![PlanLegStep::Walk(step)],
                                 from,
                                 to,
                                 length: edge.length,
@@ -284,10 +278,8 @@ impl Graph {
                             }
                             PlanLeg::Transit(_) => {
                                 legs.push(c.clone());
-                                let mut steps = Vec::<PlanLegStep>::new();
-                                steps.push(PlanLegStep::Walk(step));
                                 current = Some(PlanLeg::Walk(PlanWalkLeg {
-                                    steps,
+                                    steps: vec![PlanLegStep::Walk(step)],
                                     from,
                                     to,
                                     length: edge.length,
@@ -334,23 +326,7 @@ impl Graph {
 
                     match current {
                         None => {
-                            let mut steps = Vec::<PlanLegStep>::new();
-                            steps.push(PlanLegStep::Transit(step));
-                            current = Some(PlanLeg::Transit(PlanTransitLeg {
-                                steps,
-                                from,
-                                to,
-                                length: edge.length,
-                                start: trip_segment.departure,
-                                end: trip_segment.arrival,
-                                duration: trip_segment.arrival - trip_segment.departure,
-                                trip_id: trip_segment.trip_id,
-                                geometry: vec![],
-                                transfer_risk: None,
-                                preceding_arrival: None,
-                                preceding_route_type: None,
-                                bikes_allowed: None,
-                            }));
+                            current = Some(new_transit_leg(step, from, to, &trip_segment, edge.length));
                         }
                         Some(ref mut c) => match c {
                             PlanLeg::Transit(ct) => {
@@ -361,44 +337,12 @@ impl Graph {
                                     ct.length += edge.length;
                                 } else {
                                     legs.push(c.clone());
-                                    let mut steps = Vec::<PlanLegStep>::new();
-                                    steps.push(PlanLegStep::Transit(step));
-                                    current = Some(PlanLeg::Transit(PlanTransitLeg {
-                                        steps,
-                                        from,
-                                        to,
-                                        length: edge.length,
-                                        start: trip_segment.departure,
-                                        end: trip_segment.arrival,
-                                        duration: trip_segment.arrival - trip_segment.departure,
-                                        trip_id: trip_segment.trip_id,
-                                        geometry: vec![],
-                                        transfer_risk: None,
-                                        preceding_arrival: None,
-                                        preceding_route_type: None,
-                                        bikes_allowed: None,
-                                    }));
+                                    current = Some(new_transit_leg(step, from, to, &trip_segment, edge.length));
                                 }
                             }
                             PlanLeg::Walk(_) => {
                                 legs.push(c.clone());
-                                let mut steps = Vec::<PlanLegStep>::new();
-                                steps.push(PlanLegStep::Transit(step));
-                                current = Some(PlanLeg::Transit(PlanTransitLeg {
-                                    steps,
-                                    from,
-                                    to,
-                                    length: edge.length,
-                                    start: trip_segment.departure,
-                                    end: trip_segment.arrival,
-                                    duration: trip_segment.arrival - trip_segment.departure,
-                                    trip_id: trip_segment.trip_id,
-                                    geometry: vec![],
-                                    transfer_risk: None,
-                                    preceding_arrival: None,
-                                    preceding_route_type: None,
-                                    bikes_allowed: None,
-                                }));
+                                current = Some(new_transit_leg(step, from, to, &trip_segment, edge.length));
                             }
                         },
                     }
@@ -406,9 +350,8 @@ impl Graph {
             }
         }
 
-        match current {
-            Some(current) => legs.push(current),
-            None => {}
+        if let Some(current) = current {
+            legs.push(current);
         }
 
         Ok(legs)

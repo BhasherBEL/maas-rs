@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use async_graphql::{ComplexObject, Context, Enum, Interface, Result, SimpleObject};
+use async_graphql::{ComplexObject, Context, Interface, Result, SimpleObject};
 use gtfs_structures::RouteType;
 
 use crate::{
@@ -10,13 +10,6 @@ use crate::{
         plan::{PlanLegStep, PlanPlace, PlanTransitLegStep, PlanTrip},
     },
 };
-
-#[derive(Debug, Enum, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum PlanLegType {
-    WALK,
-    TRANSIT,
-    OTHER,
-}
 
 /// A single lat/lon coordinate point in a leg's geometry.
 #[derive(Debug, SimpleObject, Clone, Copy)]
