@@ -266,13 +266,15 @@ where
     for (service_id_str, cal_dates) in gtfs.calendar_dates {
         let service_id = service_mapper.get_or_insert(service_id_str.clone());
 
-        services.resize_with(service_id + 1, || ServicePattern {
-            days_of_week: 0,
-            start_date: 0,
-            end_date: u32::MAX,
-            added_dates: Vec::new(),
-            removed_dates: Vec::new(),
-        });
+        if service_id >= services.len() {
+            services.resize_with(service_id + 1, || ServicePattern {
+                days_of_week: 0,
+                start_date: 0,
+                end_date: u32::MAX,
+                added_dates: Vec::new(),
+                removed_dates: Vec::new(),
+            });
+        }
 
         services[service_id].added_dates = cal_dates
             .iter()
@@ -432,16 +434,18 @@ where
         }
 
         let pattern_id = pattern_mapper.get_or_insert(trip_nodes.clone());
-        pattern_trip_data.resize_with(pattern_id + 1, Vec::new);
-        pattern_sequences.resize_with(pattern_id + 1, Vec::new);
-        pattern_route_ids.resize(pattern_id + 1, RouteId(0));
+        let needed = pattern_id + 1;
+        if needed > pattern_trip_data.len() {
+            pattern_trip_data.resize_with(needed, Vec::new);
+            pattern_sequences.resize_with(needed, Vec::new);
+            pattern_route_ids.resize(needed, RouteId(0));
+            pattern_shape_data.resize_with(needed, || None);
+        }
         if pattern_sequences[pattern_id].is_empty() {
             pattern_sequences[pattern_id] = trip_nodes;
             pattern_route_ids[pattern_id] = global_route_id;
         }
         pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
-
-        pattern_shape_data.resize_with(pattern_id + 1, || None);
         if pattern_shape_data[pattern_id].is_none() {
             if let Some(ref shape_id) = trip.shape_id {
                 pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));

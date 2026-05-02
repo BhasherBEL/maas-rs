@@ -117,12 +117,13 @@ pub struct GtfsSncbIngestor {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoutingDefaultConfig {
-    pub walking_speed: u32,
-    pub estimator_speed: u32,
     /// Minimum walk-radius (seconds) used for access/egress stop search.
     /// When absent, the compiled-in default (600 s = 10 min) is used.
     #[serde(default)]
     pub min_access_secs: Option<u32>,
+    /// Pedestrian walking speed in m/s. When absent, defaults to 1.2 m/s (4.32 km/h).
+    #[serde(default)]
+    pub walking_speed_mps: Option<f64>,
 }
 
 impl Ingestor {
@@ -191,17 +192,13 @@ mod tests {
 
     #[test]
     fn config_without_server_section_uses_defaults() {
-        // A minimal Config YAML without a `server:` key should parse
-        // and fill in ServerConfig defaults.
         let yaml = r#"
 build:
   inputs:
     - ingestor: osm/pbf
       url: "path:data/test.pbf"
   output: graph.bin
-default_routing:
-  walking_speed: 1390
-  estimator_speed: 13900
+default_routing: {}
 "#;
         let cfg: Config = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cfg.server.host, "0.0.0.0");
@@ -216,9 +213,7 @@ build:
     - ingestor: osm/pbf
       url: "path:data/test.pbf"
   output: graph.bin
-default_routing:
-  walking_speed: 1390
-  estimator_speed: 13900
+default_routing: {}
 server:
   host: "127.0.0.1"
   port: 9090
@@ -226,5 +221,20 @@ server:
         let cfg: Config = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 9090);
+    }
+
+    #[test]
+    fn routing_default_config_walking_speed_absent_is_none() {
+        let yaml = "default_routing: {}";
+        let cfg: RoutingDefaultConfig = serde_yml::from_str(yaml).unwrap();
+        assert!(cfg.walking_speed_mps.is_none());
+        assert!(cfg.min_access_secs.is_none());
+    }
+
+    #[test]
+    fn routing_default_config_walking_speed_parses() {
+        let yaml = "walking_speed_mps: 1.4";
+        let cfg: RoutingDefaultConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.walking_speed_mps, Some(1.4));
     }
 }

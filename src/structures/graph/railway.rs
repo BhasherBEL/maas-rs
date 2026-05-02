@@ -4,16 +4,16 @@ impl Graph {
     /// Store the railway topology extracted from the OSM PBF.
     /// Called by `prepare_sncb` during the OSM snapshot phase.
     pub fn store_railway_graph(&mut self, nodes: Vec<(f64, f64)>, adj: Vec<Vec<(usize, u32)>>) {
-        self.railway_nodes = nodes;
-        self.railway_adj = adj;
+        self.raptor.railway_nodes = nodes;
+        self.raptor.railway_adj = adj;
     }
 
     /// Return a copy of the cached railway data, or `None` if not yet built.
     pub fn get_railway_graph_data(&self) -> Option<(Vec<(f64, f64)>, Vec<Vec<(usize, u32)>>)> {
-        if self.railway_nodes.is_empty() {
+        if self.raptor.railway_nodes.is_empty() {
             None
         } else {
-            Some((self.railway_nodes.clone(), self.railway_adj.clone()))
+            Some((self.raptor.railway_nodes.clone(), self.raptor.railway_adj.clone()))
         }
     }
 }

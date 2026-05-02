@@ -13,7 +13,11 @@ pub fn save_graph(graph: &Graph, path: &str) -> Result<(), String> {
 
 pub fn load_graph(path: &str) -> Result<Graph, String> {
     let bytes = fs::read(path).map_err(|e| format!("Failed to read graph file: {e}"))?;
-    let res = from_bytes(&bytes).map_err(|e| format!("Failed to deserialize graph: {e}"));
+    let graph: Graph = from_bytes(&bytes).map_err(|e| format!("Failed to deserialize graph: {e}"))?;
+    graph.raptor.validate().map_err(|e| {
+        tracing::error!("{e}");
+        e
+    })?;
     tracing::info!("graph restored from {path}");
-    res
+    Ok(graph)
 }

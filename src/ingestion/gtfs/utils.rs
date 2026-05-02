@@ -28,6 +28,10 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
     pub fn get(&self, gtfs_id: &T) -> Option<usize> {
         self.to_index.get(gtfs_id).copied()
     }
+
+    pub fn len(&self) -> usize {
+        self.to_string.len()
+    }
 }
 
 pub fn display_route_type(route_type: RouteType) -> &'static str {

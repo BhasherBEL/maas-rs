@@ -37,8 +37,6 @@ struct RailwayNode {
 
 struct RailwayGraph {
     nodes: Vec<RailwayNode>,
-    #[allow(dead_code)]
-    id_map: HashMap<i64, usize>,
     adj: Vec<Vec<(usize, u32)>>,
     tree: KdTree<f64, usize, [f64; 2]>,
 }
@@ -53,8 +51,7 @@ impl RailwayGraph {
         for (i, n) in nodes.iter().enumerate() {
             let _ = tree.add([n.lat, n.lon], i);
         }
-        // id_map is only needed for OSM parsing, not for routing
-        RailwayGraph { nodes, id_map: HashMap::new(), adj, tree }
+        RailwayGraph { nodes, adj, tree }
     }
 
     fn build(osm_path: &str) -> Result<Self, osmpbf::Error> {
@@ -114,7 +111,7 @@ impl RailwayGraph {
             nodes.len(),
             adj.iter().map(|v| v.len()).sum::<usize>()
         );
-        Ok(RailwayGraph { nodes, id_map, adj, tree })
+        Ok(RailwayGraph { nodes, adj, tree })
     }
 
     /// Returns up to `SNAP_CANDIDATES` railway node indices closest to `(lat, lon)`,
@@ -364,10 +361,6 @@ mod tests {
             .iter()
             .map(|&(lat, lon)| RailwayNode { lat, lon })
             .collect();
-        let mut id_map = HashMap::new();
-        for (i, _) in nodes.iter().enumerate() {
-            id_map.insert(i as i64, i);
-        }
         let n = nodes.len();
         let mut adj = vec![Vec::new(); n];
         for i in 0..n.saturating_sub(1) {
@@ -379,7 +372,7 @@ mod tests {
         for (i, nd) in nodes.iter().enumerate() {
             let _ = tree.add([nd.lat, nd.lon], i);
         }
-        RailwayGraph { nodes, id_map, adj, tree }
+        RailwayGraph { nodes, adj, tree }
     }
 
     // ── is_railway_way ────────────────────────────────────────────────────────
@@ -460,7 +453,6 @@ mod tests {
         let _ = tree.add([51.0, 5.0], 1usize);
         let rg = RailwayGraph {
             nodes,
-            id_map: HashMap::new(),
             adj: vec![Vec::new(), Vec::new()],
             tree,
         };

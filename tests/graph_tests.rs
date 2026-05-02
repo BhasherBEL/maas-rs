@@ -14,7 +14,7 @@ use maas_rs::{
         TimetableSegment, TripId, TripInfo, TripSegment,
     },
     structures::{
-        EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData, RoutingParameters,
+        EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData,
         StreetEdgeData, TransitEdgeData, TransitStopData,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
@@ -1503,114 +1503,25 @@ fn raptor_range_connecting_pattern_not_starved_by_dead_end_pattern() {
     }
 }
 
-// ── A* routing ───────────────────────────────────────────────────────────────
-
+/// Verifies that `with_access_search` doubles `access_secs` until it locates
+/// all stops, and falls back to a walk-only plan when no transit exists.
+/// Uses a two-node street-only graph so RAPTOR must double access_secs
+/// past the walk time and return the walk fallback.
 #[test]
-fn astar_walk_only_plan_on_street_graph() {
-    let (g, a, _, c) = three_node_street_graph();
-    let params = RoutingParameters {
-        walking_speed: 5 * 278, // 5 km/h in mm/s
-        estimator_speed: 50 * 278,
-    };
-
-    let plan = g.a_star(a, c, 3600, 0, 0x01, params).expect("a_star should find a route");
-
-    assert_eq!(plan.start, 3600);
-    assert!(plan.end > plan.start, "plan should have positive duration");
-    assert!(!plan.legs.is_empty(), "plan should have at least one leg");
-
-    // All legs should be Walk legs on a pure street graph
-    for leg in &plan.legs {
-        match leg {
-            PlanLeg::Walk(_) => {}
-            PlanLeg::Transit(_) => panic!("Expected only Walk legs on a street-only graph"),
-        }
-    }
-}
-
-#[test]
-fn astar_same_origin_destination_returns_empty_legs() {
-    let (g, a, _, _) = three_node_street_graph();
-    let params = RoutingParameters {
-        walking_speed: 5 * 278,
-        estimator_speed: 50 * 278,
-    };
-
-    let plan = g.a_star(a, a, 3600, 0, 0x01, params).expect("a_star should succeed");
-    assert_eq!(plan.start, 3600);
-    assert_eq!(plan.end, 3600);
-    assert!(plan.legs.is_empty());
-}
-
-#[test]
-fn astar_with_transit_edge() {
-    // Build a graph with a transit edge: A --walk-- S1 --transit-- S2 --walk-- B
+fn access_search_doubles_until_walk_plan_returned() {
     let mut g = Graph::new();
-    let a = g.add_node(osm_node("a", 50.000, 4.000));
-    let s1 = g.add_node(osm_node("s1", 50.000, 4.001));
-    let s2 = g.add_node(osm_node("s2", 50.000, 4.010));
-    let b = g.add_node(osm_node("b", 50.000, 4.011));
+    let n0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    let n1 = g.add_node(osm_node("n1", 50.001, 4.0)); // ~111 m apart
+    let dist = LatLng { latitude: 50.0, longitude: 4.0 }
+        .dist(LatLng { latitude: 50.001, longitude: 4.0 }) as usize;
+    g.add_edge(n0, street_edge(n0, n1, dist));
+    g.add_edge(n1, street_edge(n1, n0, dist));
+    g.build_raptor_index();
 
-    // Walking edges
-    g.add_edge(a, street_edge(a, s1, 100));
-    g.add_edge(s2, street_edge(s2, b, 100));
+    // min_access_secs=1 forces many doublings before walk-only is reached.
+    let plans = g.raptor(n0, n1, 0, 0, 0x7F, 1);
 
-    // Transit edge with a departure at 08:00 arriving at 08:10
-    let service = all_days_service();
-    g.add_transit_services(vec![service]);
-    g.add_transit_trips(vec![TripInfo {
-        trip_headsign: Some("Test".to_string()),
-        route_id: RouteId(0),
-        service_id: ServiceId(0),
-        bikes_allowed: None,
-    }]);
-    g.add_transit_routes(vec![RouteInfo {
-        route_short_name: "T1".to_string(),
-        route_long_name: "Test Line".to_string(),
-        route_type: RouteType::Bus,
-        agency_id: AgencyId(0),
-        route_color: None,
-        route_text_color: None,
-    }]);
-    g.add_transit_agencies(vec![AgencyInfo {
-        name: "Agency".to_string(),
-        url: "http://test".to_string(),
-        timezone: "Europe/Brussels".to_string(),
-    }]);
-
-    let departures = vec![TripSegment {
-        trip_id: TripId(0),
-        origin_stop_sequence: 0,
-        destination_stop_sequence: 1,
-        departure: 28800, // 08:00
-        arrival: 29400,   // 08:10
-        service_id: ServiceId(0),
-    }];
-    let tt = TimetableSegment { start: 0, len: 1 };
-    g.add_transit_departures(departures);
-    g.add_edge(
-        s1,
-        EdgeData::Transit(TransitEdgeData {
-            origin: s1,
-            destination: s2,
-            route_id: RouteId(0),
-            timetable_segment: tt,
-            length: 700,
-        }),
-    );
-
-    let params = RoutingParameters {
-        walking_speed: 5 * 278,
-        estimator_speed: 50 * 278,
-    };
-
-    // Start at 07:55 — walk to s1, board transit at 08:00, arrive at 08:10, walk to b
-    let plan = g.a_star(a, b, 28500, 100, 0x01, params).expect("a_star should find a route");
-
-    assert!(plan.end > plan.start);
-    // Should have walk + transit + walk legs
-    let has_transit = plan.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_)));
-    let has_walk = plan.legs.iter().any(|l| matches!(l, PlanLeg::Walk(_)));
-    assert!(has_transit, "plan should include a transit leg");
-    assert!(has_walk, "plan should include a walk leg");
+    assert_eq!(plans.len(), 1, "expected exactly one walk-only plan");
+    assert_eq!(plans[0].legs.len(), 1);
+    assert!(matches!(plans[0].legs[0], PlanLeg::Walk(_)), "single leg should be a walk");
 }
