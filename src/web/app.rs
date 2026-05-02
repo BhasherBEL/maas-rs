@@ -9,8 +9,11 @@ use chrono::{Local, NaiveDate, NaiveTime};
 use poem::{Result, Route, Server, get, handler, listener::TcpListener, web::Html};
 
 use crate::{
-    routing::{routing_astar, routing_raptor},
-    structures::{Graph, RoutingDefaultConfig, RoutingParameters, ServerConfig, plan::Plan},
+    routing::routing_raptor,
+    structures::{
+        Graph, ServerConfig,
+        plan::{CandidateStatus, Plan},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +49,80 @@ struct GtfsAgency {
     routes: Vec<GtfsRoute>,
 }
 
+// ---------------------------------------------------------------------------
+// raptorExplain debug types
+// ---------------------------------------------------------------------------
+
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+enum CandidateStatusGql {
+    /// Plan survived all filters and is in the final result.
+    Kept,
+    /// This RAPTOR round produced no arrival improvement.
+    NotImproving,
+    /// Plan reconstruction returned zero legs for this round.
+    ReconstructionEmpty,
+    /// Dropped by the extreme-risk filter.
+    ExtremeRisk,
+    /// Dropped because a transit leg moves away from the destination.
+    BackwardDetour,
+    /// Dominated in (departure↑, arrival↓, transfers↓) by another plan.
+    ParetoDominated,
+}
+
+#[derive(SimpleObject)]
+struct PlanCandidateGql {
+    /// RAPTOR round (0 = walk-only reach; transfer count = round - 1).
+    round: i32,
+    /// Departure time of the RAPTOR pass that produced this candidate (seconds since midnight).
+    origin_departure: i32,
+    /// The reconstructed plan. `null` for NOT_IMPROVING and RECONSTRUCTION_EMPTY.
+    plan: Option<Plan>,
+    status: CandidateStatusGql,
+    /// Index into `candidates` of the dominating plan. Set only when status is PARETO_DOMINATED.
+    dominator_index: Option<i32>,
+}
+
+#[derive(SimpleObject)]
+struct AccessInfoGql {
+    walk_radius_secs: i32,
+    walk_radius_meters: i32,
+    origin_stops_found: i32,
+    destination_stops_found: i32,
+    /// How many times the walk radius doubled before a result was found.
+    access_attempts: i32,
+    /// True when transit routing failed and a walk-only plan was returned instead.
+    fell_back_to_walk_only: bool,
+}
+
+#[derive(SimpleObject)]
+struct RaptorExplainResult {
+    /// Same plans as the `raptor` query would return for identical parameters.
+    plans: Vec<Plan>,
+    /// Every candidate considered across all RAPTOR rounds, including filtered ones.
+    candidates: Vec<PlanCandidateGql>,
+    access: AccessInfoGql,
+}
+
+fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql {
+    let (status, dominator_index) = match &c.status {
+        CandidateStatus::Kept => (CandidateStatusGql::Kept, None),
+        CandidateStatus::NotImproving => (CandidateStatusGql::NotImproving, None),
+        CandidateStatus::ReconstructionEmpty => (CandidateStatusGql::ReconstructionEmpty, None),
+        CandidateStatus::ExtremeRisk => (CandidateStatusGql::ExtremeRisk, None),
+        CandidateStatus::BackwardDetour => (CandidateStatusGql::BackwardDetour, None),
+        CandidateStatus::ParetoDominated { dominator_index } => {
+            (CandidateStatusGql::ParetoDominated, Some(*dominator_index as i32))
+        }
+    };
+    PlanCandidateGql {
+        round: c.round as i32,
+        origin_departure: c.origin_departure as i32,
+        plan: c.plan,
+        status,
+        dominator_index,
+    }
+}
+
 fn parse_date_time(
     date: &Option<String>,
     time: &Option<String>,
@@ -68,43 +145,12 @@ fn parse_date_time(
     Ok((parsed_date, parsed_time))
 }
 
-struct QueryRoot;
+pub struct QueryRoot;
 
 #[async_graphql::Object]
 impl QueryRoot {
     async fn ping(&self) -> &str {
         "pong"
-    }
-
-    async fn astar(
-        &self,
-        ctx: &Context<'_>,
-        from_lat: f64,
-        from_lng: f64,
-        to_lat: f64,
-        to_lng: f64,
-        date: Option<String>,
-        time: Option<String>,
-    ) -> Result<Plan, Error> {
-        let graph = ctx.data::<Arc<Graph>>()?;
-        let routing_defaults = ctx.data::<RoutingDefaultConfig>()?;
-        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
-
-        let params = RoutingParameters {
-            walking_speed: routing_defaults.walking_speed as usize,
-            estimator_speed: routing_defaults.estimator_speed as usize,
-        };
-
-        let query = routing_astar::RouteQuery {
-            from_lat,
-            from_lng,
-            to_lat,
-            to_lng,
-            date: parsed_date,
-            time: parsed_time,
-        };
-
-        routing_astar::route(graph.as_ref(), &query, params)
     }
 
     async fn raptor(
@@ -138,6 +184,50 @@ impl QueryRoot {
         };
 
         routing_raptor::route(graph.as_ref(), &query)
+    }
+
+    /// Debug query: same parameters as `raptor`, but also returns every candidate plan
+    /// considered (with filter reasons) and the access walk metadata.
+    async fn raptor_explain(
+        &self,
+        ctx: &Context<'_>,
+        from_lat: f64,
+        from_lng: f64,
+        to_lat: f64,
+        to_lng: f64,
+        date: Option<String>,
+        time: Option<String>,
+        window_minutes: Option<i32>,
+        walk_radius_secs: Option<i32>,
+    ) -> Result<RaptorExplainResult, Error> {
+        let graph = ctx.data::<Arc<Graph>>()?;
+        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+
+        let query = routing_raptor::RouteQuery {
+            from_lat,
+            from_lng,
+            to_lat,
+            to_lng,
+            date: parsed_date,
+            time: parsed_time,
+            window_minutes: window_minutes.map(|w| w.max(0) as u32),
+            min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
+        };
+
+        let result = routing_raptor::route_explain(graph.as_ref(), &query)?;
+
+        Ok(RaptorExplainResult {
+            plans: result.plans,
+            candidates: result.candidates.into_iter().map(map_candidate).collect(),
+            access: AccessInfoGql {
+                walk_radius_secs: result.access.walk_radius_secs as i32,
+                walk_radius_meters: result.access.walk_radius_meters as i32,
+                origin_stops_found: result.access.origin_stops_found as i32,
+                destination_stops_found: result.access.destination_stops_found as i32,
+                access_attempts: result.access.access_attempts as i32,
+                fell_back_to_walk_only: result.access.fell_back_to_walk_only,
+            },
+        })
     }
 
     /// Returns every transit stop loaded from GTFS.
@@ -189,15 +279,16 @@ async fn graphiql() -> Html<String> {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-pub async fn server(
+pub fn build_schema(
     graph: Arc<Graph>,
-    server_config: &ServerConfig,
-    routing_defaults: RoutingDefaultConfig,
-) -> std::io::Result<()> {
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+) -> Schema<QueryRoot, EmptyMutation, EmptySubscription> {
+    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(graph)
-        .data(routing_defaults)
-        .finish();
+        .finish()
+}
+
+pub async fn server(graph: Arc<Graph>, server_config: &ServerConfig) -> std::io::Result<()> {
+    let schema = build_schema(graph);
     let app = Route::new()
         .at("/graphql", GraphQL::new(schema))
         .at("/graphiql", get(graphiql));

@@ -108,15 +108,13 @@ async fn main() {
     if let Some(s) = config.default_routing.min_access_secs {
         g.set_min_access_secs(s);
     }
+    if let Some(v) = config.default_routing.walking_speed_mps {
+        g.set_walking_speed_mps(v);
+    }
 
     if !serve_mode {
         return;
     }
 
-    let _ = app::server(
-        Arc::new(g),
-        &config.server,
-        config.default_routing.clone(),
-    )
-    .await;
+    let _ = app::server(Arc::new(g), &config.server).await;
 }

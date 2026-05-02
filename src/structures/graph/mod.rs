@@ -1,22 +1,20 @@
 use std::collections::HashMap;
 
-use gtfs_structures::RouteType;
 use kdtree::{KdTree, distance::squared_euclidean};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ingestion::gtfs::{
-        AgencyId, AgencyInfo, RouteId, RouteInfo, ServicePattern, StopTime, TripId, TripInfo,
-        TripSegment,
-    },
-    structures::{
-        DelayCDF, EdgeData, LatLng, NodeData, NodeID,
-        raptor::{Lookup, PatternID, PatternInfo},
-    },
+    ingestion::gtfs::{AgencyId, AgencyInfo, RouteId, RouteInfo, TripId, TripInfo},
+    structures::{EdgeData, LatLng, NodeData, NodeID},
 };
 
-mod astar;
+use raptor_index::RaptorIndex;
+
+mod raptor_access;
+mod raptor_backward;
 mod raptor_build;
+mod raptor_index;
+mod raptor_plan;
 mod raptor_route;
 mod railway;
 mod transit;
@@ -32,73 +30,10 @@ pub struct Graph {
     edges: Vec<Vec<EdgeData>>,
     nodes_tree: KdTree<f64, NodeID, [f64; 2]>,
     id_mapper: HashMap<String, NodeID>,
-    transit_departures: Vec<TripSegment>,
-    transit_services: Vec<ServicePattern>,
-    transit_trips: Vec<TripInfo>,
-    transit_routes: Vec<RouteInfo>,
-    transit_agencies: Vec<AgencyInfo>,
-    transit_patterns: Vec<PatternInfo>,
-
-    transit_pattern_stops: Vec<NodeID>,
-    transit_stop_patterns: Vec<(PatternID, u32)>,
-    transit_stop_transfers: Vec<(NodeID, u32)>,
-    transit_pattern_stop_times: Vec<StopTime>,
-    transit_pattern_trips: Vec<TripId>,
-
-    transit_idx_pattern_stops: Vec<Lookup>,
-    transit_idx_stop_patterns: Vec<Lookup>,
-    transit_idx_stop_transfers: Vec<Lookup>,
-    transit_idx_pattern_stop_times: Vec<Lookup>,
-    transit_idx_pattern_trips: Vec<Lookup>,
-
-    transit_delay_models: HashMap<RouteType, DelayCDF>,
-
-    transit_node_to_stop: Vec<u32>,
-    transit_stop_to_node: Vec<NodeID>,
-
-    transit_stops_tree: KdTree<f64, usize, [f64; 2]>,
-
-    /// Minimum walk-radius for access/egress stop discovery (seconds).
-    /// Stored in the graph so config.yaml changes take effect after a rebuild.
-    /// Defaults to 600 (10 min) when absent from a serialized graph.
-    #[serde(default = "Graph::default_min_access_secs")]
-    pub min_access_secs: u32,
-
-    /// Reverse transfer index: for each compact target stop, the list of
-    /// (source_compact_idx, walk_time_secs) pairs that walk **to** it.
-    /// Built by `build_reverse_transfers()` as the inverse of `transit_stop_transfers`.
-    /// Absent from old serialised graphs → defaults to empty (backward RAPTOR
-    /// footpath relaxation is skipped, degrading gracefully).
-    #[serde(default)]
-    transit_stop_reverse_transfers: Vec<(usize, u32)>,
-    #[serde(default)]
-    transit_idx_stop_reverse_transfers: Vec<Lookup>,
-
-    /// Flattened shape-point sequences for each transit pattern.
-    /// `transit_pattern_shapes[p]` is the full ordered list of LatLng points
-    /// covering the route from the first to the last stop of pattern p.
-    /// Empty vec when no shape data is available for that pattern.
-    #[serde(default)]
-    transit_pattern_shapes: Vec<Vec<LatLng>>,
-
-    /// For each stop index `s` within pattern `p`,
-    /// `transit_pattern_shape_stop_idx[p][s]` is the index into
-    /// `transit_pattern_shapes[p]` where stop s's position begins.
-    /// Empty vec when no shape data is available.
-    #[serde(default)]
-    transit_pattern_shape_stop_idx: Vec<Vec<u32>>,
-
-    /// Cached railway topology for SNCB shape synthesis (build-time only).
-    /// Stored in osm.bin so --update-gtfs skips re-parsing the OSM PBF.
-    #[serde(default)]
-    railway_nodes: Vec<(f64, f64)>,
-
-    #[serde(default)]
-    railway_adj: Vec<Vec<(usize, u32)>>,
+    pub raptor: RaptorIndex,
 }
 
-static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
-static WALKING_SPEED_M_PER_SEC: f64 = 1.2;
+pub static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
 pub const MAX_SCENARIOS: usize = 2;
 pub const MAX_ROUNDS: usize = 20;
 
@@ -109,51 +44,16 @@ impl Graph {
             edges: Vec::new(),
             nodes_tree: KdTree::new(2),
             id_mapper: HashMap::new(),
-            transit_departures: Vec::<TripSegment>::new(),
-            transit_services: Vec::<ServicePattern>::new(),
-            transit_trips: Vec::<TripInfo>::new(),
-            transit_routes: Vec::<RouteInfo>::new(),
-            transit_agencies: Vec::<AgencyInfo>::new(),
-            transit_patterns: Vec::<PatternInfo>::new(),
-
-            transit_pattern_stops: Vec::<NodeID>::new(),
-            transit_stop_patterns: Vec::<(PatternID, u32)>::new(),
-            transit_stop_transfers: Vec::<(NodeID, u32)>::new(),
-            transit_pattern_stop_times: Vec::new(),
-            transit_pattern_trips: Vec::new(),
-
-            transit_idx_pattern_stops: Vec::<Lookup>::new(),
-            transit_idx_stop_patterns: Vec::<Lookup>::new(),
-            transit_idx_stop_transfers: Vec::<Lookup>::new(),
-            transit_idx_pattern_stop_times: Vec::new(),
-            transit_idx_pattern_trips: Vec::new(),
-
-            transit_delay_models: HashMap::new(),
-
-            transit_node_to_stop: Vec::new(),
-            transit_stop_to_node: Vec::new(),
-
-            transit_stops_tree: KdTree::new(2),
-
-            min_access_secs: Self::default_min_access_secs(),
-
-            transit_stop_reverse_transfers: Vec::new(),
-            transit_idx_stop_reverse_transfers: Vec::new(),
-
-            transit_pattern_shapes: Vec::new(),
-            transit_pattern_shape_stop_idx: Vec::new(),
-
-            railway_nodes: Vec::new(),
-            railway_adj: Vec::new(),
+            raptor: RaptorIndex::new(),
         }
     }
 
-    fn default_min_access_secs() -> u32 {
-        10 * 60
+    pub fn set_min_access_secs(&mut self, secs: u32) {
+        self.raptor.min_access_secs = secs;
     }
 
-    pub fn set_min_access_secs(&mut self, secs: u32) {
-        self.min_access_secs = secs;
+    pub fn set_walking_speed_mps(&mut self, mps: f64) {
+        self.raptor.walking_speed_mps = mps;
     }
 
     pub fn add_node(&mut self, node: NodeData) -> NodeID {
@@ -186,15 +86,15 @@ impl Graph {
     }
 
     pub fn get_trip(&self, id: TripId) -> Option<&TripInfo> {
-        self.transit_trips.get(id.0 as usize)
+        self.raptor.transit_trips.get(id.0 as usize)
     }
 
     pub fn get_route(&self, id: RouteId) -> Option<&RouteInfo> {
-        self.transit_routes.get(id.0 as usize)
+        self.raptor.transit_routes.get(id.0 as usize)
     }
 
     pub fn get_agency(&self, id: AgencyId) -> Option<&AgencyInfo> {
-        self.transit_agencies.get(id.0 as usize)
+        self.raptor.transit_agencies.get(id.0 as usize)
     }
 
     pub fn edge_count(&self) -> usize {
