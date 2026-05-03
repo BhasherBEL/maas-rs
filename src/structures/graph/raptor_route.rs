@@ -5,8 +5,8 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
-        NodeID, ScenarioBag,
-        plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate},
+        NodeData, NodeID, ScenarioBag,
+        plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, StopPathLeg, StopReach},
         raptor::Trace,
     },
 };
@@ -118,7 +118,7 @@ impl Graph {
         weekday: u8,
         origin: NodeID,
         destination: NodeID,
-    ) -> (Vec<Plan>, Vec<PlanCandidate>) {
+    ) -> (Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let n_patterns = self.raptor.transit_patterns.len();
 
@@ -217,6 +217,32 @@ impl Graph {
             }
         }
 
+        let stops_reached: Vec<StopReach> = (0..n_stops)
+            .filter_map(|stop_idx| {
+                for k in 0..=MAX_ROUNDS {
+                    if labels[k][stop_idx].is_reached() {
+                        let node_id = self.raptor.transit_stop_to_node[stop_idx];
+                        let loc = self.nodes[node_id.0].loc();
+                        let name = match &self.nodes[node_id.0] {
+                            NodeData::TransitStop(s) => s.name.clone(),
+                            _ => String::new(),
+                        };
+                        let path = self.path_to_stop(stop_idx, k, origin, &traces);
+                        return Some(StopReach {
+                            stop_idx: stop_idx as u32,
+                            round: k as u8,
+                            arrival_secs: labels[k][stop_idx].earliest(),
+                            lat: loc.latitude,
+                            lon: loc.longitude,
+                            name,
+                            path,
+                        });
+                    }
+                }
+                None
+            })
+            .collect();
+
         let mut candidates: Vec<PlanCandidate> = Vec::new();
         let plans = self.extract_with_debug(
             sources,
@@ -231,12 +257,86 @@ impl Graph {
             destination,
             Some(&mut candidates),
         );
-        (plans, candidates)
+        (plans, candidates, stops_reached)
+    }
+
+    /// Follows RAPTOR traces backward from `stop_idx` at `round` and builds the
+    /// ordered sequence of legs (walk / transit) that the algorithm used to reach it.
+    /// Transit legs include all intermediate pattern stops as geometry waypoints.
+    fn path_to_stop(
+        &self,
+        stop_idx: usize,
+        round: usize,
+        origin: NodeID,
+        traces: &[Vec<Trace>],
+    ) -> Vec<StopPathLeg> {
+        let mut legs: Vec<StopPathLeg> = Vec::new();
+        let mut stop = stop_idx;
+        let mut k = round;
+
+        loop {
+            let trace = traces[k][stop];
+            let to_node = self.raptor.transit_stop_to_node[stop];
+            let to_loc = self.nodes[to_node.0].loc();
+
+            if trace.is_transit() {
+                let p = trace.pattern as usize;
+                let bp = trace.boarded_at as usize;
+                let ap = trace.alighted_at as usize;
+                let pat_stops = self.raptor.transit_idx_pattern_stops[p]
+                    .of(&self.raptor.transit_pattern_stops);
+
+                let geometry: Vec<PlanCoordinate> = (bp..=ap)
+                    .map(|i| {
+                        let loc = self.nodes[pat_stops[i].0].loc();
+                        PlanCoordinate { lat: loc.latitude, lon: loc.longitude }
+                    })
+                    .collect();
+
+                let route_id = self.raptor.transit_patterns[p].route;
+                let route_label = self.raptor.transit_routes[route_id.0 as usize].route_short_name.clone();
+
+                legs.push(StopPathLeg { is_transit: true, route_label, geometry });
+
+                let boarding_stop = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
+                stop = boarding_stop;
+                k = k.saturating_sub(1);
+            } else if trace.is_transfer() {
+                let from = trace.from_stop as usize;
+                let from_node = self.raptor.transit_stop_to_node[from];
+                let from_loc = self.nodes[from_node.0].loc();
+                legs.push(StopPathLeg {
+                    is_transit: false,
+                    route_label: String::new(),
+                    geometry: vec![
+                        PlanCoordinate { lat: from_loc.latitude, lon: from_loc.longitude },
+                        PlanCoordinate { lat: to_loc.latitude, lon: to_loc.longitude },
+                    ],
+                });
+                stop = from;
+                // k stays the same for transfers
+            } else {
+                // Access walk: origin → this stop
+                let from_loc = self.nodes[origin.0].loc();
+                legs.push(StopPathLeg {
+                    is_transit: false,
+                    route_label: String::new(),
+                    geometry: vec![
+                        PlanCoordinate { lat: from_loc.latitude, lon: from_loc.longitude },
+                        PlanCoordinate { lat: to_loc.latitude, lon: to_loc.longitude },
+                    ],
+                });
+                break;
+            }
+        }
+
+        legs.reverse();
+        legs
     }
 
     /// Debug variant of `with_access_search`.
     ///
-    /// The closure returns `Option<(Vec<Plan>, Vec<PlanCandidate>)>`:
+    /// The closure returns `Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>`:
     /// `None` = no result yet, widen radius; `Some(...)` = routing succeeded.
     fn with_access_search_debug<F>(
         &self,
@@ -245,9 +345,9 @@ impl Graph {
         start_time: u32,
         min_access_secs: u32,
         mut try_routing: F,
-    ) -> (Vec<Plan>, Vec<PlanCandidate>, AccessInfo)
+    ) -> (Vec<Plan>, Vec<PlanCandidate>, AccessInfo, Vec<StopReach>)
     where
-        F: FnMut(&[(usize, u32)], &[(usize, u32)], u32) -> Option<(Vec<Plan>, Vec<PlanCandidate>)>,
+        F: FnMut(&[(usize, u32)], &[(usize, u32)], u32) -> Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>,
     {
         let straight_line_secs =
             (self.nodes_distance(origin, destination) as f64 / self.raptor.walking_speed_mps) as u32;
@@ -263,7 +363,7 @@ impl Graph {
             let targets = self.nearby_stops(destination, access_secs);
 
             if !raw_stops.is_empty() && !targets.is_empty() {
-                if let Some((plans, candidates)) = try_routing(&raw_stops, &targets, access_secs) {
+                if let Some((plans, candidates, stops)) = try_routing(&raw_stops, &targets, access_secs) {
                     let access = AccessInfo {
                         walk_radius_secs: access_secs,
                         walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
@@ -272,7 +372,7 @@ impl Graph {
                         access_attempts: attempts,
                         fell_back_to_walk_only: false,
                     };
-                    return (plans, candidates, access);
+                    return (plans, candidates, access, stops);
                 }
             }
 
@@ -310,7 +410,7 @@ impl Graph {
                         access_attempts: attempts,
                         fell_back_to_walk_only: true,
                     };
-                    return (plans, candidates, access);
+                    return (plans, candidates, access, vec![]);
                 }
             }
         }
@@ -325,7 +425,7 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> ExplainResult {
-        let (plans, candidates, access) = self.with_access_search_debug(
+        let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
             start_time,
@@ -333,13 +433,20 @@ impl Graph {
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> =
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
-                let (plans, cands) = self.raptor_inner_with_debug(
+                let (plans, cands, stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
                 );
-                if plans.is_empty() { None } else { Some((plans, cands)) }
+                if plans.is_empty() { None } else { Some((plans, cands, stops)) }
             },
         );
-        ExplainResult { plans, candidates, access }
+        ExplainResult {
+            plans,
+            candidates,
+            access,
+            stops_reached,
+            origin: self.node_coord(origin),
+            destination: self.node_coord(destination),
+        }
     }
 
     pub fn raptor_range_explain(
@@ -352,7 +459,7 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> ExplainResult {
-        let (plans, candidates, access) = self.with_access_search_debug(
+        let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
             start_time,
@@ -360,7 +467,7 @@ impl Graph {
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> =
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
-                let (probe, probe_cands) = self.raptor_inner_with_debug(
+                let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
                 );
                 if probe.is_empty() {
@@ -375,7 +482,7 @@ impl Graph {
                     weekday,
                 );
                 if departure_times.is_empty() {
-                    return Some((probe, probe_cands));
+                    return Some((probe, probe_cands, probe_stops));
                 }
 
                 let mut all_plans = probe;
@@ -384,7 +491,7 @@ impl Graph {
                 for t in departure_times {
                     let sources_t: Vec<(usize, u32)> =
                         raw_stops.iter().map(|&(s, w)| (s, t + w)).collect();
-                    let (plans_t, mut cands_t) = self.raptor_inner_with_debug(
+                    let (plans_t, mut cands_t, _stops_t) = self.raptor_inner_with_debug(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
                     );
                     all_plans.extend(plans_t);
@@ -404,10 +511,17 @@ impl Graph {
                 let final_plans =
                     Self::pareto_filter_with_debug(all_plans, &plan_to_sink_idx, &mut all_candidates);
 
-                Some((final_plans, all_candidates))
+                Some((final_plans, all_candidates, probe_stops))
             },
         );
-        ExplainResult { plans, candidates, access }
+        ExplainResult {
+            plans,
+            candidates,
+            access,
+            stops_reached,
+            origin: self.node_coord(origin),
+            destination: self.node_coord(destination),
+        }
     }
 
     fn collect_routes(&self, marked: &[usize], queue: &mut Vec<usize>, queue_pos: &mut [u32]) {

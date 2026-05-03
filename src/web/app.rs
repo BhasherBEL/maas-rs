@@ -12,7 +12,7 @@ use crate::{
     routing::routing_raptor,
     structures::{
         Graph, ServerConfig,
-        plan::{CandidateStatus, Plan},
+        plan::{CandidateStatus, Plan, PlanCoordinate},
     },
 };
 
@@ -80,6 +80,12 @@ struct PlanCandidateGql {
     status: CandidateStatusGql,
     /// Index into `candidates` of the dominating plan. Set only when status is PARETO_DOMINATED.
     dominator_index: Option<i32>,
+    /// Dominator departs later than this plan (true = this plan had an earlier departure but still lost).
+    dominator_departs_later: Option<bool>,
+    /// Dominator arrives earlier than this plan (true = this plan has a worse arrival time).
+    dominator_arrives_earlier: Option<bool>,
+    /// Dominator uses fewer transfers than this plan.
+    dominator_fewer_transfers: Option<bool>,
 }
 
 #[derive(SimpleObject)]
@@ -95,31 +101,82 @@ struct AccessInfoGql {
 }
 
 #[derive(SimpleObject)]
+struct StopPathLegGql {
+    /// `true` = transit leg on a scheduled route, `false` = walk.
+    is_transit: bool,
+    /// Route short name for transit legs; empty string for walk legs.
+    route_label: String,
+    /// Waypoints: boarding → intermediate stops → alighting (transit), or just endpoints (walk).
+    geometry: Vec<PlanCoordinate>,
+}
+
+#[derive(SimpleObject)]
+struct StopReachGql {
+    stop_idx: i32,
+    /// 0 = walk-access reach; k≥1 = reached after k transit legs.
+    round: i32,
+    arrival_secs: i32,
+    lat: f64,
+    lon: f64,
+    name: String,
+    /// Ordered sequence of legs that RAPTOR followed from origin to this stop.
+    path: Vec<StopPathLegGql>,
+}
+
+#[derive(SimpleObject)]
 struct RaptorExplainResult {
     /// Same plans as the `raptor` query would return for identical parameters.
     plans: Vec<Plan>,
     /// Every candidate considered across all RAPTOR rounds, including filtered ones.
     candidates: Vec<PlanCandidateGql>,
     access: AccessInfoGql,
+    /// All transit stops that received a RAPTOR label, tagged with the first
+    /// round they were reached.  Round 0 = access walk reach.
+    stops_reached: Vec<StopReachGql>,
+    /// Snapped origin coordinates (the OSM node the router actually used).
+    origin: PlanCoordinate,
+    /// Snapped destination coordinates.
+    destination: PlanCoordinate,
 }
 
 fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql {
-    let (status, dominator_index) = match &c.status {
-        CandidateStatus::Kept => (CandidateStatusGql::Kept, None),
-        CandidateStatus::NotImproving => (CandidateStatusGql::NotImproving, None),
-        CandidateStatus::ReconstructionEmpty => (CandidateStatusGql::ReconstructionEmpty, None),
-        CandidateStatus::ExtremeRisk => (CandidateStatusGql::ExtremeRisk, None),
-        CandidateStatus::BackwardDetour => (CandidateStatusGql::BackwardDetour, None),
-        CandidateStatus::ParetoDominated { dominator_index } => {
-            (CandidateStatusGql::ParetoDominated, Some(*dominator_index as i32))
-        }
-    };
+    let (status, dominator_index, dom_departs_later, dom_arrives_earlier, dom_fewer_transfers) =
+        match &c.status {
+            CandidateStatus::Kept => (CandidateStatusGql::Kept, None, None, None, None),
+            CandidateStatus::NotImproving => {
+                (CandidateStatusGql::NotImproving, None, None, None, None)
+            }
+            CandidateStatus::ReconstructionEmpty => {
+                (CandidateStatusGql::ReconstructionEmpty, None, None, None, None)
+            }
+            CandidateStatus::ExtremeRisk => {
+                (CandidateStatusGql::ExtremeRisk, None, None, None, None)
+            }
+            CandidateStatus::BackwardDetour => {
+                (CandidateStatusGql::BackwardDetour, None, None, None, None)
+            }
+            CandidateStatus::ParetoDominated {
+                dominator_index,
+                departure_worse,
+                arrival_worse,
+                transfers_worse,
+            } => (
+                CandidateStatusGql::ParetoDominated,
+                Some(*dominator_index as i32),
+                Some(*departure_worse),
+                Some(*arrival_worse),
+                Some(*transfers_worse),
+            ),
+        };
     PlanCandidateGql {
         round: c.round as i32,
         origin_departure: c.origin_departure as i32,
         plan: c.plan,
         status,
         dominator_index,
+        dominator_departs_later: dom_departs_later,
+        dominator_arrives_earlier: dom_arrives_earlier,
+        dominator_fewer_transfers: dom_fewer_transfers,
     }
 }
 
@@ -227,6 +284,21 @@ impl QueryRoot {
                 access_attempts: result.access.access_attempts as i32,
                 fell_back_to_walk_only: result.access.fell_back_to_walk_only,
             },
+            stops_reached: result.stops_reached.into_iter().map(|s| StopReachGql {
+                stop_idx: s.stop_idx as i32,
+                round: s.round as i32,
+                arrival_secs: s.arrival_secs as i32,
+                lat: s.lat,
+                lon: s.lon,
+                name: s.name,
+                path: s.path.into_iter().map(|l| StopPathLegGql {
+                    is_transit: l.is_transit,
+                    route_label: l.route_label,
+                    geometry: l.geometry,
+                }).collect(),
+            }).collect(),
+            origin: result.origin,
+            destination: result.destination,
         })
     }
 
@@ -274,6 +346,13 @@ impl QueryRoot {
     }
 }
 
+const MAP_HTML: &str = include_str!("static/map.html");
+
+#[handler]
+pub async fn map_page() -> Html<&'static str> {
+    Html(MAP_HTML)
+}
+
 #[handler]
 async fn graphiql() -> Html<String> {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
@@ -291,7 +370,8 @@ pub async fn server(graph: Arc<Graph>, server_config: &ServerConfig) -> std::io:
     let schema = build_schema(graph);
     let app = Route::new()
         .at("/graphql", GraphQL::new(schema))
-        .at("/graphiql", get(graphiql));
+        .at("/graphiql", get(graphiql))
+        .at("/map", get(map_page));
 
     let bind = format!("{}:{}", server_config.host, server_config.port);
     tracing::info!("serving on {bind}");

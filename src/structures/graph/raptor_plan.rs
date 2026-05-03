@@ -54,6 +54,7 @@ impl Graph {
             start: start_time,
             end,
             arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            expected_end: end,
         }
     }
 
@@ -284,11 +285,16 @@ impl Graph {
                         .collect(),
                 };
 
+            let expected_end = arrival_distribution
+                .iter()
+                .map(|s| s.time as f64 * s.probability as f64)
+                .sum::<f64>() as u32;
             let plan = Plan {
                 legs: Self::merge_consecutive_walks(legs),
                 start: departure,
                 end: best_arr,
                 arrival_distribution,
+                expected_end,
             };
 
             if let Some(ref mut sink) = debug_sink {
@@ -479,6 +485,7 @@ impl Graph {
                     scheduled_departure: board_dep,
                     next_departure,
                     next_reliability,
+                    margin_secs: Some(margin),
                 })
             };
 
@@ -715,6 +722,7 @@ impl Graph {
                             scheduled_departure: next_t.start,
                             next_departure: next_dep,
                             next_reliability: next_rel,
+                            margin_secs: Some(margin),
                         });
                     } else {
                         next_t.transfer_risk = None;
@@ -791,6 +799,9 @@ impl Graph {
                 if tc_e <= tc_p && existing.end <= plan.end && existing.start >= plan.start {
                     sink[sink_idx].status = CandidateStatus::ParetoDominated {
                         dominator_index: result_sink_idx[i],
+                        departure_worse: existing.start > plan.start,
+                        arrival_worse: existing.end < plan.end,
+                        transfers_worse: tc_e < tc_p,
                     };
                     continue 'outer;
                 }
@@ -808,6 +819,9 @@ impl Graph {
                     dominated[i] = true;
                     sink[result_sink_idx[i]].status = CandidateStatus::ParetoDominated {
                         dominator_index: sink_idx,
+                        departure_worse: plan.start > existing.start,
+                        arrival_worse: plan.end < existing.end,
+                        transfers_worse: tc_p < tc_e,
                     };
                 }
             }

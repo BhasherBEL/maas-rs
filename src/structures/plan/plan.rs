@@ -1,6 +1,6 @@
 use async_graphql::SimpleObject;
 
-use crate::structures::plan::PlanLeg;
+use crate::structures::plan::{PlanCoordinate, PlanLeg};
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ArrivalScenario {
@@ -18,6 +18,10 @@ pub struct Plan {
     /// Possible arrival times and their probabilities, sorted earliest first.
     /// Single entry with probability 1.0 for deterministic routes.
     pub arrival_distribution: Vec<ArrivalScenario>,
+    /// Probability-weighted expected arrival time (seconds since midnight).
+    /// Equals `end` for deterministic routes; higher than `end` when transfers
+    /// carry risk (infeasible transfer → high-delay scenario shifts expectation up).
+    pub expected_end: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +42,13 @@ pub enum CandidateStatus {
     BackwardDetour,
     /// Dominated in (departure↑, arrival↓, transfers↓) by another plan.
     /// `dominator_index` is the position of the dominator in `ExplainResult::candidates`.
-    ParetoDominated { dominator_index: usize },
+    /// The three flags record *which* dimensions the dominator wins on.
+    ParetoDominated {
+        dominator_index: usize,
+        departure_worse: bool,
+        arrival_worse: bool,
+        transfers_worse: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -64,9 +74,40 @@ pub struct AccessInfo {
     pub fell_back_to_walk_only: bool,
 }
 
+/// One leg in the path that led RAPTOR to a particular stop.
+/// Segments are ordered origin → destination.
+#[derive(Debug, Clone)]
+pub struct StopPathLeg {
+    /// `true` = transit leg on a scheduled route, `false` = walk.
+    pub is_transit: bool,
+    /// Route short name for transit legs; empty string for walk legs.
+    pub route_label: String,
+    /// Waypoints along the leg (boarding stop → intermediate stops → alighting stop,
+    /// or just origin/destination for walk legs).
+    pub geometry: Vec<PlanCoordinate>,
+}
+
+/// One transit stop reached during RAPTOR exploration.
+/// `round = 0` means the stop was seeded as an access/egress stop (walk reach).
+/// Only the lowest-round entry for each stop is included.
+#[derive(Debug, Clone)]
+pub struct StopReach {
+    pub stop_idx: u32,
+    pub round: u8,
+    pub arrival_secs: u32,
+    pub lat: f64,
+    pub lon: f64,
+    pub name: String,
+    /// Ordered sequence of legs (origin → this stop) that RAPTOR followed to reach it.
+    pub path: Vec<StopPathLeg>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExplainResult {
     pub plans: Vec<Plan>,
     pub candidates: Vec<PlanCandidate>,
     pub access: AccessInfo,
+    pub stops_reached: Vec<StopReach>,
+    pub origin: PlanCoordinate,
+    pub destination: PlanCoordinate,
 }

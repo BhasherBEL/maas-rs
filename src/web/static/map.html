@@ -1,0 +1,1164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAPTOR Map Visualizer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; font-family: system-ui, sans-serif; font-size: 14px; }
+    #root { display: flex; height: 100%; }
+
+    /* ── Sidebar ─────────────────────────────────────────── */
+    #sidebar {
+      width: 360px;
+      min-width: 360px;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #ddd;
+      overflow: hidden;
+    }
+    #sidebar section {
+      padding: 12px;
+      border-bottom: 1px solid #eee;
+    }
+    #sidebar section h2 {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #555;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+    #sidebar section h2 .toggle { font-size: 10px; color: #999; }
+
+    /* ── Input panel ─────────────────────────────────────── */
+    #input-panel label { display: block; margin-bottom: 6px; color: #333; }
+    #input-panel .coord-row { display: flex; gap: 6px; }
+    #input-panel .coord-row input { flex: 1; }
+    #input-panel input {
+      width: 100%;
+      padding: 5px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    #input-panel .hint { font-size: 11px; color: #888; margin-top: 4px; }
+    #go-btn {
+      margin-top: 10px;
+      width: 100%;
+      padding: 8px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    #go-btn:hover { background: #1d4ed8; }
+    #go-btn:disabled { background: #93c5fd; cursor: default; }
+
+    /* ── Access info ─────────────────────────────────────── */
+    #access-info { display: none; }
+    #access-info dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+    #access-info dt { color: #666; }
+    #access-info dd { font-weight: 500; }
+
+    /* ── Legend ──────────────────────────────────────────── */
+    #legend-body { font-size: 12px; line-height: 1.7; }
+    #legend-body .leg-group { margin-bottom: 6px; }
+    #legend-body .leg-group strong { display: block; color: #444; margin-bottom: 2px; }
+    .swatch {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+    .swatch-sq {
+      display: inline-block;
+      width: 12px; height: 12px;
+      border-radius: 2px;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+    .swatch-line {
+      display: inline-block;
+      width: 20px; height: 3px;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+    .swatch-dash {
+      display: inline-block;
+      width: 20px; height: 0;
+      border-top: 2px dashed #888;
+      vertical-align: middle;
+      margin-right: 4px;
+    }
+
+    /* ── Candidates ──────────────────────────────────────── */
+    #candidates-section { flex: 1; overflow-y: auto; }
+    #candidates-list { list-style: none; }
+    #candidates-list li {
+      padding: 6px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      cursor: pointer;
+    }
+    #candidates-list li:hover { background: #f7f7f7; }
+    #candidates-list li.kept { font-weight: 600; }
+    #candidates-list li.active { background: #eff6ff; }
+
+    .cand-row1 { display: flex; gap: 6px; align-items: center; }
+    .cand-row2 { font-size: 11px; color: #666; margin-top: 2px; padding-left: 2px; }
+
+    .badge {
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 10px;
+      font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .badge-kept      { background: #dcfce7; color: #166534; }
+    .badge-pareto    { background: #fef9c3; color: #713f12; }
+    .badge-risk      { background: #fee2e2; color: #991b1b; }
+    .badge-detour    { background: #ede9fe; color: #5b21b6; }
+    .badge-empty     { background: #f3f4f6; color: #6b7280; }
+    .badge-notimpr   { background: #f3f4f6; color: #6b7280; }
+
+    .candidate-time { font-variant-numeric: tabular-nums; font-size: 13px; }
+    .candidate-round { font-size: 11px; color: #888; flex-shrink: 0; }
+
+    .xfer-dot {
+      display: inline-block;
+      width: 9px; height: 9px;
+      border-radius: 2px;
+      flex-shrink: 0;
+      vertical-align: middle;
+    }
+
+    .expected-warn { color: #b45309; font-weight: 600; }
+    .dom-reason { color: #92400e; }
+
+    /* ── Error banner ────────────────────────────────────── */
+    #error-banner {
+      display: none;
+      margin: 8px 0 0;
+      padding: 8px;
+      background: #fee2e2;
+      color: #991b1b;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+
+    /* ── Map ─────────────────────────────────────────────── */
+    #map { flex: 1; }
+
+    /* ── Right-click context menu ────────────────────────── */
+    #ctx-menu {
+      display: none;
+      position: fixed;
+      z-index: 9999;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      box-shadow: 0 4px 16px #0002;
+      min-width: 180px;
+      overflow: hidden;
+    }
+    #ctx-menu button {
+      display: block;
+      width: 100%;
+      padding: 10px 16px;
+      text-align: left;
+      background: none;
+      border: none;
+      font-size: 13px;
+      cursor: pointer;
+      color: #1e293b;
+    }
+    #ctx-menu button:hover { background: #f1f5f9; }
+    #ctx-menu hr { margin: 2px 0; border: none; border-top: 1px solid #eee; }
+
+    /* ── Plan detail ─────────────────────────────────────── */
+    #plan-detail { display: none; max-height: 260px; overflow-y: auto; }
+    .pd-leg { border-bottom: 1px solid #f0f0f0; }
+    .pd-leg-header {
+      display: flex; align-items: center; gap: 7px;
+      padding: 7px 0; font-size: 13px; cursor: pointer; user-select: none;
+    }
+    .pd-leg-header:hover { background: #f8f9fa; margin: 0 -12px; padding-left: 12px; padding-right: 12px; }
+    .pd-mode {
+      width: 22px; height: 22px; border-radius: 4px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 12px;
+    }
+    .pd-transit .pd-mode { color: #fff; }
+    .pd-walk    .pd-mode { background: #f3f4f6; }
+    .pd-route-name { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pd-time { font-variant-numeric: tabular-nums; color: #6b7280; font-size: 12px; flex-shrink: 0; }
+    .pd-arrow { font-size: 9px; color: #aaa; flex-shrink: 0; }
+    .pd-stops { display: none; padding: 2px 0 6px 14px; border-left: 2px solid #e5e7eb; margin-left: 10px; }
+    .pd-stops.open { display: block; }
+    .pd-stop { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 12px; }
+    .pd-stop-dot { width: 7px; height: 7px; border-radius: 50%; background: #d1d5db; flex-shrink: 0; }
+    .pd-stop-dot.board, .pd-stop-dot.alight { background: #374151; width: 9px; height: 9px; }
+    .pd-stop-name { flex: 1; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pd-stop-time { font-variant-numeric: tabular-nums; color: #6b7280; font-size: 11px; flex-shrink: 0; }
+
+    /* ── Selected-stop comparison card ──────────────────── */
+    #stop-info { display: none; }
+    #stop-info-name { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    .stop-row {
+      display: flex; align-items: baseline; gap: 8px;
+      padding: 5px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px;
+    }
+    .stop-row:last-child { border-bottom: none; }
+    .stop-label { color: #6b7280; font-size: 11px; min-width: 60px; }
+    .stop-time  { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .stop-time.raptor { color: #7c3aed; }
+    .stop-time.plan   { color: #d97706; }
+    .stop-delta { font-size: 11px; color: #6b7280; }
+    .stop-delta.worse  { color: #dc2626; }
+    .stop-delta.better { color: #16a34a; }
+  </style>
+</head>
+<body>
+<div id="root">
+  <div id="sidebar">
+
+    <section id="input-panel">
+      <h2>Journey</h2>
+      <label>
+        From
+        <div class="coord-row">
+          <input id="from-lat" type="number" step="any" placeholder="Lat" />
+          <input id="from-lng" type="number" step="any" placeholder="Lng" />
+        </div>
+      </label>
+      <label>
+        To
+        <div class="coord-row">
+          <input id="to-lat" type="number" step="any" placeholder="Lat" />
+          <input id="to-lng" type="number" step="any" placeholder="Lng" />
+        </div>
+      </label>
+      <label>Date <input id="date" type="date" /></label>
+      <label>Time <input id="time" type="time" /></label>
+      <p class="hint">Right-click the map to set origin or destination</p>
+      <button id="go-btn">Plan</button>
+      <div id="error-banner"></div>
+    </section>
+
+    <section id="access-info">
+      <h2>Access</h2>
+      <dl>
+        <dt>Walk radius</dt><dd id="ai-radius">—</dd>
+        <dt>Origin stops</dt><dd id="ai-orig">—</dd>
+        <dt>Dest stops</dt><dd id="ai-dest">—</dd>
+        <dt>Attempts</dt><dd id="ai-att">—</dd>
+        <dt>Walk-only fallback</dt><dd id="ai-walk">—</dd>
+      </dl>
+    </section>
+
+    <section id="plan-detail">
+      <h2>Plan <span id="plan-detail-close" style="font-weight:400;font-size:11px;color:#999;cursor:pointer;float:right">✕ clear</span></h2>
+      <div id="plan-detail-body"></div>
+    </section>
+
+    <section id="stop-info">
+      <h2>Stop <span id="stop-info-close" style="font-weight:400;font-size:11px;color:#999;cursor:pointer;float:right">✕ clear</span></h2>
+      <div id="stop-info-name"></div>
+      <div id="stop-info-rows"></div>
+    </section>
+
+    <section id="legend-section">
+      <h2>Legend <span class="toggle" id="legend-toggle">▲ hide</span></h2>
+      <div id="legend-body">
+
+        <div class="leg-group">
+          <strong>Stops reached (dots on map)</strong>
+          <div><span class="swatch" style="background:#aaa"></span>Round 0 — walk access reach</div>
+          <div><span class="swatch" style="background:#e41a1c"></span>Round 1 — 1 transit leg</div>
+          <div><span class="swatch" style="background:#377eb8"></span>Round 2 — 2 transit legs</div>
+          <div><span class="swatch" style="background:#4daf4a"></span>Round 3 — 3 transit legs</div>
+          <div><span class="swatch" style="background:#984ea3"></span>Round 4 — 4 transit legs</div>
+          <div><span class="swatch" style="background:#ff7f00"></span>Round 5+ — 5+ transit legs</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Transfer boarding markers (■ squares)</strong>
+          <div><span class="swatch-sq" style="background:#ef4444"></span>Impossible — arrived after departure</div>
+          <div><span class="swatch-sq" style="background:#f97316"></span>Very risky — &lt; 2 min margin</div>
+          <div><span class="swatch-sq" style="background:#eab308"></span>Tight — 2–5 min margin</div>
+          <div><span class="swatch-sq" style="background:#22c55e"></span>Comfortable — &gt; 5 min margin</div>
+          <div><span class="swatch-sq" style="background:#94a3b8"></span>First leg — no preceding vehicle</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Plan legs</strong>
+          <div><span class="swatch-line" style="background:#2563eb"></span>Transit leg (kept plan)</div>
+          <div><span class="swatch-dash"></span>Walk leg (kept plan)</div>
+          <div><span class="swatch-line" style="background:#f59e0b"></span>Transit leg (candidate preview)</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Stop path (click a stop dot)</strong>
+          <div><span class="swatch-line" style="background:#7c3aed"></span>RAPTOR optimal path — transit</div>
+          <div><span class="swatch-dash" style="border-color:#059669"></span>RAPTOR optimal path — walk</div>
+          <div><span class="swatch-line" style="background:#f59e0b"></span>Global plan path to stop — transit</div>
+          <div><span class="swatch-dash" style="border-color:#d97706"></span>Global plan path to stop — walk</div>
+          <div style="color:#555;font-size:11px">Sidebar shows arrival-time comparison when stop is in the final plan. Click again to clear.</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Candidate status badges</strong>
+          <div><span class="badge badge-kept">KEPT</span> Final result</div>
+          <div><span class="badge badge-pareto">dominated</span> Filtered: Pareto-dominated</div>
+          <div><span class="badge badge-risk">RISK</span> Filtered: extreme risk (no safe plan exists)</div>
+          <div><span class="badge badge-detour">DETOUR</span> Filtered: backward detour</div>
+          <div><span class="badge badge-notimpr">NO-IMPV</span> Round improved nothing</div>
+          <div><span class="badge badge-empty">EMPTY</span> Plan reconstruction returned no legs</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Candidate panel — extra columns</strong>
+          <div>■ colored square = worst transfer risk in the plan</div>
+          <div>≈HH:MM = probability-weighted <em>expected</em> arrival</div>
+          <div>If expected ≫ nominal → unreliable despite earlier nominal time</div>
+          <div>dom→N = dominated by candidate N; reason shown below</div>
+        </div>
+
+        <div class="leg-group">
+          <strong>Map markers</strong>
+          <div><span class="swatch" style="background:#22c55e"></span>Snapped origin</div>
+          <div><span class="swatch" style="background:#ef4444"></span>Snapped destination</div>
+          <div>○ blue dashed circle = origin walk radius</div>
+          <div>○ green dashed circle = dest walk radius</div>
+        </div>
+
+      </div>
+    </section>
+
+    <section id="candidates-section">
+      <h2>Candidates <span id="cand-count" style="font-weight:400;color:#999"></span></h2>
+      <ul id="candidates-list"></ul>
+    </section>
+
+  </div>
+  <div id="map"></div>
+</div>
+
+<div id="ctx-menu">
+  <button id="ctx-from">📍 From this point</button>
+  <hr>
+  <button id="ctx-to">🏁 To this point</button>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+'use strict';
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const GRAPHQL_URL = '/graphql';
+
+// Round 0 = access reach (grey); rounds 1–5 distinct; 6+ grey
+const ROUND_COLORS = ['#aaaaaa','#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00'];
+function roundColor(r) {
+  return r < ROUND_COLORS.length ? ROUND_COLORS[r] : '#888888';
+}
+
+// Transfer margin → colour
+function marginColor(secs) {
+  if (secs == null)  return '#94a3b8'; // no preceding vehicle (first leg)
+  if (secs < 0)      return '#ef4444'; // impossible
+  if (secs < 120)    return '#f97316'; // < 2 min — very risky
+  if (secs < 300)    return '#eab308'; // 2–5 min — tight
+  return '#22c55e';                    // comfortable
+}
+
+function marginLabel(secs) {
+  if (secs == null) return 'first leg';
+  if (secs < 0)     return `IMPOSSIBLE (${fmtMins(secs)} late)`;
+  if (secs < 60)    return `${secs}s margin`;
+  return `${fmtMins(secs)} margin`;
+}
+
+// ── GraphQL query ─────────────────────────────────────────────────────────────
+const QUERY = `query MapExplain(
+  $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
+  $date: String, $time: String, $windowMinutes: Int
+) {
+  raptorExplain(
+    fromLat: $fromLat, fromLng: $fromLng,
+    toLat: $toLat, toLng: $toLng,
+    date: $date, time: $time,
+    windowMinutes: $windowMinutes
+  ) {
+    origin { lat lon }
+    destination { lat lon }
+    access {
+      walkRadiusMeters originStopsFound destinationStopsFound
+      accessAttempts fellBackToWalkOnly
+    }
+    stopsReached {
+      lat lon round arrivalSecs name
+      path { isTransit routeLabel geometry { lat lon } }
+    }
+    plans {
+      start end expectedEnd
+      legs {
+        ... on PlanWalkLeg { start end duration geometry { lat lon } }
+        ... on PlanTransitLeg {
+          start end geometry { lat lon }
+          precedingArrival
+          transferRisk { marginSecs reliability scheduledDeparture nextDeparture }
+          trip { headsign route { shortName mode color } }
+          from { departure node { name lat lon } }
+          steps {
+            ... on PlanTransitLegStep {
+              time
+              place { arrival node { name lat lon } }
+            }
+          }
+        }
+      }
+    }
+    candidates {
+      round status dominatorIndex originDeparture
+      dominatorDepartsLater dominatorArrivesEarlier dominatorFewerTransfers
+      plan {
+        start end expectedEnd
+        legs {
+          ... on PlanWalkLeg { start end duration geometry { lat lon } }
+          ... on PlanTransitLeg {
+            geometry { lat lon }
+            precedingArrival
+            transferRisk { marginSecs reliability scheduledDeparture nextDeparture }
+            trip { headsign route { shortName mode color } }
+            from { departure node { name lat lon } }
+            steps {
+              ... on PlanTransitLegStep {
+                time
+                place { arrival node { name lat lon } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+// ── Map init ──────────────────────────────────────────────────────────────────
+const map = L.map('map').setView([50.85, 4.35], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  maxZoom: 19,
+}).addTo(map);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let layers         = [];   // cleared on each query
+let candLayers     = [];   // per-candidate layer groups (index matches candidates array)
+let stopPathLayers = [];   // layers for the currently-selected stop path
+let selectedStop   = null; // stop object whose path is shown
+let currentResult  = null; // last raptorExplain result
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmtTime(secs) {
+  if (secs == null) return '—';
+  const h = Math.floor(secs / 3600) % 24;
+  const m = Math.floor((secs % 3600) / 60);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
+}
+
+function fmtMins(secs) {
+  const abs = Math.abs(secs);
+  const sign = secs < 0 ? '-' : '';
+  const m = Math.floor(abs / 60);
+  const s = abs % 60;
+  return s === 0 ? `${sign}${m}m` : `${sign}${m}m${s}s`;
+}
+
+function modeEmoji(mode) {
+  return { Bus:'🚌', Subway:'🚇', Rail:'🚆', Tramway:'🚋', Ferry:'⛴', Coach:'🚌' }[mode] ?? '🚍';
+}
+function modeColor(mode) {
+  return { Bus:'#2563eb', Subway:'#7c3aed', Rail:'#dc2626', Tramway:'#059669', Ferry:'#0891b2', Coach:'#2563eb' }[mode] ?? '#374151';
+}
+
+// Build ordered stop list for a transit leg: [{name, lat, lon, arrival, departure}]
+// step[i].time = departure from the stop BEFORE step[i].place
+// step[i].place = the stop ARRIVED at after that segment
+function buildStopList(leg) {
+  const steps = leg.steps || [];
+  const stops = [];
+  // Boarding stop — use from.node if available, else first geometry point
+  const fromNode = leg.from?.node;
+  stops.push({
+    name: fromNode?.name ?? null,
+    lat:  fromNode?.lat  ?? leg.geometry?.[0]?.lat,
+    lon:  fromNode?.lon  ?? leg.geometry?.[0]?.lon,
+    arrival:   null,
+    departure: steps[0]?.time ?? leg.start,
+  });
+  // Intermediate + alighting stops
+  steps.forEach((step, i) => {
+    const node = step.place?.node;
+    stops.push({
+      name: node?.name ?? null,
+      lat:  node?.lat,
+      lon:  node?.lon,
+      arrival:   step.place?.arrival ?? null,
+      departure: steps[i + 1]?.time ?? null,
+    });
+  });
+  return stops;
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+function addLayer(layer) { layer.addTo(map); layers.push(layer); return layer; }
+
+function clearLayers() {
+  layers.forEach(l => map.removeLayer(l));
+  layers = [];
+  candLayers = [];
+  clearStopPath();
+  renderPlanDetail(null);
+}
+
+function clearStopPath() {
+  stopPathLayers.forEach(l => map.removeLayer(l));
+  stopPathLayers = [];
+  selectedStop = null;
+  document.getElementById('stop-info').style.display = 'none';
+}
+
+// ── Plan-path matching ────────────────────────────────────────────────────────
+// Returns { legs: PlanLeg[], arrivalTime: number, role: 'board'|'alight' } or null.
+// Searches all kept plans for a leg whose first or last geometry point is within
+// ~50m of the clicked stop.  Coordinates come from the same graph nodes so
+// an exact-match threshold of 1e-5° (≈1m) is tight enough.
+const COORD_TOL = 1e-4;
+function coordsMatch(a, b) {
+  return a && b && Math.abs(a.lat - b.lat) < COORD_TOL && Math.abs(a.lon - b.lon) < COORD_TOL;
+}
+
+function findStopInPlans(stop) {
+  if (!currentResult?.plans) return null;
+  for (const plan of currentResult.plans) {
+    for (let i = 0; i < plan.legs.length; i++) {
+      const leg = plan.legs[i];
+      // Check boarding stop via from.node (exact name + coords)
+      if (leg.from?.node && coordsMatch(leg.from.node, stop)) {
+        return { planLegs: plan.legs.slice(0, i + 1), time: leg.start, role: 'board' };
+      }
+      // Check every step's place node (covers all intermediate + alighting stops)
+      for (const step of (leg.steps || [])) {
+        if (step.place?.node && coordsMatch(step.place.node, stop)) {
+          return { planLegs: plan.legs.slice(0, i + 1), time: step.place.arrival, role: 'pass' };
+        }
+      }
+      // Fallback: geometry endpoints (walk legs or legs without step data)
+      const geo = leg.geometry || [];
+      if (geo.length > 0) {
+        if (coordsMatch(geo[geo.length - 1], stop))
+          return { planLegs: plan.legs.slice(0, i + 1), time: leg.end, role: 'alight' };
+        if (coordsMatch(geo[0], stop))
+          return { planLegs: plan.legs.slice(0, i + 1), time: leg.start, role: 'board' };
+      }
+    }
+  }
+  return null;
+}
+
+// ── Stop-path overlays ────────────────────────────────────────────────────────
+function renderStopPath(stop) {
+  clearStopPath();
+  selectedStop = stop;
+
+  // ── Purple/green: RAPTOR optimal path to this stop ─────────────────────────
+  (stop.path || []).forEach(leg => {
+    const pts = (leg.geometry || []).map(c => [c.lat, c.lon]);
+    if (pts.length < 2) return;
+    const color  = leg.isTransit ? '#7c3aed' : '#059669';
+    const weight = leg.isTransit ? 5 : 3;
+    const dash   = leg.isTransit ? null : '6 4';
+    const label  = leg.isTransit ? (leg.routeLabel || 'Transit') : 'Walk (RAPTOR optimal)';
+    const l = L.polyline(pts, { color, weight, dashArray: dash, opacity: 0.9 })
+                .bindTooltip(label, { sticky: true });
+    l.addTo(map);
+    stopPathLayers.push(l);
+  });
+
+  // ── Amber: plan's route to this stop (if stop is in a kept plan) ────────────
+  const match = findStopInPlans(stop);
+  if (match) {
+    match.planLegs.forEach(leg => {
+      const pts = (leg.geometry || []).map(c => [c.lat, c.lon]);
+      if (pts.length < 2) return;
+      const isWalk = leg.transferRisk === undefined;
+      const color  = isWalk ? '#d97706' : '#f59e0b';
+      const weight = isWalk ? 3 : 5;
+      const dash   = isWalk ? '5 4' : null;
+      const label  = isWalk ? 'Walk (global plan)' : 'Transit (global plan)';
+      const l = L.polyline(pts, { color, weight, dashArray: dash, opacity: 0.85 })
+                  .bindTooltip(label, { sticky: true });
+      l.addTo(map);
+      stopPathLayers.push(l);
+    });
+  }
+
+  if (stopPathLayers.length > 0) {
+    map.fitBounds(L.featureGroup(stopPathLayers).getBounds().pad(0.15));
+  }
+
+  showStopInfo(stop, match);
+}
+
+// ── Stop info sidebar card ────────────────────────────────────────────────────
+function showStopInfo(stop, match) {
+  document.getElementById('stop-info-name').textContent = stop.name || '(unnamed stop)';
+
+  const rows = document.getElementById('stop-info-rows');
+  rows.innerHTML = '';
+
+  const raptorRow = document.createElement('div');
+  raptorRow.className = 'stop-row';
+  raptorRow.innerHTML = `
+    <span class="stop-label">RAPTOR</span>
+    <span class="stop-time raptor">R${stop.round} · ${fmtTime(stop.arrivalSecs)}</span>
+    <span class="stop-delta" style="color:#7c3aed;font-size:11px">optimal path</span>
+  `;
+  rows.appendChild(raptorRow);
+
+  if (match) {
+    const delta = match.time - stop.arrivalSecs;
+    const sign  = delta >= 0 ? '+' : '−';
+    const deltaClass = delta > 0 ? 'worse' : (delta < 0 ? 'better' : '');
+    const verb = match.role === 'board' ? 'departs' : 'arrives';
+
+    const planRow = document.createElement('div');
+    planRow.className = 'stop-row';
+    planRow.innerHTML = `
+      <span class="stop-label">Plan</span>
+      <span class="stop-time plan">${verb} ${fmtTime(match.time)}</span>
+      <span class="stop-delta ${deltaClass}">${sign}${fmtMins(Math.abs(delta))}</span>
+    `;
+    rows.appendChild(planRow);
+  } else {
+    const noneRow = document.createElement('div');
+    noneRow.className = 'stop-row';
+    noneRow.innerHTML = `<span class="stop-label">Plan</span><span style="color:#9ca3af;font-size:12px">not in final plan</span>`;
+    rows.appendChild(noneRow);
+  }
+
+  document.getElementById('stop-info').style.display = 'block';
+}
+
+// ── Plan detail ───────────────────────────────────────────────────────────────
+function mkEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls)  el.className = cls;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function renderPlanDetail(plan) {
+  const sec  = document.getElementById('plan-detail');
+  const body = document.getElementById('plan-detail-body');
+  if (!plan) { sec.style.display = 'none'; body.textContent = ''; return; }
+
+  body.textContent = '';
+
+  (plan.legs || []).forEach((leg, legIdx) => {
+    const isWalk = !leg.trip;
+    const legDiv = mkEl('div', 'pd-leg');
+
+    // ── header ──────────────────────────────────────────────────────────
+    const header = mkEl('div', `pd-leg-header ${isWalk ? 'pd-walk' : 'pd-transit'}`);
+
+    if (isWalk) {
+      const mode = mkEl('span', 'pd-mode');
+      mode.textContent = '🚶';
+      const name = mkEl('span', 'pd-route-name');
+      name.textContent = `Walk ${fmtMins(leg.end - leg.start)}`;
+      name.style.color = '#6b7280';
+      const time = mkEl('span', 'pd-time', `${fmtTime(leg.start)} → ${fmtTime(leg.end)}`);
+      header.append(mode, name, time);
+    } else {
+      const route  = leg.trip?.route;
+      const mode   = route?.mode ?? 'Bus';
+      const rName  = route?.shortName ?? '?';
+      const color  = route?.color ? `#${route.color}` : modeColor(mode);
+
+      const modeEl = mkEl('span', 'pd-mode', modeEmoji(mode));
+      modeEl.style.background = color;
+      const arrow  = mkEl('span', 'pd-arrow', '▶');
+      const nameEl = mkEl('span', 'pd-route-name');
+      nameEl.textContent = rName + (leg.trip?.headsign ? ` → ${leg.trip.headsign}` : '');
+      const time   = mkEl('span', 'pd-time', `${fmtTime(leg.start)} → ${fmtTime(leg.end)}`);
+
+      const expandId = `pd-stops-${legIdx}`;
+      header.dataset.expand = expandId;
+      header.append(modeEl, arrow, nameEl, time);
+
+      // ── stop list ──────────────────────────────────────────────────────
+      const stopsDiv = mkEl('div', 'pd-stops');
+      stopsDiv.id = expandId;
+
+      const stops = buildStopList(leg);
+      stops.forEach((s, si) => {
+        const isBoard  = si === 0;
+        const isAlight = si === stops.length - 1;
+        const row  = mkEl('div', 'pd-stop');
+        const dot  = mkEl('span', 'pd-stop-dot' + (isBoard ? ' board' : isAlight ? ' alight' : ''));
+        const nm   = mkEl('span', 'pd-stop-name', s.name ?? '(unnamed)');
+        const timeStr = isBoard
+          ? (s.departure != null ? `dep ${fmtTime(s.departure)}` : '')
+          : (s.arrival   != null ? `arr ${fmtTime(s.arrival)}`   : '');
+        const tm = mkEl('span', 'pd-stop-time', timeStr);
+        row.append(dot, nm, tm);
+        stopsDiv.appendChild(row);
+      });
+      legDiv.appendChild(stopsDiv);
+    }
+
+    legDiv.insertBefore(header, legDiv.firstChild);
+    body.appendChild(legDiv);
+  });
+
+  // Wire expand toggles
+  body.querySelectorAll('[data-expand]').forEach(header => {
+    header.addEventListener('click', () => {
+      const target = document.getElementById(header.dataset.expand);
+      const arrow  = header.querySelector('.pd-arrow');
+      const open   = target.classList.toggle('open');
+      if (arrow) arrow.textContent = open ? '▼' : '▶';
+    });
+  });
+
+  sec.style.display = 'block';
+}
+
+document.getElementById('plan-detail-close').addEventListener('click', () => renderPlanDetail(null));
+
+// ── Legend toggle ─────────────────────────────────────────────────────────────
+document.getElementById('legend-section').querySelector('h2').addEventListener('click', () => {
+  const body = document.getElementById('legend-body');
+  const tog  = document.getElementById('legend-toggle');
+  const vis  = body.style.display !== 'none';
+  body.style.display = vis ? 'none' : '';
+  tog.textContent = vis ? '▼ show' : '▲ hide';
+});
+
+// ── Map marker icons ──────────────────────────────────────────────────────────
+const originIcon = L.divIcon({
+  html: '<div style="width:14px;height:14px;border-radius:50%;background:#22c55e;border:2px solid #fff;box-shadow:0 0 3px #0004"></div>',
+  iconSize:[14,14], iconAnchor:[7,7], className:''
+});
+const destIcon = L.divIcon({
+  html: '<div style="width:14px;height:14px;border-radius:50%;background:#ef4444;border:2px solid #fff;box-shadow:0 0 3px #0004"></div>',
+  iconSize:[14,14], iconAnchor:[7,7], className:''
+});
+
+// ── URL ↔ form sync ───────────────────────────────────────────────────────────
+function readFormValues() {
+  return {
+    fromLat: document.getElementById('from-lat').value,
+    fromLng: document.getElementById('from-lng').value,
+    toLat:   document.getElementById('to-lat').value,
+    toLng:   document.getElementById('to-lng').value,
+    date:    document.getElementById('date').value,
+    time:    document.getElementById('time').value,
+  };
+}
+
+function syncUrlFromForm() {
+  const v = readFormValues();
+  const p = new URLSearchParams();
+  if (v.fromLat) p.set('fromLat', v.fromLat);
+  if (v.fromLng) p.set('fromLng', v.fromLng);
+  if (v.toLat)   p.set('toLat',   v.toLat);
+  if (v.toLng)   p.set('toLng',   v.toLng);
+  if (v.date)    p.set('date',    v.date);
+  if (v.time)    p.set('time',    v.time);
+  const qs = p.toString();
+  history.replaceState(null, '', qs ? `?${qs}` : location.pathname);
+}
+
+function loadFromUrl() {
+  const p = new URLSearchParams(location.search);
+  const set = (id, key) => { if (p.has(key)) document.getElementById(id).value = p.get(key); };
+  set('from-lat', 'fromLat');
+  set('from-lng', 'fromLng');
+  set('to-lat',   'toLat');
+  set('to-lng',   'toLng');
+  set('date',     'date');
+  set('time',     'time');
+}
+
+// ── Right-click context menu ──────────────────────────────────────────────────
+const ctxMenu  = document.getElementById('ctx-menu');
+let   ctxLatLng = null;
+
+function showCtxMenu(x, y, latlng) {
+  ctxLatLng = latlng;
+  // Keep menu inside viewport
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const mw = 190, mh = 80;
+  ctxMenu.style.left = `${Math.min(x, vw - mw)}px`;
+  ctxMenu.style.top  = `${Math.min(y, vh - mh)}px`;
+  ctxMenu.style.display = 'block';
+}
+
+function hideCtxMenu() { ctxMenu.style.display = 'none'; ctxLatLng = null; }
+
+map.on('contextmenu', e => {
+  showCtxMenu(e.originalEvent.clientX, e.originalEvent.clientY, e.latlng);
+});
+
+document.addEventListener('click',  hideCtxMenu);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideCtxMenu(); clearStopPath(); } });
+document.getElementById('stop-info-close').addEventListener('click', clearStopPath);
+
+document.getElementById('ctx-from').addEventListener('click', () => {
+  if (!ctxLatLng) return;
+  document.getElementById('from-lat').value = ctxLatLng.lat.toFixed(6);
+  document.getElementById('from-lng').value = ctxLatLng.lng.toFixed(6);
+  syncUrlFromForm();
+  hideCtxMenu();
+});
+
+document.getElementById('ctx-to').addEventListener('click', () => {
+  if (!ctxLatLng) return;
+  document.getElementById('to-lat').value = ctxLatLng.lat.toFixed(6);
+  document.getElementById('to-lng').value = ctxLatLng.lng.toFixed(6);
+  syncUrlFromForm();
+  hideCtxMenu();
+});
+
+// ── Query ─────────────────────────────────────────────────────────────────────
+async function runQuery() {
+  const fromLat = parseFloat(document.getElementById('from-lat').value);
+  const fromLng = parseFloat(document.getElementById('from-lng').value);
+  const toLat   = parseFloat(document.getElementById('to-lat').value);
+  const toLng   = parseFloat(document.getElementById('to-lng').value);
+
+  if ([fromLat, fromLng, toLat, toLng].some(isNaN)) {
+    showError('Fill in all four coordinates first.');
+    return;
+  }
+
+  const date = document.getElementById('date').value || null;
+  const time = document.getElementById('time').value || null;
+
+  syncUrlFromForm();
+  showError('');
+  document.getElementById('go-btn').disabled = true;
+  document.getElementById('go-btn').textContent = 'Searching…';
+
+  try {
+    const resp = await fetch(GRAPHQL_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: QUERY, variables: { fromLat, fromLng, toLat, toLng, date, time } }),
+    });
+    const json = await resp.json();
+    if (json.errors?.length) {
+      showError(json.errors.map(e => e.message).join('\n'));
+      return;
+    }
+    renderAll(json.data.raptorExplain);
+  } catch (e) {
+    showError(`Network error: ${e.message}`);
+  } finally {
+    document.getElementById('go-btn').disabled = false;
+    document.getElementById('go-btn').textContent = 'Plan';
+  }
+}
+document.getElementById('go-btn').addEventListener('click', runQuery);
+
+// ── Transfer boarding markers ─────────────────────────────────────────────────
+// Returns an array of Leaflet layers (does not add to map — caller decides).
+function buildTransferMarkers(legs) {
+  const out = [];
+  (legs || []).forEach(leg => {
+    // Only transit legs have transferRisk; walk legs are skipped
+    const risk = leg.transferRisk !== undefined ? leg.transferRisk : null;
+    // The first transit leg of a plan has no preceding vehicle → risk is null
+    // We still draw a grey marker to show "boarding here"
+    const pts = (leg.geometry || []).map(c => [c.lat, c.lon]);
+    if (!pts.length) return;
+    const [lat, lon] = pts[0]; // boarding point
+
+    // Determine margin: null if no risk object (first leg or walk)
+    const margin = risk ? risk.marginSecs : null;
+    const color  = marginColor(margin);
+
+    // Build tooltip text
+    let tip = '';
+    if (risk === null && leg.transferRisk === undefined) {
+      // Walk leg — no marker
+      return;
+    }
+    if (risk === null) {
+      tip = 'Boarding — first leg (walked from origin)';
+    } else {
+      const rel = risk.reliability != null ? `${Math.round(risk.reliability * 100)}%` : '?';
+      tip  = `Boarding — margin: ${marginLabel(margin)}\n`;
+      tip += `Reliability: ${rel}\n`;
+      tip += `Scheduled: ${fmtTime(risk.scheduledDeparture)}`;
+      if (risk.nextDeparture) tip += `\nNext: ${fmtTime(risk.nextDeparture)}`;
+      if (leg.precedingArrival != null) tip += `\nArrived: ${fmtTime(leg.precedingArrival)}`;
+    }
+
+    out.push(
+      L.circleMarker([lat, lon], {
+        radius: 6,
+        color: '#fff',
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 1,
+      }).bindTooltip(tip, { sticky: true })
+    );
+  });
+  return out;
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderAll(result) {
+  clearLayers();
+  currentResult = result;
+
+  const { origin, destination, access, stopsReached, plans, candidates } = result;
+
+  // Origin / destination
+  addLayer(L.marker([origin.lat, origin.lon], { icon: originIcon })
+    .bindTooltip('Origin (snapped node)'));
+  addLayer(L.marker([destination.lat, destination.lon], { icon: destIcon })
+    .bindTooltip('Destination (snapped node)'));
+
+  // Walk-radius circles
+  if (access.walkRadiusMeters > 0) {
+    addLayer(L.circle([origin.lat, origin.lon], {
+      radius: access.walkRadiusMeters,
+      color: '#2563eb', weight: 1.5, dashArray: '5,5', fill: false,
+    }).bindTooltip(`Origin walk radius: ${access.walkRadiusMeters} m`));
+    addLayer(L.circle([destination.lat, destination.lon], {
+      radius: access.walkRadiusMeters,
+      color: '#16a34a', weight: 1.5, dashArray: '5,5', fill: false,
+    }).bindTooltip(`Dest walk radius: ${access.walkRadiusMeters} m`));
+  }
+
+  // Access info panel
+  document.getElementById('ai-radius').textContent = `${access.walkRadiusMeters} m`;
+  document.getElementById('ai-orig').textContent   = access.originStopsFound;
+  document.getElementById('ai-dest').textContent   = access.destinationStopsFound;
+  document.getElementById('ai-att').textContent    = access.accessAttempts;
+  document.getElementById('ai-walk').textContent   = access.fellBackToWalkOnly ? 'Yes' : 'No';
+  document.getElementById('access-info').style.display = 'block';
+
+  // Reached stops — click to trace the RAPTOR path to that stop
+  (stopsReached || []).forEach(s => {
+    const c = roundColor(s.round);
+    const marker = L.circleMarker([s.lat, s.lon], {
+      radius: 4, color: c, fillColor: c, fillOpacity: 0.85, weight: 1,
+    }).bindTooltip(
+      `${s.name || '(unnamed)'}\nRound ${s.round} — ${fmtTime(s.arrivalSecs)}\n(click to trace path)`,
+      { sticky: true }
+    );
+    marker.on('click', e => {
+      L.DomEvent.stopPropagation(e);
+      if (selectedStop === s) {
+        // Second click → deselect
+        clearStopPath();
+        marker.setStyle({ weight: 1, color: c });
+      } else {
+        // Deselect old highlight if any
+        // (previous marker color resets on next query; accept the minor state drift)
+        renderStopPath(s);
+        marker.setStyle({ weight: 2.5, color: '#fff' });
+      }
+    });
+    addLayer(marker);
+  });
+
+  // Kept plan legs + transfer markers
+  (plans || []).forEach(plan => {
+    (plan.legs || []).forEach(leg => {
+      const pts = (leg.geometry || []).map(c => [c.lat, c.lon]);
+      if (pts.length < 2) return;
+      const isWalk = leg.transferRisk === undefined;
+      addLayer(L.polyline(pts, {
+        color: isWalk ? '#888' : '#2563eb',
+        weight: isWalk ? 2 : 4,
+        opacity: 0.9,
+        dashArray: isWalk ? '5,5' : null,
+      }));
+    });
+    buildTransferMarkers(plan.legs || []).forEach(m => addLayer(m));
+  });
+
+  // Candidates
+  renderCandidates(candidates || []);
+}
+
+function renderCandidates(candidates) {
+  const list = document.getElementById('candidates-list');
+  list.innerHTML = '';
+  candLayers = [];
+
+  document.getElementById('cand-count').textContent =
+    `(${candidates.length} total, ${candidates.filter(c => c.status === 'KEPT').length} kept)`;
+
+  candidates.forEach((c, i) => {
+    // Build per-candidate layer group
+    let group = null;
+    if (c.plan?.legs) {
+      const ll = [];
+      c.plan.legs.forEach(leg => {
+        const pts = (leg.geometry || []).map(p => [p.lat, p.lon]);
+        if (pts.length >= 2) {
+          const isWalk = leg.transferRisk === undefined;
+          ll.push(L.polyline(pts, {
+            color: isWalk ? '#888' : '#f59e0b',
+            weight: isWalk ? 2 : 3,
+            opacity: 0.7,
+            dashArray: isWalk ? '4,4' : null,
+          }));
+        }
+      });
+      buildTransferMarkers(c.plan.legs).forEach(m => ll.push(m));
+      if (ll.length) group = L.layerGroup(ll);
+    }
+    candLayers.push(group);
+
+    // ── Worst transfer risk across plan legs ──────────────────────────────────
+    let worstMargin = null;
+    (c.plan?.legs || []).forEach(leg => {
+      if (leg.transferRisk) {
+        const m = leg.transferRisk.marginSecs;
+        if (worstMargin === null || m < worstMargin) worstMargin = m;
+      }
+    });
+    // worstMargin === null means no transfer legs (walk-only or no plan)
+    const riskColor = c.plan ? marginColor(worstMargin === null ? undefined : worstMargin) : '#e5e7eb';
+
+    // ── Badge ─────────────────────────────────────────────────────────────────
+    const status = c.status;
+    let badgeClass = 'badge-empty', badgeText = status;
+    if      (status === 'KEPT')               { badgeClass = 'badge-kept';   badgeText = 'KEPT'; }
+    else if (status === 'PARETO_DOMINATED')    { badgeClass = 'badge-pareto'; badgeText = `dom→${c.dominatorIndex}`; }
+    else if (status === 'EXTREME_RISK')        { badgeClass = 'badge-risk';   badgeText = 'RISK'; }
+    else if (status === 'BACKWARD_DETOUR')     { badgeClass = 'badge-detour'; badgeText = 'DETOUR'; }
+    else if (status === 'NOT_IMPROVING')       { badgeClass = 'badge-notimpr';badgeText = 'NO-IMPV'; }
+    else if (status === 'RECONSTRUCTION_EMPTY'){ badgeClass = 'badge-empty';  badgeText = 'EMPTY'; }
+
+    // ── Times ─────────────────────────────────────────────────────────────────
+    const nomStr = c.plan
+      ? `${fmtTime(c.plan.start)} → ${fmtTime(c.plan.end)}`
+      : `dep ${fmtTime(c.originDeparture)}`;
+
+    // Expected end (probability-weighted) — only show if it differs from nominal by > 1 min
+    let expectedStr = '';
+    if (c.plan && c.plan.expectedEnd != null) {
+      const delta = c.plan.expectedEnd - c.plan.end;
+      if (delta > 60) {
+        expectedStr = `≈${fmtTime(c.plan.expectedEnd)} (+${fmtMins(delta)} expected)`;
+      }
+    }
+
+    // ── Domination reasons (for PARETO_DOMINATED) ─────────────────────────────
+    let domReason = '';
+    if (status === 'PARETO_DOMINATED' && c.dominatorIndex != null) {
+      const dom = candidates[c.dominatorIndex];
+      const reasons = [];
+      if (c.dominatorArrivesEarlier && c.plan && dom?.plan) {
+        const diff = c.plan.end - dom.plan.end;
+        reasons.push(`arr +${fmtMins(diff)} later`);
+      }
+      if (c.dominatorDepartsLater && c.plan && dom?.plan) {
+        const diff = dom.plan.start - c.plan.start;
+        reasons.push(`dom departs ${fmtMins(diff)} later`);
+      }
+      if (c.dominatorFewerTransfers) reasons.push('more transfers');
+      if (reasons.length) domReason = `Why: ${reasons.join(', ')}`;
+    }
+
+    // ── DOM element ───────────────────────────────────────────────────────────
+    const li = document.createElement('li');
+    li.className = status === 'KEPT' ? 'kept' : '';
+
+    const row1 = document.createElement('div');
+    row1.className = 'cand-row1';
+    row1.innerHTML = `
+      <span class="candidate-round">R${c.round}</span>
+      <span class="badge ${badgeClass}">${badgeText}</span>
+      <span class="xfer-dot" style="background:${riskColor}" title="Worst transfer margin"></span>
+      <span class="candidate-time">${nomStr}</span>
+    `;
+    li.appendChild(row1);
+
+    if (expectedStr || domReason) {
+      const row2 = document.createElement('div');
+      row2.className = 'cand-row2';
+      if (expectedStr) {
+        const s = document.createElement('span');
+        s.className = 'expected-warn';
+        s.textContent = expectedStr;
+        row2.appendChild(s);
+        if (domReason) row2.appendChild(document.createTextNode(' — '));
+      }
+      if (domReason) {
+        const s = document.createElement('span');
+        s.className = 'dom-reason';
+        s.textContent = domReason;
+        row2.appendChild(s);
+      }
+      li.appendChild(row2);
+    }
+
+    li.addEventListener('click', () => {
+      // Toggle: remove previously active candidate from map, add this one
+      const wasActive = li.classList.contains('active');
+      candLayers.forEach((g, j) => {
+        if (g) {
+          if (j === i) {
+            if (map.hasLayer(g)) { map.removeLayer(g); } else { g.addTo(map); }
+          } else {
+            map.removeLayer(g);
+          }
+        }
+      });
+      // Toggle active class + plan detail
+      list.querySelectorAll('li').forEach(el => el.classList.remove('active'));
+      if (wasActive) {
+        renderPlanDetail(null);
+      } else {
+        li.classList.add('active');
+        renderPlanDetail(c.plan ?? null);
+      }
+    });
+
+    list.appendChild(li);
+  });
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+loadFromUrl();
+const _p = new URLSearchParams(location.search);
+if (_p.has('fromLat') && _p.has('toLat')) runQuery();
+</script>
+</body>
+</html>
