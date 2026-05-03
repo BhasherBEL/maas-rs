@@ -63,6 +63,10 @@ pub struct TransferRisk {
     /// arrival_at_boarding_stop)`.  `None` when there is no next departure or
     /// no delay model for this route type.
     pub next_reliability: Option<f32>,
+    /// `scheduled_departure − arrival_at_boarding_stop` in seconds.
+    /// Negative = transfer is physically impossible (arrive after the train departs).
+    /// `None` for the first leg (no preceding vehicle).
+    pub margin_secs: Option<i32>,
 }
 
 #[derive(Debug, SimpleObject, Clone)]
@@ -89,9 +93,8 @@ pub struct PlanTransitLeg {
     pub trip_id: TripId,
 
     /// Arrival time (seconds since midnight) of the preceding transit vehicle at
-    /// this leg's boarding stop.  Used to compute `transfer_risk` for alternative
-    /// departures returned by `previousDepartures`/`nextDepartures`.
-    #[graphql(skip)]
+    /// this leg's boarding stop.  When combined with `transfer_risk.scheduled_departure`,
+    /// gives the actual transfer window (`scheduled_departure - preceding_arrival`).
     pub preceding_arrival: Option<u32>,
 
     /// Route type of the preceding transit vehicle (the one that delivered the
@@ -225,6 +228,7 @@ impl PlanTransitLeg {
                             scheduled_departure: dep,
                             next_departure: None,
                             next_reliability: None,
+                            margin_secs: Some(margin),
                         })
                     } else {
                         None
@@ -342,6 +346,7 @@ impl PlanTransitLeg {
                             scheduled_departure: segment.departure,
                             next_departure: next_dep,
                             next_reliability: next_rel,
+                            margin_secs: Some(margin),
                         })
                     } else {
                         None

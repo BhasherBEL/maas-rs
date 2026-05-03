@@ -6,29 +6,37 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
     let
       # Standalone package build — reused by eachDefaultSystem and the NixOS module.
-      mkPackage = pkgs: pkgs.rustPlatform.buildRustPackage {
-        pname = "maas-rs";
-        version = "0.0.1";
-        src = ./.;
-        cargoLock.lockFile = ./Cargo.lock;
+      mkPackage =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "maas-rs";
+          version = "0.0.1";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        # openssl-sys is a transitive dependency (via poem/hyper-tls).
-        buildInputs = [ pkgs.openssl ];
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          # openssl-sys is a transitive dependency (via poem/hyper-tls).
+          buildInputs = [ pkgs.openssl ];
 
-        meta = with pkgs.lib; {
-          description = "Multi-modal MaaS routing engine (A* + RAPTOR) over OSM + GTFS";
-          license = licenses.mit;
-          mainProgram = "maas-rs";
+          meta = with pkgs.lib; {
+            description = "Multi-modal MaaS routing engine (A* + RAPTOR) over OSM + GTFS";
+            license = licenses.mit;
+            mainProgram = "maas-rs";
+          };
         };
-      };
     in
 
     # ── Per-system outputs (packages, devShell) ───────────────────────────────
-    flake-utils.lib.eachDefaultSystem (system:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
       in
@@ -38,7 +46,12 @@
         devShells.default = pkgs.mkShell {
           # Inherit all build inputs from the package.
           inputsFrom = [ self.packages.${system}.default ];
-          packages = with pkgs; [ rust-analyzer rustfmt clippy ];
+          packages = with pkgs; [
+            rust-analyzer
+            rustfmt
+            clippy
+            python3
+          ];
           # Replicate .envrc: expose openssl for cargo build outside nix.
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         };
@@ -47,18 +60,26 @@
 
     # ── System-independent outputs (NixOS module) ─────────────────────────────
     // {
-      nixosModules.default = { config, lib, pkgs, ... }:
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         let
           cfg = config.services.maas-rs;
           yamlFormat = pkgs.formats.yaml { };
 
           configFile = pkgs.writeText "maas-rs.yaml" (builtins.toJSON cfg.settings);
 
-          startArgs = {
-            "restore-and-serve"    = "--restore --serve";
-            "build-and-serve"      = "--build --serve";
-            "update-gtfs-and-serve" = "--update-gtfs --serve";
-          }.${cfg.mode};
+          startArgs =
+            {
+              "restore-and-serve" = "--restore --serve";
+              "build-and-serve" = "--build --serve";
+              "update-gtfs-and-serve" = "--update-gtfs --serve";
+            }
+            .${cfg.mode};
         in
         {
           # ── Options ──────────────────────────────────────────────────────────
@@ -121,7 +142,13 @@
                 options = {
 
                   log_level = lib.mkOption {
-                    type = lib.types.enum [ "trace" "debug" "info" "warn" "error" ];
+                    type = lib.types.enum [
+                      "trace"
+                      "debug"
+                      "info"
+                      "warn"
+                      "error"
+                    ];
                     default = "info";
                     description = "Minimum log level emitted by the routing engine.";
                   };
@@ -303,8 +330,7 @@
             };
             users.groups.maas-rs = { };
 
-            networking.firewall.allowedTCPPorts =
-              lib.mkIf cfg.openFirewall [ cfg.settings.server.port ];
+            networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.settings.server.port ];
 
             systemd.services.maas-rs = {
               description = "maas-rs multi-modal routing engine";
@@ -345,7 +371,10 @@
                 ProtectKernelTunables = true;
                 ProtectKernelModules = true;
                 ProtectControlGroups = true;
-                RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+                RestrictAddressFamilies = [
+                  "AF_INET"
+                  "AF_INET6"
+                ];
                 RestrictNamespaces = true;
                 LockPersonality = true;
                 MemoryDenyWriteExecute = false; # Rust async runtimes need this

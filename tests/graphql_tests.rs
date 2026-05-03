@@ -186,3 +186,118 @@ fn graphql_gtfs_agencies_returns_agency_and_routes() {
     assert_eq!(route["shortName"], Value::String("42".into()));
     assert_eq!(route["mode"], Value::String("Bus".into()));
 }
+
+// ── raptorExplain map fields ───────────────────────────────────────────────────
+
+#[test]
+fn graphql_raptor_explain_stops_reached_empty_no_transit() {
+    let mut g = Graph::new();
+    g.add_node(osm_node("n0", 50.0, 4.0));
+    g.add_node(osm_node("n1", 50.01, 4.01));
+    g.build_raptor_index();
+    let schema = build_schema(Arc::new(g));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) {
+              stopsReached { stopIdx }
+           } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    let explain = match &data["raptorExplain"] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    assert_eq!(explain["stopsReached"], Value::List(vec![]),
+        "expected empty stopsReached for graph with no transit stops");
+}
+
+#[test]
+fn graphql_raptor_explain_origin_destination_present() {
+    let mut g = Graph::new();
+    g.add_node(osm_node("n0", 50.0, 4.0));
+    g.add_node(osm_node("n1", 50.01, 4.01));
+    g.build_raptor_index();
+    let schema = build_schema(Arc::new(g));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) {
+              origin { lat lon }
+              destination { lat lon }
+           } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    let explain = match &data["raptorExplain"] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    let origin = match &explain["origin"] {
+        Value::Object(m) => m,
+        other => panic!("expected origin object, got {other:?}"),
+    };
+    assert!(matches!(origin["lat"], Value::Number(_)), "origin.lat should be a number");
+    assert!(matches!(origin["lon"], Value::Number(_)), "origin.lon should be a number");
+    let destination = match &explain["destination"] {
+        Value::Object(m) => m,
+        other => panic!("expected destination object, got {other:?}"),
+    };
+    assert!(matches!(destination["lat"], Value::Number(_)));
+    assert!(matches!(destination["lon"], Value::Number(_)));
+}
+
+#[test]
+fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
+    let mut g = Graph::new();
+    // OSM node close to origin
+    let _osm0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    // Transit stop ~50m from origin, snapped to n0
+    g.add_node(transit_stop("Test Stop", 50.0004, 4.0));
+    g.build_raptor_index();
+
+    let schema = build_schema(Arc::new(g));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.1, toLng: 4.1) {
+              stopsReached { stopIdx round name }
+           } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    let explain = match &data["raptorExplain"] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    let stops = match &explain["stopsReached"] {
+        Value::List(v) => v,
+        other => panic!("expected list, got {other:?}"),
+    };
+    // If a transit stop exists and is reachable within the walk radius, it should appear
+    // with round = 0 (access/egress reach)
+    if !stops.is_empty() {
+        let stop = match &stops[0] {
+            Value::Object(m) => m,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert_eq!(stop["round"], Value::Number(async_graphql::Number::from(0i32)),
+            "access stop should be round 0");
+    }
+}
+
+// ── /map HTTP route ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_map_returns_html() {
+    use poem::{Route, get, test::TestClient};
+    use maas_rs::web::app::map_page;
+
+    let app = Route::new().at("/map", get(map_page));
+    let client = TestClient::new(app);
+    let resp = client.get("/map").send().await;
+    resp.assert_status_is_ok();
+    let ct = resp.0.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("text/html"), "expected text/html content-type, got: {ct}");
+}
