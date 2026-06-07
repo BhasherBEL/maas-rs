@@ -40,4 +40,8 @@ pub struct TransitStopData {
     pub name: String,
     pub lat_lng: LatLng,
     pub accessibility: Availability,
+    /// Original GTFS `stop_id` string. Used to match realtime feeds (GTFS-RT
+    /// stop_id, STIB pointid) to internal stops.
+    #[serde(default)]
+    pub id: String,
 }

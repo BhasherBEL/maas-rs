@@ -41,6 +41,22 @@ pub struct RaptorIndex {
     pub transit_stop_to_node: Vec<NodeID>,
     pub transit_stops_tree: KdTree<f64, usize, [f64; 2]>,
 
+    /// Original GTFS `trip_id` string per internal `TripId` (index = `TripId.0`).
+    /// Serialized — required to match realtime feeds, which key by string id.
+    #[serde(default)]
+    pub transit_trip_ids: Vec<String>,
+    /// Reverse of `transit_trip_ids`, derived at build/load time (not serialized).
+    #[serde(skip)]
+    pub trip_id_to_index: HashMap<String, TripId>,
+
+    /// Original GTFS `stop_id` string per compact stop index. Serialized so the
+    /// reverse map can be rebuilt at load without re-reading node data.
+    #[serde(default)]
+    pub transit_stop_ids: Vec<String>,
+    /// Reverse of `transit_stop_ids` (stop_id → compact stop index), derived.
+    #[serde(skip)]
+    pub stop_id_to_index: HashMap<String, usize>,
+
     #[serde(default)]
     pub transit_stop_reverse_transfers: Vec<(usize, u32)>,
     #[serde(default)]
@@ -105,6 +121,11 @@ impl RaptorIndex {
             transit_stop_to_node: Vec::new(),
             transit_stops_tree: KdTree::new(2),
 
+            transit_trip_ids: Vec::new(),
+            trip_id_to_index: HashMap::new(),
+            transit_stop_ids: Vec::new(),
+            stop_id_to_index: HashMap::new(),
+
             transit_stop_reverse_transfers: Vec::new(),
             transit_idx_stop_reverse_transfers: Vec::new(),
 
@@ -135,6 +156,40 @@ impl RaptorIndex {
 
     pub fn default_arrival_slack_secs() -> u32 {
         900
+    }
+
+    /// Rebuild non-serialized runtime indices from serialized data. Must be
+    /// called after construction (build) and after deserialization (load), since
+    /// `trip_id_to_index` is `#[serde(skip)]`.
+    pub fn build_runtime_indices(&mut self) {
+        self.trip_id_to_index = self
+            .transit_trip_ids
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), TripId(i as u32)))
+            .collect();
+        self.stop_id_to_index = self
+            .transit_stop_ids
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+    }
+
+    /// Compact stop index for a GTFS `stop_id` string, if known.
+    pub fn stop_index_of(&self, stop_id: &str) -> Option<usize> {
+        self.stop_id_to_index.get(stop_id).copied()
+    }
+
+    /// Original GTFS `trip_id` string for an internal `TripId`, if known.
+    pub fn trip_id_str(&self, trip: TripId) -> Option<&str> {
+        self.transit_trip_ids.get(trip.0 as usize).map(|s| s.as_str())
+    }
+
+    /// Internal `TripId` for a GTFS `trip_id` string, if known.
+    pub fn trip_index_of(&self, trip_id: &str) -> Option<TripId> {
+        self.trip_id_to_index.get(trip_id).copied()
     }
 
     /// Cross-reference check run after deserialization.  Returns an error if any index is
@@ -280,6 +335,19 @@ mod tests {
     }
 
     #[test]
+    fn trip_id_round_trips_through_runtime_index() {
+        let mut idx = RaptorIndex::new();
+        idx.transit_trip_ids = vec!["trip_a".into(), "trip_b".into(), "trip_c".into()];
+        idx.build_runtime_indices();
+
+        assert_eq!(idx.trip_id_str(crate::ingestion::gtfs::TripId(1)), Some("trip_b"));
+        assert_eq!(idx.trip_index_of("trip_c"), Some(crate::ingestion::gtfs::TripId(2)));
+        assert_eq!(idx.trip_index_of("trip_a"), Some(crate::ingestion::gtfs::TripId(0)));
+        assert_eq!(idx.trip_index_of("nope"), None);
+        assert_eq!(idx.trip_id_str(crate::ingestion::gtfs::TripId(99)), None);
+    }
+
+    #[test]
     fn raptor_index_new_is_empty() {
         let idx = RaptorIndex::new();
         assert!(idx.transit_departures.is_empty());
@@ -301,6 +369,10 @@ mod tests {
         assert!(idx.transit_delay_models.is_empty());
         assert!(idx.transit_node_to_stop.is_empty());
         assert!(idx.transit_stop_to_node.is_empty());
+        assert!(idx.transit_trip_ids.is_empty());
+        assert!(idx.trip_id_to_index.is_empty());
+        assert!(idx.transit_stop_ids.is_empty());
+        assert!(idx.stop_id_to_index.is_empty());
         assert!(idx.transit_stop_reverse_transfers.is_empty());
         assert!(idx.transit_idx_stop_reverse_transfers.is_empty());
         assert!(idx.transit_pattern_shapes.is_empty());

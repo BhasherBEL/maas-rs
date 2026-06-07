@@ -3,18 +3,18 @@ use std::time::SystemTime;
 
 use crate::{
     ingestion::{
-        cache::resolve_path,
+        cache::resolve_source,
         gtfs::{load_gtfs, load_gtfs_sncb, load_gtfs_stib, prepare_sncb},
         osm,
     },
-    structures::{BuildConfig, DelayCDF, Graph, Ingestor},
+    structures::{BuildConfig, DelayCDF, Graph, Ingestor, RoutingDefaultConfig},
 };
 
 /// Run only phase-0 (OSM) ingestors, then call prepare on all non-OSM ingestors.
 /// The returned graph is suitable for serialization to osm.bin.
-pub fn build_osm_phase(config: &BuildConfig) -> Option<Graph> {
+pub fn build_osm_phase(config: &BuildConfig, cache_dir: &str, force_download: bool) -> Option<Graph> {
     let mut g = Graph::new();
-    run_phase(config, &mut g, 0)?;
+    run_phase(config, &mut g, 0, cache_dir, force_download)?;
     for input in &config.inputs {
         if input.phase() != 0 {
             if let Err(e) = prepare_ingestor(input, &mut g) {
@@ -27,15 +27,20 @@ pub fn build_osm_phase(config: &BuildConfig) -> Option<Graph> {
 }
 
 /// Run only phase-1+ (GTFS) ingestors on an existing graph, then finalize.
-pub fn build_gtfs_phase(mut g: Graph, config: &BuildConfig) -> Option<Graph> {
-    run_phase(config, &mut g, 1)?;
+pub fn build_gtfs_phase(
+    mut g: Graph,
+    config: &BuildConfig,
+    cache_dir: &str,
+    force_download: bool,
+) -> Option<Graph> {
+    run_phase(config, &mut g, 1, cache_dir, force_download)?;
     finalize(g, config)
 }
 
 /// Convenience wrapper: full build without needing to manage osm.bin.
-pub fn build_graph(config: BuildConfig) -> Option<Graph> {
-    let g = build_osm_phase(&config)?;
-    build_gtfs_phase(g, &config)
+pub fn build_graph(config: BuildConfig, cache_dir: &str, force_download: bool) -> Option<Graph> {
+    let g = build_osm_phase(&config, cache_dir, force_download)?;
+    build_gtfs_phase(g, &config, cache_dir, force_download)
 }
 
 fn prepare_ingestor(input: &Ingestor, g: &mut Graph) -> Result<(), String> {
@@ -51,7 +56,13 @@ fn prepare_ingestor(input: &Ingestor, g: &mut Graph) -> Result<(), String> {
     }
 }
 
-fn run_phase(config: &BuildConfig, g: &mut Graph, phase: u8) -> Option<()> {
+fn run_phase(
+    config: &BuildConfig,
+    g: &mut Graph,
+    phase: u8,
+    cache_dir: &str,
+    force_download: bool,
+) -> Option<()> {
     let ordered: Vec<&Ingestor> = config.inputs.iter()
         .filter(|i| i.phase() == phase)
         .collect();
@@ -60,7 +71,7 @@ fn run_phase(config: &BuildConfig, g: &mut Graph, phase: u8) -> Option<()> {
         tracing::info!("loading '{}'...", input.label());
         let before = SystemTime::now();
 
-        let path = match resolve_path(input) {
+        let path = match resolve_source(input, cache_dir, force_download) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("failed to resolve '{}': {e}", input.label());
@@ -111,6 +122,23 @@ fn finalize(mut g: Graph, config: &BuildConfig) -> Option<Graph> {
     Some(g)
 }
 
+/// Apply config.yaml routing defaults onto a freshly built or restored graph.
+/// Shared by `main` (startup) and the scheduler (after a hot rebuild).
+pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
+    if let Some(s) = routing.min_access_secs {
+        g.set_min_access_secs(s);
+    }
+    if let Some(v) = routing.walking_speed_mps {
+        g.set_walking_speed_mps(v);
+    }
+    if let Some(edges) = routing.reliability_bucket_edges.clone() {
+        g.set_reliability_bucket_edges(edges);
+    }
+    if let Some(s) = routing.arrival_slack_secs {
+        g.set_arrival_slack_secs(s);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,20 +156,20 @@ mod tests {
     fn run_phase_empty_osm_succeeds() {
         let config = empty_config();
         let mut g = Graph::new();
-        assert!(run_phase(&config, &mut g, 0).is_some());
+        assert!(run_phase(&config, &mut g, 0, "cache", false).is_some());
     }
 
     #[test]
     fn run_phase_empty_gtfs_succeeds() {
         let config = empty_config();
         let mut g = Graph::new();
-        assert!(run_phase(&config, &mut g, 1).is_some());
+        assert!(run_phase(&config, &mut g, 1, "cache", false).is_some());
     }
 
     #[test]
     fn build_osm_phase_empty_config() {
         let config = empty_config();
-        let g = build_osm_phase(&config);
+        let g = build_osm_phase(&config, "cache", false);
         assert!(g.is_some());
         assert_eq!(g.unwrap().node_count(), 0);
     }
@@ -150,7 +178,7 @@ mod tests {
     fn build_gtfs_phase_empty_finalizes() {
         let config = empty_config();
         let g = Graph::new();
-        let result = build_gtfs_phase(g, &config);
+        let result = build_gtfs_phase(g, &config, "cache", false);
         assert!(result.is_some());
     }
 }

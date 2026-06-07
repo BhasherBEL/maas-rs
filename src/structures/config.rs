@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 
 use gtfs_structures::RouteType;
@@ -11,9 +12,102 @@ pub struct Config {
     pub default_routing: RoutingDefaultConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    /// Background auto-update of remote GTFS feeds. Absent ⇒ disabled.
+    #[serde(default)]
+    pub auto_update: Option<AutoUpdateConfig>,
+    /// Realtime delay feeds (GTFS-RT + custom STIB). Absent ⇒ disabled.
+    #[serde(default)]
+    pub realtime: Option<RealtimeConfig>,
     /// Minimum log level: trace | debug | info | warn | error  (default: info)
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RealtimeConfig {
+    /// When false (or the section is absent) no realtime polling runs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between poll cycles across all feeds.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Per-request HTTP timeout for realtime polls.
+    #[serde(default = "default_rt_timeout_secs")]
+    pub request_timeout_secs: u64,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub feeds: Vec<RealtimeFeedConfig>,
+}
+
+fn default_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_rt_timeout_secs() -> u64 {
+    20
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_429_threshold")]
+    pub consecutive_429_threshold: u32,
+    #[serde(default = "default_throttled_interval_secs")]
+    pub throttled_min_interval_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            consecutive_429_threshold: default_429_threshold(),
+            throttled_min_interval_secs: default_throttled_interval_secs(),
+        }
+    }
+}
+
+fn default_429_threshold() -> u32 {
+    3
+}
+
+fn default_throttled_interval_secs() -> u64 {
+    60
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum RealtimeFeedConfig {
+    /// Generic GTFS-Realtime protobuf trip-update feed (SNCB, TEC).
+    #[serde(rename = "gtfs-rt")]
+    GtfsRt {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    /// Custom STIB / MIVB waiting-times feed.
+    #[serde(rename = "stib")]
+    Stib {
+        name: String,
+        waiting_time_url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AutoUpdateConfig {
+    /// When false (or the section is absent) no background updates run.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cron schedule. Standard 5-field (e.g. "0 5 * * *") or 6-field (leading seconds).
+    pub schedule: String,
+    /// Directory for downloaded feeds and the hash sidecar.
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
+}
+
+fn default_cache_dir() -> String {
+    "cache".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +192,8 @@ pub enum Ingestor {
 pub struct OsmPbfIngestor {
     pub url: String,
     pub phase: Option<u8>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +201,8 @@ pub struct GtfsGenericIngestor {
     pub name: String,
     pub url: String,
     pub phase: Option<u8>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +211,8 @@ pub struct GtfsSncbIngestor {
     pub url: String,
     pub osm_url: String,
     pub phase: Option<u8>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +248,14 @@ impl Ingestor {
             Ingestor::OsmPbf(c) => &c.url,
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.url,
             Ingestor::GtfsSncb(c) => &c.url,
+        }
+    }
+
+    pub fn headers(&self) -> &HashMap<String, String> {
+        match self {
+            Ingestor::OsmPbf(c) => &c.headers,
+            Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.headers,
+            Ingestor::GtfsSncb(c) => &c.headers,
         }
     }
 
@@ -244,5 +352,97 @@ server:
         let yaml = "walking_speed_mps: 1.4";
         let cfg: RoutingDefaultConfig = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cfg.walking_speed_mps, Some(1.4));
+    }
+
+    #[test]
+    fn gtfs_ingestor_parses_headers() {
+        let yaml = r#"
+ingestor: gtfs/generic
+name: stib
+url: "https://example.com/gtfs.zip"
+headers:
+  Authorization: "Bearer ${TOKEN}"
+  X-Api-Key: "${file:/run/secrets/key}"
+"#;
+        let ing: Ingestor = serde_yml::from_str(yaml).unwrap();
+        let h = ing.headers();
+        assert_eq!(
+            h.get("Authorization").map(|s| s.as_str()),
+            Some("Bearer ${TOKEN}")
+        );
+        assert_eq!(
+            h.get("X-Api-Key").map(|s| s.as_str()),
+            Some("${file:/run/secrets/key}")
+        );
+    }
+
+    #[test]
+    fn ingestor_without_headers_is_empty() {
+        let yaml = "ingestor: gtfs/generic\nname: x\nurl: \"path:data/x.zip\"";
+        let ing: Ingestor = serde_yml::from_str(yaml).unwrap();
+        assert!(ing.headers().is_empty());
+    }
+
+    #[test]
+    fn auto_update_section_parses() {
+        let yaml = "enabled: true\nschedule: \"0 5 * * *\"\ncache_dir: \"mycache\"";
+        let au: AutoUpdateConfig = serde_yml::from_str(yaml).unwrap();
+        assert!(au.enabled);
+        assert_eq!(au.schedule, "0 5 * * *");
+        assert_eq!(au.cache_dir, "mycache");
+    }
+
+    #[test]
+    fn auto_update_cache_dir_defaults() {
+        let yaml = "enabled: false\nschedule: \"0 5 * * *\"";
+        let au: AutoUpdateConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(au.cache_dir, "cache");
+    }
+
+    #[test]
+    fn realtime_config_parses_both_feed_kinds() {
+        let yaml = r#"
+enabled: true
+poll_interval_secs: 45
+feeds:
+  - type: gtfs-rt
+    name: sncb
+    url: "https://example.com/rt?format=protobuf"
+    headers:
+      bmc-partner-key: "${BMC_PARTNER_KEY}"
+  - type: stib
+    name: stib
+    waiting_time_url: "https://example.com/WaitingTimes/"
+"#;
+        let rt: RealtimeConfig = serde_yml::from_str(yaml).unwrap();
+        assert!(rt.enabled);
+        assert_eq!(rt.poll_interval_secs, 45);
+        assert_eq!(rt.request_timeout_secs, 20); // default
+        assert_eq!(rt.feeds.len(), 2);
+        match &rt.feeds[0] {
+            RealtimeFeedConfig::GtfsRt { name, url, headers } => {
+                assert_eq!(name, "sncb");
+                assert!(url.contains("protobuf"));
+                assert_eq!(headers.get("bmc-partner-key").unwrap(), "${BMC_PARTNER_KEY}");
+            }
+            _ => panic!("expected gtfs-rt feed first"),
+        }
+        match &rt.feeds[1] {
+            RealtimeFeedConfig::Stib { name, waiting_time_url, .. } => {
+                assert_eq!(name, "stib");
+                assert!(waiting_time_url.ends_with("WaitingTimes/"));
+            }
+            _ => panic!("expected stib feed second"),
+        }
+    }
+
+    #[test]
+    fn realtime_rate_limit_defaults() {
+        let yaml = "enabled: true";
+        let rt: RealtimeConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(rt.rate_limit.consecutive_429_threshold, 3);
+        assert_eq!(rt.rate_limit.throttled_min_interval_secs, 60);
+        assert_eq!(rt.poll_interval_secs, 30);
+        assert!(rt.feeds.is_empty());
     }
 }

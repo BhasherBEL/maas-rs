@@ -1,5 +1,6 @@
 use std::{env, sync::Arc};
 
+use arc_swap::ArcSwap;
 use maas_rs::{
     logging,
     services::{
@@ -23,6 +24,12 @@ async fn main() {
 
     logging::init(&config.log_level);
 
+    let cache_dir = config
+        .auto_update
+        .as_ref()
+        .map(|a| a.cache_dir.clone())
+        .unwrap_or_else(|| "cache".to_string());
+
     let args: Vec<String> = env::args().collect();
 
     let build_mode = args.contains(&"--build".to_string());
@@ -45,7 +52,7 @@ async fn main() {
     }
 
     let mut g = if build_mode {
-        let osm_graph = match build_osm_phase(&config.build) {
+        let osm_graph = match build_osm_phase(&config.build, &cache_dir, false) {
             Some(g) => g,
             None => {
                 tracing::error!("OSM phase failed");
@@ -60,7 +67,7 @@ async fn main() {
             }
         }
 
-        match build_gtfs_phase(osm_graph, &config.build) {
+        match build_gtfs_phase(osm_graph, &config.build, &cache_dir, false) {
             Some(g) => g,
             None => {
                 tracing::error!("GTFS phase failed");
@@ -79,7 +86,8 @@ async fn main() {
             }
         };
 
-        match build_gtfs_phase(osm_graph, &config.build) {
+        // Manual refresh: always pull fresh remote feeds.
+        match build_gtfs_phase(osm_graph, &config.build, &cache_dir, true) {
             Some(g) => g,
             None => {
                 tracing::error!("GTFS phase failed");
@@ -105,22 +113,13 @@ async fn main() {
     }
 
     // Apply config.yaml routing defaults (works for all modes).
-    if let Some(s) = config.default_routing.min_access_secs {
-        g.set_min_access_secs(s);
-    }
-    if let Some(v) = config.default_routing.walking_speed_mps {
-        g.set_walking_speed_mps(v);
-    }
-    if let Some(edges) = config.default_routing.reliability_bucket_edges.clone() {
-        g.set_reliability_bucket_edges(edges);
-    }
-    if let Some(s) = config.default_routing.arrival_slack_secs {
-        g.set_arrival_slack_secs(s);
-    }
+    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
 
     if !serve_mode {
         return;
     }
 
-    let _ = app::server(Arc::new(g), &config.server).await;
+    let shared: maas_rs::services::scheduler::SharedGraph = Arc::new(ArcSwap::from_pointee(g));
+    let config = Arc::new(config);
+    let _ = app::server(shared, config).await;
 }

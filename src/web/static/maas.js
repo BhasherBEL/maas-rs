@@ -23,6 +23,24 @@ function fmtTime(secs) {
   return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
 }
 
+// Build a leg-time-col cell that reflects realtime: non-RT legs show a plain
+// (black) time; RT legs are green; an RT time that differs from schedule shows
+// the scheduled time struck through with the realtime time in red.
+function mkLegTime(secs, schedSecs, isRealtime) {
+  const wrap = mkEl('div', 'leg-time-col');
+  if (isRealtime && schedSecs != null && secs !== schedSecs) {
+    wrap.classList.add('rt', 'rt-late');
+    wrap.appendChild(mkEl('span', 'lt-sched', fmtTime(schedSecs)));
+    wrap.appendChild(mkEl('span', 'lt-rt', fmtTime(secs)));
+  } else if (isRealtime) {
+    wrap.classList.add('rt', 'rt-ontime');
+    wrap.appendChild(mkEl('span', 'lt-rt', fmtTime(secs)));
+  } else {
+    wrap.textContent = fmtTime(secs);
+  }
+  return wrap;
+}
+
 function fmtTimeSec(secs) {
   if (secs == null) return '—';
   const h = Math.floor(secs / 3600) % 24;

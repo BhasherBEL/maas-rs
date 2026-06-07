@@ -5,7 +5,7 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
-        NodeData, NodeID, ReliabilityBuckets, ScenarioBag,
+        NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
         plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, StopPathLeg, StopReach},
         raptor::Trace,
     },
@@ -16,6 +16,12 @@ use super::{Graph, MAX_ROUNDS};
 /// Maximum labels kept per `(round, stop)` cell. One per reliability bucket, so this
 /// bounds the supported bucket count (edges.len()+2). Default config uses 5.
 pub(super) const MAX_LABELS: usize = 16;
+
+/// Apply a signed realtime delay (seconds) to a scheduled time, clamped at 0.
+#[inline]
+fn apply_delay(scheduled: u32, delay: i32) -> u32 {
+    (scheduled as i64 + delay as i64).max(0) as u32
+}
 
 /// A label currently riding a route during a single `scan_route` pass.
 #[derive(Clone, Copy)]
@@ -239,12 +245,30 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> Vec<Plan> {
+        self.raptor_tuned_rt(origin, destination, start_time, date, weekday, min_access_secs,
+            buckets, slack, &RealtimeIndex::new())
+    }
+
+    /// `raptor_tuned` with a realtime delay index applied to trip times.
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_tuned_rt(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs,
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> = raw_stops.iter()
                     .map(|&(s, w)| (s, start_time + w))
                     .collect();
-                self.raptor_inner(&sources, targets, start_time, access_secs, date, weekday, origin, destination, buckets, slack)
+                self.raptor_inner(&sources, targets, start_time, access_secs, date, weekday, origin, destination, buckets, slack, rt)
             })
     }
 
@@ -261,10 +285,11 @@ impl Graph {
         destination: NodeID,
         buckets: &ReliabilityBuckets,
         slack: u32,
+        rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_inner_with_debug(
             sources, targets, start_time, access_secs, date, weekday, origin, destination,
-            buckets, slack,
+            buckets, slack, rt,
         )
         .0
     }
@@ -282,6 +307,7 @@ impl Graph {
         destination: NodeID,
         buckets: &ReliabilityBuckets,
         slack: u32,
+        rt: &RealtimeIndex,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let n_patterns = self.raptor.transit_patterns.len();
@@ -347,6 +373,7 @@ impl Graph {
                         curr_slice,
                         &mut best,
                         buckets,
+                        rt,
                         &mut marked,
                         &mut is_marked,
                     );
@@ -409,6 +436,7 @@ impl Graph {
             buckets,
             origin,
             destination,
+            rt,
             Some(&mut candidates),
         );
         (plans, candidates, stops_reached)
@@ -599,6 +627,23 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> ExplainResult {
+        self.raptor_explain_tuned_rt(origin, destination, start_time, date, weekday,
+            min_access_secs, buckets, slack, &RealtimeIndex::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_explain_tuned_rt(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
@@ -609,7 +654,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack,
+                    buckets, slack, rt,
                 );
                 if plans.is_empty() { None } else { Some((plans, cands, stops)) }
             },
@@ -652,6 +697,24 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> ExplainResult {
+        self.raptor_range_explain_tuned_rt(origin, destination, start_time, window_secs, date,
+            weekday, min_access_secs, buckets, slack, &RealtimeIndex::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_explain_tuned_rt(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
@@ -662,7 +725,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack,
+                    buckets, slack, rt,
                 );
                 if probe.is_empty() {
                     return None;
@@ -687,7 +750,7 @@ impl Graph {
                         raw_stops.iter().map(|&(s, w)| (s, t + w)).collect();
                     let (plans_t, mut cands_t, _stops_t) = self.raptor_inner_with_debug(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
-                        buckets, slack,
+                        buckets, slack, rt,
                     );
                     all_plans.extend(plans_t);
                     all_candidates.append(&mut cands_t);
@@ -744,6 +807,7 @@ impl Graph {
         curr: &mut [LabelSet],
         best: &mut [LabelSet],
         buckets: &ReliabilityBuckets,
+        rt: &RealtimeIndex,
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
     ) {
@@ -770,7 +834,9 @@ impl Graph {
 
             // 1. Settle arrivals at this stop for every riding label.
             for r in &riding {
-                let arr = col[r.t].arrival;
+                // Realtime: shift the scheduled arrival by the live delay for this
+                // trip at this stop (0 when no realtime info — inert default).
+                let arr = apply_delay(col[r.t].arrival, rt.delay(trip_ids[r.t], stop as u32));
                 if arr >= cutoff {
                     continue;
                 }
@@ -817,7 +883,8 @@ impl Graph {
                         if !self.is_trip_active(trip_ids[t], date, weekday) {
                             continue;
                         }
-                        let trip_dep = col[t].departure;
+                        // Realtime: effective departure = scheduled + live delay.
+                        let trip_dep = apply_delay(col[t].departure, rt.delay(trip_ids[t], stop as u32));
 
                         // Cumulative reliability — same per-transfer formula as
                         // reconstruction (earliest-based), so buckets agree.
@@ -1107,6 +1174,24 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> Vec<Plan> {
+        self.raptor_range_tuned_rt(origin, destination, start_time, window_secs, date, weekday,
+            min_access_secs, buckets, slack, &RealtimeIndex::new())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_tuned_rt(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs,
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> = raw_stops.iter()
@@ -1114,7 +1199,7 @@ impl Graph {
                     .collect();
                 let probe = self.raptor_inner(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack,
+                    buckets, slack, rt,
                 );
                 if probe.is_empty() {
                     return vec![];
@@ -1138,7 +1223,7 @@ impl Graph {
                         .collect();
                     let plans = self.raptor_inner(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
-                        buckets, slack,
+                        buckets, slack, rt,
                     );
                     all_plans.extend(plans);
                 }

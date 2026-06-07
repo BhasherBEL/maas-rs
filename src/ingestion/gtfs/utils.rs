@@ -32,6 +32,11 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
     pub fn len(&self) -> usize {
         self.to_string.len()
     }
+
+    /// The original ids in index order (index `i` is the id that maps to `i`).
+    pub fn strings(&self) -> &[T] {
+        &self.to_string
+    }
 }
 
 pub fn display_route_type(route_type: RouteType) -> &'static str {

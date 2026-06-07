@@ -1,7 +1,7 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 
 use crate::ingestion::gtfs::date_to_days;
-use crate::structures::{Graph, ReliabilityBuckets, valid_reliability_edges};
+use crate::structures::{Graph, RealtimeIndex, ReliabilityBuckets, valid_reliability_edges};
 use crate::structures::plan::{ExplainResult, Plan};
 
 pub struct RouteQuery {
@@ -62,16 +62,20 @@ fn resolve_query_params(
     Ok((origin, destination, time, date, weekday, min_access))
 }
 
-pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graphql::Error> {
+pub fn route(
+    graph: &Graph,
+    query: &RouteQuery,
+    rt: &RealtimeIndex,
+) -> Result<Vec<Plan>, async_graphql::Error> {
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
     let (buckets, slack) = resolve_tuning(graph, query)?;
 
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_tuned(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack)
+            graph.raptor_range_tuned_rt(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
         }
-        _ => graph.raptor_tuned(origin, destination, time, date, weekday, min_access, &buckets, slack),
+        _ => graph.raptor_tuned_rt(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
     };
 
     if plans.is_empty() {
@@ -86,6 +90,7 @@ pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graph
 pub fn route_explain(
     graph: &Graph,
     query: &RouteQuery,
+    rt: &RealtimeIndex,
 ) -> Result<ExplainResult, async_graphql::Error> {
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
@@ -93,9 +98,9 @@ pub fn route_explain(
 
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_explain_tuned(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack)
+            graph.raptor_range_explain_tuned_rt(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
         }
-        _ => graph.raptor_explain_tuned(origin, destination, time, date, weekday, min_access, &buckets, slack),
+        _ => graph.raptor_explain_tuned_rt(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
     };
 
     Ok(result)

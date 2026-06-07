@@ -3,7 +3,7 @@ use super::raptor_route::{Label, LabelSet};
 use crate::{
     ingestion::gtfs::TimetableSegment,
     structures::{
-        EdgeData, NodeID, ReliabilityBuckets, ScenarioBag,
+        EdgeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
         plan::{
             ArrivalScenario, CandidateStatus, Plan, PlanCandidate, PlanLeg, PlanLegStep, PlanPlace,
             PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep, TransferRisk,
@@ -12,6 +12,12 @@ use crate::{
 };
 
 use super::Graph;
+
+/// Apply a signed realtime delay (seconds) to a time, clamped at 0.
+#[inline]
+fn apply_signed_delay(t: u32, delay: i32) -> u32 {
+    (t as i64 + delay as i64).max(0) as u32
+}
 
 impl Graph {
     pub(super) fn build_walk_plan(
@@ -106,6 +112,7 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         origin: NodeID,
         destination: NodeID,
+        rt: &RealtimeIndex,
         mut debug_sink: Option<&mut Vec<PlanCandidate>>,
     ) -> Vec<Plan> {
         use super::MAX_ROUNDS;
@@ -185,6 +192,10 @@ impl Graph {
                 );
                 self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday);
             }
+
+            // Realtime post-pass: shift leg times by live delays, re-chain the
+            // timeline, and recompute transfer reliability on the new margins.
+            self.apply_realtime(&mut legs, rt);
 
             if let Some(&(_, stop_arrival)) = sources.iter().find(|&&(s, _)| s == origin_stop) {
                 let first_walk = stop_arrival.saturating_sub(start_time);
@@ -621,6 +632,9 @@ impl Graph {
                 },
                 start: board_dep,
                 end: alight_arr,
+                scheduled_start: board_dep,
+                scheduled_end: alight_arr,
+                realtime: false,
                 trip_id: trip_ids[t],
                 length: total_length,
                 duration: alight_arr - board_dep,
@@ -640,6 +654,94 @@ impl Graph {
         legs.reverse();
 
         (legs, stop)
+    }
+
+    /// Realtime post-pass: rewrite each transit leg's times from scheduled to
+    /// effective (scheduled + live delay), re-chain the whole timeline, and
+    /// recompute transfer reliability on the new margins. Walks between legs
+    /// follow the (possibly delayed) preceding arrival. With an empty index this
+    /// is a no-op, so schedule-only behaviour is preserved exactly.
+    ///
+    /// Runs *before* the access/egress walks are attached, so `legs` here is the
+    /// transit/transfer chain only; `cursor` is the running effective arrival.
+    pub(super) fn apply_realtime(&self, legs: &mut [PlanLeg], rt: &RealtimeIndex) {
+        if rt.is_empty() {
+            return;
+        }
+        let compact = |node: NodeID| -> Option<u32> {
+            let c = self.raptor.transit_node_to_stop[node.0];
+            if c == u32::MAX { None } else { Some(c) }
+        };
+
+        let mut cursor: Option<u32> = None;
+        for leg in legs.iter_mut() {
+            match leg {
+                PlanLeg::Transit(t) => {
+                    let board = compact(t.from.node_id);
+                    let alight = compact(t.to.node_id);
+                    let d_board = board.map_or(0, |s| rt.delay(t.trip_id, s));
+                    let d_alight = alight.map_or(0, |s| rt.delay(t.trip_id, s));
+                    let has_rt = board.is_some_and(|s| rt.delay_opt(t.trip_id, s).is_some())
+                        || alight.is_some_and(|s| rt.delay_opt(t.trip_id, s).is_some());
+
+                    t.scheduled_start = t.start;
+                    t.scheduled_end = t.end;
+                    t.start = apply_signed_delay(t.start, d_board);
+                    t.end = apply_signed_delay(t.end, d_alight);
+                    t.realtime = has_rt;
+                    t.duration = t.end.saturating_sub(t.start);
+                    t.from.departure = Some(t.start);
+                    t.to.arrival = Some(t.end);
+
+                    for step in t.steps.iter_mut() {
+                        if let PlanLegStep::Transit(s) = step {
+                            if let Some(sc) = compact(s.place.node_id) {
+                                let d = rt.delay(t.trip_id, sc);
+                                s.place.arrival = s.place.arrival.map(|a| apply_signed_delay(a, d));
+                                s.place.departure = s.place.departure.map(|x| apply_signed_delay(x, d));
+                            }
+                        }
+                    }
+
+                    // Recompute the transfer onto this leg from the realtime arrival.
+                    if let (Some(prev_arr), Some(prt)) = (cursor, t.preceding_route_type) {
+                        let margin = t.start as i32 - prev_arr as i32;
+                        let next_dep = t.transfer_risk.as_ref().and_then(|r| r.next_departure);
+                        let (rel, next_rel) = match self.raptor.transit_delay_models.get(&prt) {
+                            Some(cdf) => (
+                                cdf.prob_on_time(margin),
+                                next_dep.map(|nd| cdf.prob_on_time(nd as i32 - prev_arr as i32)),
+                            ),
+                            None => (1.0, None),
+                        };
+                        t.preceding_arrival = Some(prev_arr);
+                        t.transfer_risk = Some(TransferRisk {
+                            reliability: rel,
+                            scheduled_departure: t.scheduled_start,
+                            next_departure: next_dep,
+                            next_reliability: next_rel,
+                            margin_secs: Some(margin),
+                        });
+                    }
+                    cursor = Some(t.end);
+                }
+                PlanLeg::Walk(w) => {
+                    if let Some(prev) = cursor {
+                        let dur = w.duration;
+                        w.start = prev;
+                        w.end = prev + dur;
+                        w.from.departure = Some(w.start);
+                        w.to.arrival = Some(w.end);
+                        for step in w.steps.iter_mut() {
+                            if let PlanLegStep::Walk(ws) = step {
+                                ws.place.arrival = Some(w.end);
+                            }
+                        }
+                        cursor = Some(w.end);
+                    }
+                }
+            }
+        }
     }
 
     /// Pass 3 of three-pass RAPTOR: tighten transit legs using backward labels.

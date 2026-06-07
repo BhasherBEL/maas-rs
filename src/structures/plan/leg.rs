@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use async_graphql::{ComplexObject, Context, Interface, Result, SimpleObject};
 use gtfs_structures::RouteType;
@@ -73,9 +72,19 @@ pub struct TransferRisk {
 #[graphql(complex)]
 pub struct PlanTransitLeg {
     pub length: usize,
+    /// Effective boarding time (seconds since midnight). Equals `scheduled_start`
+    /// unless realtime data shifts it.
     pub start: u32,
+    /// Effective alighting time. Equals `scheduled_end` unless realtime shifts it.
     pub end: u32,
     pub duration: u32,
+
+    /// Scheduled (timetable) boarding time, before any realtime delay.
+    pub scheduled_start: u32,
+    /// Scheduled (timetable) alighting time, before any realtime delay.
+    pub scheduled_end: u32,
+    /// True when realtime data informs this leg's times (UI shows it as "live").
+    pub realtime: bool,
 
     pub from: PlanPlace,
     pub to: PlanPlace,
@@ -111,8 +120,8 @@ pub struct PlanTransitLeg {
 #[ComplexObject]
 impl PlanTransitLeg {
     async fn trip(&self, ctx: &Context<'_>) -> Result<Option<PlanTrip>> {
-        let graph = ctx.data::<Arc<Graph>>()?;
-        Ok(PlanTrip::from_trip_id(graph, self.trip_id))
+        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
+        Ok(PlanTrip::from_trip_id(graph.as_ref(), self.trip_id))
     }
 
     async fn previous_departures(
@@ -123,7 +132,7 @@ impl PlanTransitLeg {
         if count == 0 {
             return Ok(vec![]);
         }
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
         let first = match self.steps[0] {
             PlanLegStep::Walk(_) => {
                 return Err(async_graphql::Error::new(
@@ -167,7 +176,7 @@ impl PlanTransitLeg {
         if count == 0 {
             return Ok(vec![]);
         }
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
         let first = match self.steps[0] {
             PlanLegStep::Walk(_) => {
                 return Err(async_graphql::Error::new(
@@ -238,6 +247,9 @@ impl PlanTransitLeg {
                     trip_id,
                     start: dep,
                     end: arr,
+                    scheduled_start: dep,
+                    scheduled_end: arr,
+                    realtime: false,
                     length: 0,
                     from: PlanPlace {
                         departure: Some(dep),
@@ -365,6 +377,9 @@ impl PlanTransitLeg {
                     trip_id,
                     start: segment.departure,
                     end: current_arrival,
+                    scheduled_start: segment.departure,
+                    scheduled_end: current_arrival,
+                    realtime: false,
                     length: 0,
                     from: PlanPlace {
                         departure: Some(segment.departure),

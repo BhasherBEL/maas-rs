@@ -16,6 +16,11 @@ type TestSchema = async_graphql::Schema<QueryRoot, async_graphql::EmptyMutation,
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Wrap a graph in the hot-swappable container the schema now expects.
+fn shared(g: Graph) -> maas_rs::services::scheduler::SharedGraph {
+    Arc::new(arc_swap::ArcSwap::from_pointee(g))
+}
+
 fn osm_node(eid: &str, lat: f64, lon: f64) -> NodeData {
     NodeData::OsmNode(OsmNodeData {
         eid: eid.to_string(),
@@ -28,6 +33,7 @@ fn transit_stop(name: &str, lat: f64, lon: f64) -> NodeData {
         name: name.to_string(),
         lat_lng: LatLng { latitude: lat, longitude: lon },
         accessibility: Availability::Available,
+        id: name.to_string(),
     })
 }
 
@@ -48,7 +54,7 @@ fn data_obj(resp: async_graphql::Response) -> async_graphql::indexmap::IndexMap<
 
 #[test]
 fn graphql_ping_returns_pong() {
-    let schema = build_schema(Arc::new(Graph::new()));
+    let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(&schema, "{ ping }");
     assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
     let data = data_obj(resp);
@@ -57,7 +63,7 @@ fn graphql_ping_returns_pong() {
 
 #[test]
 fn graphql_raptor_no_nodes_returns_error() {
-    let schema = build_schema(Arc::new(Graph::new()));
+    let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(
         &schema,
         r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) { start } }"#,
@@ -72,7 +78,7 @@ fn graphql_raptor_accepts_tuning_overrides() {
     // The reliability/slack override arguments must be part of the schema. With an
     // empty graph the query still fails at routing ("no node"), but it must NOT fail
     // with an unknown-argument schema error.
-    let schema = build_schema(Arc::new(Graph::new()));
+    let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(
         &schema,
         r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01,
@@ -90,7 +96,7 @@ fn graphql_raptor_invalid_date_returns_error() {
     let mut g = Graph::new();
     g.add_node(osm_node("n0", 50.0, 4.0));
     g.build_raptor_index();
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
         r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01, date: "not-a-date") { start } }"#,
@@ -105,7 +111,7 @@ fn graphql_raptor_invalid_date_returns_error() {
 
 #[test]
 fn graphql_gtfs_stops_empty_on_no_transit() {
-    let schema = build_schema(Arc::new(Graph::new()));
+    let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(&schema, "{ gtfsStops { id } }");
     assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
     let data = data_obj(resp);
@@ -114,11 +120,54 @@ fn graphql_gtfs_stops_empty_on_no_transit() {
 
 #[test]
 fn graphql_gtfs_agencies_empty_on_no_transit() {
-    let schema = build_schema(Arc::new(Graph::new()));
+    let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(&schema, "{ gtfsAgencies { id } }");
     assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
     let data = data_obj(resp);
     assert_eq!(data["gtfsAgencies"], Value::List(vec![]));
+}
+
+#[test]
+fn hot_swap_is_visible_to_resolvers() {
+    // The scheduler hot-swaps the graph by calling `.store()` on the shared
+    // ArcSwap the schema holds. This proves a swap reaches live queries through
+    // the SAME schema instance — the core auto-update promise.
+    let shared_graph = shared(Graph::new());
+    let schema = build_schema(shared_graph.clone());
+
+    // Before: empty graph → no stops.
+    let resp = execute_sync(&schema, "{ gtfsStops { id } }");
+    let data = data_obj(resp);
+    assert_eq!(data["gtfsStops"], Value::List(vec![]), "expected no stops before swap");
+
+    // Build a graph with one known-visible stop and swap it into the same container.
+    let mut g = Graph::new();
+    g.add_node(transit_stop("Central Station", 50.845, 4.357));
+    g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 0 });
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "1".into(),
+        route_long_name: "Test Route".into(),
+        route_type: gtfs_structures::RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    g.build_raptor_index();
+    shared_graph.store(Arc::new(g));
+
+    // After: the SAME schema must now see the swapped-in stop.
+    let resp = execute_sync(&schema, "{ gtfsStops { id name } }");
+    let data = data_obj(resp);
+    let stops = match &data["gtfsStops"] {
+        Value::List(v) => v,
+        other => panic!("expected list, got {other:?}"),
+    };
+    assert_eq!(stops.len(), 1, "swap must be visible to the live schema");
+    let stop_obj = match &stops[0] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    assert_eq!(stop_obj["name"], Value::String("Central Station".into()));
 }
 
 #[test]
@@ -136,7 +185,7 @@ fn graphql_gtfs_stops_returns_stop_data() {
     }]);
     g.build_raptor_index();
 
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(&schema, "{ gtfsStops { id name mode } }");
     assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
 
@@ -172,7 +221,7 @@ fn graphql_gtfs_agencies_returns_agency_and_routes() {
     }]);
     g.build_raptor_index();
 
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
         "{ gtfsAgencies { id name url routes { shortName mode } } }",
@@ -213,7 +262,7 @@ fn graphql_raptor_explain_stops_reached_empty_no_transit() {
     g.add_node(osm_node("n0", 50.0, 4.0));
     g.add_node(osm_node("n1", 50.01, 4.01));
     g.build_raptor_index();
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
         r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) {
@@ -236,7 +285,7 @@ fn graphql_raptor_explain_origin_destination_present() {
     g.add_node(osm_node("n0", 50.0, 4.0));
     g.add_node(osm_node("n1", 50.01, 4.01));
     g.build_raptor_index();
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
         r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) {
@@ -273,7 +322,7 @@ fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
     g.add_node(transit_stop("Test Stop", 50.0004, 4.0));
     g.build_raptor_index();
 
-    let schema = build_schema(Arc::new(g));
+    let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
         r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.1, toLng: 4.1) {
