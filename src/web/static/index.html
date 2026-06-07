@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MaaS Trip Planner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+/* ── Global tokens (header, map, modal) ─────────────────────── */
+:root {
+  --bg:        #f6f7f9;
+  --panel:     #ffffff;
+  --panel-2:   #fafbfc;
+  --border:    #e3e6eb;
+  --border-2:  #eef0f3;
+  --fg:        #1c2025;
+  --fg-2:      #54606b;
+  --fg-3:      #8a95a1;
+  --accent:    #1c64f2;
+  --accent-2:  #e0ecff;
+  --danger:    #d92d20;
+  --warn:      #f59e0b;
+  --ok:        #16a34a;
+  --shadow:    0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.06);
+  --shadow-l:  0 8px 24px rgba(16,24,40,.12);
+  --radius:    8px;
+  --radius-s:  6px;
+  --mono:      ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:       #0e1116;
+    --panel:    #161a21;
+    --panel-2:  #1c2129;
+    --border:   #262c36;
+    --border-2: #1f242c;
+    --fg:       #e6e9ee;
+    --fg-2:     #aab2bd;
+    --fg-3:     #6c7682;
+    --accent:   #5e8bff;
+    --accent-2: #1a2a4a;
+    --shadow:   0 1px 2px rgba(0,0,0,.4);
+    --shadow-l: 0 8px 24px rgba(0,0,0,.6);
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--bg); color: var(--fg); }
+body { font: 13.5px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; display: flex; flex-direction: column; }
+button { font: inherit; color: inherit; cursor: pointer; }
+input, select { font: inherit; color: inherit; }
+
+/* ── Header ──────────────────────────────────────────────────── */
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+header .logo { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; flex: 1; }
+header .logo .dot { color: var(--accent); }
+header .head-btn {
+  padding: 5px 10px; background: transparent; border: 1px solid var(--border);
+  border-radius: var(--radius-s); font-size: 12px; color: var(--fg-2);
+}
+header .head-btn:hover { background: var(--panel-2); color: var(--fg); }
+header .head-btn.active { background: var(--accent-2); border-color: var(--accent); color: var(--accent); }
+header a.head-btn { text-decoration: none; }
+
+/* ── Layout ──────────────────────────────────────────────────── */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+#sidebar {
+  width: 440px; flex-shrink: 0;
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--border); background: var(--panel);
+  overflow: hidden;
+  /* ── Design system palette override (warm neutral) ── */
+  --ds-bg:        oklch(0.978 0.004 95);
+  --ds-surface:   #ffffff;
+  --ds-surface-2: oklch(0.967 0.005 95);
+  --ds-surface-3: oklch(0.945 0.006 95);
+  --ds-line:      oklch(0.905 0.006 95);
+  --ds-line-soft: oklch(0.935 0.005 95);
+  --ds-ink:       oklch(0.255 0.012 70);
+  --ds-ink-2:     oklch(0.46 0.012 70);
+  --ds-ink-3:     oklch(0.62 0.009 70);
+  --ds-ink-4:     oklch(0.74 0.007 70);
+  --ds-accent:      oklch(0.52 0.085 205);
+  --ds-accent-deep: oklch(0.43 0.09 207);
+  --ds-accent-soft: oklch(0.95 0.022 205);
+  --ds-rel-high: oklch(0.60 0.125 152);
+  --ds-rel-mid:  oklch(0.71 0.135 80);
+  --ds-rel-low:  oklch(0.60 0.165 33);
+  --ds-rel-high-soft: oklch(0.95 0.04 152);
+  --ds-rel-mid-soft:  oklch(0.955 0.05 88);
+  --ds-rel-low-soft:  oklch(0.955 0.045 33);
+  --ds-radius:    11px;
+  --ds-radius-sm: 7px;
+  --ds-shadow-sm: 0 1px 2px oklch(0.4 0.02 70 / 0.06), 0 1px 1px oklch(0.4 0.02 70 / 0.04);
+  --ds-shadow-md: 0 2px 6px oklch(0.4 0.02 70 / 0.08), 0 8px 24px oklch(0.4 0.02 70 / 0.06);
+}
+
+#map { flex: 1; min-width: 0; }
+@media (prefers-color-scheme: dark) {
+  .leaflet-container { background: #0a0d12; }
+  .leaflet-tile { filter: invert(1) hue-rotate(180deg) brightness(.95) contrast(.92); }
+  .leaflet-control-attribution { background: rgba(20,20,20,.7) !important; color: #aaa !important; }
+  .leaflet-control-attribution a { color: #6cf !important; }
+}
+
+/* ── Stop search / dropdown (global) ─────────────────────────── */
+.maas-input {
+  width: 100%; padding: 7px 9px; border: 1px solid var(--border);
+  border-radius: var(--radius-s); background: var(--panel-2);
+  color: var(--fg); outline: none; font-size: 13px;
+  transition: border-color .12s, background .12s;
+}
+.maas-input:focus { border-color: var(--accent); background: var(--panel); }
+
+.maas-dropdown {
+  display: none; position: absolute; top: 100%; left: 0; right: 0;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 0 0 var(--radius-s) var(--radius-s);
+  box-shadow: var(--shadow-l); z-index: 1000;
+  max-height: 240px; overflow-y: auto;
+}
+.maas-dropdown .row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; cursor: pointer; font-size: 13px; color: var(--fg);
+}
+.maas-dropdown .row.hl, .maas-dropdown .row:hover { background: var(--accent-2); }
+.maas-dropdown .row .badge {
+  font-size: 10px; font-weight: 600; padding: 1px 6px;
+  border-radius: 8px; background: var(--accent-2); color: var(--accent);
+  flex-shrink: 0; white-space: nowrap;
+}
+.maas-dropdown .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Panel head: brand + OD ──────────────────────────────────── */
+.panel-head {
+  padding: 16px 18px 14px;
+  background: var(--ds-surface);
+  border-bottom: 1px solid var(--ds-line);
+  flex-shrink: 0;
+  font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.panel-brand {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 13px; font-weight: 700; letter-spacing: -0.01em; color: var(--ds-ink);
+}
+.panel-brand .brand-dot {
+  width: 9px; height: 9px; border-radius: 3px; background: var(--ds-accent);
+  box-shadow: 0 0 0 3px var(--ds-accent-soft); flex: none;
+}
+.panel-brand small { color: var(--ds-ink-3); font-weight: 600; }
+.panel-hint {
+  font-size: 11px; color: var(--ds-ink-4); margin: 7px 0 0;
+  font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+}
+.od-grid { margin-top: 11px; display: flex; gap: 7px; align-items: stretch; }
+.od-rows { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.od-row-wrap {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--ds-surface-2); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius-sm); padding: 6px 11px;
+  position: relative;
+}
+.od-row-wrap .pin { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.od-row-wrap .pin.from { background: var(--ds-ink); }
+.od-row-wrap .pin.to   { background: var(--ds-accent); }
+.od-row-wrap .od-lbl {
+  font-size: 9.5px; font-weight: 700; letter-spacing: .09em;
+  color: var(--ds-ink-4); width: 28px; text-transform: uppercase; flex: none;
+}
+.od-row-wrap .od-input { flex: 1; min-width: 0; }
+.od-row-wrap .od-input .maas-input {
+  border: none; background: transparent; padding: 0;
+  font-size: 13.5px; font-weight: 600; color: var(--ds-ink);
+  font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+}
+.od-row-wrap .od-input .maas-input::placeholder { color: var(--ds-ink-4); font-weight: 500; }
+.od-row-wrap .od-input .maas-input:focus { border: none; background: transparent; }
+.od-swap {
+  background: var(--ds-surface-2); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius-sm); color: var(--ds-ink-3);
+  width: 32px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.od-swap:hover { background: var(--ds-accent-soft); border-color: var(--ds-accent); color: var(--ds-accent); }
+
+/* ── Date/time/go section ────────────────────────────────────── */
+.input-section { padding: 10px 12px 12px; border-bottom: 1px solid var(--border); }
+.field { margin-bottom: 8px; }
+.field-label {
+  display: block; font-size: 10.5px; font-weight: 600; color: var(--fg-3);
+  text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px;
+}
+.field input, .field select {
+  width: 100%; padding: 7px 9px; border: 1px solid var(--border);
+  border-radius: var(--radius-s); background: var(--panel-2);
+  color: var(--fg); outline: none; font-size: 13px;
+  transition: border-color .12s, background .12s;
+}
+.field input:focus, .field select:focus { border-color: var(--accent); background: var(--panel); }
+.field-row { display: flex; gap: 6px; }
+.field-row .field { flex: 1; margin-bottom: 0; }
+.now-btn {
+  padding: 7px 10px; background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-s); color: var(--fg-2); font-size: 12px; align-self: flex-end;
+}
+.now-btn:hover { background: var(--accent-2); color: var(--accent); border-color: var(--accent); }
+#go {
+  width: 100%; padding: 9px; background: var(--accent); color: #fff;
+  border: none; border-radius: var(--radius-s); font-weight: 600;
+  margin-top: 8px; transition: opacity .12s;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+}
+#go:hover { opacity: .92; }
+#go:disabled { background: var(--fg-3); cursor: default; opacity: .8; }
+#error-msg {
+  display: none; margin-top: 8px; padding: 8px 10px;
+  background: #fee; color: var(--danger); border: 1px solid #fcc;
+  border-radius: var(--radius-s); font-size: 12px;
+}
+@media (prefers-color-scheme: dark) {
+  #error-msg { background: #2a1418; color: #ff8a8a; border-color: #5a2228; }
+}
+
+/* ── Advanced drawer ──────────────────────────────────────────── */
+.advanced { display: none; padding: 10px 12px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+.advanced.open { display: block; }
+.advanced .row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.advanced .row:last-child { margin-bottom: 0; }
+.advanced label { flex: 1; font-size: 12px; color: var(--fg-2); }
+.advanced label small { display: block; color: var(--fg-3); font-size: 10.5px; margin-top: 1px; }
+.advanced input[type=number], .advanced input[type=range], .advanced select { width: 110px; padding: 4px 6px; font-size: 12px; }
+.advanced input[type=range] { width: 130px; }
+.advanced .val { width: 44px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--fg); }
+
+/* ── Plans panel ─────────────────────────────────────────────── */
+#plans-panel {
+  flex: 1; overflow-y: auto;
+  background: var(--ds-bg);
+  font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.plans-list-head {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px 4px; position: sticky; top: 0;
+  background: var(--ds-bg); z-index: 5;
+}
+.eyebrow {
+  font-size: 10px; font-weight: 800; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--ds-ink-4);
+}
+#plans-list { padding: 4px 14px 20px; display: flex; flex-direction: column; }
+
+.status-msg { color: var(--fg-3); font-size: 13px; padding: 24px 14px; text-align: center; }
+.status-msg.error { color: var(--danger); }
+
+/* ── Trip card ───────────────────────────────────────────────── */
+.card {
+  background: var(--ds-surface); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius); padding: 13px 14px 11px; margin-bottom: 10px;
+  cursor: pointer; transition: border-color .14s, box-shadow .14s;
+}
+.card:hover { border-color: oklch(0.86 0.01 70); box-shadow: var(--ds-shadow-sm); }
+.card.open { border-color: var(--ds-accent); box-shadow: var(--ds-shadow-md); cursor: default; }
+.card-top { display: flex; align-items: baseline; justify-content: space-between; }
+.card-times { display: flex; align-items: baseline; gap: 8px; }
+.t-dep, .t-arr { font-size: 19px; font-weight: 600; color: var(--ds-ink); font-family: 'IBM Plex Mono', monospace; }
+.t-arrow { color: var(--ds-ink-4); font-size: 13px; }
+.card-meta { display: flex; align-items: center; gap: 9px; }
+.m-dur { font-size: 13px; color: var(--ds-ink-2); font-weight: 600; font-family: 'IBM Plex Mono', monospace; }
+.card-tag { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 650; color: var(--ds-ink-3); margin: 3px 0 11px; min-height: 18px; }
+.card-tag .lead { color: var(--ds-accent); font-size: 8px; }
+
+/* ── Ribbon ──────────────────────────────────────────────────── */
+.rb { display: flex; flex-direction: column; gap: 4px; }
+.rb-track { display: flex; align-items: stretch; gap: 2px; height: 34px; }
+.rb-seg { display: flex; align-items: center; justify-content: center; gap: 5px; border-radius: 5px; min-width: 14px; overflow: hidden; position: relative; }
+.rb-transit { color: #fff; }
+.rb-line { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 700; }
+.rb-walk { background: repeating-linear-gradient(135deg, var(--ds-surface-3) 0 5px, var(--ds-surface-2) 5px 10px); }
+.rb-min { font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 600; color: var(--ds-ink-3); }
+.rb-min.light { color: #fff; opacity: .82; }
+.rb-ic { flex: none; }
+.rb-transfer {
+  display: flex; align-items: center; gap: 6px; flex: 0 1 auto; padding: 0 9px;
+  white-space: nowrap; color: var(--ds-ink-2); background: var(--ds-surface);
+  border: 1px solid var(--ds-line); border-radius: 5px;
+}
+.rb-transfer.clickable { cursor: pointer; }
+.rb-transit.clickable, .rb-transfer.clickable { transition: box-shadow .12s, filter .12s; }
+.rb-seg.clickable:hover, .rb-transfer.clickable:hover { box-shadow: 0 0 0 2px var(--ds-accent-soft); filter: brightness(1.03); }
+.rb-transit.hi, .rb-transfer.hi { box-shadow: 0 0 0 2px var(--ds-accent); }
+.rb-xw { display: inline-flex; align-items: center; gap: 3px; font-size: 10.5px; font-weight: 600; color: var(--ds-ink-3); }
+.rb-xw em { font-style: normal; color: var(--ds-ink-4); font-weight: 500; }
+.rb-xt { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 700; color: var(--ds-ink); position: relative; padding-bottom: 3px; }
+.rb-xt.key::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2.5px; border-radius: 2px; }
+.rb-xt.key.t-low::after  { background: var(--ds-rel-low); }
+.rb-xt.key.t-mid::after  { background: var(--ds-rel-mid); }
+.rb-xt.key.t-high::after { background: var(--ds-rel-high); }
+.t-low  { color: var(--ds-rel-low); }
+.t-mid  { color: oklch(0.55 0.13 64); }
+.t-high { color: var(--ds-rel-high); }
+
+/* ── Card footer ─────────────────────────────────────────────── */
+.card-foot { display: flex; align-items: center; gap: 7px; margin-top: 11px; font-size: 11.5px; color: var(--ds-ink-3); }
+.card-foot .sep { color: var(--ds-line); }
+.card-foot .warn-txt { color: oklch(0.55 0.13 64); font-weight: 600; }
+.card-foot .expand { margin-left: auto; color: var(--ds-accent); font-weight: 650; }
+
+/* ── Reliability chip + donut ────────────────────────────────── */
+.rel {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600;
+  padding: 2.5px 8px 2.5px 7px; border-radius: 999px; white-space: nowrap;
+}
+.rel .bead { width: 7px; height: 7px; border-radius: 50%; }
+.rel.high { background: var(--ds-rel-high-soft); color: oklch(0.42 0.13 152); }
+.rel.high .bead { background: var(--ds-rel-high); }
+.rel.mid  { background: var(--ds-rel-mid-soft);  color: oklch(0.48 0.12 64); }
+.rel.mid  .bead { background: var(--ds-rel-mid); }
+.rel.low  { background: var(--ds-rel-low-soft);  color: oklch(0.5 0.17 33); }
+.rel.low  .bead { background: var(--ds-rel-low); }
+
+.donut {
+  width: 15px; height: 15px; border-radius: 50%; flex: none; position: relative;
+  background: conic-gradient(var(--dc, var(--ds-rel-mid)) calc(var(--p, 50) * 1%), var(--ds-surface-3) 0);
+}
+.donut::after { content: ""; position: absolute; inset: 3.5px; background: var(--ds-surface); border-radius: 50%; }
+.donut[data-rel="high"] { --dc: var(--ds-rel-high); }
+.donut[data-rel="mid"]  { --dc: var(--ds-rel-mid); }
+.donut[data-rel="low"]  { --dc: var(--ds-rel-low); }
+
+/* ── Mode badge ──────────────────────────────────────────────── */
+.rt-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 21px; height: 21px; padding: 0 6px; border-radius: 5px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 700;
+  line-height: 1; color: #fff; flex: none;
+}
+.rt-badge.sm { min-width: 17px; height: 17px; font-size: 10px; padding: 0 4px; border-radius: 4px; }
+
+/* ── Expanded card detail ────────────────────────────────────── */
+.card-detail { margin-top: 13px; padding-top: 13px; border-top: 1px dashed var(--ds-line); }
+
+/* ── Leg list ────────────────────────────────────────────────── */
+.legs { margin-bottom: 14px; }
+.leg-row { display: grid; grid-template-columns: 42px 16px 1fr; gap: 8px; }
+.leg-time-col { font-size: 11.5px; color: var(--ds-ink-3); padding-top: 1px; font-family: 'IBM Plex Mono', monospace; }
+.leg-rail { display: flex; flex-direction: column; align-items: center; }
+.leg-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; flex: none; z-index: 1; }
+.leg-line-v { width: 2px; flex: 1; background: var(--ds-line); margin: 1px 0; min-height: 14px; }
+.leg-body { padding-bottom: 11px; }
+.leg-main { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.leg-desc { display: flex; align-items: baseline; gap: 7px; min-width: 0; flex: 1; }
+.leg-meta { display: flex; align-items: center; gap: 7px; flex: none; margin-left: auto; }
+.leg-walk-lbl { color: var(--ds-ink-3); font-weight: 600; white-space: nowrap; }
+.leg-to { color: var(--ds-ink); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.leg-dur { font-size: 11px; color: var(--ds-ink-3); font-family: 'IBM Plex Mono', monospace; }
+
+/* ── Transfer card (in leg list) ─────────────────────────────── */
+.leg-row.xfer .leg-dot.xfer-dot { width: 11px; height: 11px; background: var(--ds-surface); border: 2.5px solid var(--ds-accent); margin-top: 3px; }
+.xfer-card {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: var(--ds-surface-2); border: 1px solid var(--ds-line);
+  border-radius: 8px; padding: 10px 13px; margin-bottom: 11px;
+}
+.xfer-d-walk { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--ds-ink-2); }
+.xfer-d-walk em { font-style: normal; color: var(--ds-ink-4); font-weight: 500; }
+.xfer-d-tot { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 700; color: var(--ds-ink); position: relative; padding-bottom: 4px; }
+.xfer-d-tot.key::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2.5px; border-radius: 2px; }
+.xfer-d-tot.key.t-low::after  { background: var(--ds-rel-low); }
+.xfer-d-tot.key.t-mid::after  { background: var(--ds-rel-mid); }
+.xfer-d-tot.key.t-high::after { background: var(--ds-rel-high); }
+.xfer-d-walk svg, .xfer-d-tot svg, .rb-ic { flex: none; }
+.xfer-prob { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 700; }
+.xfer-prob[data-rel="high"] { color: oklch(0.46 0.13 152); }
+.xfer-prob[data-rel="mid"]  { color: oklch(0.52 0.12 64); }
+.xfer-prob[data-rel="low"]  { color: oklch(0.52 0.17 33); }
+
+/* ── Plan reliability banner ─────────────────────────────────── */
+.plan-rel {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px;
+  padding: 9px 12px; background: var(--ds-surface-2); border: 1px solid var(--ds-line); border-radius: 9px;
+}
+.pr-k { font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--ds-ink-4); }
+.pr-note { font-size: 11px; color: var(--ds-ink-3); flex: 1 1 100%; }
+
+/* ── Connection card ─────────────────────────────────────────── */
+.conn { background: var(--ds-surface-2); border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm); padding: 12px 13px; }
+.conn-head { display: flex; align-items: center; gap: 8px; }
+.conn-title { font-size: 12.5px; font-weight: 700; color: var(--ds-ink); }
+.conn-rel { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 700; }
+.conn-rel[data-rel="high"] { color: oklch(0.46 0.13 152); }
+.conn-rel[data-rel="mid"]  { color: oklch(0.52 0.12 64); }
+.conn-rel[data-rel="low"]  { color: oklch(0.52 0.17 33); }
+.conn-block { margin-top: 11px; }
+.conn-lbl { font-size: 11px; color: var(--ds-ink-3); margin-bottom: 8px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.feeder { display: flex; gap: 7px; flex-wrap: wrap; }
+.fopt {
+  font: inherit; cursor: pointer; flex: 1; min-width: 80px; text-align: left;
+  display: flex; flex-direction: column; gap: 5px;
+  background: var(--ds-surface); border: 1px solid var(--ds-line); border-radius: 8px;
+  padding: 8px 9px; transition: .12s;
+}
+.fopt:hover { border-color: oklch(0.84 0.02 70); }
+.fopt.planned { border-color: var(--ds-accent); background: var(--ds-accent-soft); }
+.fopt-time { font-size: 14px; font-weight: 600; color: var(--ds-ink); font-family: 'IBM Plex Mono', monospace; }
+.fopt-rel { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; }
+.fopt-delta { font-size: 10px; color: var(--ds-ink-4); }
+.fopt.planned .fopt-delta { color: var(--ds-accent); font-weight: 650; }
+.conn-foot { margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--ds-line); display: flex; flex-direction: column; gap: 5px; }
+.cf-item { font-size: 11px; line-height: 1.5; color: var(--ds-ink-3); }
+.cf-k { font-weight: 700; color: var(--ds-ink-2); }
+.cf-mono { font-family: 'IBM Plex Mono', monospace; color: var(--ds-ink); font-weight: 600; }
+
+/* ── Modal ───────────────────────────────────────────────────── */
+.modal-backdrop {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
+  z-index: 9000; align-items: center; justify-content: center; padding: 24px;
+}
+.modal-backdrop.open { display: flex; }
+.modal {
+  background: var(--panel); border-radius: 10px; box-shadow: var(--shadow-l);
+  width: 100%; max-width: 540px; max-height: 88vh; display: flex; flex-direction: column;
+  border: 1px solid var(--border);
+}
+.modal-head {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+}
+.modal-head .title { flex: 1; font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.modal-head .agency { color: var(--fg-3); font-weight: 400; }
+.modal-head .close { background: none; border: none; font-size: 18px; color: var(--fg-3); padding: 0 4px; }
+.modal-body { padding: 14px 16px; overflow-y: auto; }
+.hint { font-size: 11px; color: var(--fg-3); margin-bottom: 8px; }
+.stops { margin-top: 8px; padding-left: 4px; border-left: 2px solid var(--border-2); }
+.stop { display: grid; grid-template-columns: 56px 1fr; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--fg-2); }
+.stop .t { font-family: var(--mono); font-size: 11.5px; color: var(--fg-3); white-space: nowrap; }
+.stop .n { color: var(--fg); cursor: pointer; }
+.stop .n:hover { color: var(--accent); text-decoration: underline; }
+.stop.terminus .n { font-weight: 600; }
+kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; color: var(--fg-2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">MaaS<span class="dot">·</span> Trip Planner</div>
+  <button id="reverse-btn" class="head-btn" title="Swap origin and destination (R)">⇅ Reverse</button>
+  <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
+  <a href="/debug" class="head-btn" target="_blank">Debug ↗</a>
+  <a href="/graphiql" class="head-btn" target="_blank">GraphQL ↗</a>
+</header>
+
+<div class="main">
+  <div id="sidebar">
+    <div class="panel-head">
+      <div class="panel-brand">
+        <span class="brand-dot"></span>
+        MaaS<small>· trip planner</small>
+      </div>
+      <p class="panel-hint">Right-click the map to set origin or destination.</p>
+      <div class="od-grid">
+        <div class="od-rows">
+          <div class="od-row-wrap">
+            <span class="pin from"></span>
+            <span class="od-lbl">From</span>
+            <div class="od-input" id="from-search"></div>
+          </div>
+          <div class="od-row-wrap">
+            <span class="pin to"></span>
+            <span class="od-lbl">To</span>
+            <div class="od-input" id="to-search"></div>
+          </div>
+        </div>
+        <button id="swap-stops" class="od-swap" title="Swap (R)">⇅</button>
+      </div>
+    </div>
+
+    <div class="input-section">
+      <div class="field-row">
+        <div class="field">
+          <label class="field-label">Date</label>
+          <input id="date" type="date">
+        </div>
+        <div class="field">
+          <label class="field-label">Time</label>
+          <input id="time" type="time">
+        </div>
+        <button class="now-btn" id="now-btn" title="Set to now (N)">Now</button>
+      </div>
+      <button id="go">
+        <span>Plan journey</span>
+        <kbd>↵</kbd>
+      </button>
+      <div id="error-msg"></div>
+    </div>
+
+    <div id="advanced" class="advanced">
+      <div class="row">
+        <label>Departure window
+          <small>Range-RAPTOR — return all Pareto-optimal departures within N minutes</small>
+        </label>
+        <input id="adv-window" type="range" min="0" max="120" step="5" value="0">
+        <span id="adv-window-val" class="val">0m</span>
+      </div>
+      <div class="row">
+        <label>Walk radius
+          <small>Max access/egress walk before falling back further</small>
+        </label>
+        <input id="adv-walk-radius" type="number" min="60" max="3600" step="60" placeholder="600">
+        <span class="val">s</span>
+      </div>
+      <div class="row">
+        <label>Show real-time
+          <small>Hook for upcoming RT feed (currently scheduled only)</small>
+        </label>
+        <select id="adv-rt">
+          <option value="0">All scheduled</option>
+          <option value="1">Live (when available)</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>Density
+          <small>Visual density of plan cards</small>
+        </label>
+        <select id="adv-density">
+          <option value="comfy">Comfortable</option>
+          <option value="compact">Compact</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="plans-panel">
+      <div class="plans-list-head">
+        <span class="eyebrow">Results</span>
+        <span class="eyebrow" id="plans-count"></span>
+      </div>
+      <div id="plans-list">
+        <p class="status-msg">Set origin and destination above, or right-click the map.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<div id="trip-modal" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="title" id="trip-modal-title">Trip</div>
+      <button class="close" id="trip-modal-close">×</button>
+    </div>
+    <div class="modal-body" id="trip-modal-body"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/maas.js"></script>
+<script>
+'use strict';
+
+// ── GraphQL query ─────────────────────────────────────────────
+const PLAN_FRAGMENT = `
+  start end expectedEnd
+  arrivalDistribution { time probability }
+  legs {
+    ... on PlanWalkLeg {
+      __typename start end duration
+      from { node { name lat lon } }
+      to   { node { name lat lon } }
+      geometry { lat lon }
+    }
+    ... on PlanTransitLeg {
+      __typename start end duration
+      bikesAllowed
+      transferRisk {
+        reliability scheduledDeparture nextDeparture nextReliability marginSecs
+      }
+      trip {
+        headsign
+        route { shortName longName mode color textColor agency { name } }
+      }
+      from { departure node { name lat lon } }
+      to   { arrival   node { name lat lon } }
+      geometry { lat lon }
+      steps {
+        ... on PlanTransitLegStep {
+          place { arrival departure node { name lat lon } }
+        }
+      }
+      previousDepartures(count: 3) {
+        start end duration
+        trip { headsign route { shortName mode color textColor } }
+        from { departure node { name lat lon } }
+        to   { arrival   node { name lat lon } }
+        steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
+        geometry { lat lon }
+      }
+      nextDepartures(count: 4) {
+        start end duration
+        trip { headsign route { shortName mode color textColor } }
+        from { departure node { name lat lon } }
+        to   { arrival   node { name lat lon } }
+        steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
+        geometry { lat lon }
+      }
+    }
+  }
+`;
+
+const QUERY = `query Plan(
+  $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
+  $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int
+) {
+  raptor(
+    fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
+    date: $date, time: $time,
+    windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs
+  ) { ${PLAN_FRAGMENT} }
+}`;
+
+// ── Map ───────────────────────────────────────────────────────
+const map = L.map('map').setView([50.85, 4.35], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors', maxZoom: 19,
+}).addTo(map);
+
+// ── State ─────────────────────────────────────────────────────
+const state = {
+  plans: [],
+  selectedIdx: -1,
+  selectedLegIdxMap: new Map(), // planIdx -> leg index within that plan
+  legLayers: [],
+};
+
+// ── Stop search inputs ────────────────────────────────────────
+const fromSearch = createStopSearch(
+  document.getElementById('from-search'), 'Search stop or right-click map',
+  s => { setOriginMarker(s.lat, s.lon); doSyncUrl(); },
+);
+const toSearch = createStopSearch(
+  document.getElementById('to-search'), 'Search stop or right-click map',
+  s => { setDestMarker(s.lat, s.lon); doSyncUrl(); },
+);
+
+let originMarker = null, destMarker = null;
+function setOriginMarker(lat, lon) {
+  if (originMarker) map.removeLayer(originMarker);
+  originMarker = L.marker([lat, lon], { icon: PIN_ORIGIN }).addTo(map).bindTooltip('Origin');
+}
+function setDestMarker(lat, lon) {
+  if (destMarker) map.removeLayer(destMarker);
+  destMarker = L.marker([lat, lon], { icon: PIN_DEST }).addTo(map).bindTooltip('Destination');
+}
+
+createContextMenu(map,
+  latlng => {
+    fromSearch.setCoords(latlng.lat, latlng.lng);
+    setOriginMarker(latlng.lat, latlng.lng);
+    doSyncUrl();
+  },
+  latlng => {
+    toSearch.setCoords(latlng.lat, latlng.lng);
+    setDestMarker(latlng.lat, latlng.lng);
+    doSyncUrl();
+    if (fromSearch.getLat() != null && toSearch.getLat() != null) runQuery();
+  },
+);
+
+// ── URL state ─────────────────────────────────────────────────
+function el(id) { return document.getElementById(id); }
+
+function doSyncUrl() {
+  syncUrl({
+    fromLat:    fromSearch.getLat(),
+    fromLng:    fromSearch.getLng(),
+    fromName:   fromSearch.getLat() != null ? fromSearch.getName() : null,
+    toLat:      toSearch.getLat(),
+    toLng:      toSearch.getLng(),
+    toName:     toSearch.getLat() != null ? toSearch.getName() : null,
+    date:       el('date').value || null,
+    time:       el('time').value || null,
+    window:     parseInt(el('adv-window').value, 10) || null,
+    walkRadius: parseInt(el('adv-walk-radius').value, 10) || null,
+    advanced:   el('advanced').classList.contains('open') ? 1 : null,
+    sel:        state.selectedIdx >= 0 ? state.selectedIdx : null,
+  });
+}
+
+function loadFromUrl() {
+  const p = readUrl();
+  if (p.has('date'))       el('date').value = p.get('date');
+  if (p.has('time'))       el('time').value = p.get('time');
+  if (p.has('window')) {
+    el('adv-window').value = p.get('window');
+    el('adv-window-val').textContent = p.get('window') + 'm';
+  }
+  if (p.has('walkRadius')) el('adv-walk-radius').value = p.get('walkRadius');
+  if (p.get('advanced') === '1') {
+    el('advanced').classList.add('open');
+    el('advanced-btn').classList.add('active');
+  }
+  const fLat = parseFloat(p.get('fromLat')), fLng = parseFloat(p.get('fromLng'));
+  const tLat = parseFloat(p.get('toLat')),   tLng = parseFloat(p.get('toLng'));
+  if (!isNaN(fLat) && !isNaN(fLng)) {
+    fromSearch.setValue(p.get('fromName') || `${fLat.toFixed(5)}, ${fLng.toFixed(5)}`, fLat, fLng);
+    setOriginMarker(fLat, fLng);
+  }
+  if (!isNaN(tLat) && !isNaN(tLng)) {
+    toSearch.setValue(p.get('toName') || `${tLat.toFixed(5)}, ${tLng.toFixed(5)}`, tLat, tLng);
+    setDestMarker(tLat, tLng);
+  }
+  if (p.has('sel')) state.selectedIdx = parseInt(p.get('sel'), 10);
+}
+
+['date', 'time', 'adv-window', 'adv-walk-radius'].forEach(id => {
+  el(id).addEventListener('change', doSyncUrl);
+});
+el('adv-window').addEventListener('input', e => {
+  el('adv-window-val').textContent = e.target.value + 'm';
+});
+
+// ── Header buttons ────────────────────────────────────────────
+el('advanced-btn').addEventListener('click', () => {
+  const drawer = el('advanced');
+  drawer.classList.toggle('open');
+  el('advanced-btn').classList.toggle('active', drawer.classList.contains('open'));
+  doSyncUrl();
+});
+
+function reverseEndpoints() {
+  const fLat = fromSearch.getLat(), fLng = fromSearch.getLng(), fN = fromSearch.getName();
+  const tLat = toSearch.getLat(),   tLng = toSearch.getLng(),   tN = toSearch.getName();
+  if (tLat != null) fromSearch.setValue(tN, tLat, tLng); else fromSearch.clear();
+  if (fLat != null) toSearch.setValue(fN, fLat, fLng);   else toSearch.clear();
+  if (tLat != null) setOriginMarker(tLat, tLng); else if (originMarker) { map.removeLayer(originMarker); originMarker = null; }
+  if (fLat != null) setDestMarker(fLat, fLng);   else if (destMarker)   { map.removeLayer(destMarker);   destMarker   = null; }
+  doSyncUrl();
+}
+el('reverse-btn').addEventListener('click', reverseEndpoints);
+el('swap-stops').addEventListener('click', reverseEndpoints);
+
+el('now-btn').addEventListener('click', () => {
+  const d = new Date();
+  el('date').value = d.toISOString().slice(0, 10);
+  el('time').value = d.toTimeString().slice(0, 5);
+  doSyncUrl();
+});
+
+// ── Run query ─────────────────────────────────────────────────
+async function runQuery() {
+  const fromLat = fromSearch.getLat();
+  const fromLng = fromSearch.getLng();
+  const toLat   = toSearch.getLat();
+  const toLng   = toSearch.getLng();
+
+  const errEl = el('error-msg');
+  if (fromLat == null || toLat == null) {
+    errEl.textContent = 'Set origin and destination first.';
+    errEl.style.display = 'block';
+    return;
+  }
+  errEl.style.display = 'none';
+  doSyncUrl();
+
+  const date           = el('date').value || null;
+  const time           = el('time').value || null;
+  const windowMinutes  = parseInt(el('adv-window').value, 10) || null;
+  const walkRadiusSecs = parseInt(el('adv-walk-radius').value, 10) || null;
+
+  const btn = el('go');
+  btn.disabled = true;
+  btn.replaceChildren(mkEl('span', null, 'Planning…'));
+  el('plans-count').textContent = '';
+  el('plans-list').replaceChildren(mkEl('p', 'status-msg', 'Routing…'));
+
+  try {
+    const data = await gql(QUERY, { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs });
+    state.plans = data.raptor || [];
+    state.selectedLegIdxMap.clear();
+    if (state.selectedIdx < 0 || state.selectedIdx >= state.plans.length) {
+      state.selectedIdx = state.plans.length > 0 ? 0 : -1;
+    }
+    renderList();
+    if (state.selectedIdx >= 0) renderPlanOnMap(state.selectedIdx);
+  } catch (err) {
+    el('plans-list').replaceChildren(mkEl('p', 'status-msg error', 'Error: ' + err.message));
+  } finally {
+    btn.disabled = false;
+    btn.replaceChildren(mkEl('span', null, 'Plan journey'), mkEl('kbd', null, '↵'));
+  }
+}
+el('go').addEventListener('click', runQuery);
+
+// ── Plan helpers ──────────────────────────────────────────────
+function planTransferCount(plan) {
+  return Math.max(0, plan.legs.filter(l => l.__typename === 'PlanTransitLeg').length - 1);
+}
+function planWalkSeconds(plan) {
+  return plan.legs.filter(l => l.__typename === 'PlanWalkLeg').reduce((s, l) => s + (l.duration || 0), 0);
+}
+function planReliability(plan) {
+  let r = 1;
+  plan.legs.forEach(l => { if (l.transferRisk?.reliability != null) r *= l.transferRisk.reliability; });
+  return r;
+}
+
+// ── Design helpers ────────────────────────────────────────────
+function relClass(p)    { return p >= 0.8 ? 'high' : p >= 0.5 ? 'mid' : 'low'; }
+function relPct(p)      { return Math.round(p * 100) + '%'; }
+function tightClass(ms) { return ms < 120 ? 'low' : ms < 480 ? 'mid' : 'high'; }
+
+function mkDonut(p) {
+  const d = mkEl('span', 'donut');
+  d.dataset.rel = relClass(p);
+  d.style.setProperty('--p', Math.round(p * 100));
+  return d;
+}
+
+function mkRelChip(p) {
+  const r = mkEl('span', 'rel ' + relClass(p));
+  r.appendChild(mkEl('span', 'bead'));
+  r.appendChild(document.createTextNode(relPct(p)));
+  return r;
+}
+
+function mkBadge(text, bg, fg, small) {
+  const b = mkEl('span', 'rt-badge' + (small ? ' sm' : ''));
+  b.textContent = text;
+  b.style.background = bg || '#888';
+  b.style.color = fg || '#fff';
+  return b;
+}
+
+function mkSvgIcon(paths, size) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', 'rb-ic');
+  svg.setAttribute('width', size); svg.setAttribute('height', size);
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor'); svg.setAttribute('stroke-width', '2.1');
+  svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+  paths.forEach(([tag, attrs]) => {
+    const e = document.createElementNS(ns, tag);
+    Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
+    svg.appendChild(e);
+  });
+  return svg;
+}
+
+function mkWalkIcon(s) {
+  return mkSvgIcon([
+    ['circle', { cx: 13, cy: 4, r: 2 }],
+    ['path', { d: 'M13 22l-2-7-3-2 1.5-6 3 1.5 2.5 2.5' }],
+    ['path', { d: 'M8 13l-1 4-2 3' }],
+    ['path', { d: 'M16 12l2 1 1 3' }],
+  ], s || 12);
+}
+
+function mkClockIcon(s) {
+  return mkSvgIcon([
+    ['circle', { cx: 12, cy: 12, r: 9 }],
+    ['path', { d: 'M12 7.5V12l3 2' }],
+  ], s || 12);
+}
+
+function planTag(plans, plan) {
+  const dur  = p => p.end - p.start;
+  const rel  = p => planReliability(p);
+  const xfr  = p => planTransferCount(p);
+  const minDur  = Math.min(...plans.map(dur));
+  const maxRel  = Math.max(...plans.map(rel));
+  const minXfr  = Math.min(...plans.map(xfr));
+  const maxXfr  = Math.max(...plans.map(xfr));
+  const fastest  = dur(plan) === minDur;
+  const mostRel  = rel(plan) === maxRel;
+  const fewest   = xfr(plan) === minXfr && minXfr < maxXfr;
+  if (fastest && mostRel) return null;
+  if (fastest)   return 'Fastest';
+  if (mostRel)   return 'Most reliable';
+  if (fewest)    return 'Fewer changes';
+  return null;
+}
+
+// ── Segment builder ───────────────────────────────────────────
+function buildPlanSegs(plan) {
+  const legs = plan.legs;
+  const out  = [];
+  legs.forEach((leg, i) => {
+    const isWalk    = leg.__typename === 'PlanWalkLeg';
+    const isTransit = leg.__typename === 'PlanTransitLeg';
+    if (isWalk) {
+      const prev = legs[i - 1], next = legs[i + 1];
+      if (prev?.__typename === 'PlanTransitLeg' && next?.__typename === 'PlanTransitLeg') return;
+      out.push({ type: 'walk', mins: Math.round((leg.end - leg.start) / 60), leg });
+      return;
+    }
+    if (isTransit) {
+      const pw     = legs[i - 1];
+      const before = legs[i - 2];
+      const hasXfer = pw?.__typename === 'PlanWalkLeg' && before?.__typename === 'PlanTransitLeg';
+      if (hasXfer) {
+        const walkMins  = Math.round((pw.end - pw.start) / 60);
+        const gapSecs   = Math.max(0, leg.start - pw.end);
+        const totalMins = walkMins + Math.round(gapSecs / 60);
+        const walkDist  = Math.round((pw.end - pw.start) * 1.2 / 10) * 10;
+        const marginSecs = leg.transferRisk?.marginSecs ?? gapSecs;
+        out.push({ type: 'transfer', walkMins, totalMins, walkDist, marginSecs, leg,
+          place: pw.to?.node?.name || '—' });
+      }
+      out.push({ type: 'transit', mins: Math.round((leg.end - leg.start) / 60), leg });
+    }
+  });
+  return out;
+}
+
+// ── Ribbon renderer ───────────────────────────────────────────
+function renderRibbon(plan, openLeg, onLeg) {
+  const segs     = buildPlanSegs(plan);
+  const totalMin = (plan.end - plan.start) / 60;
+
+  function basisOf(s) {
+    if (s.type === 'transfer') return Math.max((s.totalMins / totalMin) * 100, 13) + '%';
+    return Math.max((s.mins / totalMin) * 100, s.type === 'walk' ? 6 : 7) + '%';
+  }
+
+  const track = mkEl('div', 'rb-track');
+  segs.forEach(s => {
+    if (s.type === 'walk') {
+      const seg = mkEl('div', 'rb-seg rb-walk');
+      seg.style.flexBasis = basisOf(s);
+      if (s.mins >= 4) seg.appendChild(mkEl('span', 'rb-min', s.mins + '′'));
+      track.appendChild(seg);
+      return;
+    }
+    if (s.type === 'transfer') {
+      const tc = tightClass(s.marginSecs);
+      const div = mkEl('div', 'rb-transfer' + (s.leg.transferRisk ? ' clickable' : '') +
+        (openLeg === s.leg ? ' hi' : ''));
+      div.style.flexBasis = basisOf(s);
+      div.title = `${s.walkDist} m walk (${s.walkMins}′) · ${s.totalMins}′ to make the connection`;
+      if (onLeg) div.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
+      if (s.walkMins >= 3) {
+        const xw = mkEl('span', 'rb-xw');
+        xw.appendChild(mkWalkIcon(12));
+        xw.appendChild(document.createTextNode(s.walkDist + ' m '));
+        xw.appendChild(mkEl('em', null, '(' + s.walkMins + '′)'));
+        div.appendChild(xw);
+      }
+      const xt = mkEl('span', 'rb-xt key t-' + tc);
+      xt.appendChild(mkClockIcon(12));
+      xt.appendChild(document.createTextNode(s.totalMins + '′'));
+      div.appendChild(xt);
+      track.appendChild(div);
+      return;
+    }
+    if (s.type === 'transit') {
+      const route = s.leg.trip?.route;
+      const { bg, fg } = routeColors(route);
+      const seg = mkEl('div', 'rb-seg rb-transit clickable' + (openLeg === s.leg ? ' hi' : ''));
+      seg.style.flexBasis = basisOf(s);
+      seg.style.background = bg;
+      if (onLeg) seg.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
+      seg.appendChild(mkEl('span', 'rb-line', route?.shortName || route?.mode || '?'));
+      if (s.mins >= 10) seg.appendChild(mkEl('span', 'rb-min light', s.mins + '′'));
+      track.appendChild(seg);
+    }
+  });
+
+  const rb = mkEl('div', 'rb');
+  rb.appendChild(track);
+  return rb;
+}
+
+// ── Leg list (expanded timeline) ──────────────────────────────
+function renderLegList(plan) {
+  const legs   = plan.legs;
+  const legsEl = mkEl('div', 'legs');
+
+  legs.forEach((leg, i) => {
+    const isLast    = i === legs.length - 1;
+    const isWalk    = leg.__typename === 'PlanWalkLeg';
+    const isTransit = leg.__typename === 'PlanTransitLeg';
+
+    if (isWalk) {
+      const prev = legs[i - 1], next = legs[i + 1];
+      if (prev?.__typename === 'PlanTransitLeg' && next?.__typename === 'PlanTransitLeg') return;
+      const row  = mkEl('div', 'leg-row');
+      row.appendChild(mkEl('div', 'leg-time-col', fmtTime(leg.start)));
+      const rail = mkEl('div', 'leg-rail');
+      const dot  = mkEl('span', 'leg-dot'); dot.style.background = 'var(--ds-ink-4)';
+      rail.appendChild(dot);
+      if (!isLast) rail.appendChild(mkEl('span', 'leg-line-v'));
+      row.appendChild(rail);
+      const body = mkEl('div', 'leg-body');
+      const main = mkEl('div', 'leg-main');
+      const desc = mkEl('div', 'leg-desc');
+      const mins = Math.round((leg.end - leg.start) / 60);
+      desc.appendChild(mkEl('span', 'leg-walk-lbl', 'Walk ' + mins + '′'));
+      if (leg.to?.node?.name) desc.appendChild(mkEl('span', 'leg-to', 'to ' + leg.to.node.name));
+      main.appendChild(desc);
+      body.appendChild(main);
+      row.appendChild(body);
+      legsEl.appendChild(row);
+      return;
+    }
+
+    if (isTransit) {
+      const pw     = legs[i - 1];
+      const before = legs[i - 2];
+      const hasXfer = pw?.__typename === 'PlanWalkLeg' && before?.__typename === 'PlanTransitLeg';
+
+      if (hasXfer) {
+        const walkMins   = Math.round((pw.end - pw.start) / 60);
+        const gapSecs    = Math.max(0, leg.start - pw.end);
+        const totalMins  = walkMins + Math.round(gapSecs / 60);
+        const walkDist   = Math.round((pw.end - pw.start) * 1.2 / 10) * 10;
+        const marginSecs = leg.transferRisk?.marginSecs ?? gapSecs;
+        const tc         = tightClass(marginSecs);
+
+        const xRow = mkEl('div', 'leg-row xfer');
+        xRow.appendChild(mkEl('div', 'leg-time-col', fmtTime(pw.end)));
+        const xRail = mkEl('div', 'leg-rail');
+        xRail.appendChild(mkEl('span', 'leg-dot xfer-dot'));
+        xRail.appendChild(mkEl('span', 'leg-line-v'));
+        xRow.appendChild(xRail);
+
+        const xBody = mkEl('div', 'leg-body');
+        const card  = mkEl('div', 'xfer-card');
+
+        const dw = mkEl('span', 'xfer-d-walk');
+        dw.appendChild(mkWalkIcon(15));
+        if (walkMins >= 3) {
+          dw.appendChild(document.createTextNode(walkDist + ' m '));
+          dw.appendChild(mkEl('em', null, '(' + walkMins + '′)'));
+          dw.appendChild(document.createTextNode(' to ' + (pw.to?.node?.name || '—')));
+        } else {
+          dw.appendChild(document.createTextNode('Change at ' + (pw.to?.node?.name || '—')));
+        }
+        card.appendChild(dw);
+
+        const tot = mkEl('span', 'xfer-d-tot key t-' + tc);
+        tot.appendChild(mkClockIcon(15));
+        tot.appendChild(document.createTextNode(totalMins + '′ to make it'));
+        card.appendChild(tot);
+
+        if (leg.transferRisk?.reliability != null) {
+          const r   = leg.transferRisk.reliability;
+          const prb = mkEl('span', 'xfer-prob');
+          prb.dataset.rel = relClass(r);
+          prb.title = 'Probability of making this connection';
+          prb.appendChild(mkDonut(r));
+          prb.appendChild(document.createTextNode(relPct(r)));
+          card.appendChild(prb);
+        }
+
+        xBody.appendChild(card);
+        xRow.appendChild(xBody);
+        legsEl.appendChild(xRow);
+      }
+
+      const route = leg.trip?.route;
+      const { bg, fg } = routeColors(route);
+      const row  = mkEl('div', 'leg-row');
+      row.appendChild(mkEl('div', 'leg-time-col', fmtTime(leg.start)));
+      const rail = mkEl('div', 'leg-rail');
+      const dot  = mkEl('span', 'leg-dot'); dot.style.background = bg;
+      rail.appendChild(dot);
+      if (!isLast) rail.appendChild(mkEl('span', 'leg-line-v'));
+      row.appendChild(rail);
+
+      const body = mkEl('div', 'leg-body');
+      const main = mkEl('div', 'leg-main');
+      const desc = mkEl('div', 'leg-desc');
+      desc.appendChild(mkBadge(route?.shortName || route?.mode || '?', bg, fg));
+      const headsign = leg.trip?.headsign || '';
+      const kind     = route?.mode ? route.mode.charAt(0) + route.mode.slice(1).toLowerCase() : '';
+      const toText   = headsign ? (kind ? kind + ' → ' : '') + headsign : leg.to?.node?.name || '';
+      if (toText) desc.appendChild(mkEl('span', 'leg-to', toText));
+      main.appendChild(desc);
+
+      const meta = mkEl('div', 'leg-meta');
+      meta.appendChild(mkEl('span', 'leg-dur', Math.round((leg.end - leg.start) / 60) + '′'));
+      main.appendChild(meta);
+      body.appendChild(main);
+      row.appendChild(body);
+      legsEl.appendChild(row);
+    }
+  });
+
+  return legsEl;
+}
+
+// ── Connection card (always renders for any transit leg) ──────
+function renderConnection(leg) {
+  const r        = leg.transferRisk;
+  const prevDeps = leg.previousDepartures || [];
+
+  const route = leg.trip?.route;
+  const { bg, fg } = routeColors(route);
+  const line  = route?.shortName || route?.mode || '?';
+  const kind  = route?.mode ? route.mode.charAt(0) + route.mode.slice(1).toLowerCase() : '';
+
+  const conn = mkEl('div', 'conn');
+
+  const head = mkEl('div', 'conn-head');
+  head.appendChild(mkBadge(line, bg, fg));
+  const title = mkEl('span', 'conn-title');
+  title.textContent = fmtTime(leg.start) + ' ' + kind + ' → ' + (leg.to?.node?.name || '—');
+  head.appendChild(title);
+  if (r) {
+    const connRel = mkEl('span', 'conn-rel');
+    connRel.dataset.rel = relClass(r.reliability);
+    connRel.appendChild(mkDonut(r.reliability));
+    connRel.appendChild(document.createTextNode(relPct(r.reliability)));
+    head.appendChild(connRel);
+  }
+  conn.appendChild(head);
+
+  // Feeder block: earlier departures + planned
+  const block   = mkEl('div', 'conn-block');
+  const lbl     = mkEl('div', 'conn-lbl');
+  lbl.textContent = prevDeps.length > 0
+    ? 'Earlier departures of the same service'
+    : 'This is the planned departure';
+  block.appendChild(lbl);
+
+  // Not-implemented notice (hidden, revealed on click)
+  const notImpl = mkEl('div');
+  notImpl.style.cssText = 'display:none;font-size:11px;color:var(--ds-rel-low);margin:0 0 8px;padding:5px 9px;background:var(--ds-rel-low-soft);border-radius:6px;';
+  notImpl.textContent = 'Switching to an earlier departure is not yet implemented.';
+  block.appendChild(notImpl);
+
+  const feeder = mkEl('div', 'feeder');
+
+  [...prevDeps].reverse().forEach(dep => {
+    const btn = mkEl('button', 'fopt');
+    btn.appendChild(mkEl('span', 'fopt-time', fmtTime(dep.start)));
+    // Reliability for alternative departures is not available from the backend
+    const relRow = mkEl('span', 'fopt-rel');
+    relRow.appendChild(mkEl('span', null, '?? reliability'));
+    relRow.style.cssText = 'font-size:10.5px;color:var(--ds-ink-4);font-style:italic;';
+    btn.appendChild(relRow);
+    const deltaMins = Math.round((leg.start - dep.start) / 60);
+    btn.appendChild(mkEl('span', 'fopt-delta', '−' + deltaMins + ' min earlier'));
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      notImpl.style.display = 'block';
+    });
+    feeder.appendChild(btn);
+  });
+
+  // Planned departure (current one)
+  const planned = mkEl('button', 'fopt planned');
+  planned.appendChild(mkEl('span', 'fopt-time', fmtTime(leg.start)));
+  if (r) {
+    const pFr = mkEl('span', 'fopt-rel');
+    const pRs = mkEl('span'); pRs.dataset.rel = relClass(r.reliability);
+    pRs.appendChild(mkDonut(r.reliability));
+    pRs.appendChild(document.createTextNode(relPct(r.reliability)));
+    pFr.appendChild(pRs);
+    planned.appendChild(pFr);
+  }
+  planned.appendChild(mkEl('span', 'fopt-delta', 'planned'));
+  planned.addEventListener('click', e => e.stopPropagation());
+  feeder.appendChild(planned);
+
+  block.appendChild(feeder);
+  conn.appendChild(block);
+
+  if (r?.nextDeparture != null) {
+    const foot = mkEl('div', 'conn-foot');
+    const miss = mkEl('div', 'cf-item');
+    miss.appendChild(mkEl('span', 'cf-k', 'Miss it'));
+    miss.appendChild(document.createTextNode(' '));
+    miss.appendChild(mkBadge(line, bg, fg, true));
+    miss.appendChild(document.createTextNode(' '));
+    miss.appendChild(mkEl('span', 'cf-mono', fmtTime(r.nextDeparture)));
+    if (r.nextReliability != null) {
+      miss.appendChild(document.createTextNode(' · ' + relPct(r.nextReliability) + ' on time'));
+    }
+    foot.appendChild(miss);
+    conn.appendChild(foot);
+  }
+
+  return conn;
+}
+
+// ── Trip card ─────────────────────────────────────────────────
+function renderTripCard(plan, idx, isOpen) {
+  const card = mkEl('div', 'card' + (isOpen ? ' open' : ''));
+
+  const top   = mkEl('div', 'card-top');
+  const times = mkEl('div', 'card-times');
+  times.appendChild(mkEl('span', 't-dep', fmtTime(plan.start)));
+  times.appendChild(mkEl('span', 't-arrow', '→'));
+  times.appendChild(mkEl('span', 't-arr', fmtTime(plan.end)));
+  top.appendChild(times);
+
+  const meta    = mkEl('div', 'card-meta');
+  const totMins = Math.round((plan.end - plan.start) / 60);
+  const h = Math.floor(totMins / 60), m = totMins % 60;
+  meta.appendChild(mkEl('span', 'm-dur', h > 0 ? h + 'h' + String(m).padStart(2, '0') : m + '′'));
+  const rel = planReliability(plan);
+  if (rel < 1) meta.appendChild(mkRelChip(rel));
+  top.appendChild(meta);
+  card.appendChild(top);
+
+  const tagEl = mkEl('div', 'card-tag');
+  const tag   = planTag(state.plans, plan);
+  if (tag) {
+    if (idx === 0) tagEl.appendChild(mkEl('span', 'lead', '●'));
+    tagEl.appendChild(document.createTextNode(tag));
+  }
+  card.appendChild(tagEl);
+
+  // Resolve which transit leg is currently selected for the detail panel
+  let openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
+  if (openLegIdx < 0) {
+    // Default: first transit leg (preferring one with transferRisk)
+    openLegIdx = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg' && l.transferRisk);
+    if (openLegIdx < 0) openLegIdx = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg');
+  }
+  const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
+
+  const onLeg = (e, clickedLeg) => {
+    e.stopPropagation();
+    if (clickedLeg.__typename === 'PlanWalkLeg') {
+      if (!isOpen) openCard(idx);
+      return;
+    }
+    const clickedIdx = plan.legs.indexOf(clickedLeg);
+    if (!isOpen) {
+      if (clickedIdx >= 0) state.selectedLegIdxMap.set(idx, clickedIdx);
+      openCard(idx);
+      return;
+    }
+    // Card already open — switch which leg's detail is shown
+    if (clickedIdx >= 0 && clickedIdx !== openLegIdx) {
+      state.selectedLegIdxMap.set(idx, clickedIdx);
+      renderList();
+    }
+  };
+
+  card.appendChild(renderRibbon(plan, openLeg, onLeg));
+
+  const foot = mkEl('div', 'card-foot');
+  const xfer = planTransferCount(plan);
+  foot.appendChild(document.createTextNode(xfer + ' transfer' + (xfer !== 1 ? 's' : '')));
+  foot.appendChild(mkEl('span', 'sep', '·'));
+  foot.appendChild(document.createTextNode(Math.round(planWalkSeconds(plan) / 60) + '′ walk'));
+  if (plan.expectedEnd && plan.expectedEnd !== plan.end) {
+    const tax = Math.round((plan.expectedEnd - plan.end) / 60);
+    foot.appendChild(mkEl('span', 'sep', '·'));
+    const w = mkEl('span', 'warn-txt');
+    w.title = 'Probability-weighted arrival is ' + tax + ' min later';
+    w.textContent = '+' + tax + '′ expected';
+    foot.appendChild(w);
+  }
+  foot.appendChild(mkEl('span', 'expand', isOpen ? 'Hide detail ▴' : 'Tap a transit leg ▾'));
+  card.appendChild(foot);
+
+  if (isOpen) {
+    const detail = mkEl('div', 'card-detail');
+    detail.addEventListener('click', e => e.stopPropagation());
+
+    // Plan reliability banner — only when there are risky connections
+    const xferLegs = plan.legs.filter(l => l.transferRisk);
+    if (xferLegs.length > 0) {
+      const pRel = mkEl('div', 'plan-rel');
+      pRel.appendChild(mkEl('span', 'pr-k', 'Plan reliability'));
+      pRel.appendChild(mkRelChip(rel));
+      const note = mkEl('span', 'pr-note');
+      note.textContent = xferLegs.length > 1
+        ? 'Chance of making every connection — ' + xferLegs.map(l => relPct(l.transferRisk.reliability)).join(' × ')
+        : "Chance of making this plan's single connection";
+      pRel.appendChild(note);
+      detail.appendChild(pRel);
+    }
+
+    detail.appendChild(renderLegList(plan));
+
+    // Connection card for the selected transit leg
+    if (openLeg) {
+      const connEl = renderConnection(openLeg);
+      if (connEl) detail.appendChild(connEl);
+    }
+
+    card.appendChild(detail);
+  }
+
+  card.addEventListener('click', e => {
+    if (e.target.closest('button')) return;
+    if (isOpen) { closeCard(); return; }
+    openCard(idx);
+  });
+
+  return card;
+}
+
+// ── Render list ───────────────────────────────────────────────
+function renderList() {
+  const listEl = el('plans-list');
+  listEl.replaceChildren();
+  el('plans-count').textContent = state.plans.length
+    ? state.plans.length + ' option' + (state.plans.length === 1 ? '' : 's')
+    : '';
+
+  if (!state.plans.length) {
+    listEl.appendChild(mkEl('p', 'status-msg', 'No results found.'));
+    return;
+  }
+
+  state.plans.forEach((plan, idx) => {
+    listEl.appendChild(renderTripCard(plan, idx, idx === state.selectedIdx));
+  });
+}
+
+function openCard(idx) {
+  state.selectedIdx = idx;
+  renderList();
+  renderPlanOnMap(idx);
+  doSyncUrl();
+}
+
+function closeCard() {
+  state.selectedIdx = -1;
+  renderList();
+  doSyncUrl();
+}
+
+// ── Trip drill-down modal ─────────────────────────────────────
+function openTripModal(leg) {
+  const route    = leg.trip?.route;
+  const { bg, fg } = routeColors(route);
+  const titleEl  = el('trip-modal-title');
+  titleEl.replaceChildren();
+  titleEl.appendChild(mkBadge(route?.shortName || route?.mode || '?', bg, fg));
+  titleEl.appendChild(document.createTextNode(' ' + (leg.trip?.headsign || route?.longName || '')));
+  if (route?.agency?.name) titleEl.appendChild(mkEl('span', 'agency', '· ' + route.agency.name));
+
+  const body = el('trip-modal-body');
+  body.replaceChildren();
+  body.appendChild(mkEl('p', 'hint',
+    `Departs ${fmtTime(leg.start)} from ${leg.from?.node?.name || '—'}, ` +
+    `arrives ${fmtTime(leg.end)} at ${leg.to?.node?.name || '—'} (${fmtDuration(leg.duration)}).`));
+
+  const stopsEl = mkEl('div', 'stops');
+  buildStopList(leg).forEach((s, i, arr) => {
+    const isFirst = i === 0, isLast = i === arr.length - 1;
+    const row = mkEl('div', 'stop' + (isFirst || isLast ? ' terminus' : ''));
+    row.appendChild(mkEl('span', 't', isFirst ? fmtTime(s.departure) : fmtTime(s.arrival)));
+    const n = mkEl('span', 'n', s.name || '—');
+    n.addEventListener('click', () => { if (s.lat != null && s.lon != null) map.setView([s.lat, s.lon], 16); });
+    row.appendChild(n);
+    stopsEl.appendChild(row);
+  });
+  body.appendChild(stopsEl);
+
+  const note = mkEl('p', 'hint', 'Note: shows the boarding-to-alighting segment used by the planner.');
+  note.style.marginTop = '12px';
+  body.appendChild(note);
+  el('trip-modal').classList.add('open');
+}
+el('trip-modal-close').addEventListener('click', () => el('trip-modal').classList.remove('open'));
+el('trip-modal').addEventListener('click', e => {
+  if (e.target === el('trip-modal')) el('trip-modal').classList.remove('open');
+});
+
+// ── Map rendering ─────────────────────────────────────────────
+function clearLegLayers() {
+  state.legLayers.forEach(l => map.removeLayer(l));
+  state.legLayers = [];
+}
+function renderPlanOnMap(idx) {
+  clearLegLayers();
+  const plan = state.plans[idx];
+  if (!plan) return;
+  const allPts = [];
+  plan.legs.forEach(leg => {
+    const geom = leg.geometry;
+    if (!geom?.length) return;
+    const pts = geom.map(p => [p.lat, p.lon]);
+    allPts.push(...pts);
+    const isTransit = leg.__typename === 'PlanTransitLeg';
+    const color = isTransit ? routeColors(leg.trip?.route).bg : '#78909c';
+    state.legLayers.push(L.polyline(pts, {
+      color, weight: isTransit ? 5 : 3, opacity: 0.9,
+      dashArray: isTransit ? null : '5,6',
+    }).addTo(map));
+    if (isTransit && leg.from?.node && leg.to?.node) {
+      state.legLayers.push(
+        L.marker([leg.from.node.lat, leg.from.node.lon], { icon: makeStopDot(color) })
+          .addTo(map).bindTooltip(leg.from.node.name),
+        L.marker([leg.to.node.lat, leg.to.node.lon], { icon: makeStopDot(color) })
+          .addTo(map).bindTooltip(leg.to.node.name),
+      );
+    }
+  });
+  if (allPts.length) map.fitBounds(L.latLngBounds(allPts), { padding: [50, 50] });
+}
+
+// ── Keyboard ──────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input, select, textarea')) return;
+  if (e.key === '/') { e.preventDefault(); fromSearch.el.focus(); return; }
+  if (e.key === 'r' || e.key === 'R') { reverseEndpoints(); return; }
+  if (e.key === 'n' || e.key === 'N') { el('now-btn').click(); return; }
+  if (e.key === 'Enter' || e.key === 'g' || e.key === 'G') { runQuery(); return; }
+  if (e.key === 'Escape') { el('trip-modal').classList.remove('open'); return; }
+  if ((e.key === 'ArrowDown' || e.key === 'j') && state.plans.length) {
+    e.preventDefault();
+    state.selectedIdx = Math.min(state.plans.length - 1, state.selectedIdx + 1);
+    renderList(); renderPlanOnMap(state.selectedIdx); doSyncUrl();
+  }
+  if ((e.key === 'ArrowUp' || e.key === 'k') && state.plans.length) {
+    e.preventDefault();
+    state.selectedIdx = Math.max(0, state.selectedIdx - 1);
+    renderList(); renderPlanOnMap(state.selectedIdx); doSyncUrl();
+  }
+});
+
+// ── Bootstrap ─────────────────────────────────────────────────
+loadFromUrl();
+const _p = readUrl();
+if (_p.has('fromLat') && _p.has('toLat')) runQuery();
+</script>
+</body>
+</html>

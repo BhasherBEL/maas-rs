@@ -23,6 +23,58 @@ impl DelayCDF {
 
 }
 
+/// Reliability values `>=` this collapse into the single CERTAIN bucket, so
+/// near-certain plans (0.999, 0.9999, …) don't each spawn a distinct alternative.
+pub const CERTAIN_THRESHOLD: f32 = 0.99;
+
+/// Quantizes a plan/label reliability into a small number of buckets so each stop
+/// keeps at most one label per bucket (see RAPTOR multi-criteria labels). Higher
+/// bucket index = more reliable.
+#[derive(Clone, Debug)]
+pub struct ReliabilityBuckets {
+    /// Sorted, strictly increasing edges in (0,1). The CERTAIN bucket (>=0.99) is
+    /// implicit and always the highest index.
+    edges: Vec<f32>,
+}
+
+impl Default for ReliabilityBuckets {
+    fn default() -> Self {
+        Self::new(&[0.50, 0.80, 0.95])
+    }
+}
+
+/// Returns true if `edges` is a valid bucket-edge list: non-empty, every value in
+/// the open interval (0,1), and strictly increasing.
+pub fn valid_reliability_edges(edges: &[f32]) -> bool {
+    !edges.is_empty()
+        && edges.iter().all(|&e| e > 0.0 && e < 1.0)
+        && edges.windows(2).all(|w| w[0] < w[1])
+}
+
+impl ReliabilityBuckets {
+    pub fn new(edges: &[f32]) -> Self {
+        ReliabilityBuckets { edges: edges.to_vec() }
+    }
+
+    /// Bucket index in `0..=edges.len()+1`. `0` = least reliable band,
+    /// `edges.len()+1` = CERTAIN (reliability >= 0.99).
+    #[inline]
+    pub fn bucket(&self, reliability: f32) -> u8 {
+        if reliability >= CERTAIN_THRESHOLD {
+            return (self.edges.len() + 1) as u8;
+        }
+        let mut idx = 0u8;
+        for &e in &self.edges {
+            if reliability >= e {
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        idx
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Scenario {
     pub time: u32,
@@ -146,6 +198,35 @@ impl ScenarioBag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ReliabilityBuckets ────────────────────────────────────────────────────
+
+    #[test]
+    fn bucket_collapses_certain() {
+        let b = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+        assert_eq!(b.bucket(1.0), b.bucket(0.99)); // >=0.99 -> CERTAIN
+        assert_eq!(b.bucket(0.995), b.bucket(0.99));
+        assert!(b.bucket(0.989) < b.bucket(0.99)); // just below certain is lower
+    }
+
+    #[test]
+    fn bucket_bands_are_ordered_and_inclusive_low() {
+        let b = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+        assert!(b.bucket(0.10) < b.bucket(0.60));
+        assert!(b.bucket(0.60) < b.bucket(0.90));
+        assert!(b.bucket(0.90) < b.bucket(0.97));
+        // edge value falls in the upper band (>= edge)
+        assert_eq!(b.bucket(0.50), b.bucket(0.79));
+        assert_eq!(b.bucket(0.80), b.bucket(0.94));
+    }
+
+    #[test]
+    fn bucket_handles_zero_and_default() {
+        let b = ReliabilityBuckets::default();
+        assert_eq!(b.bucket(0.0), 0);
+        // default edges [0.50,0.80,0.95] => CERTAIN index = 4
+        assert_eq!(b.bucket(1.0), 4);
+    }
 
     // ── DelayCDF ──────────────────────────────────────────────────────────────
 

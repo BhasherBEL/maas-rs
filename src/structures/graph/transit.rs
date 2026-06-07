@@ -165,15 +165,10 @@ impl Graph {
         initial_index: usize,
     ) -> impl Iterator<Item = (usize, &TripSegment)> {
         let slice = &self.raptor.transit_departures[tt.start..tt.start + tt.len];
-        let relative_index = initial_index - tt.start;
-
-        debug_assert!(
-            initial_index >= tt.start && initial_index < tt.start + tt.len,
-            "initial_index {} out of timetable segment [{}, {}]",
-            initial_index,
-            tt.start,
-            tt.start + tt.len
-        );
+        // Guard against an out-of-segment index (saturating, never underflows): an
+        // inconsistent `initial_index` yields no previous departures rather than panicking.
+        let relative_index = initial_index.saturating_sub(tt.start).min(slice.len());
+        let base = tt.start + relative_index;
 
         slice[..relative_index]
             .iter()
@@ -182,7 +177,7 @@ impl Graph {
             .filter(move |(_, dep)| {
                 self.raptor.transit_services[dep.service_id.0 as usize].is_active(date, weekday)
             })
-            .map(move |(i, dep)| (initial_index - 1 - i, dep))
+            .map(move |(i, dep)| (base - 1 - i, dep))
     }
 
     pub fn next_departures(
@@ -193,15 +188,9 @@ impl Graph {
         initial_index: usize,
     ) -> impl Iterator<Item = (usize, &TripSegment)> {
         let slice = &self.raptor.transit_departures[tt.start..tt.start + tt.len];
-        let relative_index = initial_index - tt.start;
-
-        debug_assert!(
-            initial_index >= tt.start && initial_index < tt.start + tt.len,
-            "initial_index {} out of timetable segment [{}, {}]",
-            initial_index,
-            tt.start,
-            tt.start + tt.len
-        );
+        // Guard against an out-of-segment index (saturating, never underflows).
+        let relative_index = initial_index.saturating_sub(tt.start).min(slice.len());
+        let base = tt.start + relative_index;
 
         slice
             .get(relative_index + 1..)
@@ -211,7 +200,7 @@ impl Graph {
             .filter(move |(_, dep)| {
                 self.raptor.transit_services[dep.service_id.0 as usize].is_active(date, weekday)
             })
-            .map(move |(i, dep)| (initial_index + 1 + i, dep))
+            .map(move |(i, dep)| (base + 1 + i, dep))
     }
 
     /// Returns up to `count` departures from RAPTOR patterns that serve both

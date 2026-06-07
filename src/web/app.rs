@@ -6,7 +6,7 @@ use async_graphql::{
 };
 use async_graphql_poem::GraphQL;
 use chrono::{Local, NaiveDate, NaiveTime};
-use poem::{Result, Route, Server, get, handler, listener::TcpListener, web::Html};
+use poem::{IntoResponse, Response, Result, Route, Server, get, handler, listener::TcpListener, web::Html};
 
 use crate::{
     routing::routing_raptor,
@@ -86,6 +86,8 @@ struct PlanCandidateGql {
     dominator_arrives_earlier: Option<bool>,
     /// Dominator uses fewer transfers than this plan.
     dominator_fewer_transfers: Option<bool>,
+    /// Dominator is more reliable (higher reliability bucket) than this plan.
+    dominator_higher_reliability: Option<bool>,
 }
 
 #[derive(SimpleObject)]
@@ -140,34 +142,42 @@ struct RaptorExplainResult {
 }
 
 fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql {
-    let (status, dominator_index, dom_departs_later, dom_arrives_earlier, dom_fewer_transfers) =
-        match &c.status {
-            CandidateStatus::Kept => (CandidateStatusGql::Kept, None, None, None, None),
-            CandidateStatus::NotImproving => {
-                (CandidateStatusGql::NotImproving, None, None, None, None)
-            }
-            CandidateStatus::ReconstructionEmpty => {
-                (CandidateStatusGql::ReconstructionEmpty, None, None, None, None)
-            }
-            CandidateStatus::ExtremeRisk => {
-                (CandidateStatusGql::ExtremeRisk, None, None, None, None)
-            }
-            CandidateStatus::BackwardDetour => {
-                (CandidateStatusGql::BackwardDetour, None, None, None, None)
-            }
-            CandidateStatus::ParetoDominated {
-                dominator_index,
-                departure_worse,
-                arrival_worse,
-                transfers_worse,
-            } => (
-                CandidateStatusGql::ParetoDominated,
-                Some(*dominator_index as i32),
-                Some(*departure_worse),
-                Some(*arrival_worse),
-                Some(*transfers_worse),
-            ),
-        };
+    let (
+        status,
+        dominator_index,
+        dom_departs_later,
+        dom_arrives_earlier,
+        dom_fewer_transfers,
+        dom_higher_reliability,
+    ) = match &c.status {
+        CandidateStatus::Kept => (CandidateStatusGql::Kept, None, None, None, None, None),
+        CandidateStatus::NotImproving => {
+            (CandidateStatusGql::NotImproving, None, None, None, None, None)
+        }
+        CandidateStatus::ReconstructionEmpty => {
+            (CandidateStatusGql::ReconstructionEmpty, None, None, None, None, None)
+        }
+        CandidateStatus::ExtremeRisk => {
+            (CandidateStatusGql::ExtremeRisk, None, None, None, None, None)
+        }
+        CandidateStatus::BackwardDetour => {
+            (CandidateStatusGql::BackwardDetour, None, None, None, None, None)
+        }
+        CandidateStatus::ParetoDominated {
+            dominator_index,
+            departure_worse,
+            arrival_worse,
+            transfers_worse,
+            reliability_worse,
+        } => (
+            CandidateStatusGql::ParetoDominated,
+            Some(*dominator_index as i32),
+            Some(*departure_worse),
+            Some(*arrival_worse),
+            Some(*transfers_worse),
+            Some(*reliability_worse),
+        ),
+    };
     PlanCandidateGql {
         round: c.round as i32,
         origin_departure: c.origin_departure as i32,
@@ -177,6 +187,7 @@ fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql 
         dominator_departs_later: dom_departs_later,
         dominator_arrives_earlier: dom_arrives_earlier,
         dominator_fewer_transfers: dom_fewer_transfers,
+        dominator_higher_reliability: dom_higher_reliability,
     }
 }
 
@@ -225,6 +236,12 @@ impl QueryRoot {
         // Override the default walk-radius (seconds) for access/egress stop
         // search.  Falls back to the value in config.yaml (default 600 s).
         walk_radius_secs: Option<i32>,
+        // Arrival-slack (seconds): explore plans arriving up to this much after the
+        // fastest, surfacing safer-but-slower alternatives. Falls back to config (900 s).
+        arrival_slack_secs: Option<i32>,
+        // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
+        // Finer edges surface more reliability-distinct alternatives. Falls back to config.
+        reliability_bucket_edges: Option<Vec<f64>>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -238,6 +255,9 @@ impl QueryRoot {
             time: parsed_time,
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
+            arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            reliability_bucket_edges: reliability_bucket_edges
+                .map(|v| v.into_iter().map(|x| x as f32).collect()),
         };
 
         routing_raptor::route(graph.as_ref(), &query)
@@ -256,6 +276,8 @@ impl QueryRoot {
         time: Option<String>,
         window_minutes: Option<i32>,
         walk_radius_secs: Option<i32>,
+        arrival_slack_secs: Option<i32>,
+        reliability_bucket_edges: Option<Vec<f64>>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<Arc<Graph>>()?;
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -269,6 +291,9 @@ impl QueryRoot {
             time: parsed_time,
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
+            arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            reliability_bucket_edges: reliability_bucket_edges
+                .map(|v| v.into_iter().map(|x| x as f32).collect()),
         };
 
         let result = routing_raptor::route_explain(graph.as_ref(), &query)?;
@@ -346,12 +371,31 @@ impl QueryRoot {
     }
 }
 
-const MAP_HTML: &str = include_str!("static/map.html");
+const DEBUG_HTML: &str = include_str!("static/debug.html");
+const INDEX_HTML: &str = include_str!("static/index.html");
+const MAAS_JS: &str    = include_str!("static/maas.js");
+
+struct Js(&'static str);
+impl IntoResponse for Js {
+    fn into_response(self) -> Response {
+        Response::builder()
+            .content_type("application/javascript; charset=utf-8")
+            .body(self.0)
+    }
+}
 
 #[handler]
-pub async fn map_page() -> Html<&'static str> {
-    Html(MAP_HTML)
+pub async fn debug_page() -> Html<&'static str> {
+    Html(DEBUG_HTML)
 }
+
+#[handler]
+pub async fn index_page() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+#[handler]
+pub async fn maas_js_handler() -> Js { Js(MAAS_JS) }
 
 #[handler]
 async fn graphiql() -> Html<String> {
@@ -371,7 +415,9 @@ pub async fn server(graph: Arc<Graph>, server_config: &ServerConfig) -> std::io:
     let app = Route::new()
         .at("/graphql", GraphQL::new(schema))
         .at("/graphiql", get(graphiql))
-        .at("/map", get(map_page));
+        .at("/maas.js", get(maas_js_handler))
+        .at("/debug", get(debug_page))
+        .at("/", get(index_page));
 
     let bind = format!("{}:{}", server_config.host, server_config.port);
     tracing::info!("serving on {bind}");

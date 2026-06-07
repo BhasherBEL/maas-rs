@@ -82,6 +82,27 @@
             .${cfg.mode};
         in
         {
+
+          nixpkgs.overlays = [
+            (
+              final: prev:
+              let
+                fixedImportCargoLock = final.callPackage (builtins.toFile "import-cargo-lock.nix" (
+                  builtins.replaceStrings [ "https://crates.io/api/v1/crates" ] [ "https://static.crates.io/crates" ]
+                    (builtins.readFile "${prev.path}/pkgs/build-support/rust/import-cargo-lock.nix")
+                )) { };
+              in
+              {
+                importCargoLock = fixedImportCargoLock;
+                rustPlatform = prev.rustPlatform // {
+                  buildRustPackage = prev.rustPlatform.buildRustPackage.override {
+                    importCargoLock = fixedImportCargoLock;
+                  };
+                };
+              }
+            )
+          ];
+
           # ── Options ──────────────────────────────────────────────────────────
           options.services.maas-rs = {
             enable = lib.mkEnableOption "maas-rs multi-modal routing engine";

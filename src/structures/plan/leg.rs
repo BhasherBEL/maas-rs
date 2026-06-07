@@ -284,17 +284,25 @@ impl PlanTransitLeg {
             .collect();
 
         Ok(candidates
-            .filter_map(|(idx, segment)| {
+            .filter_map(|(_idx, segment)| {
                 let trip_id = segment.trip_id;
                 let mut current_arrival = segment.arrival;
                 let mut new_steps = Vec::with_capacity(self.steps.len());
 
+                // Derive the first step's departure index from THIS leg's first
+                // timetable segment (not the caller's index, which may come from a
+                // different segment/pattern — e.g. the backward-tightening path). If
+                // the trip isn't on this segment it isn't a valid alternative here.
+                let first_slice = graph.get_transit_departure_slice(first.timetable_segment);
+                let (first_local, first_seg) =
+                    first_slice.iter().enumerate().find(|(_, d)| d.trip_id == trip_id)?;
+
                 new_steps.push(PlanLegStep::Transit(PlanTransitLegStep {
-                    departure_index: idx,
+                    departure_index: first.timetable_segment.start + first_local,
                     weekday: first.weekday,
                     date: first.date,
                     timetable_segment: first.timetable_segment,
-                    time: segment.departure,
+                    time: first_seg.departure,
                     place: first.place,
                     length: first.length,
                 }));
@@ -324,13 +332,13 @@ impl PlanTransitLeg {
                     if let (Some(pa), Some(prt)) =
                         (self.preceding_arrival, self.preceding_route_type)
                     {
-                        let margin = segment.departure as i32 - pa as i32;
+                        let margin = first_seg.departure as i32 - pa as i32;
                         let next_dep = graph
                             .next_departures(
                                 first.timetable_segment,
                                 first.date,
                                 first.weekday,
-                                idx,
+                                first.timetable_segment.start + first_local,
                             )
                             .next()
                             .map(|(_, seg)| seg.departure);

@@ -61,6 +61,14 @@ pub struct RaptorIndex {
 
     #[serde(default = "RaptorIndex::default_walking_speed_mps")]
     pub walking_speed_mps: f64,
+
+    // Runtime tuning params, applied from config.yaml at startup — not serialized,
+    // so adding them does not change the `graph.bin` (postcard) layout.
+    #[serde(skip, default = "RaptorIndex::default_reliability_bucket_edges")]
+    pub reliability_bucket_edges: Vec<f32>,
+
+    #[serde(skip, default = "RaptorIndex::default_arrival_slack_secs")]
+    pub arrival_slack_secs: u32,
 }
 
 impl Default for RaptorIndex {
@@ -108,6 +116,8 @@ impl RaptorIndex {
 
             min_access_secs: Self::default_min_access_secs(),
             walking_speed_mps: Self::default_walking_speed_mps(),
+            reliability_bucket_edges: Self::default_reliability_bucket_edges(),
+            arrival_slack_secs: Self::default_arrival_slack_secs(),
         }
     }
 
@@ -117,6 +127,14 @@ impl RaptorIndex {
 
     pub fn default_walking_speed_mps() -> f64 {
         1.2
+    }
+
+    pub fn default_reliability_bucket_edges() -> Vec<f32> {
+        vec![0.50, 0.80, 0.95]
+    }
+
+    pub fn default_arrival_slack_secs() -> u32 {
+        900
     }
 
     /// Cross-reference check run after deserialization.  Returns an error if any index is
@@ -291,5 +309,7 @@ mod tests {
         assert!(idx.railway_adj.is_empty());
         assert_eq!(idx.min_access_secs, 600);
         assert_eq!(idx.walking_speed_mps, 1.2);
+        assert_eq!(idx.reliability_bucket_edges, vec![0.50, 0.80, 0.95]);
+        assert_eq!(idx.arrival_slack_secs, 900);
     }
 }
