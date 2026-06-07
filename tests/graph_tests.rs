@@ -14,8 +14,8 @@ use maas_rs::{
         TimetableSegment, TripId, TripInfo, TripSegment,
     },
     structures::{
-        DelayCDF, EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData, ReliabilityBuckets,
-        StreetEdgeData, TransitEdgeData, TransitStopData,
+        DelayCDF, EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData, RealtimeIndex,
+        ReliabilityBuckets, StreetEdgeData, TransitEdgeData, TransitStopData,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
     },
@@ -42,6 +42,7 @@ fn transit_stop(name: &str, lat: f64, lon: f64) -> NodeData {
             longitude: lon,
         },
         accessibility: Availability::Available,
+        id: name.to_string(),
     })
 }
 
@@ -1083,6 +1084,139 @@ fn raptor_backward_tightening_shifts_first_leg_to_later_trip() {
         9 * 3600,
         "Backward tightening should shift bus boarding to 09:00 (not 08:00); got {}s",
         bus_leg.start
+    );
+}
+
+/// Realtime (differential): delaying *only* the tram trip at its alighting stop
+/// shifts the plan's arrival by exactly that delay, while delaying an unrelated
+/// trip leaves the arrival unchanged — proving the delay is applied per-trip, not
+/// uniformly. (Compact stop indices follow node insertion order: A=0,B=1,C=2,D=3;
+/// the tram is TripId(2), alighting at stop_D = compact 3.)
+#[test]
+fn raptor_realtime_delay_is_per_trip() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let base = g.raptor_tuned(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900);
+    let base_end = base.iter().map(|p| p.end).min().unwrap();
+
+    // Delay only the tram (TripId 2) at stop_D (compact 3) by 600s.
+    let d: i32 = 600;
+    let tram_delay = RealtimeIndex::from_delays(1, [((TripId(2), 3u32), d)]);
+    let delayed =
+        g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &tram_delay);
+    let delayed_end = delayed.iter().map(|p| p.end).min().unwrap();
+    assert_eq!(
+        delayed_end,
+        base_end + d as u32,
+        "delaying the tram (the decisive last leg) must push arrival by {d}s \
+         (base {base_end}, delayed {delayed_end})"
+    );
+
+    // Delaying a trip that is NOT on the chosen path leaves the arrival unchanged.
+    let unrelated = RealtimeIndex::from_delays(1, [((TripId(0), 0u32), 600)]);
+    let same =
+        g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &unrelated);
+    assert_eq!(same.iter().map(|p| p.end).min().unwrap(), base_end);
+}
+
+/// Realtime reaches the reconstructed leg: delaying the tram at its alighting
+/// stop shifts that leg's `end` (effective) while `scheduled_end` keeps the
+/// timetable value and `realtime` is flagged true; the un-delayed bus leg stays
+/// scheduled with `realtime == false`.
+#[test]
+fn raptor_realtime_shows_on_leg_times() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    // Delay only the tram (TripId 2) at stop_D (compact 3) by 600s.
+    let rt = RealtimeIndex::from_delays(1, [((TripId(2), 3u32), 600)]);
+    let plans = g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+
+    let plan = plans
+        .iter()
+        .find(|p| {
+            p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2
+        })
+        .expect("a bus+tram plan");
+
+    let mut saw_tram = false;
+    let mut saw_bus = false;
+    for leg in &plan.legs {
+        if let PlanLeg::Transit(t) = leg {
+            if t.trip_id == TripId(2) {
+                saw_tram = true;
+                assert!(t.realtime, "tram leg should be flagged realtime");
+                assert_eq!(t.scheduled_end, 9 * 3600 + 2700, "tram scheduled arrival kept");
+                assert_eq!(t.end, t.scheduled_end + 600, "tram effective arrival = scheduled + 600");
+            } else {
+                saw_bus = true;
+                assert!(!t.realtime, "bus leg has no realtime data");
+                assert_eq!(t.start, t.scheduled_start, "bus leg unshifted");
+            }
+        }
+    }
+    assert!(saw_tram && saw_bus, "expected both a tram and a bus leg");
+}
+
+/// STIB pointid → stop resolution: an exact stop_id match wins; otherwise every
+/// platform-suffixed stop whose id is prefixed by the pointid is returned.
+#[test]
+fn stib_stop_indices_exact_and_prefix() {
+    let mut g = Graph::new();
+    g.raptor.transit_stop_ids =
+        vec!["0470701".into(), "0470101".into(), "1234".into(), "0470".into()];
+    g.raptor.build_runtime_indices();
+
+    // Exact match takes priority (does not also pull in the prefixed platforms).
+    assert_eq!(g.stib_stop_indices("0470"), vec![3]);
+    // Exact match on a non-prefix id.
+    assert_eq!(g.stib_stop_indices("1234"), vec![2]);
+    // Prefix match: pointid with no exact id → all platform-suffixed stops.
+    let mut pref = g.stib_stop_indices("04707");
+    pref.sort();
+    assert_eq!(pref, vec![0]);
+    // Unknown point resolves to nothing.
+    assert!(g.stib_stop_indices("9999").is_empty());
+}
+
+/// Realtime: a uniform delay applied to every trip at every stop must shift the
+/// fastest plan's arrival by exactly that delay (walk legs are unaffected), and
+/// an empty index must reproduce the schedule-only result.
+#[test]
+fn raptor_realtime_delay_shifts_arrival() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let base = g.raptor_tuned(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900);
+    assert!(!base.is_empty(), "expected a baseline plan");
+    let base_min_end = base.iter().map(|p| p.end).min().unwrap();
+
+    // Empty index reproduces the baseline exactly.
+    let empty = RealtimeIndex::new();
+    let same = g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &empty);
+    assert_eq!(same.iter().map(|p| p.end).min().unwrap(), base_min_end);
+
+    // Delay every (trip, stop) by D seconds.
+    let d: i32 = 300;
+    let n_trips = g.get_transit_trips_size() as u32;
+    let mut delays = Vec::new();
+    for t in 0..n_trips {
+        for stop in 0..64u32 {
+            delays.push(((TripId(t), stop), d));
+        }
+    }
+    let rt = RealtimeIndex::from_delays(1, delays);
+
+    let delayed = g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    assert!(!delayed.is_empty(), "expected a plan under realtime delay");
+    let rt_min_end = delayed.iter().map(|p| p.end).min().unwrap();
+
+    assert_eq!(
+        rt_min_end,
+        base_min_end + d as u32,
+        "uniform +{d}s realtime delay should push the fastest arrival by exactly {d}s \
+         (base {base_min_end}, rt {rt_min_end})"
     );
 }
 

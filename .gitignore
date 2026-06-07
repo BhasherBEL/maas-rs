@@ -3,3 +3,6 @@ data/
 *.bin
 docs/
 design/
+.envrc
+*.bin.prev
+cache/

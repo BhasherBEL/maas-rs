@@ -17,7 +17,10 @@ mod raptor_index;
 mod raptor_plan;
 mod raptor_route;
 mod railway;
+mod realtime_match;
 mod transit;
+
+pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GraphError {

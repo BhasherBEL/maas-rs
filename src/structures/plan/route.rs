@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use async_graphql::{ComplexObject, Context, Enum, Result, SimpleObject};
 use gtfs_structures::RouteType;
@@ -62,9 +61,9 @@ pub struct PlanRoute {
 #[ComplexObject]
 impl PlanRoute {
     pub async fn agency(&self, ctx: &Context<'_>) -> Result<Option<PlanAgency>> {
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
 
-        Ok(PlanAgency::from_agency_id(graph, Some(self.agency_id)))
+        Ok(PlanAgency::from_agency_id(graph.as_ref(), Some(self.agency_id)))
     }
 }
 

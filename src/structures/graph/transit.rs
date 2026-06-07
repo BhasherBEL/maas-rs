@@ -40,6 +40,32 @@ impl Graph {
         self.raptor.transit_trips.extend(trips);
     }
 
+    /// Append GTFS `trip_id` strings, aligned 1:1 with `add_transit_trips` so the
+    /// nth appended string corresponds to the nth appended `TripInfo`.
+    pub fn add_transit_trip_ids(&mut self, ids: Vec<String>) {
+        self.raptor.transit_trip_ids.extend(ids);
+    }
+
+    /// Original GTFS `trip_id` for an internal `TripId`, if known.
+    pub fn trip_id_str(&self, trip: TripId) -> Option<&str> {
+        self.raptor.trip_id_str(trip)
+    }
+
+    /// Internal `TripId` for a GTFS `trip_id` string, if known.
+    pub fn trip_index_of(&self, trip_id: &str) -> Option<TripId> {
+        self.raptor.trip_index_of(trip_id)
+    }
+
+    /// Compact stop index for a GTFS `stop_id` string, if known.
+    pub fn stop_index_of(&self, stop_id: &str) -> Option<usize> {
+        self.raptor.stop_index_of(stop_id)
+    }
+
+    /// GTFS `stop_id` string for a compact stop index, if known.
+    pub fn stop_id_str(&self, stop: usize) -> Option<&str> {
+        self.raptor.transit_stop_ids.get(stop).map(|s| s.as_str())
+    }
+
     pub fn get_transit_routes_size(&self) -> usize {
         self.raptor.transit_routes.len()
     }

@@ -354,6 +354,14 @@ header a.head-btn { text-decoration: none; }
 .legs { margin-bottom: 14px; }
 .leg-row { display: grid; grid-template-columns: 42px 16px 1fr; gap: 8px; }
 .leg-time-col { font-size: 11.5px; color: var(--ds-ink-3); padding-top: 1px; font-family: 'IBM Plex Mono', monospace; }
+/* Realtime time cell: green when live & on time, scheduled struck through + red when delayed. */
+.leg-time-col.rt { display: flex; flex-direction: column; line-height: 1.15; }
+.leg-time-col.rt-ontime .lt-rt { color: var(--ok); font-weight: 700; }
+.leg-time-col .lt-sched { color: var(--ds-ink-4); text-decoration: line-through; font-size: 10.5px; }
+.leg-time-col .lt-rt { color: var(--danger); font-weight: 700; }
+/* A realtime-backed transit leg reads green; non-RT legs stay default (black). */
+.leg-row.rt-leg .leg-to { color: var(--ok); }
+.leg-dot.rt-dot { box-shadow: 0 0 0 2px var(--ok); }
 .leg-rail { display: flex; flex-direction: column; align-items: center; }
 .leg-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 3px; flex: none; z-index: 1; }
 .leg-line-v { width: 2px; flex: 1; background: var(--ds-line); margin: 1px 0; min-height: 14px; }
@@ -581,6 +589,7 @@ const PLAN_FRAGMENT = `
     }
     ... on PlanTransitLeg {
       __typename start end duration
+      scheduledStart scheduledEnd realtime
       bikesAllowed
       transferRisk {
         reliability scheduledDeparture nextDeparture nextReliability marginSecs
@@ -1070,10 +1079,10 @@ function renderLegList(plan) {
 
       const route = leg.trip?.route;
       const { bg, fg } = routeColors(route);
-      const row  = mkEl('div', 'leg-row');
-      row.appendChild(mkEl('div', 'leg-time-col', fmtTime(leg.start)));
+      const row  = mkEl('div', 'leg-row' + (leg.realtime ? ' rt-leg' : ''));
+      row.appendChild(mkLegTime(leg.start, leg.scheduledStart, leg.realtime));
       const rail = mkEl('div', 'leg-rail');
-      const dot  = mkEl('span', 'leg-dot'); dot.style.background = bg;
+      const dot  = mkEl('span', 'leg-dot' + (leg.realtime ? ' rt-dot' : '')); dot.style.background = bg;
       rail.appendChild(dot);
       if (!isLast) rail.appendChild(mkEl('span', 'leg-line-v'));
       row.appendChild(rail);

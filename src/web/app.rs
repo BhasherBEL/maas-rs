@@ -10,8 +10,10 @@ use poem::{IntoResponse, Response, Result, Route, Server, get, handler, listener
 
 use crate::{
     routing::routing_raptor,
+    services::realtime_poller::{self, SharedRealtime},
+    services::scheduler::{self, SharedGraph},
     structures::{
-        Graph, ServerConfig,
+        Config, RealtimeIndex,
         plan::{CandidateStatus, Plan, PlanCoordinate},
     },
 };
@@ -243,7 +245,7 @@ impl QueryRoot {
         // Finer edges surface more reliability-distinct alternatives. Falls back to config.
         reliability_bucket_edges: Option<Vec<f64>>,
     ) -> Result<Vec<Plan>, Error> {
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
 
         let query = routing_raptor::RouteQuery {
@@ -260,7 +262,8 @@ impl QueryRoot {
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
         };
 
-        routing_raptor::route(graph.as_ref(), &query)
+        let rt = ctx.data::<SharedRealtime>()?.load_full();
+        routing_raptor::route(graph.as_ref(), &query, rt.as_ref())
     }
 
     /// Debug query: same parameters as `raptor`, but also returns every candidate plan
@@ -279,7 +282,7 @@ impl QueryRoot {
         arrival_slack_secs: Option<i32>,
         reliability_bucket_edges: Option<Vec<f64>>,
     ) -> Result<RaptorExplainResult, Error> {
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
 
         let query = routing_raptor::RouteQuery {
@@ -296,7 +299,8 @@ impl QueryRoot {
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
         };
 
-        let result = routing_raptor::route_explain(graph.as_ref(), &query)?;
+        let rt = ctx.data::<SharedRealtime>()?.load_full();
+        let result = routing_raptor::route_explain(graph.as_ref(), &query, rt.as_ref())?;
 
         Ok(RaptorExplainResult {
             plans: result.plans,
@@ -330,7 +334,7 @@ impl QueryRoot {
     /// Returns every transit stop loaded from GTFS.
     /// Used by the Flutter client for the initial data sync (stop search).
     async fn gtfs_stops(&self, ctx: &Context<'_>) -> Result<Vec<GtfsStop>, Error> {
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<SharedGraph>()?.load_full();
         Ok(graph
             .gtfs_stops()
             .into_iter()
@@ -347,7 +351,7 @@ impl QueryRoot {
     /// Returns every transit agency with its routes loaded from GTFS.
     /// Used by the Flutter client for the initial data sync (agency/route filter).
     async fn gtfs_agencies(&self, ctx: &Context<'_>) -> Result<Vec<GtfsAgency>, Error> {
-        let graph = ctx.data::<Arc<Graph>>()?;
+        let graph = ctx.data::<SharedGraph>()?.load_full();
         Ok(graph
             .gtfs_agencies_with_routes()
             .into_iter()
@@ -402,16 +406,28 @@ async fn graphiql() -> Html<String> {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
-pub fn build_schema(
-    graph: Arc<Graph>,
+pub fn build_schema(graph: SharedGraph) -> Schema<QueryRoot, EmptyMutation, EmptySubscription> {
+    let realtime: SharedRealtime = Arc::new(arc_swap::ArcSwap::from_pointee(RealtimeIndex::new()));
+    build_schema_rt(graph, realtime)
+}
+
+pub fn build_schema_rt(
+    graph: SharedGraph,
+    realtime: SharedRealtime,
 ) -> Schema<QueryRoot, EmptyMutation, EmptySubscription> {
     Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(graph)
+        .data(realtime)
         .finish()
 }
 
-pub async fn server(graph: Arc<Graph>, server_config: &ServerConfig) -> std::io::Result<()> {
-    let schema = build_schema(graph);
+pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<()> {
+    scheduler::spawn(graph.clone(), config.clone());
+
+    let realtime: SharedRealtime = Arc::new(arc_swap::ArcSwap::from_pointee(RealtimeIndex::new()));
+    realtime_poller::spawn(graph.clone(), realtime.clone(), config.clone());
+
+    let schema = build_schema_rt(graph, realtime);
     let app = Route::new()
         .at("/graphql", GraphQL::new(schema))
         .at("/graphiql", get(graphiql))
@@ -419,7 +435,7 @@ pub async fn server(graph: Arc<Graph>, server_config: &ServerConfig) -> std::io:
         .at("/debug", get(debug_page))
         .at("/", get(index_page));
 
-    let bind = format!("{}:{}", server_config.host, server_config.port);
+    let bind = format!("{}:{}", config.server.host, config.server.port);
     tracing::info!("serving on {bind}");
     Server::new(TcpListener::bind(&bind)).run(app).await
 }

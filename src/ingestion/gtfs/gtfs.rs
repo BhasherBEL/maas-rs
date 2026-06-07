@@ -154,6 +154,7 @@ where
             name: name.clone(),
             lat_lng: loc,
             accessibility: raw.wheelchair_boarding,
+            id: stop_id.clone(),
         };
 
         let transit_stop = NodeData::TransitStop(gtfs_stop_data);
@@ -533,6 +534,7 @@ where
         );
     }
 
+    g.add_transit_trip_ids(trip_mapper.strings().to_vec());
     g.add_transit_trips(trip_infos);
     g.add_transit_routes(route_infos);
     g.add_transit_services(services);

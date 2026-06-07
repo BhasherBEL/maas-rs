@@ -13,18 +13,21 @@ impl Graph {
         self.build_stop_patterns();
         self.build_stop_transfers();
         self.build_reverse_transfers();
+        self.raptor.build_runtime_indices();
     }
 
     fn build_compact_stop_index(&mut self) {
         self.raptor.transit_node_to_stop = vec![u32::MAX; self.nodes.len()];
         self.raptor.transit_stop_to_node.clear();
+        self.raptor.transit_stop_ids.clear();
         self.raptor.transit_stops_tree = KdTree::new(2);
 
         for (i, node) in self.nodes.iter().enumerate() {
-            if matches!(node, NodeData::TransitStop(_)) {
+            if let NodeData::TransitStop(stop) = node {
                 let compact = self.raptor.transit_stop_to_node.len();
                 self.raptor.transit_node_to_stop[i] = compact as u32;
                 self.raptor.transit_stop_to_node.push(NodeID(i));
+                self.raptor.transit_stop_ids.push(stop.id.clone());
                 let loc = node.loc();
                 let _ = self
                     .raptor.transit_stops_tree
