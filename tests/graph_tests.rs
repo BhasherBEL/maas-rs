@@ -14,12 +14,13 @@ use maas_rs::{
         TimetableSegment, TripId, TripInfo, TripSegment,
     },
     structures::{
-        EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData,
+        DelayCDF, EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData, ReliabilityBuckets,
         StreetEdgeData, TransitEdgeData, TransitStopData,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
     },
 };
+use std::collections::HashMap;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1524,4 +1525,364 @@ fn access_search_doubles_until_walk_plan_returned() {
     assert_eq!(plans.len(), 1, "expected exactly one walk-only plan");
     assert_eq!(plans[0].legs.len(), 1);
     assert!(matches!(plans[0].legs[0], PlanLeg::Walk(_)), "single leg should be a walk");
+}
+
+// ── Pareto boarding fix (prefer later boarding stop on same trip) ─────────────
+
+/// Route X: stop_A → stop_B → stop_C (single trip T).
+/// Origin is near stop_B. Footpath B↔A exists (~180 m).
+/// The user can board T at B directly (dep 10:02); the bug boards at A instead
+/// (dep 10:00) via the backward footpath and produces a Walk(B→A) leg.
+///
+/// Layout (longitude only; lat fixed at 50.000):
+///   osm_a (4.000) ─10m─ stop_A (4.000)
+///   osm_a ────180m────── osm_origin (4.002) ─10m─ stop_B (4.002)
+///   osm_origin ──7000m── osm_dest (4.100) ─10m─ stop_C (4.100)
+fn backward_walk_graph() -> (Graph, NodeID, NodeID, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_a      = g.add_node(osm_node("osm_a",  50.000, 4.000));
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.002));
+    let osm_dest   = g.add_node(osm_node("dest",   50.000, 4.100));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.000));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.002));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.100));
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: false, foot: true, bike: true, car: true,
+            }));
+        }
+    };
+    add_street(&mut g, osm_a, osm_origin, 180);
+    add_street(&mut g, osm_origin, osm_dest, 7_000);
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (o, d) in [(stop, osm), (osm, stop)] {
+            g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, length: m,
+                partial: true, foot: true, bike: false, car: false,
+            }));
+        }
+    };
+    add_snap(&mut g, stop_a, osm_a,      10);
+    add_snap(&mut g, stop_b, osm_origin, 10);
+    add_snap(&mut g, stop_c, osm_dest,   10);
+
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 },
+        length: 180,
+    }));
+    g.add_edge(stop_b, EdgeData::Transit(TransitEdgeData {
+        origin: stop_b, destination: stop_c, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 },
+        length: 7_000,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "X".into(), route_long_name: "Route X".into(),
+        route_type: RouteType::Bus, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None,
+    }]);
+
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 10 * 3600, arrival: 10 * 3600 + 120, service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 1, destination_stop_sequence: 2,
+            departure: 10 * 3600 + 120, arrival: 10 * 3600 + 1200, service_id: ServiceId(0),
+        },
+    ]);
+
+    // Pattern 0: stop_A → stop_B → stop_C, 1 trip (column-major stop-times)
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b, stop_c]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 3 });
+
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 10 * 3600,       departure: 10 * 3600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 10 * 3600 + 120, departure: 10 * 3600 + 120 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 10 * 3600 + 1200, departure: 10 * 3600 + 1200 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 3 });
+
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+
+    g.build_raptor_index();
+
+    (g, osm_origin, osm_dest, stop_a, stop_b)
+}
+
+/// Verifies that when a footpath exists from stop B back to stop A (A is earlier
+/// on the same route), RAPTOR boards the trip at B — not at A via a backward walk.
+/// The backward footpath B→A must NOT appear as a walk leg in any returned plan.
+#[test]
+fn raptor_no_backward_walk_same_trip() {
+    let (g, origin, dest, stop_a, stop_b) = backward_walk_graph();
+
+    // Start at 9:50 so the 10:00/10:02 trips at A/B are both reachable.
+    let plans = g.raptor(origin, dest, 9 * 3600 + 600, 0, 0x7F, 30);
+
+    assert!(!plans.is_empty(), "expected at least one plan");
+
+    for plan in &plans {
+        // No plan should walk to stop_A — that would be the backward detour.
+        let backward_walk = plan.legs.iter().any(|leg| {
+            matches!(leg, PlanLeg::Walk(w) if w.to.node_id == stop_a)
+        });
+        assert!(!backward_walk, "plan contains a backward walk to stop_A");
+
+        // Every transit leg should board at stop_B (not stop_A).
+        for leg in &plan.legs {
+            if let PlanLeg::Transit(t) = leg {
+                assert_ne!(
+                    t.from.node_id, stop_a,
+                    "transit leg boarded at stop_A — expected stop_B as boarding stop \
+                     (from={:?}, to={:?})",
+                    t.from.node_id, t.to.node_id
+                );
+                assert_eq!(
+                    t.from.node_id, stop_b,
+                    "transit leg should board at stop_B, got {:?}",
+                    t.from.node_id
+                );
+            }
+        }
+    }
+}
+
+/// Verifies the walking Pareto criterion: among plans with the same arrival,
+/// departure, and transfer count, the one with less walking should dominate.
+/// Uses the backward_walk_graph: the corrected plan (board at B, no backward walk)
+/// has less walking than the buggy plan (board at A via Walk B→A).
+/// After both fixes the buggy plan is never produced, so there is exactly one plan
+/// and it has no backward walk.
+#[test]
+fn raptor_pareto_less_walking_plan_survives() {
+    let (g, origin, dest, stop_a, _stop_b) = backward_walk_graph();
+
+    let plans = g.raptor(origin, dest, 9 * 3600 + 600, 0, 0x7F, 30);
+
+    assert!(!plans.is_empty(), "expected at least one plan");
+
+    // Verify no plan has a walk leg landing at stop_A (the backward walk).
+    for plan in &plans {
+        let has_backward_walk = plan.legs.iter().any(|leg| {
+            matches!(leg, PlanLeg::Walk(w) if w.to.node_id == stop_a)
+        });
+        assert!(
+            !has_backward_walk,
+            "a plan with a backward Walk(→stop_A) survived the Pareto filter; \
+             the less-walking plan should have dominated it"
+        );
+    }
+}
+
+/// `previous_departures` / `next_departures` must never panic on an index that
+/// falls outside the timetable segment (regression: a backward-tightened leg could
+/// pair a departure index from one segment with another segment's bounds, causing a
+/// `usize` underflow and a slice-range panic that crashed the server).
+#[test]
+fn departures_out_of_segment_index_does_not_panic() {
+    let mut g = Graph::new();
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_departures(vec![
+        TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 100, arrival: 200, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 300, arrival: 400, service_id: ServiceId(0) },
+    ]);
+    // Segment covers only index 1; querying with index 0 (< start) used to underflow.
+    let tt = TimetableSegment { start: 1, len: 1 };
+    let prev: Vec<_> = g.previous_departures(tt, 0, 0x7F, 0).collect();
+    assert!(prev.is_empty(), "out-of-segment previous_departures should be empty, not panic");
+    let next: Vec<_> = g.next_departures(tt, 0, 0x7F, 0).collect();
+    assert!(next.is_empty(), "out-of-segment next_departures should be empty, not panic");
+    // A valid in-segment index still works.
+    let prev_ok: Vec<_> = g.previous_departures(TimetableSegment { start: 0, len: 2 }, 0, 0x7F, 1).collect();
+    assert_eq!(prev_ok.len(), 1);
+}
+
+// ── Reliability-aware multi-criteria labels ───────────────────────────────────
+
+/// Bus A→B (one trip, arr 09:15), walk B→C, then a Tram C→D with TWO trips:
+///   tight: dep 09:20 → arr 09:35  (≈3 min after reaching C; risky under delay model)
+///   safe:  dep 10:00 → arr 10:15  (≈40 min margin; reliable)
+/// A Bus delay model makes the tight connection low-reliability and the safe one
+/// reliable, so the two options differ on (arrival, reliability) — a trade-off.
+fn reliability_tradeoff_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_ab = g.add_node(osm_node("ab", 50.000, 4.010));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.019));
+    let osm_cd = g.add_node(osm_node("cd", 50.000, 4.030));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.041));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.020));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.022));
+    let stop_d = g.add_node(transit_stop("Stop D", 50.000, 4.040));
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+    };
+    add_street(&mut g, osm_origin, osm_ab, 718);
+    add_street(&mut g, osm_ab, osm_b, 645);
+    add_street(&mut g, osm_b, osm_cd, 789);
+    add_street(&mut g, osm_cd, osm_dest, 789);
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        g.add_edge(stop, EdgeData::Street(StreetEdgeData {
+            origin: stop, destination: osm, length: m, partial: true, foot: true, bike: false, car: false,
+        }));
+        g.add_edge(osm, EdgeData::Street(StreetEdgeData {
+            origin: osm, destination: stop, length: m, partial: true, foot: true, bike: false, car: false,
+        }));
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_b, osm_b, 72);
+    add_snap(&mut g, stop_c, osm_b, 215);
+    add_snap(&mut g, stop_d, osm_dest, 72);
+
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 1362,
+    }));
+    g.add_edge(stop_c, EdgeData::Transit(TransitEdgeData {
+        origin: stop_c, destination: stop_d, route_id: RouteId(1),
+        timetable_segment: TimetableSegment { start: 1, len: 2 }, length: 1290,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo { route_short_name: "1".into(), route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0), route_color: None, route_text_color: None },
+        RouteInfo { route_short_name: "T".into(), route_long_name: "Tram T".into(),
+            route_type: RouteType::Tramway, agency_id: AgencyId(0), route_color: None, route_text_color: None },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None }, // 0: bus
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None }, // 1: tram tight
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None }, // 2: tram safe
+    ]);
+    g.add_transit_departures(vec![
+        TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 9 * 3600, arrival: 9 * 3600 + 900, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 9 * 3600 + 1200, arrival: 9 * 3600 + 2100, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(2), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 10 * 3600, arrival: 10 * 3600 + 900, service_id: ServiceId(0) },
+    ]);
+
+    // Pattern 0: Bus [A,B], 1 trip
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 900, departure: 9 * 3600 + 900 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+
+    // Pattern 1: Tram [C,D], 2 trips (tight then safe)
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_c, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_pattern_trip(TripId(2));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 2 });
+        let sts = g.transit_pattern_stop_times_len();
+        // col C (dep): tight 09:20, safe 10:00
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1200, departure: 9 * 3600 + 1200 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 10 * 3600, departure: 10 * 3600 });
+        // col D (arr): tight 09:35, safe 10:15
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 2100, departure: 9 * 3600 + 2100 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 10 * 3600 + 900, departure: 10 * 3600 + 900 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 2 });
+    }
+
+    g.build_raptor_index();
+
+    // Bus delay model: small transfer margin ⇒ low on-time prob, large margin ⇒ certain.
+    let mut models = HashMap::new();
+    models.insert(
+        RouteType::Bus,
+        DelayCDF { bins: vec![(0, 0.05), (300, 0.5), (900, 0.9), (1800, 1.0)] },
+    );
+    g.set_transit_delay_models(models);
+
+    (g, osm_origin, osm_dest)
+}
+
+/// With enough arrival slack, the multi-criteria core returns BOTH the fast-but-risky
+/// plan (tight tram) and the slower-but-reliable plan (later tram). Without the
+/// feature only the fastest would survive.
+#[test]
+fn raptor_returns_fast_risky_and_slow_safe() {
+    let (g, origin, dest) = reliability_tradeoff_graph();
+    let buckets = ReliabilityBuckets::default();
+
+    // Generous slack so the later, safer tram is explored.
+    let plans = g.raptor_tuned(origin, dest, 8 * 3600 + 1800, 0, 0x7F, 10 * 60, &buckets, 3600);
+
+    // Worst transfer reliability per plan (1.0 if no risk), with its arrival time.
+    let mut summary: Vec<(f32, u32)> = plans
+        .iter()
+        .map(|p| {
+            let worst = p.legs.iter().filter_map(|l| match l {
+                PlanLeg::Transit(t) => t.transfer_risk.as_ref().map(|r| r.reliability),
+                _ => None,
+            }).fold(1.0f32, f32::min);
+            (worst, p.end)
+        })
+        .collect();
+    summary.sort_by(|a, b| a.1.cmp(&b.1));
+    eprintln!("plans (worst_rel, arrive): {:?}", summary);
+
+    let risky = summary.iter().find(|(r, _)| *r < 0.5);
+    let safe = summary.iter().find(|(r, _)| *r >= 0.99);
+    let risky = risky.expect("expected a fast low-reliability plan");
+    let safe = safe.expect("expected a slow high-reliability alternative");
+    assert!(
+        safe.1 > risky.1,
+        "the reliable alternative ({:?}) should arrive later than the risky one ({:?})",
+        safe, risky
+    );
+}
+
+/// Increasing arrival slack never removes plans — a wider explored band can only
+/// add non-dominated alternatives. Guards the slack lever's monotonicity.
+#[test]
+fn raptor_more_slack_never_fewer_plans() {
+    let (g, origin, dest) = reliability_tradeoff_graph();
+    let buckets = ReliabilityBuckets::default();
+    let few = g.raptor_tuned(origin, dest, 8 * 3600 + 1800, 0, 0x7F, 10 * 60, &buckets, 0).len();
+    let many = g.raptor_tuned(origin, dest, 8 * 3600 + 1800, 0, 0x7F, 10 * 60, &buckets, 3600).len();
+    assert!(many >= few, "more slack ({many}) should not yield fewer plans than less ({few})");
 }

@@ -5,13 +5,152 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
-        NodeData, NodeID, ScenarioBag,
+        NodeData, NodeID, ReliabilityBuckets, ScenarioBag,
         plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, StopPathLeg, StopReach},
         raptor::Trace,
     },
 };
 
 use super::{Graph, MAX_ROUNDS};
+
+/// Maximum labels kept per `(round, stop)` cell. One per reliability bucket, so this
+/// bounds the supported bucket count (edges.len()+2). Default config uses 5.
+pub(super) const MAX_LABELS: usize = 16;
+
+/// A label currently riding a route during a single `scan_route` pass.
+#[derive(Clone, Copy)]
+pub(super) struct Riding {
+    /// Trip index within the pattern (smaller = earlier = arrives earlier downstream).
+    t: usize,
+    boarded_at: u32,
+    /// Marginal on-time probability for arrival-bag construction.
+    hit_prob: f32,
+    /// Cumulative path reliability (for bucketing).
+    reliability: f32,
+    /// Reliability bucket of the prev label this was boarded from (for reconstruction).
+    from_bucket: u8,
+}
+
+/// One RAPTOR label: an arrival-time distribution plus the cumulative reliability
+/// and the trace needed to reconstruct how the stop was reached.
+#[derive(Clone, Copy)]
+pub(super) struct Label {
+    pub bag: ScenarioBag,
+    pub route_type: Option<RouteType>,
+    pub reliability: f32,
+    pub trace: Trace,
+}
+
+impl Label {
+    pub const NONE: Self = Self {
+        bag: ScenarioBag::EMPTY,
+        route_type: None,
+        reliability: 0.0,
+        trace: Trace::NONE,
+    };
+}
+
+/// Bounded Pareto set of labels per `(round, stop)`, traded off on
+/// `(scheduled arrival ↓, reliability bucket ↑)`. At most one label per bucket
+/// (the earliest-arriving one). Fixed-capacity & `Copy` — no heap per cell.
+#[derive(Clone, Copy)]
+pub(super) struct LabelSet {
+    labels: [Label; MAX_LABELS],
+    len: u8,
+}
+
+impl LabelSet {
+    pub const EMPTY: Self = Self {
+        labels: [Label::NONE; MAX_LABELS],
+        len: 0,
+    };
+
+    #[inline]
+    pub fn is_reached(&self) -> bool {
+        self.len > 0
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Label> {
+        self.labels[..self.len as usize].iter()
+    }
+
+    /// Earliest (scheduled, best-case) arrival across all labels (`u32::MAX` if empty).
+    /// This is the time axis of the Pareto front — risk lives in the reliability axis,
+    /// so we compare on scheduled arrival, not probability-weighted expected arrival.
+    pub fn earliest(&self) -> u32 {
+        self.iter().map(|l| l.bag.earliest()).min().unwrap_or(u32::MAX)
+    }
+
+    /// The label whose reliability falls in bucket `b`, if any.
+    pub fn get_by_bucket(&self, buckets: &ReliabilityBuckets, b: u8) -> Option<&Label> {
+        self.iter().find(|l| buckets.bucket(l.reliability) == b)
+    }
+
+    /// The label with the earliest scheduled arrival (fastest), if any.
+    pub fn min_arrival_label(&self) -> Option<&Label> {
+        self.iter().fold(None, |acc, l| match acc {
+            None => Some(l),
+            Some(b) if l.bag.earliest() < b.bag.earliest() => Some(l),
+            Some(b) => Some(b),
+        })
+    }
+
+    /// Pareto-inserts `cand`. Returns true if the set changed (i.e. `cand` was kept).
+    /// Dominance over (scheduled arrival ↓, reliability bucket ↑): an existing label
+    /// dominates `cand` if it has a `>=` bucket AND a `<=` earliest arrival. At most
+    /// one label survives per bucket (the earliest-arriving one). A label is never
+    /// overridden by a later-arriving one in the same bucket.
+    pub fn insert(&mut self, cand: Label, buckets: &ReliabilityBuckets) -> bool {
+        let cb = buckets.bucket(cand.reliability);
+        let ce = cand.bag.earliest();
+
+        for l in self.iter() {
+            if buckets.bucket(l.reliability) >= cb && l.bag.earliest() <= ce {
+                return false;
+            }
+        }
+
+        // Drop existing labels dominated by `cand`.
+        let mut w = 0usize;
+        for i in 0..self.len as usize {
+            let e = self.labels[i];
+            let eb = buckets.bucket(e.reliability);
+            let ee = e.bag.earliest();
+            let dominated = eb <= cb && ee >= ce && (eb < cb || ee > ce);
+            if !dominated {
+                self.labels[w] = e;
+                w += 1;
+            }
+        }
+        self.len = w as u8;
+
+        if (self.len as usize) < MAX_LABELS {
+            self.labels[self.len as usize] = cand;
+            self.len += 1;
+            return true;
+        }
+
+        // Full (only possible with very fine custom bucket edges): replace the worst
+        // label (lowest bucket, then latest arrival) if `cand` beats it.
+        let mut worst = 0usize;
+        for i in 1..self.len as usize {
+            let wb = buckets.bucket(self.labels[worst].reliability);
+            let ib = buckets.bucket(self.labels[i].reliability);
+            if ib < wb
+                || (ib == wb && self.labels[i].bag.earliest() > self.labels[worst].bag.earliest())
+            {
+                worst = i;
+            }
+        }
+        let wb = buckets.bucket(self.labels[worst].reliability);
+        if cb > wb || (cb == wb && ce < self.labels[worst].bag.earliest()) {
+            self.labels[worst] = cand;
+            return true;
+        }
+        false
+    }
+}
 
 impl Graph {
     /// Retry loop shared by `raptor` and `raptor_range`.
@@ -73,6 +212,7 @@ impl Graph {
         }
     }
 
+    /// Convenience wrapper using the graph's configured buckets and slack.
     pub fn raptor(
         &self,
         origin: NodeID,
@@ -82,15 +222,33 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> Vec<Plan> {
+        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
+        self.raptor_tuned(origin, destination, start_time, date, weekday, min_access_secs,
+            &buckets, self.raptor.arrival_slack_secs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_tuned(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+    ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs,
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> = raw_stops.iter()
                     .map(|&(s, w)| (s, start_time + w))
                     .collect();
-                self.raptor_inner(&sources, targets, start_time, access_secs, date, weekday, origin, destination)
+                self.raptor_inner(&sources, targets, start_time, access_secs, date, weekday, origin, destination, buckets, slack)
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn raptor_inner(
         &self,
         sources: &[(usize, u32)],
@@ -101,13 +259,17 @@ impl Graph {
         weekday: u8,
         origin: NodeID,
         destination: NodeID,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
     ) -> Vec<Plan> {
         self.raptor_inner_with_debug(
             sources, targets, start_time, access_secs, date, weekday, origin, destination,
+            buckets, slack,
         )
         .0
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn raptor_inner_with_debug(
         &self,
         sources: &[(usize, u32)],
@@ -118,15 +280,14 @@ impl Graph {
         weekday: u8,
         origin: NodeID,
         destination: NodeID,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let n_patterns = self.raptor.transit_patterns.len();
 
-        let mut best = vec![ScenarioBag::EMPTY; n_stops];
-        let mut labels = vec![vec![ScenarioBag::EMPTY; n_stops]; MAX_ROUNDS + 1];
-        let mut labels_rt: Vec<Vec<Option<RouteType>>> =
-            vec![vec![None; n_stops]; MAX_ROUNDS + 1];
-        let mut traces = vec![vec![Trace::NONE; n_stops]; MAX_ROUNDS + 1];
+        let mut best = vec![LabelSet::EMPTY; n_stops];
+        let mut labels = vec![vec![LabelSet::EMPTY; n_stops]; MAX_ROUNDS + 1];
 
         let mut marked = Vec::with_capacity(2048);
         let mut is_marked = vec![false; n_stops];
@@ -134,17 +295,21 @@ impl Graph {
         let mut queue_pos = vec![u32::MAX; n_patterns];
 
         for &(stop, time) in sources {
-            let bag = ScenarioBag::single(time);
-            labels[0][stop] = bag;
-            best[stop] = bag;
+            let lab = Label {
+                bag: ScenarioBag::single(time),
+                route_type: None,
+                reliability: 1.0,
+                trace: Trace::NONE,
+            };
+            labels[0][stop].insert(lab, buckets);
+            best[stop].insert(lab, buckets);
             Self::mark(stop, &mut marked, &mut is_marked);
         }
 
         self.apply_transfers(
             &mut labels[0],
-            &mut labels_rt[0],
             &mut best,
-            &mut traces[0],
+            buckets,
             &mut marked,
             &mut is_marked,
             start_time + access_secs,
@@ -155,10 +320,6 @@ impl Graph {
                 let (prev, rest) = labels.split_at_mut(k);
                 rest[0].copy_from_slice(&prev[k - 1]);
             }
-            {
-                let (prev_rt, rest_rt) = labels_rt.split_at_mut(k);
-                rest_rt[0].copy_from_slice(&prev_rt[k - 1]);
-            }
 
             self.collect_routes(&marked, &mut queue, &mut queue_pos);
             marked.clear();
@@ -168,15 +329,12 @@ impl Graph {
                 break;
             }
 
-            let cutoff = Self::target_cutoff(&best, targets);
+            let cutoff = Self::target_cutoff(&best, targets, slack);
 
             {
                 let (prev, rest) = labels.split_at_mut(k);
-                let (prev_rt, rest_rt) = labels_rt.split_at_mut(k);
                 let prev_slice = &prev[k - 1];
                 let curr_slice = &mut rest[0];
-                let prev_rt_slice = &prev_rt[k - 1];
-                let curr_rt_slice = &mut rest_rt[0];
 
                 for &pat in &queue {
                     self.scan_route(
@@ -186,11 +344,9 @@ impl Graph {
                         weekday,
                         cutoff,
                         prev_slice,
-                        prev_rt_slice,
                         curr_slice,
-                        curr_rt_slice,
                         &mut best,
-                        &mut traces[k],
+                        buckets,
                         &mut marked,
                         &mut is_marked,
                     );
@@ -204,9 +360,8 @@ impl Graph {
 
             self.apply_transfers(
                 &mut labels[k],
-                &mut labels_rt[k],
                 &mut best,
-                &mut traces[k],
+                buckets,
                 &mut marked,
                 &mut is_marked,
                 cutoff,
@@ -227,7 +382,7 @@ impl Graph {
                             NodeData::TransitStop(s) => s.name.clone(),
                             _ => String::new(),
                         };
-                        let path = self.path_to_stop(stop_idx, k, origin, &traces);
+                        let path = self.path_to_stop(stop_idx, k, origin, &labels);
                         return Some(StopReach {
                             stop_idx: stop_idx as u32,
                             round: k as u8,
@@ -251,8 +406,7 @@ impl Graph {
             date,
             weekday,
             &labels,
-            &labels_rt,
-            &traces,
+            buckets,
             origin,
             destination,
             Some(&mut candidates),
@@ -268,14 +422,17 @@ impl Graph {
         stop_idx: usize,
         round: usize,
         origin: NodeID,
-        traces: &[Vec<Trace>],
+        labels: &[Vec<LabelSet>],
     ) -> Vec<StopPathLeg> {
         let mut legs: Vec<StopPathLeg> = Vec::new();
         let mut stop = stop_idx;
         let mut k = round;
 
         loop {
-            let trace = traces[k][stop];
+            let trace = match labels[k][stop].min_arrival_label() {
+                Some(l) => l.trace,
+                None => break,
+            };
             let to_node = self.raptor.transit_stop_to_node[stop];
             let to_loc = self.nodes[to_node.0].loc();
 
@@ -425,6 +582,23 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> ExplainResult {
+        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
+        self.raptor_explain_tuned(origin, destination, start_time, date, weekday, min_access_secs,
+            &buckets, self.raptor.arrival_slack_secs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_explain_tuned(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+    ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
@@ -435,6 +609,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
+                    buckets, slack,
                 );
                 if plans.is_empty() { None } else { Some((plans, cands, stops)) }
             },
@@ -459,6 +634,24 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> ExplainResult {
+        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
+        self.raptor_range_explain_tuned(origin, destination, start_time, window_secs, date, weekday,
+            min_access_secs, &buckets, self.raptor.arrival_slack_secs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_explain_tuned(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+    ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
             destination,
@@ -469,6 +662,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
+                    buckets, slack,
                 );
                 if probe.is_empty() {
                     return None;
@@ -493,6 +687,7 @@ impl Graph {
                         raw_stops.iter().map(|&(s, w)| (s, t + w)).collect();
                     let (plans_t, mut cands_t, _stops_t) = self.raptor_inner_with_debug(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
+                        buckets, slack,
                     );
                     all_plans.extend(plans_t);
                     all_candidates.append(&mut cands_t);
@@ -509,7 +704,7 @@ impl Graph {
                     .collect();
 
                 let final_plans =
-                    Self::pareto_filter_with_debug(all_plans, &plan_to_sink_idx, &mut all_candidates);
+                    Self::pareto_filter_with_debug(all_plans, &plan_to_sink_idx, &mut all_candidates, buckets);
 
                 Some((final_plans, all_candidates, probe_stops))
             },
@@ -537,6 +732,7 @@ impl Graph {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_route(
         &self,
         pattern: usize,
@@ -544,12 +740,10 @@ impl Graph {
         date: u32,
         weekday: u8,
         cutoff: u32,
-        prev: &[ScenarioBag],
-        prev_rt: &[Option<RouteType>],
-        curr: &mut [ScenarioBag],
-        curr_rt: &mut [Option<RouteType>],
-        best: &mut [ScenarioBag],
-        traces: &mut [Trace],
+        prev: &[LabelSet],
+        curr: &mut [LabelSet],
+        best: &mut [LabelSet],
+        buckets: &ReliabilityBuckets,
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
     ) {
@@ -566,80 +760,152 @@ impl Graph {
             self.raptor.transit_idx_pattern_stop_times[pattern].of(&self.raptor.transit_pattern_stop_times);
         let trip_ids = self.raptor.transit_idx_pattern_trips[pattern].of(&self.raptor.transit_pattern_trips);
 
-        let mut boarded: Option<(usize, u32, f32)> = None;
+        // Labels currently riding this route. Pareto set over (trip index ↓, bucket ↑):
+        // a smaller trip index arrives earlier at every downstream stop.
+        let mut riding: Vec<Riding> = Vec::new();
 
         for pos in first_pos as usize..pat_stops.len() {
             let stop = self.raptor.transit_node_to_stop[pat_stops[pos].0] as usize;
             let col = &all_times[pos * n_trips..(pos + 1) * n_trips];
 
-            if let Some((t, bp, hit_prob)) = boarded {
-                let arr = col[t].arrival;
-                if arr < cutoff {
-                    let bag = if hit_prob < 1.0 {
-                        let miss_arr =
-                            self.next_trip_arrival(trip_ids, t + 1, col, date, weekday);
-                        match miss_arr {
-                            Some(ma) => {
-                                ScenarioBag::with_scenarios(arr, hit_prob, ma, 1.0 - hit_prob)
-                            }
-                            None => ScenarioBag::with_scenarios(
-                                arr,
-                                hit_prob,
-                                u32::MAX,
-                                1.0 - hit_prob,
-                            ),
-                        }
-                    } else {
-                        ScenarioBag::single(arr)
-                    };
-
-                    if bag.improves_on(&best[stop]) {
-                        curr[stop].try_improve(&bag);
-                        best[stop].try_improve(&bag);
-                        curr_rt[stop] = Some(pat_rt);
-                        traces[stop] = Trace {
-                            pattern: pattern as u32,
-                            trip: t as u32,
-                            boarded_at: bp,
-                            alighted_at: pos as u32,
-                            from_stop: u32::MAX,
-                        };
-                        Self::mark(stop, marked, is_marked);
+            // 1. Settle arrivals at this stop for every riding label.
+            for r in &riding {
+                let arr = col[r.t].arrival;
+                if arr >= cutoff {
+                    continue;
+                }
+                let bag = if r.hit_prob < 1.0 {
+                    let miss_arr = self.next_trip_arrival(trip_ids, r.t + 1, col, date, weekday);
+                    match miss_arr {
+                        Some(ma) => ScenarioBag::with_scenarios(arr, r.hit_prob, ma, 1.0 - r.hit_prob),
+                        None => ScenarioBag::with_scenarios(arr, r.hit_prob, u32::MAX, 1.0 - r.hit_prob),
                     }
+                } else {
+                    ScenarioBag::single(arr)
+                };
+                let cand = Label {
+                    bag,
+                    route_type: Some(pat_rt),
+                    reliability: r.reliability,
+                    trace: Trace {
+                        pattern: pattern as u32,
+                        trip: r.t as u32,
+                        boarded_at: r.boarded_at,
+                        alighted_at: pos as u32,
+                        from_stop: u32::MAX,
+                        from_bucket: r.from_bucket,
+                    },
+                };
+                if best[stop].insert(cand, buckets) {
+                    curr[stop].insert(cand, buckets);
+                    Self::mark(stop, marked, is_marked);
                 }
             }
 
+            // 2. Board from each prev label at this stop. We board the earliest
+            //    catchable trip, then successively-later trips that reach a *higher*
+            //    reliability bucket (waiting longer = safer connection), up to CERTAIN.
+            //    Reliability is monotonic in departure margin, so buckets only rise.
+            let max_bucket = buckets.bucket(1.0);
             if prev[stop].is_reached() {
-                let min_dep = prev[stop].expected() as u32;
-                let t_start = col.partition_point(|st| st.departure < min_dep);
-                for t in t_start..n_trips {
-                    if self.is_trip_active(trip_ids[t], date, weekday) {
-                        if boarded.map_or(true, |(ct, _, _)| t < ct) {
-                            let trip_dep = col[t].departure;
-
-                            let total_hit_prob: f32 = prev[stop]
-                                .scenarios()
-                                .iter()
-                                .map(|s| {
-                                    let buf = trip_dep as i32 - s.time as i32;
-                                    let p_make = match prev_rt[stop] {
-                                        Some(rt) => self
-                                            .raptor.transit_delay_models
-                                            .get(&rt)
-                                            .map(|cdf| cdf.prob_on_time(buf))
-                                            .unwrap_or(1.0),
-                                        None => 1.0,
-                                    };
-                                    s.prob * p_make
-                                })
-                                .sum();
-
-                            boarded = Some((t, pos as u32, total_hit_prob));
+                for pl in prev[stop].iter() {
+                    let from_bucket = buckets.bucket(pl.reliability);
+                    let min_dep = pl.bag.earliest() as u32;
+                    let t_start = col.partition_point(|st| st.departure < min_dep);
+                    let mut best_bucket_seen: Option<u8> = None;
+                    for t in t_start..n_trips {
+                        if !self.is_trip_active(trip_ids[t], date, weekday) {
+                            continue;
                         }
-                        break;
+                        let trip_dep = col[t].departure;
+
+                        // Cumulative reliability — same per-transfer formula as
+                        // reconstruction (earliest-based), so buckets agree.
+                        let factor = self.transfer_on_time_prob(
+                            pl.route_type,
+                            pl.bag.earliest(),
+                            trip_dep,
+                        );
+                        let rel = pl.reliability * factor;
+                        let cb = buckets.bucket(rel);
+
+                        // Only board this trip if it reaches a bucket we haven't covered
+                        // yet for this prev label (the earliest trip per bucket level).
+                        if best_bucket_seen.map_or(false, |bs| cb <= bs) {
+                            continue;
+                        }
+                        best_bucket_seen = Some(cb);
+
+                        // Marginal on-time probability over the prev arrival
+                        // distribution — used to build the arrival-time bag.
+                        let hit_prob: f32 = pl
+                            .bag
+                            .scenarios()
+                            .iter()
+                            .map(|s| {
+                                let buf = trip_dep as i32 - s.time as i32;
+                                let p_make = match pl.route_type {
+                                    Some(rt) => self
+                                        .raptor.transit_delay_models
+                                        .get(&rt)
+                                        .map(|cdf| cdf.prob_on_time(buf))
+                                        .unwrap_or(1.0),
+                                    None => 1.0,
+                                };
+                                s.prob * p_make
+                            })
+                            .sum();
+
+                        Self::push_riding(
+                            &mut riding,
+                            Riding {
+                                t,
+                                boarded_at: pos as u32,
+                                hit_prob,
+                                reliability: rel,
+                                from_bucket,
+                            },
+                            buckets,
+                        );
+                        if cb >= max_bucket {
+                            break;
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Pareto-inserts a riding label into the route bag over (trip index ↓, bucket ↑).
+    fn push_riding(riding: &mut Vec<Riding>, cand: Riding, buckets: &ReliabilityBuckets) {
+        let cb = buckets.bucket(cand.reliability);
+        for r in riding.iter() {
+            if r.t <= cand.t && buckets.bucket(r.reliability) >= cb {
+                return; // dominated
+            }
+        }
+        riding.retain(|r| {
+            let rb = buckets.bucket(r.reliability);
+            !(cand.t <= r.t && cb >= rb && (cand.t < r.t || cb > rb))
+        });
+        if riding.len() < MAX_LABELS {
+            riding.push(cand);
+        }
+    }
+
+    /// Probability of boarding a vehicle departing at `board_dep` given arrival at
+    /// the boarding stop at `arr_at_stop` on a preceding leg of type `prev_rt`.
+    /// `1.0` when there is no preceding transit leg or no delay model. Shared by the
+    /// RAPTOR core (label reliability) and reconstruction (`TransferRisk.reliability`).
+    pub(super) fn transfer_on_time_prob(
+        &self,
+        prev_rt: Option<RouteType>,
+        arr_at_stop: u32,
+        board_dep: u32,
+    ) -> f32 {
+        match prev_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)) {
+            Some(cdf) => cdf.prob_on_time(board_dep as i32 - arr_at_stop as i32),
+            None => 1.0,
         }
     }
 
@@ -671,10 +937,9 @@ impl Graph {
 
     fn apply_transfers(
         &self,
-        labels: &mut [ScenarioBag],
-        labels_rt: &mut [Option<RouteType>],
-        best: &mut [ScenarioBag],
-        traces: &mut [Trace],
+        labels: &mut [LabelSet],
+        best: &mut [LabelSet],
+        buckets: &ReliabilityBuckets,
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
         cutoff: u32,
@@ -682,8 +947,8 @@ impl Graph {
         let n = marked.len();
         for i in 0..n {
             let stop = marked[i];
-            let time = labels[stop].earliest();
-            if time >= cutoff {
+            let src = labels[stop]; // Copy; releases the borrow on `labels`.
+            if !src.is_reached() || src.earliest() >= cutoff {
                 continue;
             }
 
@@ -691,22 +956,28 @@ impl Graph {
             for &(target_node, walk) in transfers {
                 let target = self.raptor.transit_node_to_stop[target_node.0] as usize;
 
-                let bag = labels[stop].shifted_by(walk);
-                if bag.earliest() >= cutoff {
-                    continue;
-                }
-                if bag.improves_on(&best[target]) {
-                    labels[target].try_improve(&bag);
-                    best[target].try_improve(&bag);
-                    labels_rt[target] = labels_rt[stop];
-                    traces[target] = Trace {
-                        pattern: u32::MAX,
-                        trip: u32::MAX,
-                        boarded_at: u32::MAX,
-                        alighted_at: u32::MAX,
-                        from_stop: stop as u32,
+                for l in src.iter() {
+                    let bag = l.bag.shifted_by(walk);
+                    if bag.earliest() >= cutoff {
+                        continue;
+                    }
+                    let cand = Label {
+                        bag,
+                        route_type: l.route_type,
+                        reliability: l.reliability,
+                        trace: Trace {
+                            pattern: u32::MAX,
+                            trip: u32::MAX,
+                            boarded_at: u32::MAX,
+                            alighted_at: u32::MAX,
+                            from_stop: stop as u32,
+                            from_bucket: buckets.bucket(l.reliability),
+                        },
                     };
-                    Self::mark(target, marked, is_marked);
+                    if best[target].insert(cand, buckets) {
+                        labels[target].insert(cand, buckets);
+                        Self::mark(target, marked, is_marked);
+                    }
                 }
             }
         }
@@ -718,19 +989,22 @@ impl Graph {
         self.raptor.transit_services[svc.0 as usize].is_active(date, weekday)
     }
 
+    /// Cutoff = (minimum expected arrival at any target + its egress walk) + `slack`.
+    /// `slack` widens the explored arrival band so safer-but-slower plans survive.
     #[inline]
-    fn target_cutoff(best: &[ScenarioBag], targets: &[(usize, u32)]) -> u32 {
+    fn target_cutoff(best: &[LabelSet], targets: &[(usize, u32)], slack: u32) -> u32 {
         targets
             .iter()
             .map(|&(s, w)| {
                 if best[s].is_reached() {
-                    (best[s].expected() + w as f32) as u32
+                    best[s].earliest().saturating_add(w)
                 } else {
                     u32::MAX
                 }
             })
             .min()
             .unwrap_or(u32::MAX)
+            .saturating_add(slack)
     }
 
     #[inline]
@@ -815,6 +1089,24 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> Vec<Plan> {
+        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
+        self.raptor_range_tuned(origin, destination, start_time, window_secs, date, weekday,
+            min_access_secs, &buckets, self.raptor.arrival_slack_secs)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_tuned(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+    ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs,
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> = raw_stops.iter()
@@ -822,6 +1114,7 @@ impl Graph {
                     .collect();
                 let probe = self.raptor_inner(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
+                    buckets, slack,
                 );
                 if probe.is_empty() {
                     return vec![];
@@ -845,10 +1138,80 @@ impl Graph {
                         .collect();
                     let plans = self.raptor_inner(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
+                        buckets, slack,
                     );
                     all_plans.extend(plans);
                 }
-                Self::pareto_filter(all_plans)
+                Self::pareto_filter(all_plans, buckets)
             })
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    fn lbl(time: u32, rel: f32) -> Label {
+        Label {
+            bag: ScenarioBag::single(time),
+            route_type: None,
+            reliability: rel,
+            trace: Trace::NONE,
+        }
+    }
+
+    #[test]
+    fn labelset_keeps_one_per_bucket_min_expected() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        assert!(s.insert(lbl(100, 1.0), &b));
+        assert!(!s.insert(lbl(200, 1.0), &b)); // same bucket, later -> rejected
+        assert_eq!(s.iter().count(), 1);
+        assert_eq!(s.earliest(), 100);
+        assert!(s.insert(lbl(50, 1.0), &b)); // same bucket, earlier -> replaces
+        assert_eq!(s.iter().count(), 1);
+        assert_eq!(s.earliest(), 50);
+    }
+
+    #[test]
+    fn labelset_keeps_pareto_tradeoff() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        assert!(s.insert(lbl(100, 0.10), &b)); // fast, risky
+        assert!(s.insert(lbl(200, 1.00), &b)); // slow, safe
+        assert_eq!(s.iter().count(), 2);
+    }
+
+    #[test]
+    fn labelset_drops_dominated() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        assert!(s.insert(lbl(100, 1.00), &b)); // fast AND safe
+        assert!(!s.insert(lbl(200, 0.10), &b)); // slow AND risky -> dominated
+        assert_eq!(s.iter().count(), 1);
+    }
+
+    /// Within a bucket, dominance is by SCHEDULED arrival, not expected. A label with
+    /// an earlier scheduled arrival but worse expected arrival must NOT be overridden
+    /// by one with a later scheduled arrival but better expected. (Regression: the
+    /// expected-based version made the front flip with query start time.)
+    #[test]
+    fn labelset_earlier_scheduled_wins_over_better_expected() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        // Same reliability bucket (both CERTAIN). First: scheduled 100 but expected 910
+        // (90% chance of a late miss). Second: scheduled & expected 200.
+        let risky_early = Label {
+            bag: ScenarioBag::with_scenarios(100, 0.1, 1000, 0.9),
+            route_type: None,
+            reliability: 1.0,
+            trace: Trace::NONE,
+        };
+        assert_eq!(risky_early.bag.earliest(), 100);
+        assert!(s.insert(risky_early, &b));
+        // Later scheduled arrival, same bucket -> must be rejected (no override).
+        assert!(!s.insert(lbl(200, 1.0), &b));
+        assert_eq!(s.iter().count(), 1);
+        assert_eq!(s.earliest(), 100, "earliest-scheduled label must survive");
     }
 }

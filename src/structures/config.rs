@@ -124,6 +124,14 @@ pub struct RoutingDefaultConfig {
     /// Pedestrian walking speed in m/s. When absent, defaults to 1.2 m/s (4.32 km/h).
     #[serde(default)]
     pub walking_speed_mps: Option<f64>,
+    /// Reliability bucket edges (sorted, strictly increasing, each in (0,1)) used to
+    /// quantize plan reliability. When absent, defaults to [0.50, 0.80, 0.95].
+    #[serde(default)]
+    pub reliability_bucket_edges: Option<Vec<f32>>,
+    /// Arrival-time slack (seconds) added to the fastest expected arrival when pruning,
+    /// widening the explored band so safer-but-slower plans survive. Default 900 s.
+    #[serde(default)]
+    pub arrival_slack_secs: Option<u32>,
 }
 
 impl Ingestor {

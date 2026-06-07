@@ -30,6 +30,9 @@ pub struct Trace {
     pub boarded_at: u32,
     pub alighted_at: u32,
     pub from_stop: u32,
+    /// Reliability bucket of the predecessor label this leg was reached from
+    /// (used during reconstruction to pick the right predecessor in a label set).
+    pub from_bucket: u8,
 }
 
 impl Trace {
@@ -39,6 +42,7 @@ impl Trace {
         boarded_at: u32::MAX,
         alighted_at: u32::MAX,
         from_stop: u32::MAX,
+        from_bucket: 0,
     };
 
     #[inline]
@@ -103,6 +107,7 @@ mod tests {
             boarded_at: 0,
             alighted_at: 3,
             from_stop: u32::MAX,
+            from_bucket: 0,
         };
         assert!(t.is_transit());
         assert!(!t.is_transfer());
@@ -116,6 +121,7 @@ mod tests {
             boarded_at: u32::MAX,
             alighted_at: u32::MAX,
             from_stop: 3,
+            from_bucket: 0,
         };
         assert!(!t.is_transit());
         assert!(t.is_transfer());
@@ -130,6 +136,7 @@ mod tests {
             boarded_at: 0,
             alighted_at: 1,
             from_stop: 2,
+            from_bucket: 0,
         };
         assert!(t.is_transit());
         assert!(!t.is_transfer());

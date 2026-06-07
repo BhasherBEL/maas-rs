@@ -44,7 +44,20 @@ cargo clippy
 
 The GraphQL playground is available at `http://127.0.0.1:3000/graphiql` when the server is running.
 
-> **Never run the server directly** (`cargo run -- --serve`). Starting the server is the user's responsibility. Only write and run tests, or build the binary.
+> **Server startup.** Do not start the server for general use — that is the user's responsibility. The **one exception** is the autonomous API-probing workflow below, used to validate routing end-to-end against the live GraphQL API. Even then, **always detect a server already listening first and reuse it** (the user may be running their own concurrently); never start a second instance.
+
+## API Probing (autonomous end-to-end testing)
+
+Test routing exactly as the UI does, by querying the **same GraphQL API the UI uses** — no separate harness, no new endpoints. The UI is just one client of this API; this workflow is another.
+
+The port comes from `config.yaml` (`server.port`, currently **8000**); adjust the examples below if it changes.
+
+1. **Detect first.** Before starting anything, check whether a server is already listening:
+   `curl -s -X POST http://127.0.0.1:8000/graphql -H 'Content-Type: application/json' -d '{"query":"{ ping }"}'` should return `{"data":{"ping":"pong"}}`.
+   If it answers, **reuse it** — never launch a second instance.
+2. **Otherwise start one in the background.** Rebuild if stale (`cargo build --release`), then run `target/release/maas-rs --restore --serve` as a background process. It loads `graph.bin` (~1.8 GB), so poll `{ ping }` until it returns `pong` before querying. Reuse this single instance for all queries in the session.
+3. **Query** `http://127.0.0.1:8000/graphql` with `curl`, using the same queries the UI sends — `raptor` (ranked plans) and `raptorExplain` (plans + every candidate's drop/filter reason + access-walk metadata + stops reached). The query bodies live in `src/web/static/index.html` (`PLAN_FRAGMENT`) and `src/web/static/debug.html`. Inputs are raw coordinates.
+4. **Parse** the JSON response (e.g. with `jq`) and analyze.
 
 ## Architecture
 

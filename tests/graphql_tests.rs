@@ -68,6 +68,24 @@ fn graphql_raptor_no_nodes_returns_error() {
 }
 
 #[test]
+fn graphql_raptor_accepts_tuning_overrides() {
+    // The reliability/slack override arguments must be part of the schema. With an
+    // empty graph the query still fails at routing ("no node"), but it must NOT fail
+    // with an unknown-argument schema error.
+    let schema = build_schema(Arc::new(Graph::new()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01,
+                    arrivalSlackSecs: 600, reliabilityBucketEdges: [0.5, 0.9]) { start } }"#,
+    );
+    assert!(
+        resp.errors.iter().all(|e| !e.message.to_lowercase().contains("unknown")),
+        "tuning override arguments should be recognised by the schema: {:?}",
+        resp.errors
+    );
+}
+
+#[test]
 fn graphql_raptor_invalid_date_returns_error() {
     let mut g = Graph::new();
     g.add_node(osm_node("n0", 50.0, 4.0));
@@ -284,20 +302,52 @@ fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
     }
 }
 
-// ── /map HTTP route ────────────────────────────────────────────────────────────
+// ── HTTP routes ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn get_map_returns_html() {
+async fn get_index_returns_html() {
     use poem::{Route, get, test::TestClient};
-    use maas_rs::web::app::map_page;
+    use maas_rs::web::app::index_page;
 
-    let app = Route::new().at("/map", get(map_page));
+    let app = Route::new().at("/", get(index_page));
     let client = TestClient::new(app);
-    let resp = client.get("/map").send().await;
+    let resp = client.get("/").send().await;
     resp.assert_status_is_ok();
     let ct = resp.0.headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert!(ct.contains("text/html"), "expected text/html content-type, got: {ct}");
+}
+
+#[tokio::test]
+async fn get_debug_returns_html() {
+    use poem::{Route, get, test::TestClient};
+    use maas_rs::web::app::debug_page;
+
+    let app = Route::new().at("/debug", get(debug_page));
+    let client = TestClient::new(app);
+    let resp = client.get("/debug").send().await;
+    resp.assert_status_is_ok();
+    let ct = resp.0.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("text/html"), "expected text/html content-type, got: {ct}");
+}
+
+#[tokio::test]
+async fn get_maas_js_returns_javascript() {
+    use poem::{Route, get, test::TestClient};
+    use maas_rs::web::app::maas_js_handler;
+
+    let app = Route::new().at("/maas.js", get(maas_js_handler));
+    let client = TestClient::new(app);
+    let resp = client.get("/maas.js").send().await;
+    resp.assert_status_is_ok();
+    let ct = resp.0.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("javascript"), "expected javascript content-type, got: {ct}");
 }

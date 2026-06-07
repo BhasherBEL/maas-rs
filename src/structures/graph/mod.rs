@@ -56,6 +56,20 @@ impl Graph {
         self.raptor.walking_speed_mps = mps;
     }
 
+    /// Sets reliability bucket edges after validating they are sorted, strictly
+    /// increasing, and each in `(0.0, 1.0)`. Invalid input is ignored (keeps default).
+    pub fn set_reliability_bucket_edges(&mut self, edges: Vec<f32>) {
+        if crate::structures::valid_reliability_edges(&edges) {
+            self.raptor.reliability_bucket_edges = edges;
+        } else {
+            tracing::warn!("ignoring invalid reliability_bucket_edges: {:?}", edges);
+        }
+    }
+
+    pub fn set_arrival_slack_secs(&mut self, secs: u32) {
+        self.raptor.arrival_slack_secs = secs;
+    }
+
     pub fn add_node(&mut self, node: NodeData) -> NodeID {
         let id = NodeID(self.nodes.len());
 

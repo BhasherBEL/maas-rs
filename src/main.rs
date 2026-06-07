@@ -111,6 +111,12 @@ async fn main() {
     if let Some(v) = config.default_routing.walking_speed_mps {
         g.set_walking_speed_mps(v);
     }
+    if let Some(edges) = config.default_routing.reliability_bucket_edges.clone() {
+        g.set_reliability_bucket_edges(edges);
+    }
+    if let Some(s) = config.default_routing.arrival_slack_secs {
+        g.set_arrival_slack_secs(s);
+    }
 
     if !serve_mode {
         return;

@@ -1,7 +1,7 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 
 use crate::ingestion::gtfs::date_to_days;
-use crate::structures::Graph;
+use crate::structures::{Graph, ReliabilityBuckets, valid_reliability_edges};
 use crate::structures::plan::{ExplainResult, Plan};
 
 pub struct RouteQuery {
@@ -16,6 +16,29 @@ pub struct RouteQuery {
     /// Per-query override for the minimum walk-radius used for access/egress
     /// stop discovery (seconds).  `None` → use the graph's configured default.
     pub min_access_secs: Option<u32>,
+    /// Per-query override for the arrival-slack (seconds). `None` → graph default.
+    pub arrival_slack_secs: Option<u32>,
+    /// Per-query override for reliability bucket edges. `None`/invalid → graph default.
+    pub reliability_bucket_edges: Option<Vec<f32>>,
+}
+
+/// Resolves the effective buckets + slack for a query, honouring per-request overrides
+/// (validated) and falling back to the graph's configured defaults.
+fn resolve_tuning(
+    graph: &Graph,
+    query: &RouteQuery,
+) -> Result<(ReliabilityBuckets, u32), async_graphql::Error> {
+    let buckets = match &query.reliability_bucket_edges {
+        Some(edges) if !valid_reliability_edges(edges) => {
+            return Err(async_graphql::Error::new(
+                "reliabilityBucketEdges must be sorted, strictly increasing, each in (0,1)",
+            ));
+        }
+        Some(edges) => ReliabilityBuckets::new(edges),
+        None => ReliabilityBuckets::new(&graph.raptor.reliability_bucket_edges),
+    };
+    let slack = query.arrival_slack_secs.unwrap_or(graph.raptor.arrival_slack_secs);
+    Ok((buckets, slack))
 }
 
 fn resolve_query_params(
@@ -42,12 +65,13 @@ fn resolve_query_params(
 pub fn route(graph: &Graph, query: &RouteQuery) -> Result<Vec<Plan>, async_graphql::Error> {
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
+    let (buckets, slack) = resolve_tuning(graph, query)?;
 
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range(origin, destination, time, w * 60, date, weekday, min_access)
+            graph.raptor_range_tuned(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack)
         }
-        _ => graph.raptor(origin, destination, time, date, weekday, min_access),
+        _ => graph.raptor_tuned(origin, destination, time, date, weekday, min_access, &buckets, slack),
     };
 
     if plans.is_empty() {
@@ -65,12 +89,13 @@ pub fn route_explain(
 ) -> Result<ExplainResult, async_graphql::Error> {
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
+    let (buckets, slack) = resolve_tuning(graph, query)?;
 
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_explain(origin, destination, time, w * 60, date, weekday, min_access)
+            graph.raptor_range_explain_tuned(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack)
         }
-        _ => graph.raptor_explain(origin, destination, time, date, weekday, min_access),
+        _ => graph.raptor_explain_tuned(origin, destination, time, date, weekday, min_access, &buckets, slack),
     };
 
     Ok(result)
