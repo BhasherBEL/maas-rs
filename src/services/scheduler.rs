@@ -8,13 +8,15 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Local};
 use cron::Schedule;
 
 use crate::ingestion::cache::{
-    SourceLocation, gtfs_content_hash, load_feed_hashes, resolve_source, save_feed_hashes,
+    SourceLocation, gtfs_content_hash, load_feed_hashes, load_last_checked, resolve_source,
+    save_feed_hashes, save_last_checked,
 };
 use crate::services::build::{apply_routing_defaults, build_gtfs_phase};
-use crate::services::persistence::{load_graph, save_graph_with_rollback};
+use crate::services::persistence::{load_osm_graph, save_graph_with_rollback};
 use crate::structures::{Config, Graph, Ingestor};
 
 pub type SharedGraph = Arc<ArcSwap<Graph>>;
@@ -43,6 +45,17 @@ pub fn spawn(graph: SharedGraph, config: Arc<Config>) {
 }
 
 async fn run_loop(graph: SharedGraph, config: Arc<Config>, schedule: Schedule, cache_dir: String) {
+    // Startup catch-up: if a scheduled tick elapsed while the service was down
+    // (or no check was ever recorded), refresh once before the normal wait loop.
+    let due = match load_last_checked(&cache_dir) {
+        Some(last) => feeds_stale(&schedule, last, Local::now()),
+        None => true,
+    };
+    if due {
+        tracing::info!("auto_update: feeds stale at startup, running catch-up");
+        run_once(&graph, &config, &cache_dir).await;
+    }
+
     loop {
         let Some(next) = schedule.upcoming(chrono::Local).next() else {
             tracing::warn!("auto_update: cron has no future occurrences; stopping");
@@ -54,19 +67,29 @@ async fn run_loop(graph: SharedGraph, config: Arc<Config>, schedule: Schedule, c
         tracing::info!("auto_update: next run at {next}");
         tokio::time::sleep(wait).await;
 
-        let graph_c = graph.clone();
-        let config_c = config.clone();
-        let cache_c = cache_dir.clone();
-        let result =
-            tokio::task::spawn_blocking(move || run_update_cycle(&graph_c, &config_c, &cache_c))
-                .await;
-        match result {
-            Ok(Ok(true)) => tracing::info!("auto_update: graph updated and swapped"),
-            Ok(Ok(false)) => tracing::info!("auto_update: no feed changes"),
-            Ok(Err(e)) => tracing::error!("auto_update: cycle failed (keeping current graph): {e}"),
-            Err(e) => tracing::error!("auto_update: cycle panicked (keeping current graph): {e}"),
-        }
+        run_once(&graph, &config, &cache_dir).await;
     }
+}
+
+/// Run one update cycle on a blocking thread and log the outcome.
+async fn run_once(graph: &SharedGraph, config: &Arc<Config>, cache_dir: &str) {
+    let graph_c = graph.clone();
+    let config_c = config.clone();
+    let cache_c = cache_dir.to_string();
+    let result =
+        tokio::task::spawn_blocking(move || run_update_cycle(&graph_c, &config_c, &cache_c)).await;
+    match result {
+        Ok(Ok(true)) => tracing::info!("auto_update: graph updated and swapped"),
+        Ok(Ok(false)) => tracing::info!("auto_update: no feed changes"),
+        Ok(Err(e)) => tracing::error!("auto_update: cycle failed (keeping current graph): {e}"),
+        Err(e) => tracing::error!("auto_update: cycle panicked (keeping current graph): {e}"),
+    }
+}
+
+/// True if a scheduled fire time falls in `(last_checked, now]` — i.e. at least
+/// one refresh tick elapsed since the last successful feed check.
+fn feeds_stale(schedule: &Schedule, last_checked: DateTime<Local>, now: DateTime<Local>) -> bool {
+    matches!(schedule.after(&last_checked).next(), Some(fire) if fire <= now)
 }
 
 /// One update cycle. Returns Ok(true) if a new graph was swapped in.
@@ -83,11 +106,17 @@ fn run_update_cycle(graph: &SharedGraph, config: &Config, cache_dir: &str) -> Re
         new_hashes.insert(input.label().to_string(), hash);
     }
 
+    // Record the check time regardless of outcome so a quiet period does not
+    // make every restart re-pull.
+    if let Err(e) = save_last_checked(cache_dir, Local::now()) {
+        tracing::warn!("auto_update: failed to persist last_checked: {e}");
+    }
+
     if !any_changed(&old_hashes, &new_hashes) {
         return Ok(false);
     }
 
-    let osm = load_graph(&config.build.osm_output)?;
+    let osm = load_osm_graph(&config.build.osm_output)?;
     // Feeds were just downloaded above (force=true); reuse the cache here.
     let mut new_graph = build_gtfs_phase(osm, &config.build, cache_dir, false)
         .ok_or_else(|| "GTFS rebuild failed".to_string())?;
@@ -144,6 +173,19 @@ mod tests {
     #[test]
     fn parse_cron_rejects_garbage() {
         assert!(parse_cron("not a cron").is_err());
+    }
+
+    #[test]
+    fn feeds_stale_detects_elapsed_tick() {
+        // Hourly schedule.
+        let sched = parse_cron("0 * * * *").unwrap();
+        let now = Local::now();
+
+        // Checked 90 minutes ago: at least one top-of-hour tick has passed.
+        assert!(feeds_stale(&sched, now - chrono::Duration::minutes(90), now));
+
+        // Checked just now: no tick since (next fire is in the future).
+        assert!(!feeds_stale(&sched, now, now));
     }
 
     #[test]

@@ -14,14 +14,21 @@ Rust/Cargo commands run directly — no `devenv shell` wrapper needed.
 # Build the project
 cargo build --release
 
-# Build graph from config + save to graph.bin
+# Self-healing startup (how the service runs): restore the cached graph.bin if
+# its schema version matches, else rebuild — reusing osm.bin when its version
+# still matches so only the GTFS phase re-runs — then serve. A cron-gated GTFS
+# refresh (config.yaml `auto_update`) runs in the background, and at startup if a
+# scheduled tick was missed while down.
+cargo run -- --serve
+
+# Manual / first-time full build from config + save to graph.bin (and osm.bin)
 cargo run -- --build --save
 
-# Load pre-built graph and start API server
+# Explicitly load a pre-built graph and serve (no rebuild fallback)
 cargo run -- --restore --serve
 
-# Build in-memory (no save) and serve
-cargo run -- --build --serve
+# Manually re-ingest GTFS only on top of cached osm.bin
+cargo run -- --update-gtfs --serve
 
 # Run all tests (unit + integration)
 cargo test
@@ -135,5 +142,6 @@ Routes return as `Plan → PlanLeg (Walk|Transit) → PlanLegStep`, with rich me
 - `DelayCDF` in `structures/delay.rs` models delay probability distributions for future multi-scenario routing.
 - `MAX_ROUNDS` in `graph/mod.rs` controls RAPTOR transit rounds (higher = more transfers explored).
 - The `.envrc` sets up a Nix environment for OpenSSL; run `direnv allow` if using Nix.
-- `graph.bin` (~63MB for Brussels) is the serialized graph cache — commit-ignored, regenerated with `--build --save`.
-- **Serialization note**: `graph.bin` format changed in Phase 2 (RaptorIndex sub-struct). Old `graph.bin` files are incompatible — rebuild with `--build --save`.
+- `graph.bin` / `osm.bin` are treated as a **cache**: both carry an 8-byte header (`MAAS` magic + a `u32` schema version) checked at load. `GRAPH_SCHEMA_VERSION` (any `Graph`/`RaptorIndex` change) gates `graph.bin`; `OSM_SCHEMA_VERSION` (OSM-side fields only) gates `osm.bin`, so a transit-only struct change lets `--serve` reuse `osm.bin` and re-run only the GTFS phase. Both consts live in `src/services/persistence.rs` — **bump them when the corresponding fields change layout.** `osm.bin` serializes an OSM-only view (no `RaptorIndex`) so it survives transit-struct changes.
+- **Freshness gate**: `cache/last_checked` (RFC3339) records the last feed *check* (download+hash), stamped every scheduler cycle and on every build — *not* only on change. At startup the auto path refreshes once if a cron tick elapsed since then (`feeds_stale` in `src/services/scheduler.rs`).
+- **Serialization note**: any header/version or struct change makes old `graph.bin`/`osm.bin` files report a version mismatch — `--serve` auto-rebuilds them; no manual step needed.

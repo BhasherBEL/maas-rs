@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use chrono::{DateTime, Local};
 use sha2::{Digest, Sha256};
 
 use crate::ingestion::secrets::interpolate;
@@ -117,6 +118,24 @@ pub fn save_feed_hashes(cache_dir: &str, hashes: &BTreeMap<String, String>) -> R
     fs::write(&path, s).map_err(|e| format!("write feed hashes: {e}"))
 }
 
+/// Wall-clock time of the last successful feed *check* (download + hash),
+/// regardless of whether the content changed. Used to cron-gate the startup
+/// freshness catch-up. Missing/corrupt → None.
+pub fn load_last_checked(cache_dir: &str) -> Option<DateTime<Local>> {
+    let path = format!("{cache_dir}/last_checked");
+    let s = fs::read_to_string(&path).ok()?;
+    DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Local))
+}
+
+pub fn save_last_checked(cache_dir: &str, when: DateTime<Local>) -> Result<(), String> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
+    let path = format!("{cache_dir}/last_checked");
+    fs::write(&path, when.to_rfc3339()).map_err(|e| format!("write last_checked: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +177,20 @@ mod tests {
             gtfs_content_hash(a.to_str().unwrap()).unwrap(),
             gtfs_content_hash(b.to_str().unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn last_checked_round_trip() {
+        let dir = std::env::temp_dir().join("maas_last_checked_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.to_str().unwrap();
+        let _ = std::fs::remove_file(format!("{cache}/last_checked"));
+        assert!(load_last_checked(cache).is_none());
+
+        let now = Local::now();
+        save_last_checked(cache, now).unwrap();
+        let loaded = load_last_checked(cache).unwrap();
+        assert_eq!(loaded.timestamp(), now.timestamp());
     }
 
     #[test]

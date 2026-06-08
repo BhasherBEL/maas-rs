@@ -395,6 +395,11 @@ impl Graph {
         self.raptor.transit_delay_models.get(&route_type)
     }
 
+    pub fn route_type_of_trip(&self, trip_id: TripId) -> Option<RouteType> {
+        let route_id = self.get_trip(trip_id)?.route_id;
+        self.get_route(route_id).map(|r| r.route_type)
+    }
+
     /// Returns the latest trip across all RAPTOR patterns serving both
     /// `boarding_node` → `alighting_node` (in that order) where:
     ///   - boarding departure ≥ min_boarding
