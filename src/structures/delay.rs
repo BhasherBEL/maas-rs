@@ -21,6 +21,33 @@ impl DelayCDF {
         }
     }
 
+    /// Probability mass per bin, derived from the cumulative bins as
+    /// `(delay_i, cum_i − cum_{i-1})`. The first jump is `cum_0`. Zero-mass
+    /// entries are skipped.
+    pub fn pmf(&self) -> impl Iterator<Item = (i32, f32)> + '_ {
+        let mut prev = 0.0f32;
+        self.bins.iter().filter_map(move |&(delay, cum)| {
+            let mass = cum - prev;
+            prev = cum;
+            (mass > 0.0).then_some((delay, mass))
+        })
+    }
+
+    /// Probability of making a transfer given a `margin` of slack, accounting
+    /// for both this (feeder) delay distribution and the `board`ing vehicle's.
+    /// You board iff `D_feeder − D_board ≤ margin`, so assuming the two delays
+    /// are independent:
+    ///   `Σ_i mass_board(b_i) · P(D_feeder ≤ margin + b_i)`.
+    /// With no boarding model this collapses to `prob_on_time(margin)`.
+    pub fn prob_on_time_vs(&self, board: Option<&DelayCDF>, margin: i32) -> f32 {
+        match board {
+            Some(b) if !b.bins.is_empty() => b
+                .pmf()
+                .map(|(delay, mass)| mass * self.prob_on_time(margin + delay))
+                .sum(),
+            _ => self.prob_on_time(margin),
+        }
+    }
 }
 
 /// Reliability values `>=` this collapse into the single CERTAIN bucket, so
@@ -323,6 +350,70 @@ mod tests {
         assert_eq!(cdf.prob_on_time(120), 0.50);
         assert_eq!(cdf.prob_on_time(180), 0.80);
         assert_eq!(cdf.prob_on_time(1000), 1.0);
+    }
+
+    // ── pmf / prob_on_time_vs (two-delay convolution) ─────────────────────────
+
+    fn make_bus_cdf() -> DelayCDF {
+        // Mirrors the bus model from config.yaml
+        DelayCDF {
+            bins: vec![
+                (-300, 0.03), (-120, 0.09), (-60, 0.16), (0, 0.45), (60, 0.58),
+                (120, 0.67), (180, 0.74), (300, 0.84), (600, 0.93), (900, 0.97),
+                (1800, 1.00),
+            ],
+        }
+    }
+
+    #[test]
+    fn pmf_reproduces_bin_jumps() {
+        let pmf: Vec<(i32, f32)> = make_cdf().pmf().collect();
+        let expected = [(0, 0.1f32), (60, 0.4), (120, 0.4), (300, 0.1)];
+        assert_eq!(pmf.len(), expected.len());
+        for (got, want) in pmf.iter().zip(expected.iter()) {
+            assert_eq!(got.0, want.0);
+            assert!((got.1 - want.1).abs() < 1e-6, "got {got:?} want {want:?}");
+        }
+        let total: f32 = pmf.iter().map(|&(_, m)| m).sum();
+        assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prob_on_time_vs_none_collapses_to_feeder_only() {
+        let feeder = make_cdf_with_early();
+        for m in [-50, 0, 96, 200, 1000] {
+            assert_eq!(feeder.prob_on_time_vs(None, m), feeder.prob_on_time(m));
+        }
+    }
+
+    #[test]
+    fn prob_on_time_vs_point_mass_at_zero_equals_feeder_only() {
+        let feeder = make_cdf_with_early();
+        let on_time = DelayCDF { bins: vec![(0, 1.0)] };
+        assert!((feeder.prob_on_time_vs(Some(&on_time), 96) - feeder.prob_on_time(96)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn prob_on_time_vs_late_boarding_vehicle_raises_reliability() {
+        // SUBWAY feeder, BUS boarding, 96s margin — the real-world case.
+        // Feeder-only gives exactly 0.22; convolving the (often-late) bus lifts it.
+        let feeder = make_cdf_with_early();
+        let board = make_bus_cdf();
+        let merged = feeder.prob_on_time_vs(Some(&board), 96);
+        assert_eq!(feeder.prob_on_time(96), 0.22);
+        assert!(merged > 0.22, "merged {merged} should exceed feeder-only 0.22");
+        assert!((merged - 0.516).abs() < 1e-3, "merged was {merged}");
+    }
+
+    #[test]
+    fn prob_on_time_vs_early_boarding_vehicle_lowers_reliability() {
+        // A boarding vehicle that almost always leaves 2 min early eats the margin.
+        let feeder = make_cdf_with_early();
+        let early = DelayCDF { bins: vec![(-120, 0.9), (0, 1.0)] };
+        let merged = feeder.prob_on_time_vs(Some(&early), 96);
+        // 0.9·P(feeder≤-24) + 0.1·P(feeder≤96) = 0.9·0.02 + 0.1·0.22 = 0.04
+        assert!((merged - 0.04).abs() < 1e-6, "merged was {merged}");
+        assert!(merged < feeder.prob_on_time(96));
     }
 
     // ── ScenarioBag ───────────────────────────────────────────────────────────

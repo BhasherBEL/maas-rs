@@ -528,12 +528,15 @@ impl Graph {
                 let margin = board_dep as i32 - arrival_at_bs as i32;
                 let next_departure =
                     self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
+                let board = self
+                    .route_type_of_trip(trip_ids[t])
+                    .and_then(|brt| self.raptor.transit_delay_models.get(&brt));
                 let (reliability, next_reliability) =
                     match self.raptor.transit_delay_models.get(&rt) {
                         Some(cdf) => (
-                            cdf.prob_on_time(margin),
+                            cdf.prob_on_time_vs(board, margin),
                             next_departure.map(|nd| {
-                                cdf.prob_on_time(nd as i32 - arrival_at_bs as i32)
+                                cdf.prob_on_time_vs(board, nd as i32 - arrival_at_bs as i32)
                             }),
                         ),
                         None => (1.0, None),
@@ -643,6 +646,7 @@ impl Graph {
                 transfer_risk,
                 preceding_arrival: if preceding_rt.is_none() { None } else { preceding_arr },
                 preceding_route_type: preceding_rt,
+                route_type: self.route_type_of_trip(trip_ids[t]),
                 bikes_allowed: self.get_trip(trip_ids[t]).and_then(|t| t.bikes_allowed),
             }));
 
@@ -707,10 +711,14 @@ impl Graph {
                     if let (Some(prev_arr), Some(prt)) = (cursor, t.preceding_route_type) {
                         let margin = t.start as i32 - prev_arr as i32;
                         let next_dep = t.transfer_risk.as_ref().and_then(|r| r.next_departure);
+                        let board = t
+                            .route_type
+                            .and_then(|brt| self.raptor.transit_delay_models.get(&brt));
                         let (rel, next_rel) = match self.raptor.transit_delay_models.get(&prt) {
                             Some(cdf) => (
-                                cdf.prob_on_time(margin),
-                                next_dep.map(|nd| cdf.prob_on_time(nd as i32 - prev_arr as i32)),
+                                cdf.prob_on_time_vs(board, margin),
+                                next_dep
+                                    .map(|nd| cdf.prob_on_time_vs(board, nd as i32 - prev_arr as i32)),
                             ),
                             None => (1.0, None),
                         };
@@ -854,11 +862,14 @@ impl Graph {
                         let margin = next_t.start as i32 - cursor as i32;
                         let next_dep =
                             next_t.transfer_risk.as_ref().and_then(|r| r.next_departure);
+                        let board = next_t
+                            .route_type
+                            .and_then(|brt| self.raptor.transit_delay_models.get(&brt));
                         let (rel, next_rel) = match self.raptor.transit_delay_models.get(&prt) {
                             Some(cdf) => (
-                                cdf.prob_on_time(margin),
+                                cdf.prob_on_time_vs(board, margin),
                                 next_dep.map(|nd| {
-                                    cdf.prob_on_time(nd as i32 - cursor as i32)
+                                    cdf.prob_on_time_vs(board, nd as i32 - cursor as i32)
                                 }),
                             ),
                             None => (1.0, None),

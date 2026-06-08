@@ -1,11 +1,13 @@
 use std::{env, sync::Arc};
 
 use arc_swap::ArcSwap;
+use chrono::Local;
 use maas_rs::{
+    ingestion::cache::save_last_checked,
     logging,
     services::{
         build::{build_gtfs_phase, build_osm_phase},
-        persistence::{load_graph, save_graph},
+        persistence::{load_graph, load_osm_graph, save_graph, save_graph_with_rollback, save_osm_graph},
     },
     structures::Config,
     web::app,
@@ -42,8 +44,8 @@ async fn main() {
         .iter()
         .filter(|&&x| x)
         .count();
-    if mode_count != 1 {
-        tracing::error!("exactly one of --build, --restore, or --update-gtfs must be set");
+    if mode_count > 1 {
+        tracing::error!("at most one of --build, --restore, or --update-gtfs may be set");
         return;
     }
     if save_mode && restore_mode {
@@ -51,7 +53,16 @@ async fn main() {
         return;
     }
 
-    let mut g = if build_mode {
+    // No explicit mode flag ⇒ self-healing auto path: restore the cached graph,
+    // or rebuild it (reusing osm.bin when possible), then serve.
+    let auto = mode_count == 0;
+
+    let mut g = if auto {
+        match acquire_auto(&config, &cache_dir) {
+            Some(g) => g,
+            None => return,
+        }
+    } else if build_mode {
         let osm_graph = match build_osm_phase(&config.build, &cache_dir, false) {
             Some(g) => g,
             None => {
@@ -61,7 +72,7 @@ async fn main() {
         };
 
         if save_mode {
-            if let Err(e) = save_graph(&osm_graph, &config.build.osm_output) {
+            if let Err(e) = save_osm_graph(&osm_graph, &config.build.osm_output) {
                 tracing::error!("{e}");
                 return;
             }
@@ -75,7 +86,7 @@ async fn main() {
             }
         }
     } else if update_gtfs_mode {
-        let osm_graph = match load_graph(&config.build.osm_output) {
+        let osm_graph = match load_osm_graph(&config.build.osm_output) {
             Ok(g) => g,
             Err(_) => {
                 tracing::error!(
@@ -110,16 +121,52 @@ async fn main() {
             tracing::error!("{e}");
             return;
         }
+        if let Err(e) = save_last_checked(&cache_dir, Local::now()) {
+            tracing::warn!("failed to persist last_checked: {e}");
+        }
     }
 
     // Apply config.yaml routing defaults (works for all modes).
     maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
 
-    if !serve_mode {
+    if !auto && !serve_mode {
         return;
     }
 
     let shared: maas_rs::services::scheduler::SharedGraph = Arc::new(ArcSwap::from_pointee(g));
     let config = Arc::new(config);
     let _ = app::server(shared, config).await;
+}
+
+/// Restore the cached graph if its version matches, else rebuild reusing osm.bin
+/// when possible. Returns `None` on a fatal build error.
+fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures::Graph> {
+    match load_graph(&config.build.output) {
+        Ok(g) => return Some(g),
+        Err(e) => tracing::info!("rebuilding graph ({e})"),
+    }
+
+    let osm = match load_osm_graph(&config.build.osm_output) {
+        Ok(o) => {
+            tracing::info!("reusing cached OSM network");
+            o
+        }
+        Err(e) => {
+            tracing::info!("rebuilding OSM network ({e})");
+            let o = build_osm_phase(&config.build, cache_dir, false)?;
+            if let Err(e) = save_osm_graph(&o, &config.build.osm_output) {
+                tracing::error!("{e}");
+            }
+            o
+        }
+    };
+
+    let g = build_gtfs_phase(osm, &config.build, cache_dir, false)?;
+    if let Err(e) = save_graph_with_rollback(&g, &config.build.output) {
+        tracing::error!("{e}");
+    }
+    if let Err(e) = save_last_checked(cache_dir, Local::now()) {
+        tracing::warn!("failed to persist last_checked: {e}");
+    }
+    Some(g)
 }

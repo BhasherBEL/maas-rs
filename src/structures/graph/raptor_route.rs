@@ -890,6 +890,7 @@ impl Graph {
                         // reconstruction (earliest-based), so buckets agree.
                         let factor = self.transfer_on_time_prob(
                             pl.route_type,
+                            Some(pat_rt),
                             pl.bag.earliest(),
                             trip_dep,
                         );
@@ -967,11 +968,15 @@ impl Graph {
     pub(super) fn transfer_on_time_prob(
         &self,
         prev_rt: Option<RouteType>,
+        board_rt: Option<RouteType>,
         arr_at_stop: u32,
         board_dep: u32,
     ) -> f32 {
         match prev_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)) {
-            Some(cdf) => cdf.prob_on_time(board_dep as i32 - arr_at_stop as i32),
+            Some(cdf) => {
+                let board = board_rt.and_then(|brt| self.raptor.transit_delay_models.get(&brt));
+                cdf.prob_on_time_vs(board, board_dep as i32 - arr_at_stop as i32)
+            }
             None => 1.0,
         }
     }

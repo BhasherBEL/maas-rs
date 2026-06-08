@@ -36,6 +36,22 @@ pub struct Graph {
     pub raptor: RaptorIndex,
 }
 
+#[derive(Serialize)]
+struct OsmView<'a> {
+    nodes: &'a Vec<NodeData>,
+    edges: &'a Vec<Vec<EdgeData>>,
+    nodes_tree: &'a KdTree<f64, NodeID, [f64; 2]>,
+    id_mapper: &'a HashMap<String, NodeID>,
+}
+
+#[derive(Deserialize)]
+struct OsmOwned {
+    nodes: Vec<NodeData>,
+    edges: Vec<Vec<EdgeData>>,
+    nodes_tree: KdTree<f64, NodeID, [f64; 2]>,
+    id_mapper: HashMap<String, NodeID>,
+}
+
 pub static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
 pub const MAX_SCENARIOS: usize = 2;
 pub const MAX_ROUNDS: usize = 20;
@@ -49,6 +65,28 @@ impl Graph {
             id_mapper: HashMap::new(),
             raptor: RaptorIndex::new(),
         }
+    }
+
+    pub fn to_osm_postcard(&self) -> Result<Vec<u8>, String> {
+        let view = OsmView {
+            nodes: &self.nodes,
+            edges: &self.edges,
+            nodes_tree: &self.nodes_tree,
+            id_mapper: &self.id_mapper,
+        };
+        postcard::to_allocvec(&view).map_err(|e| format!("Failed to serialize OSM graph: {e}"))
+    }
+
+    pub fn from_osm_postcard(bytes: &[u8]) -> Result<Graph, String> {
+        let o: OsmOwned =
+            postcard::from_bytes(bytes).map_err(|e| format!("Failed to deserialize OSM graph: {e}"))?;
+        Ok(Graph {
+            nodes: o.nodes,
+            edges: o.edges,
+            nodes_tree: o.nodes_tree,
+            id_mapper: o.id_mapper,
+            raptor: RaptorIndex::new(),
+        })
     }
 
     pub fn set_min_access_secs(&mut self, secs: u32) {

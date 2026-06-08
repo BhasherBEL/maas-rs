@@ -72,14 +72,6 @@
           yamlFormat = pkgs.formats.yaml { };
 
           configFile = yamlFormat.generate "maas-rs.yaml" cfg.settings;
-
-          startArgs =
-            {
-              "restore-and-serve" = "--restore --serve";
-              "build-and-serve" = "--build --serve";
-              "update-gtfs-and-serve" = "--update-gtfs --serve";
-            }
-            .${cfg.mode};
         in
         {
           # ── Options ──────────────────────────────────────────────────────────
@@ -100,25 +92,6 @@
                 Working directory for the service. graph.bin, osm.bin, and any
                 data files referenced by relative `path:` URLs in
                 `settings.build.inputs` must live here.
-              '';
-            };
-
-            mode = lib.mkOption {
-              type = lib.types.enum [
-                "restore-and-serve"
-                "build-and-serve"
-                "update-gtfs-and-serve"
-              ];
-              default = "restore-and-serve";
-              description = ''
-                How the service starts:
-                - `restore-and-serve`      – load a pre-built graph.bin, then serve (fast).
-                - `build-and-serve`        – ingest OSM + GTFS from scratch, then serve
-                                             (runs the full build on every restart).
-                - `update-gtfs-and-serve`  – reload osm.bin, re-ingest GTFS only, then serve
-                                             (faster than a full rebuild when only transit data
-                                             changed; requires osm.bin from a prior
-                                             `--build --save` run).
               '';
             };
 
@@ -230,7 +203,10 @@
                   "${cfg.dataDir}/config.yaml"
                 ];
 
-                ExecStart = "${cfg.package}/bin/maas-rs ${startArgs}";
+                # Self-healing startup: restore the cached graph.bin, or rebuild
+                # it (reusing osm.bin when possible), then serve. A cron-gated
+                # GTFS refresh runs in the background per `settings.auto_update`.
+                ExecStart = "${cfg.package}/bin/maas-rs --serve";
 
                 Restart = "on-failure";
                 RestartSec = "5s";

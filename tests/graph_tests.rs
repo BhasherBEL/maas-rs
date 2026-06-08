@@ -907,6 +907,60 @@ fn raptor_transfer_risk_reliability_is_one_without_delay_model() {
     );
 }
 
+/// The transfer Bus → Tram convolves BOTH delay distributions: the feeder (Bus)
+/// arrival and the boarding (Tram) departure. The reconstructed reliability must
+/// equal `feeder.prob_on_time_vs(Some(board), margin)`, and the leg must carry its
+/// own route type so the boarding distribution can be looked up.
+#[test]
+fn raptor_transfer_risk_merges_feeder_and_boarding_delays() {
+    let (mut g, origin, dest) = two_route_raptor_graph();
+
+    // Feeder (Bus) stair CDF and a boarding (Tram) model with heavy early mass, so
+    // the convolution measurably differs from the feeder-only result at any margin.
+    let bus = DelayCDF { bins: vec![(0, 0.1), (300, 0.4), (600, 0.6), (900, 0.8), (1200, 1.0)] };
+    let tram = DelayCDF { bins: vec![(-600, 0.5), (0, 1.0)] };
+    let mut models = HashMap::new();
+    models.insert(RouteType::Bus, bus.clone());
+    models.insert(RouteType::Tramway, tram.clone());
+    g.set_transit_delay_models(models);
+
+    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    let two_leg = plans
+        .iter()
+        .find(|p| {
+            p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2
+        })
+        .expect("Expected a 2-transit-leg plan");
+
+    let tram_leg = two_leg
+        .legs
+        .iter()
+        .filter_map(|l| if let PlanLeg::Transit(t) = l { Some(t) } else { None })
+        .nth(1)
+        .unwrap();
+
+    assert_eq!(
+        tram_leg.route_type,
+        Some(RouteType::Tramway),
+        "Boarding leg must carry its own route type for the convolution lookup"
+    );
+
+    let risk = tram_leg.transfer_risk.as_ref().unwrap();
+    let margin = risk.scheduled_departure as i32 - tram_leg.preceding_arrival.unwrap() as i32;
+
+    let feeder_only = bus.prob_on_time(margin);
+    let expected = bus.prob_on_time_vs(Some(&tram), margin);
+    assert!(
+        (expected - feeder_only).abs() > 1e-6,
+        "test setup should exercise the convolution (margin {margin}): merged {expected} vs feeder-only {feeder_only}"
+    );
+    assert!(
+        (risk.reliability - expected).abs() < 1e-6,
+        "reliability {} should equal the two-delay convolution {expected} (margin {margin})",
+        risk.reliability
+    );
+}
+
 // ── Three-pass RAPTOR: backward tightening ────────────────────────────────────
 
 /// Like `two_route_raptor_graph` but the Bus has TWO trips:
@@ -2019,4 +2073,23 @@ fn raptor_more_slack_never_fewer_plans() {
     let few = g.raptor_tuned(origin, dest, 8 * 3600 + 1800, 0, 0x7F, 10 * 60, &buckets, 0).len();
     let many = g.raptor_tuned(origin, dest, 8 * 3600 + 1800, 0, 0x7F, 10 * 60, &buckets, 3600).len();
     assert!(many >= few, "more slack ({many}) should not yield fewer plans than less ({few})");
+}
+
+#[test]
+fn osm_only_cache_round_trip_preserves_network() {
+    use maas_rs::services::persistence::{load_osm_graph, save_osm_graph};
+
+    let (g, a, _b, _c) = three_node_street_graph();
+    let dir = std::env::temp_dir().join("maas_osm_view_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("osm.bin");
+    let path_s = path.to_str().unwrap();
+
+    save_osm_graph(&g, path_s).unwrap();
+    let restored = load_osm_graph(path_s).unwrap();
+
+    assert_eq!(restored.node_count(), g.node_count());
+    assert_eq!(restored.get_id("a"), Some(&a));
+    assert_eq!(restored.nearest_node(50.000, 4.000), Some(a));
+    assert_eq!(restored.raptor.transit_trips.len(), 0);
 }

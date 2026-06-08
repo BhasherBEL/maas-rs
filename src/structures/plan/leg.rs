@@ -58,9 +58,9 @@ pub struct TransferRisk {
     /// The client computes `wait_if_missed = next_departure - scheduled_departure`.
     pub next_departure: Option<u32>,
     /// Probability (0.0–1.0) of boarding the *next* trip (if the scheduled one
-    /// is missed).  Computed as `cdf.prob_on_time(next_departure −
-    /// arrival_at_boarding_stop)`.  `None` when there is no next departure or
-    /// no delay model for this route type.
+    /// is missed), convolving the feeder and boarding delay distributions over
+    /// the `next_departure − arrival_at_boarding_stop` margin.  `None` when there
+    /// is no next departure or no delay model for the feeder route type.
     pub next_reliability: Option<f32>,
     /// `scheduled_departure − arrival_at_boarding_stop` in seconds.
     /// Negative = transfer is physically impossible (arrive after the train departs).
@@ -111,6 +111,12 @@ pub struct PlanTransitLeg {
     /// select the correct delay-CDF when populating `transfer_risk` on alternatives.
     #[graphql(skip)]
     pub preceding_route_type: Option<RouteType>,
+
+    /// This leg's own route type (the vehicle being boarded).  Combined with
+    /// `preceding_route_type` to convolve both delay-CDFs when scoring the
+    /// transfer onto this leg.
+    #[graphql(skip)]
+    pub route_type: Option<RouteType>,
 
     /// Whether bikes are allowed on this transit leg.
     /// `None` = no information available.
@@ -228,8 +234,11 @@ impl PlanTransitLeg {
                         (self.preceding_arrival, self.preceding_route_type)
                     {
                         let margin = dep as i32 - pa as i32;
+                        let board = graph
+                            .route_type_of_trip(trip_id)
+                            .and_then(|rt| graph.get_delay_model(rt));
                         let rel = match graph.get_delay_model(prt) {
-                            Some(cdf) => cdf.prob_on_time(margin),
+                            Some(cdf) => cdf.prob_on_time_vs(board, margin),
                             None => 1.0,
                         };
                         Some(TransferRisk {
@@ -268,6 +277,7 @@ impl PlanTransitLeg {
                     transfer_risk,
                     preceding_arrival: self.preceding_arrival,
                     preceding_route_type: self.preceding_route_type,
+                    route_type: graph.route_type_of_trip(trip_id),
                     bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
                 }
             })
@@ -354,10 +364,13 @@ impl PlanTransitLeg {
                             )
                             .next()
                             .map(|(_, seg)| seg.departure);
+                        let board = graph
+                            .route_type_of_trip(trip_id)
+                            .and_then(|rt| graph.get_delay_model(rt));
                         let (rel, next_rel) = match graph.get_delay_model(prt) {
                             Some(cdf) => (
-                                cdf.prob_on_time(margin),
-                                next_dep.map(|nd| cdf.prob_on_time(nd as i32 - pa as i32)),
+                                cdf.prob_on_time_vs(board, margin),
+                                next_dep.map(|nd| cdf.prob_on_time_vs(board, nd as i32 - pa as i32)),
                             ),
                             None => (1.0, None),
                         };
@@ -398,6 +411,7 @@ impl PlanTransitLeg {
                     transfer_risk,
                     preceding_arrival: self.preceding_arrival,
                     preceding_route_type: self.preceding_route_type,
+                    route_type: graph.route_type_of_trip(trip_id),
                     bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
                 })
             })
