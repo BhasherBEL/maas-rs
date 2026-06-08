@@ -71,7 +71,7 @@
           cfg = config.services.maas-rs;
           yamlFormat = pkgs.formats.yaml { };
 
-          configFile = pkgs.writeText "maas-rs.yaml" (builtins.toJSON cfg.settings);
+          configFile = yamlFormat.generate "maas-rs.yaml" cfg.settings;
 
           startArgs =
             {
@@ -82,27 +82,6 @@
             .${cfg.mode};
         in
         {
-
-          nixpkgs.overlays = [
-            (
-              final: prev:
-              let
-                fixedImportCargoLock = final.callPackage (builtins.toFile "import-cargo-lock.nix" (
-                  builtins.replaceStrings [ "https://crates.io/api/v1/crates" ] [ "https://static.crates.io/crates" ]
-                    (builtins.readFile "${prev.path}/pkgs/build-support/rust/import-cargo-lock.nix")
-                )) { };
-              in
-              {
-                importCargoLock = fixedImportCargoLock;
-                rustPlatform = prev.rustPlatform // {
-                  buildRustPackage = prev.rustPlatform.buildRustPackage.override {
-                    importCargoLock = fixedImportCargoLock;
-                  };
-                };
-              }
-            )
-          ];
-
           # ── Options ──────────────────────────────────────────────────────────
           options.services.maas-rs = {
             enable = lib.mkEnableOption "maas-rs multi-modal routing engine";
@@ -150,192 +129,65 @@
             };
 
             settings = lib.mkOption {
-              description = ''
-                Structured config.yaml content. All keys are written verbatim to
-                the generated config file; see the upstream config.yaml for
-                field-level documentation.
-              '';
+              type = yamlFormat.type;
               default = { };
-              type = lib.types.submodule {
-                # Allow any extra keys the user wants to pass through.
-                freeformType = yamlFormat.type;
+              description = ''
+                Verbatim `config.yaml` content. The whole attrset is serialized
+                to YAML as-is and copied to `''${dataDir}/config.yaml` at startup,
+                so every field the binary understands is supported automatically
+                — no per-key plumbing in this module. See the upstream
+                `config.yaml` for the full, authoritative schema (`build.inputs`,
+                `build.delay_models`, `default_routing`, `server`, `auto_update`,
+                `realtime`, `log_level`).
 
-                options = {
+                Only one key is interpreted by this module: `settings.server.port`,
+                read by `openFirewall` (falls back to 3000 when unset).
 
-                  log_level = lib.mkOption {
-                    type = lib.types.enum [
-                      "trace"
-                      "debug"
-                      "info"
-                      "warn"
-                      "error"
+                URLs in `build.inputs` may use `path:` (relative to `dataDir`) or
+                `http(s)://`. Keep secrets out of the Nix store: reference them via
+                `''${VAR}` (environment) or `''${file:/path}` placeholders in
+                header values rather than inlining them here.
+              '';
+              example = lib.literalExpression ''
+                {
+                  log_level = "info";
+
+                  build = {
+                    inputs = [
+                      { ingestor = "osm/pbf"; url = "path:data/region.osm.pbf"; }
+                      { ingestor = "gtfs/generic"; name = "MyAgency"; url = "path:data/gtfs.zip"; }
+                      {
+                        ingestor = "gtfs/sncb";
+                        name     = "SNCB";
+                        url      = "https://example.com/sncb/static/";
+                        osm_url  = "path:data/region.osm.pbf";
+                        headers."bmc-partner-key" = "''${BMC_PARTNER_KEY}";
+                      }
                     ];
-                    default = "info";
-                    description = "Minimum log level emitted by the routing engine.";
+                    output     = "graph.bin";
+                    osm_output = "osm.bin";
+                    delay_models = [
+                      { mode = "bus";  bins = [ [ (-300) 0.03 ] [ 0 0.45 ] [ 1800 1.00 ] ]; }
+                      { mode = "tram"; bins = [ [ (-300) 0.02 ] [ 0 0.55 ] [ 1800 1.00 ] ]; }
+                    ];
                   };
 
-                  # ── default_routing ────────────────────────────────────────
-                  default_routing = lib.mkOption {
-                    default = { };
-                    description = "Default routing parameters applied to every query.";
-                    type = lib.types.submodule {
-                      options = {
-                        walking_speed = lib.mkOption {
-                          type = lib.types.ints.positive;
-                          default = 1390;
-                          description = "Walking speed in mm/s (1390 ≈ 5 km/h).";
-                        };
-                        estimator_speed = lib.mkOption {
-                          type = lib.types.ints.positive;
-                          default = 13900;
-                          description = "A* heuristic speed in mm/s (13900 ≈ 50 km/h).";
-                        };
-                        min_access_secs = lib.mkOption {
-                          type = lib.types.nullOr lib.types.ints.positive;
-                          default = null;
-                          description = ''
-                            Walk-radius in seconds used for RAPTOR access/egress stop search.
-                            Null uses the compiled-in default (600 s = 10 min).
-                          '';
-                        };
-                      };
-                    };
+                  default_routing = { walking_speed_mps = 1.2; };
+
+                  server = { host = "0.0.0.0"; port = 3000; };
+
+                  auto_update = { enabled = true; schedule = "0 * * * *"; cache_dir = "cache"; };
+
+                  realtime = {
+                    enabled = true;
+                    poll_interval_secs = 30;
+                    feeds = [
+                      { type = "gtfs-rt"; name = "sncb"; url = "https://example.com/rt?format=protobuf";
+                        headers."bmc-partner-key" = "''${BMC_PARTNER_KEY}"; }
+                    ];
                   };
-
-                  # ── build ─────────────────────────────────────────────────
-                  build = lib.mkOption {
-                    default = { };
-                    description = "Graph ingestion and output paths.";
-                    type = lib.types.submodule {
-                      options = {
-                        inputs = lib.mkOption {
-                          type = lib.types.listOf lib.types.attrs;
-                          default = [ ];
-                          description = ''
-                            Ordered list of data sources to ingest.  Each entry must have an
-                            `ingestor` key.  Supported ingestors:
-
-                              osm/pbf        – OpenStreetMap PBF file.
-                                               Required: url
-                              gtfs/generic   – Generic GTFS zip.
-                                               Required: name, url
-                              gtfs/stib      – STIB-flavoured GTFS zip.
-                                               Required: name, url
-                              gtfs/sncb      – SNCB-flavoured GTFS zip with a separate OSM file
-                                               for railway matching.
-                                               Required: name, url, osm_url
-
-                            URLs may use the `path:` scheme (relative to dataDir) or `http(s)://`.
-                          '';
-                          example = lib.literalExpression ''
-                            [
-                              {
-                                ingestor = "osm/pbf";
-                                url      = "path:data/region.osm.pbf";
-                              }
-                              {
-                                ingestor = "gtfs/generic";
-                                name     = "MyAgency";
-                                url      = "path:data/gtfs.zip";
-                              }
-                              {
-                                ingestor = "gtfs/sncb";
-                                name     = "SNCB";
-                                url      = "path:data/sncb.zip";
-                                osm_url  = "path:data/region.osm.pbf";
-                              }
-                            ]
-                          '';
-                        };
-
-                        output = lib.mkOption {
-                          type = lib.types.str;
-                          default = "graph.bin";
-                          description = ''
-                            Path for the serialized combined graph (OSM + GTFS).
-                            Relative paths are resolved from `dataDir`.
-                          '';
-                        };
-
-                        osm_output = lib.mkOption {
-                          type = lib.types.str;
-                          default = "osm.bin";
-                          description = ''
-                            Path for the OSM-only intermediate graph, used by
-                            `update-gtfs-and-serve` to skip the slow OSM ingestion phase.
-                            Relative paths are resolved from `dataDir`.
-                          '';
-                        };
-
-                        delay_models = lib.mkOption {
-                          type = lib.types.listOf lib.types.attrs;
-                          default = [ ];
-                          description = ''
-                            Per-mode delay CDF models.  Each entry specifies a transit mode
-                            and a list of [delay_seconds, cumulative_probability] breakpoints.
-                            Supported modes: subway, metro, tram, bus, rail, train, ferry,
-                                             cable_car, cablecar, gondola, funicular.
-                          '';
-                          example = lib.literalExpression ''
-                            [
-                              {
-                                mode = "bus";
-                                bins = [
-                                  [-300 0.03] [-120 0.09] [-60 0.16]
-                                  [0 0.45] [60 0.58] [120 0.67]
-                                  [300 0.84] [600 0.93] [900 0.97] [1800 1.00]
-                                ];
-                              }
-                              {
-                                mode = "tram";
-                                bins = [
-                                  [-300 0.02] [-60 0.15]
-                                  [0 0.55] [60 0.67]
-                                  [300 0.90] [900 0.98] [1800 1.00]
-                                ];
-                              }
-                            ]
-                          '';
-                        };
-                      };
-                    };
-                  };
-
-                  # ── server ────────────────────────────────────────────────
-                  # NOTE: host and port are not yet read by the binary — the
-                  # server currently binds to 0.0.0.0:3000 unconditionally.
-                  # These options are defined here so that:
-                  #   a) `openFirewall` can open the right port today, and
-                  #   b) downstream configs are forward-compatible once the
-                  #      binary starts honouring config.yaml's server section.
-                  server = lib.mkOption {
-                    default = { };
-                    description = ''
-                      GraphQL server bind settings.
-                      Warning: the binary currently ignores these values and
-                      always binds to 0.0.0.0:3000.  They are persisted in
-                      config.yaml for forward compatibility.
-                    '';
-                    type = lib.types.submodule {
-                      options = {
-                        host = lib.mkOption {
-                          type = lib.types.str;
-                          default = "0.0.0.0";
-                          description = "Bind host (not yet read by the binary).";
-                        };
-                        port = lib.mkOption {
-                          type = lib.types.port;
-                          default = 3000;
-                          description = ''
-                            Listen port.  Used by `openFirewall`; the binary
-                            currently binds unconditionally to port 3000.
-                          '';
-                        };
-                      };
-                    };
-                  };
-                };
-              };
+                }
+              '';
             };
           };
 
@@ -351,7 +203,9 @@
             };
             users.groups.maas-rs = { };
 
-            networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ cfg.settings.server.port ];
+            networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [
+              (cfg.settings.server.port or 3000)
+            ];
 
             systemd.services.maas-rs = {
               description = "maas-rs multi-modal routing engine";
