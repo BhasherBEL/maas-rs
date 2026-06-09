@@ -122,6 +122,19 @@ fn finalize(mut g: Graph, config: &BuildConfig) -> Option<Graph> {
     Some(g)
 }
 
+/// Sorted list of non-OSM input labels from the build config.
+/// Used to detect when a source is added/removed between restarts.
+pub fn gtfs_input_labels(config: &BuildConfig) -> Vec<String> {
+    let mut labels: Vec<String> = config
+        .inputs
+        .iter()
+        .filter(|i| i.phase() != 0)
+        .map(|i| i.label().to_string())
+        .collect();
+    labels.sort();
+    labels
+}
+
 /// Apply config.yaml routing defaults onto a freshly built or restored graph.
 /// Shared by `main` (startup) and the scheduler (after a hot rebuild).
 pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {

@@ -3,10 +3,10 @@ use std::{env, sync::Arc};
 use arc_swap::ArcSwap;
 use chrono::Local;
 use maas_rs::{
-    ingestion::cache::save_last_checked,
+    ingestion::cache::{load_input_labels, save_input_labels, save_last_checked},
     logging,
     services::{
-        build::{build_gtfs_phase, build_osm_phase},
+        build::{build_gtfs_phase, build_osm_phase, gtfs_input_labels},
         persistence::{load_graph, load_osm_graph, save_graph, save_graph_with_rollback, save_osm_graph},
     },
     structures::Config,
@@ -138,11 +138,24 @@ async fn main() {
     let _ = app::server(shared, config).await;
 }
 
-/// Restore the cached graph if its version matches, else rebuild reusing osm.bin
-/// when possible. Returns `None` on a fatal build error.
+/// Restore the cached graph if its version matches and the configured GTFS inputs
+/// are unchanged, else rebuild reusing osm.bin when possible.
+/// Returns `None` on a fatal build error.
 fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures::Graph> {
+    let current_labels = gtfs_input_labels(&config.build);
+
     match load_graph(&config.build.output) {
-        Ok(g) => return Some(g),
+        Ok(g) => {
+            let stored_labels = load_input_labels(cache_dir);
+            if stored_labels == current_labels {
+                return Some(g);
+            }
+            tracing::info!(
+                "GTFS inputs changed (was {:?}, now {:?}), rebuilding GTFS phase",
+                stored_labels,
+                current_labels,
+            );
+        }
         Err(e) => tracing::info!("rebuilding graph ({e})"),
     }
 
@@ -167,6 +180,9 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
     }
     if let Err(e) = save_last_checked(cache_dir, Local::now()) {
         tracing::warn!("failed to persist last_checked: {e}");
+    }
+    if let Err(e) = save_input_labels(cache_dir, &current_labels) {
+        tracing::warn!("failed to persist input_labels: {e}");
     }
     Some(g)
 }
