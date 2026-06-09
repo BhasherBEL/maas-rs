@@ -82,6 +82,7 @@ impl Graph {
 
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
     const EXTREME_RISK_WAIT_SECS: u32 = 7200;
+    const TIGHTEN_MIN_RELIABILITY: f32 = 0.80;
 
     pub(super) fn is_extreme_risk(plan: &Plan) -> bool {
         plan.legs.iter().any(|leg| {
@@ -196,6 +197,11 @@ impl Graph {
             // Realtime post-pass: shift leg times by live delays, re-chain the
             // timeline, and recompute transfer reliability on the new margins.
             self.apply_realtime(&mut legs, rt);
+
+            // Record each transit leg's downstream connection *after* tighten and
+            // realtime have settled the final scheduled times, so the outbound
+            // margin used to score alternatives matches the leg's actual arrival.
+            Self::link_following_connections(&mut legs);
 
             if let Some(&(_, stop_arrival)) = sources.iter().find(|&&(s, _)| s == origin_stop) {
                 let first_walk = stop_arrival.saturating_sub(start_time);
@@ -647,6 +653,10 @@ impl Graph {
                 preceding_arrival: if preceding_rt.is_none() { None } else { preceding_arr },
                 preceding_route_type: preceding_rt,
                 route_type: self.route_type_of_trip(trip_ids[t]),
+                // Populated by `link_following_connections` once the legs are in
+                // forward order (the next transit leg isn't known yet here).
+                following_route_type: None,
+                following_margin_secs: None,
                 bikes_allowed: self.get_trip(trip_ids[t]).and_then(|t| t.bikes_allowed),
             }));
 
@@ -658,6 +668,42 @@ impl Graph {
         legs.reverse();
 
         (legs, stop)
+    }
+
+    /// Fills `following_route_type` / `following_margin_secs` on each transit leg
+    /// from the next transit leg in the (forward-ordered) chain. The margin is the
+    /// scheduled outbound slack: next boarding − this leg's scheduled arrival −
+    /// intervening transfer walk. Last transit leg keeps `None` (no connection to
+    /// make). Operates on the transit/transfer chain only — access/egress walks are
+    /// attached later and never follow a transit leg here.
+    fn link_following_connections(legs: &mut [PlanLeg]) {
+        // (index, scheduled_start, route_type) of each transit leg, in order.
+        let transit: Vec<(usize, u32, Option<gtfs_structures::RouteType>)> = legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| match l {
+                PlanLeg::Transit(t) => Some((i, t.scheduled_start, t.route_type)),
+                _ => None,
+            })
+            .collect();
+
+        for w in transit.windows(2) {
+            let (i, _, _) = w[0];
+            let (j, next_start, next_rt) = w[1];
+            // Sum any transfer-walk durations sitting between the two transit legs.
+            let walk: u32 = legs[i + 1..j]
+                .iter()
+                .map(|l| match l {
+                    PlanLeg::Walk(wk) => wk.duration,
+                    _ => 0,
+                })
+                .sum();
+            if let PlanLeg::Transit(t) = &mut legs[i] {
+                t.following_route_type = next_rt;
+                t.following_margin_secs =
+                    Some(next_start as i32 - t.scheduled_end as i32 - walk as i32);
+            }
+        }
     }
 
     /// Realtime post-pass: rewrite each transit leg's times from scheduled to
@@ -753,6 +799,47 @@ impl Graph {
     }
 
     /// Pass 3 of three-pass RAPTOR: tighten transit legs using backward labels.
+    fn reliability_capped_alighting(
+        &self,
+        feeder_rt: Option<gtfs_structures::RouteType>,
+        board_rt: Option<gtfs_structures::RouteType>,
+        walk_to_next: u32,
+        next_start: u32,
+        max_alighting: u32,
+    ) -> u32 {
+        if feeder_rt
+            .and_then(|rt| self.raptor.transit_delay_models.get(&rt))
+            .is_none()
+        {
+            return max_alighting;
+        }
+        let reliable = |alight: u32| {
+            self.transfer_on_time_prob(
+                feeder_rt,
+                board_rt,
+                alight.saturating_add(walk_to_next),
+                next_start,
+            ) >= Self::TIGHTEN_MIN_RELIABILITY
+        };
+        if reliable(max_alighting) {
+            return max_alighting;
+        }
+        if !reliable(0) {
+            return 0;
+        }
+        let mut lo = 0u32;
+        let mut hi = max_alighting;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if reliable(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     pub(super) fn tighten_with_backward_labels(
         &self,
         legs: &mut Vec<PlanLeg>,
@@ -800,6 +887,23 @@ impl Graph {
                     .sum()
             } else {
                 0
+            };
+
+            let max_alighting = if i < k - 1 && max_alighting > 0 {
+                let next_ti = transit_indices[i + 1];
+                let (next_start, next_rt) = match &legs[next_ti] {
+                    PlanLeg::Transit(t) => (t.start, t.route_type),
+                    _ => unreachable!(),
+                };
+                let feeder_rt = match &legs[ti] {
+                    PlanLeg::Transit(t) => t.route_type,
+                    _ => unreachable!(),
+                };
+                self.reliability_capped_alighting(
+                    feeder_rt, next_rt, walk_to_next, next_start, max_alighting,
+                )
+            } else {
+                max_alighting
             };
 
             if max_alighting > 0 {
