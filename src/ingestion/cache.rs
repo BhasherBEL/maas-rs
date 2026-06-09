@@ -136,6 +136,22 @@ pub fn save_last_checked(cache_dir: &str, when: DateTime<Local>) -> Result<(), S
     fs::write(&path, when.to_rfc3339()).map_err(|e| format!("write last_checked: {e}"))
 }
 
+/// Sorted list of GTFS input labels that were active when the graph was last built.
+/// Missing file → empty vec (triggers rebuild on first run or after cache wipe).
+pub fn load_input_labels(cache_dir: &str) -> Vec<String> {
+    let path = format!("{cache_dir}/input_labels");
+    fs::read_to_string(&path)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_input_labels(cache_dir: &str, labels: &[String]) -> Result<(), String> {
+    fs::create_dir_all(cache_dir)
+        .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
+    let path = format!("{cache_dir}/input_labels");
+    fs::write(&path, labels.join("\n")).map_err(|e| format!("write input_labels: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

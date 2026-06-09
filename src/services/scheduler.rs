@@ -13,9 +13,9 @@ use cron::Schedule;
 
 use crate::ingestion::cache::{
     SourceLocation, gtfs_content_hash, load_feed_hashes, load_last_checked, resolve_source,
-    save_feed_hashes, save_last_checked,
+    save_feed_hashes, save_input_labels, save_last_checked,
 };
-use crate::services::build::{apply_routing_defaults, build_gtfs_phase};
+use crate::services::build::{apply_routing_defaults, build_gtfs_phase, gtfs_input_labels};
 use crate::services::persistence::{load_osm_graph, save_graph_with_rollback};
 use crate::structures::{Config, Graph, Ingestor};
 
@@ -124,6 +124,10 @@ fn run_update_cycle(graph: &SharedGraph, config: &Config, cache_dir: &str) -> Re
 
     save_graph_with_rollback(&new_graph, &config.build.output)?;
     save_feed_hashes(cache_dir, &new_hashes)?;
+    let labels = gtfs_input_labels(&config.build);
+    if let Err(e) = save_input_labels(cache_dir, &labels) {
+        tracing::warn!("auto_update: failed to persist input_labels: {e}");
+    }
     graph.store(Arc::new(new_graph));
     Ok(true)
 }
