@@ -64,22 +64,6 @@ impl Graph {
         }
     }
 
-    /// Returns `true` if any transit leg in the plan moves the user farther from the
-    /// destination than where that leg started (backward detour).
-    /// A 150 m slack is allowed to tolerate minor alignment bends.
-    pub(super) fn has_backward_transit_leg(&self, plan: &Plan, destination: NodeID) -> bool {
-        const BACKWARD_SLACK_M: usize = 150;
-        plan.legs.iter().any(|leg| {
-            if let PlanLeg::Transit(t) = leg {
-                let from_dist = self.nodes_distance(t.from.node_id, destination);
-                let to_dist = self.nodes_distance(t.to.node_id, destination);
-                to_dist > from_dist.saturating_add(BACKWARD_SLACK_M)
-            } else {
-                false
-            }
-        })
-    }
-
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
     const EXTREME_RISK_WAIT_SECS: u32 = 7200;
     const TIGHTEN_MIN_RELIABILITY: f32 = 0.80;
@@ -345,7 +329,6 @@ impl Graph {
 
         if candidates.iter().any(|p| !Self::is_extreme_risk(p)) {
             let mut new_candidates = Vec::new();
-            let mut new_sink_indices = Vec::new();
             for (plan, si) in candidates.into_iter().zip(sink_indices.into_iter()) {
                 if Self::is_extreme_risk(&plan) {
                     if let Some(ref mut sink) = debug_sink {
@@ -353,24 +336,6 @@ impl Graph {
                     }
                 } else {
                     new_candidates.push(plan);
-                    new_sink_indices.push(si);
-                }
-            }
-            candidates = new_candidates;
-            sink_indices = new_sink_indices;
-        }
-
-        if candidates.iter().any(|p| !self.has_backward_transit_leg(p, destination)) {
-            let mut new_candidates = Vec::new();
-            let mut new_sink_indices = Vec::new();
-            for (plan, si) in candidates.into_iter().zip(sink_indices.into_iter()) {
-                if self.has_backward_transit_leg(&plan, destination) {
-                    if let Some(ref mut sink) = debug_sink {
-                        sink[si].status = CandidateStatus::BackwardDetour;
-                    }
-                } else {
-                    new_candidates.push(plan);
-                    new_sink_indices.push(si);
                 }
             }
             candidates = new_candidates;
@@ -1060,6 +1025,12 @@ impl Graph {
             result.push(plan);
         }
 
+        result.sort_by(|a, b| {
+            a.end
+                .cmp(&b.end)
+                .then(b.start.cmp(&a.start))
+                .then(rel_bucket(b).cmp(&rel_bucket(a)))
+        });
         result
     }
 
@@ -1151,6 +1122,12 @@ impl Graph {
             result_sink_idx.push(sink_idx);
         }
 
+        result.sort_by(|a, b| {
+            a.end
+                .cmp(&b.end)
+                .then(b.start.cmp(&a.start))
+                .then(rel_bucket(b).cmp(&rel_bucket(a)))
+        });
         result
     }
 }
