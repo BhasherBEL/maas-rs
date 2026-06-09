@@ -424,6 +424,12 @@ header a.head-btn { text-decoration: none; }
 .fopt-rel { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; }
 .fopt-delta { font-size: 10px; color: var(--ds-ink-4); }
 .fopt.planned .fopt-delta { color: var(--ds-accent); font-weight: 650; }
+.fopt-more {
+  flex: 1 0 100%; padding: 4px 8px; font-size: 11px; font-weight: 600;
+  color: var(--ds-ink-3); background: var(--ds-surface-2);
+  border: 1px dashed var(--ds-line); border-radius: var(--ds-radius-sm);
+}
+.fopt-more:hover { color: var(--ds-accent); border-color: var(--ds-accent); }
 .conn-foot { margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--ds-line); display: flex; flex-direction: column; gap: 5px; }
 .cf-item { font-size: 11px; line-height: 1.5; color: var(--ds-ink-3); }
 .cf-k { font-weight: 700; color: var(--ds-ink-2); }
@@ -456,12 +462,45 @@ header a.head-btn { text-decoration: none; }
 .stop .n:hover { color: var(--accent); text-decoration: underline; }
 .stop.terminus .n { font-weight: 600; }
 kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; color: var(--fg-2); }
+
+/* ── Mobile List|Map toggle (hidden on desktop) ──────────────── */
+#view-toggle { display: none; gap: 0; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
+#view-toggle button {
+  padding: 5px 12px; font-size: 12px; font-weight: 600;
+  background: transparent; border: none; color: var(--fg-2);
+}
+#view-toggle button.active { background: var(--accent-2); color: var(--accent); }
+
+@media (max-width: 760px) {
+  header { gap: 8px; padding: 8px 10px; }
+  header .logo { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #view-toggle { display: inline-flex; flex-shrink: 0; }
+  /* Keep the header compact: drop the secondary desktop links. */
+  header a.head-btn { display: none; }
+
+  .main { position: relative; }
+  #sidebar { width: 100%; overflow-y: auto; }
+  #map { position: absolute; inset: 0; z-index: 400; display: none; }
+  .main.show-map #sidebar { display: none; }
+  .main.show-map #map { display: block; }
+
+  /* The origin/destination selector scrolls away with the results instead of
+     pinning to the top and starving the list of vertical space. */
+  .panel-brand, .panel-hint { display: none; }
+  .panel-head { padding: 10px 12px; }
+  #plans-panel { overflow: visible; flex: 0 0 auto; }
+  .plans-list-head { position: static; }
+}
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">MaaS<span class="dot">·</span> Trip Planner</div>
+  <div id="view-toggle">
+    <button data-view="list" class="active">List</button>
+    <button data-view="map">Map</button>
+  </div>
   <button id="reverse-btn" class="head-btn" title="Swap origin and destination (R)">⇅ Reverse</button>
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
   <a href="/debug" class="head-btn" target="_blank">Debug ↗</a>
@@ -517,8 +556,8 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
         <label>Departure window
           <small>Range-RAPTOR — return all Pareto-optimal departures within N minutes</small>
         </label>
-        <input id="adv-window" type="range" min="0" max="120" step="5" value="0">
-        <span id="adv-window-val" class="val">0m</span>
+        <input id="adv-window" type="range" min="0" max="120" step="5" value="30">
+        <span id="adv-window-val" class="val">30m</span>
       </div>
       <div class="row">
         <label>Walk radius
@@ -578,8 +617,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 
 // ── GraphQL query ─────────────────────────────────────────────
 const PLAN_FRAGMENT = `
-  start end expectedEnd
-  arrivalDistribution { time probability }
+  start end
   legs {
     ... on PlanWalkLeg {
       __typename start end duration
@@ -606,22 +644,6 @@ const PLAN_FRAGMENT = `
           place { arrival departure node { name lat lon } }
         }
       }
-      previousDepartures(count: 3) {
-        start end duration
-        trip { headsign route { shortName mode color textColor } }
-        from { departure node { name lat lon } }
-        to   { arrival   node { name lat lon } }
-        steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
-        geometry { lat lon }
-      }
-      nextDepartures(count: 4) {
-        start end duration
-        trip { headsign route { shortName mode color textColor } }
-        from { departure node { name lat lon } }
-        to   { arrival   node { name lat lon } }
-        steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
-        geometry { lat lon }
-      }
     }
   }
 `;
@@ -637,18 +659,53 @@ const QUERY = `query Plan(
   ) { ${PLAN_FRAGMENT} }
 }`;
 
+// Lazily fetch earlier/later alternatives for ONE leg (planIndex/legIndex into
+// the same routing result) — avoids computing alternatives for every leg/plan.
+const ALT_QUERY = `query Alts(
+  $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
+  $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int,
+  $planIndex: Int!, $legIndex: Int!, $prevCount: Int!, $nextCount: Int!
+) {
+  legAlternatives(
+    fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
+    date: $date, time: $time,
+    windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs,
+    planIndex: $planIndex, legIndex: $legIndex,
+    prevCount: $prevCount, nextCount: $nextCount
+  ) {
+    previous { start end reliability }
+    next     { start end reliability }
+  }
+}`;
+
 // ── Map ───────────────────────────────────────────────────────
 const map = L.map('map').setView([50.85, 4.35], 12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap contributors', maxZoom: 19,
 }).addTo(map);
 
+// ── Mobile List|Map toggle ────────────────────────────────────
+const mainEl = document.querySelector('.main');
+function setMobileView(view) {
+  const showMap = view === 'map';
+  mainEl.classList.toggle('show-map', showMap);
+  document.querySelectorAll('#view-toggle button').forEach(b =>
+    b.classList.toggle('active', b.dataset.view === view));
+  // Leaflet sizes lazily; the map was hidden when initialised, so recompute.
+  if (showMap) setTimeout(() => map.invalidateSize(), 0);
+}
+document.querySelectorAll('#view-toggle button').forEach(b =>
+  b.addEventListener('click', () => setMobileView(b.dataset.view)));
+
 // ── State ─────────────────────────────────────────────────────
+const DEFAULT_ALT_COUNT = 1, DEPARTURE_STEP = 3;
 const state = {
   plans: [],
   selectedIdx: -1,
   selectedLegIdxMap: new Map(), // planIdx -> leg index within that plan
   legLayers: [],
+  queryVars: null,              // routing inputs of the current result (for lazy alternatives)
+  altCache: new Map(),          // `${planIdx}:${legIdx}` -> { prev:[], next:[], prevCount, nextCount, loading }
 };
 
 // ── Stop search inputs ────────────────────────────────────────
@@ -785,6 +842,7 @@ async function runQuery() {
   const time           = el('time').value || null;
   const windowMinutes  = parseInt(el('adv-window').value, 10) || null;
   const walkRadiusSecs = parseInt(el('adv-walk-radius').value, 10) || null;
+  const vars = { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs };
 
   const btn = el('go');
   btn.disabled = true;
@@ -793,8 +851,10 @@ async function runQuery() {
   el('plans-list').replaceChildren(mkEl('p', 'status-msg', 'Routing…'));
 
   try {
-    const data = await gql(QUERY, { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs });
+    const data = await gql(QUERY, vars);
     state.plans = data.raptor || [];
+    state.queryVars = vars;          // reused by lazy per-leg alternative fetches
+    state.altCache.clear();
     state.selectedLegIdxMap.clear();
     if (state.selectedIdx < 0 || state.selectedIdx >= state.plans.length) {
       state.selectedIdx = state.plans.length > 0 ? 0 : -1;
@@ -808,7 +868,32 @@ async function runQuery() {
     btn.replaceChildren(mkEl('span', null, 'Plan journey'), mkEl('kbd', null, '↵'));
   }
 }
-el('go').addEventListener('click', runQuery);
+el('go').addEventListener('click', () => runQuery());
+
+// Lazily load (and cache) earlier/later alternatives for one leg, then re-render.
+async function loadAlternatives(planIdx, legIdx, prevCount, nextCount) {
+  if (!state.queryVars) return;
+  const key = planIdx + ':' + legIdx;
+  const entry = state.altCache.get(key) || { prev: [], next: [], prevCount: 0, nextCount: 0, loading: false };
+  entry.loading = true;
+  state.altCache.set(key, entry);
+  try {
+    const data = await gql(ALT_QUERY, {
+      ...state.queryVars, planIndex: planIdx, legIndex: legIdx, prevCount, nextCount,
+    });
+    const a = data.legAlternatives || { previous: [], next: [] };
+    entry.prev = a.previous || [];
+    entry.next = a.next || [];
+    entry.prevCount = prevCount;
+    entry.nextCount = nextCount;
+  } catch (err) {
+    entry.error = err.message;
+  } finally {
+    entry.loading = false;
+    state.altCache.set(key, entry);
+    renderList();
+  }
+}
 
 // ── Plan helpers ──────────────────────────────────────────────
 function planTransferCount(plan) {
@@ -1110,9 +1195,8 @@ function renderLegList(plan) {
 }
 
 // ── Connection card (always renders for any transit leg) ──────
-function renderConnection(leg) {
-  const r        = leg.transferRisk;
-  const prevDeps = leg.previousDepartures || [];
+function renderConnection(leg, planIdx, legIdx) {
+  const r = leg.transferRisk;
 
   const route = leg.trip?.route;
   const { bg, fg } = routeColors(route);
@@ -1135,53 +1219,72 @@ function renderConnection(leg) {
   }
   conn.appendChild(head);
 
-  // Feeder block: earlier departures + planned
-  const block   = mkEl('div', 'conn-block');
-  const lbl     = mkEl('div', 'conn-lbl');
-  lbl.textContent = prevDeps.length > 0
-    ? 'Earlier departures of the same service'
-    : 'This is the planned departure';
+  // Lazily-loaded alternatives for this leg (fetched per-leg, not for the whole plan).
+  const key   = planIdx + ':' + legIdx;
+  const cache = state.altCache.get(key);
+  if (!cache && !(cache && cache.loading)) {
+    loadAlternatives(planIdx, legIdx, DEFAULT_ALT_COUNT, DEFAULT_ALT_COUNT);
+  }
+  const prevDeps = cache?.prev || [];
+  const nextDeps = cache?.next || [];
+
+  const block = mkEl('div', 'conn-block');
+  const lbl   = mkEl('div', 'conn-lbl');
+  lbl.textContent = cache && !cache.loading
+    ? 'Earlier & later departures — chance the journey still works if you swap to one'
+    : 'Loading alternative departures…';
   block.appendChild(lbl);
 
   // Not-implemented notice (hidden, revealed on click)
   const notImpl = mkEl('div');
   notImpl.style.cssText = 'display:none;font-size:11px;color:var(--ds-rel-low);margin:0 0 8px;padding:5px 9px;background:var(--ds-rel-low-soft);border-radius:6px;';
-  notImpl.textContent = 'Switching to an earlier departure is not yet implemented.';
+  notImpl.textContent = 'Switching departures is not yet implemented — the reliability shown is for changing this leg only.';
   block.appendChild(notImpl);
 
   const feeder = mkEl('div', 'feeder');
 
-  [...prevDeps].reverse().forEach(dep => {
-    const btn = mkEl('button', 'fopt');
+  // A single departure option: time + swap-reliability donut + delta vs planned.
+  const mkOption = (dep, { planned = false } = {}) => {
+    const btn = mkEl('button', 'fopt' + (planned ? ' planned' : ''));
     btn.appendChild(mkEl('span', 'fopt-time', fmtTime(dep.start)));
-    // Reliability for alternative departures is not available from the backend
-    const relRow = mkEl('span', 'fopt-rel');
-    relRow.appendChild(mkEl('span', null, '?? reliability'));
-    relRow.style.cssText = 'font-size:10.5px;color:var(--ds-ink-4);font-style:italic;';
-    btn.appendChild(relRow);
-    const deltaMins = Math.round((leg.start - dep.start) / 60);
-    btn.appendChild(mkEl('span', 'fopt-delta', '−' + deltaMins + ' min earlier'));
+    const rel = planned ? r?.reliability : dep.reliability;
+    if (rel != null) {
+      const fr = mkEl('span', 'fopt-rel');
+      const rs = mkEl('span'); rs.dataset.rel = relClass(rel);
+      rs.appendChild(mkDonut(rel));
+      rs.appendChild(document.createTextNode(relPct(rel)));
+      fr.appendChild(rs);
+      btn.appendChild(fr);
+    }
+    const deltaMins = Math.round((dep.start - leg.start) / 60);
+    btn.appendChild(mkEl('span', 'fopt-delta',
+      planned ? 'planned'
+              : (deltaMins <= 0 ? '−' + Math.abs(deltaMins) + ' min earlier'
+                                : '+' + deltaMins + ' min later')));
     btn.addEventListener('click', e => {
       e.stopPropagation();
-      notImpl.style.display = 'block';
+      if (!planned) notImpl.style.display = 'block';
     });
-    feeder.appendChild(btn);
-  });
+    return btn;
+  };
 
-  // Planned departure (current one)
-  const planned = mkEl('button', 'fopt planned');
-  planned.appendChild(mkEl('span', 'fopt-time', fmtTime(leg.start)));
-  if (r) {
-    const pFr = mkEl('span', 'fopt-rel');
-    const pRs = mkEl('span'); pRs.dataset.rel = relClass(r.reliability);
-    pRs.appendChild(mkDonut(r.reliability));
-    pRs.appendChild(document.createTextNode(relPct(r.reliability)));
-    pFr.appendChild(pRs);
-    planned.appendChild(pFr);
-  }
-  planned.appendChild(mkEl('span', 'fopt-delta', 'planned'));
-  planned.addEventListener('click', e => e.stopPropagation());
-  feeder.appendChild(planned);
+  const mkLoadMore = (label, onClick) => {
+    const b = mkEl('button', 'fopt-more');
+    b.textContent = label;
+    b.disabled = !!cache?.loading;
+    b.addEventListener('click', e => { e.stopPropagation(); onClick(); });
+    return b;
+  };
+
+  // Load earlier (top) → earlier departures (closest last) → planned →
+  // later departures → load later (bottom).
+  feeder.appendChild(mkLoadMore('↑ earlier', () =>
+    loadAlternatives(planIdx, legIdx, (cache?.prevCount || DEFAULT_ALT_COUNT) + DEPARTURE_STEP, cache?.nextCount || DEFAULT_ALT_COUNT)));
+  [...prevDeps].reverse().forEach(dep => feeder.appendChild(mkOption(dep)));
+  feeder.appendChild(mkOption({ start: leg.start }, { planned: true }));
+  nextDeps.forEach(dep => feeder.appendChild(mkOption(dep)));
+  feeder.appendChild(mkLoadMore('↓ later', () =>
+    loadAlternatives(planIdx, legIdx, cache?.prevCount || DEFAULT_ALT_COUNT, (cache?.nextCount || DEFAULT_ALT_COUNT) + DEPARTURE_STEP)));
 
   block.appendChild(feeder);
   conn.appendChild(block);
@@ -1267,14 +1370,6 @@ function renderTripCard(plan, idx, isOpen) {
   foot.appendChild(document.createTextNode(xfer + ' transfer' + (xfer !== 1 ? 's' : '')));
   foot.appendChild(mkEl('span', 'sep', '·'));
   foot.appendChild(document.createTextNode(Math.round(planWalkSeconds(plan) / 60) + '′ walk'));
-  if (plan.expectedEnd && plan.expectedEnd !== plan.end) {
-    const tax = Math.round((plan.expectedEnd - plan.end) / 60);
-    foot.appendChild(mkEl('span', 'sep', '·'));
-    const w = mkEl('span', 'warn-txt');
-    w.title = 'Probability-weighted arrival is ' + tax + ' min later';
-    w.textContent = '+' + tax + '′ expected';
-    foot.appendChild(w);
-  }
   foot.appendChild(mkEl('span', 'expand', isOpen ? 'Hide detail ▴' : 'Tap a transit leg ▾'));
   card.appendChild(foot);
 
@@ -1300,7 +1395,7 @@ function renderTripCard(plan, idx, isOpen) {
 
     // Connection card for the selected transit leg
     if (openLeg) {
-      const connEl = renderConnection(openLeg);
+      const connEl = renderConnection(openLeg, idx, openLegIdx);
       if (connEl) detail.appendChild(connEl);
     }
 

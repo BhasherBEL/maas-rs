@@ -14,7 +14,7 @@ use crate::{
     services::scheduler::{self, SharedGraph},
     structures::{
         Config, RealtimeIndex,
-        plan::{CandidateStatus, Plan, PlanCoordinate},
+        plan::{CandidateStatus, Plan, PlanCoordinate, PlanLeg},
     },
 };
 
@@ -215,6 +215,25 @@ fn parse_date_time(
     Ok((parsed_date, parsed_time))
 }
 
+/// One earlier/later departure alternative for a single transit leg.
+#[derive(SimpleObject)]
+struct AltDeparture {
+    /// Boarding time of the alternative (seconds since midnight).
+    start: i32,
+    /// Alighting time of the alternative (seconds since midnight).
+    end: i32,
+    /// Outbound swap reliability: chance the rest of the journey still works if you
+    /// take this departure instead, everything else fixed. `null` when unscored.
+    reliability: Option<f64>,
+}
+
+/// Earlier and later alternatives for one transit leg, computed on demand.
+#[derive(SimpleObject)]
+struct LegAlternatives {
+    previous: Vec<AltDeparture>,
+    next: Vec<AltDeparture>,
+}
+
 pub struct QueryRoot;
 
 #[async_graphql::Object]
@@ -328,6 +347,77 @@ impl QueryRoot {
             }).collect(),
             origin: result.origin,
             destination: result.destination,
+        })
+    }
+
+    /// Lazily compute earlier/later departure alternatives for **one** transit leg
+    /// of one plan, instead of pre-computing them for every leg of every plan.
+    /// `plan_index` / `leg_index` address the leg within the deterministic result
+    /// of the same routing inputs the UI already issued. Returns only the data the
+    /// alternatives UI needs (boarding time, arrival, swap reliability).
+    #[allow(clippy::too_many_arguments)]
+    async fn leg_alternatives(
+        &self,
+        ctx: &Context<'_>,
+        from_lat: f64,
+        from_lng: f64,
+        to_lat: f64,
+        to_lng: f64,
+        date: Option<String>,
+        time: Option<String>,
+        window_minutes: Option<i32>,
+        walk_radius_secs: Option<i32>,
+        arrival_slack_secs: Option<i32>,
+        reliability_bucket_edges: Option<Vec<f64>>,
+        plan_index: i32,
+        leg_index: i32,
+        #[graphql(default = 0)] prev_count: i32,
+        #[graphql(default = 0)] next_count: i32,
+    ) -> Result<LegAlternatives, Error> {
+        let graph = ctx.data::<SharedGraph>()?.load_full();
+        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+
+        let query = routing_raptor::RouteQuery {
+            from_lat,
+            from_lng,
+            to_lat,
+            to_lng,
+            date: parsed_date,
+            time: parsed_time,
+            window_minutes: window_minutes.map(|w| w.max(0) as u32),
+            min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
+            arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            reliability_bucket_edges: reliability_bucket_edges
+                .map(|v| v.into_iter().map(|x| x as f32).collect()),
+        };
+
+        let rt = ctx.data::<SharedRealtime>()?.load_full();
+        let plans = routing_raptor::route(graph.as_ref(), &query, rt.as_ref())?;
+
+        let plan = plans
+            .get(plan_index.max(0) as usize)
+            .ok_or_else(|| Error::new("plan_index out of range"))?;
+        let leg = match plan.legs.get(leg_index.max(0) as usize) {
+            Some(PlanLeg::Transit(t)) => t,
+            _ => return Err(Error::new("leg_index is not a transit leg")),
+        };
+
+        let previous = leg.previous_departures_on(graph.as_ref(), prev_count.max(0) as usize)?;
+        let next = leg.next_departures_on(graph.as_ref(), next_count.max(0) as usize)?;
+
+        let to_alt = |legs: Vec<crate::structures::plan::PlanTransitLeg>| {
+            legs.into_iter()
+                .map(|l| AltDeparture {
+                    start: l.start as i32,
+                    end: l.end as i32,
+                    reliability: l.transfer_risk.map(|r| r.reliability as f64),
+                })
+                .collect()
+        };
+
+        Ok(LegAlternatives {
+            previous: to_alt(previous),
+            next: to_alt(next),
         })
     }
 

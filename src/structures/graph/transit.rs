@@ -395,6 +395,36 @@ impl Graph {
         self.raptor.transit_delay_models.get(&route_type)
     }
 
+    /// Probability that an alternative for one transit leg still makes the *next*
+    /// (unchanged) transit leg of the journey — the "outbound" half of an
+    /// alternative's marginal swap reliability.
+    ///
+    /// `following_margin_secs` is the original plan's outbound slack (next
+    /// boarding − this leg's scheduled arrival at the boarding stop). `arrival_shift`
+    /// is `original_scheduled_end − alternative_end`: positive when the alternative
+    /// arrives earlier (more slack), negative when it arrives later (less slack).
+    /// The feeder is this alternative's own vehicle (`leg_route_type`); the boarding
+    /// vehicle is the next leg's (`following_route_type`).
+    ///
+    /// Returns `1.0` when there is no following transit leg (last leg of the
+    /// journey) or no delay model for the alternative's own route type.
+    pub(crate) fn outbound_reliability(
+        &self,
+        leg_route_type: Option<RouteType>,
+        following_route_type: Option<RouteType>,
+        following_margin_secs: Option<i32>,
+        arrival_shift: i32,
+    ) -> f32 {
+        let (Some(_), Some(base_margin)) = (following_route_type, following_margin_secs) else {
+            return 1.0;
+        };
+        let board = following_route_type.and_then(|rt| self.get_delay_model(rt));
+        match leg_route_type.and_then(|rt| self.get_delay_model(rt)) {
+            Some(feeder) => feeder.prob_on_time_vs(board, base_margin + arrival_shift),
+            None => 1.0,
+        }
+    }
+
     pub fn route_type_of_trip(&self, trip_id: TripId) -> Option<RouteType> {
         let route_id = self.get_trip(trip_id)?.route_id;
         self.get_route(route_id).map(|r| r.route_type)
@@ -538,5 +568,68 @@ impl Graph {
             self.raptor.transit_pattern_shapes[p] = pts;
             self.raptor.transit_pattern_shape_stop_idx[p] = stop_idx;
         }
+    }
+}
+
+#[cfg(test)]
+mod outbound_reliability_tests {
+    use super::*;
+
+    /// A bus-mode CDF: ~62% on time (delay ≤ 0), rising with slack.
+    fn bus_cdf() -> DelayCDF {
+        DelayCDF { bins: vec![(-120, 0.10), (0, 0.62), (120, 0.80), (300, 0.95), (600, 1.00)] }
+    }
+
+    fn graph_with_bus_model() -> Graph {
+        let mut g = Graph::new();
+        let mut models = HashMap::new();
+        models.insert(RouteType::Bus, bus_cdf());
+        g.set_transit_delay_models(models);
+        g
+    }
+
+    #[test]
+    fn last_leg_has_no_following_so_reliability_is_one() {
+        let g = graph_with_bus_model();
+        // No following route type / margin ⇒ outbound term is identity.
+        assert_eq!(
+            g.outbound_reliability(Some(RouteType::Bus), None, None, 0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn missed_downstream_connection_collapses_to_near_zero() {
+        let g = graph_with_bus_model();
+        // Original slack 60s, but the alternative arrives 600s later than planned
+        // ⇒ effective margin −540s ⇒ essentially impossible to make the next leg.
+        let rel = g.outbound_reliability(
+            Some(RouteType::Bus),
+            Some(RouteType::Bus),
+            Some(60),
+            -600,
+        );
+        assert!(rel < 0.05, "expected near-zero, got {rel}");
+    }
+
+    #[test]
+    fn earlier_arrival_loosens_the_connection() {
+        let g = graph_with_bus_model();
+        // Arriving 300s earlier than planned adds slack ⇒ more reliable than the
+        // same connection at the original margin.
+        let base = g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 0);
+        let earlier =
+            g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 300);
+        assert!(earlier > base, "earlier ({earlier}) should beat base ({base})");
+    }
+
+    #[test]
+    fn unknown_leg_route_type_is_treated_as_certain() {
+        let g = graph_with_bus_model();
+        // No delay model for the alternative's own vehicle ⇒ outbound term = 1.0.
+        assert_eq!(
+            g.outbound_reliability(Some(RouteType::Ferry), Some(RouteType::Bus), Some(60), -600),
+            1.0
+        );
     }
 }
