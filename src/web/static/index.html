@@ -856,11 +856,11 @@ async function runQuery() {
     state.queryVars = vars;          // reused by lazy per-leg alternative fetches
     state.altCache.clear();
     state.selectedLegIdxMap.clear();
-    if (state.selectedIdx < 0 || state.selectedIdx >= state.plans.length) {
-      state.selectedIdx = state.plans.length > 0 ? 0 : -1;
+    if (state.selectedIdx >= state.plans.length) {
+      state.selectedIdx = -1;
     }
     renderList();
-    if (state.selectedIdx >= 0) renderPlanOnMap(state.selectedIdx);
+    renderAllPlansOnMap();
   } catch (err) {
     el('plans-list').replaceChildren(mkEl('p', 'status-msg error', 'Error: ' + err.message));
   } finally {
@@ -1310,6 +1310,7 @@ function renderConnection(leg, planIdx, legIdx) {
 // ── Trip card ─────────────────────────────────────────────────
 function renderTripCard(plan, idx, isOpen) {
   const card = mkEl('div', 'card' + (isOpen ? ' open' : ''));
+  card.id = 'plan-card-' + idx;
 
   const top   = mkEl('div', 'card-top');
   const times = mkEl('div', 'card-times');
@@ -1336,12 +1337,8 @@ function renderTripCard(plan, idx, isOpen) {
   card.appendChild(tagEl);
 
   // Resolve which transit leg is currently selected for the detail panel
+  // -1 means no leg is open (user hasn't clicked one yet)
   let openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
-  if (openLegIdx < 0) {
-    // Default: first transit leg (preferring one with transferRisk)
-    openLegIdx = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg' && l.transferRisk);
-    if (openLegIdx < 0) openLegIdx = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg');
-  }
   const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
 
   const onLeg = (e, clickedLeg) => {
@@ -1356,11 +1353,15 @@ function renderTripCard(plan, idx, isOpen) {
       openCard(idx);
       return;
     }
-    // Card already open — switch which leg's detail is shown
-    if (clickedIdx >= 0 && clickedIdx !== openLegIdx) {
+    // Card already open — toggle or switch leg detail
+    if (clickedIdx >= 0 && clickedIdx === openLegIdx) {
+      // Same leg clicked again — close the detail panel
+      state.selectedLegIdxMap.set(idx, -1);
+    } else if (clickedIdx >= 0) {
+      // Different leg — switch to it
       state.selectedLegIdxMap.set(idx, clickedIdx);
-      renderList();
     }
+    renderList();
   };
 
   card.appendChild(renderRibbon(plan, openLeg, onLeg));
@@ -1370,7 +1371,7 @@ function renderTripCard(plan, idx, isOpen) {
   foot.appendChild(document.createTextNode(xfer + ' transfer' + (xfer !== 1 ? 's' : '')));
   foot.appendChild(mkEl('span', 'sep', '·'));
   foot.appendChild(document.createTextNode(Math.round(planWalkSeconds(plan) / 60) + '′ walk'));
-  foot.appendChild(mkEl('span', 'expand', isOpen ? 'Hide detail ▴' : 'Tap a transit leg ▾'));
+  foot.appendChild(mkEl('span', 'expand', isOpen ? (openLeg ? 'Hide detail ▴' : 'Tap a transit leg ▾') : 'Tap a transit leg ▾'));
   card.appendChild(foot);
 
   if (isOpen) {
@@ -1433,12 +1434,14 @@ function openCard(idx) {
   state.selectedIdx = idx;
   renderList();
   renderPlanOnMap(idx);
+  document.getElementById('plan-card-' + idx)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   doSyncUrl();
 }
 
 function closeCard() {
   state.selectedIdx = -1;
   renderList();
+  renderAllPlansOnMap();
   doSyncUrl();
 }
 
@@ -1485,32 +1488,72 @@ function clearLegLayers() {
   state.legLayers.forEach(l => map.removeLayer(l));
   state.legLayers = [];
 }
-function renderPlanOnMap(idx) {
+
+function geomKey(geom) {
+  // Compact key for deduplication — first+last+length is fast and sufficient.
+  const f = geom[0], l = geom[geom.length - 1];
+  return `${f.lat},${f.lon}|${l.lat},${l.lon}|${geom.length}`;
+}
+
+function renderAllPlansOnMap() {
   clearLegLayers();
-  const plan = state.plans[idx];
-  if (!plan) return;
+  if (!state.plans.length) return;
+
+  const selIdx = state.selectedIdx;
   const allPts = [];
-  plan.legs.forEach(leg => {
-    const geom = leg.geometry;
-    if (!geom?.length) return;
-    const pts = geom.map(p => [p.lat, p.lon]);
-    allPts.push(...pts);
-    const isTransit = leg.__typename === 'PlanTransitLeg';
-    const color = isTransit ? routeColors(leg.trip?.route).bg : '#78909c';
-    state.legLayers.push(L.polyline(pts, {
-      color, weight: isTransit ? 5 : 3, opacity: 0.9,
-      dashArray: isTransit ? null : '5,6',
-    }).addTo(map));
-    if (isTransit && leg.from?.node && leg.to?.node) {
-      state.legLayers.push(
-        L.marker([leg.from.node.lat, leg.from.node.lon], { icon: makeStopDot(color) })
-          .addTo(map).bindTooltip(leg.from.node.name),
-        L.marker([leg.to.node.lat, leg.to.node.lon], { icon: makeStopDot(color) })
-          .addTo(map).bindTooltip(leg.to.node.name),
-      );
-    }
+  const drawnGray = new Map(); // key -> plan idx (first/best match)
+
+  // Gray pass — all non-selected plans (deduplicated by geometry key)
+  state.plans.forEach((plan, idx) => {
+    if (idx === selIdx) return;
+    plan.legs.forEach(leg => {
+      const geom = leg.geometry;
+      if (!geom?.length) return;
+      const key = geomKey(geom);
+      if (drawnGray.has(key)) return;
+      drawnGray.set(key, idx);
+      const pts = geom.map(p => [p.lat, p.lon]);
+      if (selIdx < 0) allPts.push(...pts);
+      const isTransit = leg.__typename === 'PlanTransitLeg';
+      const poly = L.polyline(pts, {
+        color: '#607080', weight: isTransit ? 5 : 3, opacity: 0.45,
+        dashArray: isTransit ? null : '5,6',
+      }).addTo(map);
+      poly.on('click', () => openCard(idx));
+      state.legLayers.push(poly);
+    });
   });
+
+  // Colored pass — selected plan on top
+  if (selIdx >= 0) {
+    const plan = state.plans[selIdx];
+    plan.legs.forEach(leg => {
+      const geom = leg.geometry;
+      if (!geom?.length) return;
+      const pts = geom.map(p => [p.lat, p.lon]);
+      allPts.push(...pts);
+      const isTransit = leg.__typename === 'PlanTransitLeg';
+      const color = isTransit ? routeColors(leg.trip?.route).bg : '#78909c';
+      state.legLayers.push(L.polyline(pts, {
+        color, weight: isTransit ? 5 : 3, opacity: 0.9,
+        dashArray: isTransit ? null : '5,6',
+      }).addTo(map));
+      if (isTransit && leg.from?.node && leg.to?.node) {
+        state.legLayers.push(
+          L.marker([leg.from.node.lat, leg.from.node.lon], { icon: makeStopDot(color) })
+            .addTo(map).bindTooltip(leg.from.node.name),
+          L.marker([leg.to.node.lat, leg.to.node.lon], { icon: makeStopDot(color) })
+            .addTo(map).bindTooltip(leg.to.node.name),
+        );
+      }
+    });
+  }
+
   if (allPts.length) map.fitBounds(L.latLngBounds(allPts), { padding: [50, 50] });
+}
+
+function renderPlanOnMap(_idx) {
+  renderAllPlansOnMap();
 }
 
 // ── Keyboard ──────────────────────────────────────────────────
