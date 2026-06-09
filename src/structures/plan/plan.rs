@@ -38,8 +38,6 @@ pub enum CandidateStatus {
     ReconstructionEmpty,
     /// Dropped by the extreme-risk filter (only when at least one safe plan exists).
     ExtremeRisk,
-    /// Dropped by the backward-detour filter (leg moves away from destination).
-    BackwardDetour,
     /// Dominated in (departure↑, arrival↓, transfers↓, reliability↓) by another plan.
     /// `dominator_index` is the position of the dominator in `ExplainResult::candidates`.
     /// The flags record *which* dimensions the dominator wins on.

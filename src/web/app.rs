@@ -65,8 +65,6 @@ enum CandidateStatusGql {
     ReconstructionEmpty,
     /// Dropped by the extreme-risk filter.
     ExtremeRisk,
-    /// Dropped because a transit leg moves away from the destination.
-    BackwardDetour,
     /// Dominated in (departure↑, arrival↓, transfers↓) by another plan.
     ParetoDominated,
 }
@@ -161,9 +159,6 @@ fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql 
         }
         CandidateStatus::ExtremeRisk => {
             (CandidateStatusGql::ExtremeRisk, None, None, None, None, None)
-        }
-        CandidateStatus::BackwardDetour => {
-            (CandidateStatusGql::BackwardDetour, None, None, None, None, None)
         }
         CandidateStatus::ParetoDominated {
             dominator_index,
