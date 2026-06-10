@@ -6,7 +6,7 @@ use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
         NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
-        plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, StopPathLeg, StopReach},
+        plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, PlanLeg, PlanLegStep, StopPathLeg, StopReach},
         raptor::Trace,
     },
 };
@@ -35,6 +35,8 @@ pub(super) struct Riding {
     reliability: f32,
     /// Reliability bucket of the prev label this was boarded from (for reconstruction).
     from_bucket: u8,
+    /// Arena index of the prev label this trip was boarded from (the alight label's parent).
+    from_arena: u32,
 }
 
 /// One RAPTOR label: an arrival-time distribution plus the cumulative reliability
@@ -45,6 +47,19 @@ pub(super) struct Label {
     pub route_type: Option<RouteType>,
     pub reliability: f32,
     pub trace: Trace,
+    /// Index of the departure (in the range driver's latest-first ordering) whose
+    /// pass created this label. 0 for single-pass queries. NOT a Pareto axis — it
+    /// lets per-departure extraction select this-departure target labels.
+    pub created_by: u32,
+    /// Compact stop id this label resides at (needed to recover a footpath leg's
+    /// destination during reconstruction, which the trace alone does not record).
+    pub at_stop: u32,
+    /// Arena index of the predecessor label (`u32::MAX` = source/root). Reconstruction
+    /// follows these exact pointers instead of re-looking-up grid cells by bucket,
+    /// which would drift to a different (overwritten) label and mis-score the plan.
+    pub parent: u32,
+    /// Own index in the per-pass label arena (`u32::MAX` until pushed).
+    pub arena_id: u32,
 }
 
 impl Label {
@@ -53,7 +68,20 @@ impl Label {
         route_type: None,
         reliability: 0.0,
         trace: Trace::NONE,
+        created_by: 0,
+        at_stop: u32::MAX,
+        parent: u32::MAX,
+        arena_id: u32::MAX,
     };
+
+    /// Pushes `lab` into the per-pass arena, stamping its `arena_id`, and returns the
+    /// updated copy to store in the grid so children can reference it as a parent.
+    #[inline]
+    pub fn arena_push(arena: &mut Vec<Label>, mut lab: Label) -> Label {
+        lab.arena_id = arena.len() as u32;
+        arena.push(lab);
+        lab
+    }
 }
 
 /// Bounded Pareto set of labels per `(round, stop)`, traded off on
@@ -88,11 +116,6 @@ impl LabelSet {
         self.iter().map(|l| l.bag.earliest()).min().unwrap_or(u32::MAX)
     }
 
-    /// The label whose reliability falls in bucket `b`, if any.
-    pub fn get_by_bucket(&self, buckets: &ReliabilityBuckets, b: u8) -> Option<&Label> {
-        self.iter().find(|l| buckets.bucket(l.reliability) == b)
-    }
-
     /// The label with the earliest scheduled arrival (fastest), if any.
     pub fn min_arrival_label(&self) -> Option<&Label> {
         self.iter().fold(None, |acc, l| match acc {
@@ -100,6 +123,16 @@ impl LabelSet {
             Some(b) if l.bag.earliest() < b.bag.earliest() => Some(l),
             Some(b) => Some(b),
         })
+    }
+
+    /// True if some member dominates `cand` over (scheduled arrival ↓, bucket ↑):
+    /// `>=` bucket AND `<=` earliest arrival. Used as a per-pass cross-round local
+    /// prune that does NOT mutate the set (unlike `insert`).
+    pub fn dominates(&self, cand: Label, buckets: &ReliabilityBuckets) -> bool {
+        let cb = buckets.bucket(cand.reliability);
+        let ce = cand.bag.earliest();
+        self.iter()
+            .any(|l| buckets.bucket(l.reliability) >= cb && l.bag.earliest() <= ce)
     }
 
     /// Pareto-inserts `cand`. Returns true if the set changed (i.e. `cand` was kept).
@@ -289,11 +322,15 @@ impl Graph {
     ) -> Vec<Plan> {
         self.raptor_inner_with_debug(
             sources, targets, start_time, access_secs, date, weekday, origin, destination,
-            buckets, slack, rt,
+            buckets, slack, rt, false,
         )
         .0
     }
 
+    /// Core RAPTOR over one departure. `want_debug` gates the *discardable* debug
+    /// instrumentation — the `stops_reached` survey and the per-candidate `PlanCandidate`
+    /// sink (which clones every plan). The production path (`raptor_inner`) passes `false`
+    /// so neither is computed; only `raptor_explain*` pays for them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn raptor_inner_with_debug(
         &self,
@@ -308,6 +345,7 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
         rt: &RealtimeIndex,
+        want_debug: bool,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let n_patterns = self.raptor.transit_patterns.len();
@@ -319,113 +357,49 @@ impl Graph {
         let mut is_marked = vec![false; n_stops];
         let mut queue = Vec::with_capacity(512);
         let mut queue_pos = vec![u32::MAX; n_patterns];
+        let mut arena: Vec<Label> = Vec::new();
 
-        for &(stop, time) in sources {
-            let lab = Label {
-                bag: ScenarioBag::single(time),
-                route_type: None,
-                reliability: 1.0,
-                trace: Trace::NONE,
-            };
-            labels[0][stop].insert(lab, buckets);
-            best[stop].insert(lab, buckets);
-            Self::mark(stop, &mut marked, &mut is_marked);
-        }
-
-        self.apply_transfers(
-            &mut labels[0],
-            &mut best,
-            buckets,
-            &mut marked,
-            &mut is_marked,
-            start_time + access_secs,
+        self.run_departure_into(
+            sources, targets, start_time, access_secs, date, weekday, buckets, slack, rt,
+            0, false,
+            &mut best, &mut labels, &mut marked, &mut is_marked, &mut queue, &mut queue_pos,
+            &mut arena,
         );
 
-        for k in 1..=MAX_ROUNDS {
-            {
-                let (prev, rest) = labels.split_at_mut(k);
-                rest[0].copy_from_slice(&prev[k - 1]);
-            }
-
-            self.collect_routes(&marked, &mut queue, &mut queue_pos);
-            marked.clear();
-            is_marked.fill(false);
-
-            if queue.is_empty() {
-                break;
-            }
-
-            let cutoff = Self::target_cutoff(&best, targets, slack);
-
-            {
-                let (prev, rest) = labels.split_at_mut(k);
-                let prev_slice = &prev[k - 1];
-                let curr_slice = &mut rest[0];
-
-                for &pat in &queue {
-                    self.scan_route(
-                        pat,
-                        queue_pos[pat],
-                        date,
-                        weekday,
-                        cutoff,
-                        prev_slice,
-                        curr_slice,
-                        &mut best,
-                        buckets,
-                        rt,
-                        &mut marked,
-                        &mut is_marked,
-                    );
-                }
-            }
-
-            for &p in &queue {
-                queue_pos[p] = u32::MAX;
-            }
-            queue.clear();
-
-            self.apply_transfers(
-                &mut labels[k],
-                &mut best,
-                buckets,
-                &mut marked,
-                &mut is_marked,
-                cutoff,
-            );
-
-            if marked.is_empty() {
-                break;
-            }
-        }
-
-        let stops_reached: Vec<StopReach> = (0..n_stops)
-            .filter_map(|stop_idx| {
-                for k in 0..=MAX_ROUNDS {
-                    if labels[k][stop_idx].is_reached() {
-                        let node_id = self.raptor.transit_stop_to_node[stop_idx];
-                        let loc = self.nodes[node_id.0].loc();
-                        let name = match &self.nodes[node_id.0] {
-                            NodeData::TransitStop(s) => s.name.clone(),
-                            _ => String::new(),
-                        };
-                        let path = self.path_to_stop(stop_idx, k, origin, &labels);
-                        return Some(StopReach {
-                            stop_idx: stop_idx as u32,
-                            round: k as u8,
-                            arrival_secs: labels[k][stop_idx].earliest(),
-                            lat: loc.latitude,
-                            lon: loc.longitude,
-                            name,
-                            path,
-                        });
+        // Discardable debug survey: only built for `raptor_explain*`.
+        let stops_reached: Vec<StopReach> = if want_debug {
+            (0..n_stops)
+                .filter_map(|stop_idx| {
+                    for k in 0..=MAX_ROUNDS {
+                        if labels[k][stop_idx].is_reached() {
+                            let node_id = self.raptor.transit_stop_to_node[stop_idx];
+                            let loc = self.nodes[node_id.0].loc();
+                            let name = match &self.nodes[node_id.0] {
+                                NodeData::TransitStop(s) => s.name.clone(),
+                                _ => String::new(),
+                            };
+                            let path = self.path_to_stop(stop_idx, k, origin, &labels);
+                            return Some(StopReach {
+                                stop_idx: stop_idx as u32,
+                                round: k as u8,
+                                arrival_secs: labels[k][stop_idx].earliest(),
+                                lat: loc.latitude,
+                                lon: loc.longitude,
+                                name,
+                                path,
+                            });
+                        }
                     }
-                }
-                None
-            })
-            .collect();
+                    None
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
+        // The candidate sink clones every kept plan; only `raptor_explain*` needs it.
         let mut candidates: Vec<PlanCandidate> = Vec::new();
+        let debug_sink = if want_debug { Some(&mut candidates) } else { None };
         let plans = self.extract_with_debug(
             sources,
             targets,
@@ -437,9 +411,161 @@ impl Graph {
             origin,
             destination,
             rt,
-            Some(&mut candidates),
+            debug_sink,
+            0,
+            &arena,
         );
         (plans, candidates, stops_reached)
+    }
+
+    /// Runs one RAPTOR departure (seed → rounds) into caller-owned grids.
+    ///
+    /// `best` is per-pass: it is **reset** here and gates only the per-pass
+    /// cross-round local prune + `target_cutoff`. `labels` is **carried** across
+    /// departures by the self-pruning range driver and is NOT reset — marking is
+    /// gated on per-round `labels[k]` improvement (the round-stratified, transfers-
+    /// preserving, cross-departure bound). `stamp` brands every label this pass
+    /// creates so reconstruction can follow this-departure traces. When `carried`,
+    /// the round-start carry-forward Pareto-**merges** `labels[k-1]` into the
+    /// already-populated `labels[k]`; single-pass uses the faster `copy_from_slice`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_departure_into(
+        &self,
+        sources: &[(usize, u32)],
+        targets: &[(usize, u32)],
+        start_time: u32,
+        access_secs: u32,
+        date: u32,
+        weekday: u8,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+        stamp: u32,
+        carried: bool,
+        best: &mut [LabelSet],
+        labels: &mut [Vec<LabelSet>],
+        marked: &mut Vec<usize>,
+        is_marked: &mut [bool],
+        queue: &mut Vec<usize>,
+        queue_pos: &mut [u32],
+        arena: &mut Vec<Label>,
+    ) {
+        let n_stops = best.len();
+
+        // `best` is the per-pass exploration bound — reset it; `labels` is carried.
+        for b in best.iter_mut() {
+            *b = LabelSet::EMPTY;
+        }
+        marked.clear();
+        is_marked.fill(false);
+        // The arena holds this pass's labels for exact parent-pointer reconstruction.
+        // Same-stamp build keeps a pass's chains within its own arena, so reset it per
+        // pass; carried foreign grid labels keep stale `arena_id`s that are never followed
+        // (extraction and boarding both filter to the current pass's stamp).
+        arena.clear();
+
+        for &(stop, time) in sources {
+            let lab = Label::arena_push(arena, Label {
+                bag: ScenarioBag::single(time),
+                route_type: None,
+                reliability: 1.0,
+                trace: Trace::NONE,
+                created_by: stamp,
+                at_stop: stop as u32,
+                parent: u32::MAX,
+                arena_id: u32::MAX,
+            });
+            labels[0][stop].insert(lab, buckets);
+            best[stop].insert(lab, buckets);
+            Self::mark(stop, marked, is_marked);
+        }
+
+        self.apply_transfers(
+            &mut labels[0],
+            best,
+            buckets,
+            marked,
+            is_marked,
+            start_time + access_secs,
+            stamp,
+            arena,
+        );
+
+        for k in 1..=MAX_ROUNDS {
+            {
+                let (prev, rest) = labels.split_at_mut(k);
+                let prev_k = &prev[k - 1];
+                let curr_k = &mut rest[0];
+                if carried {
+                    // Carried-aware carry-forward: keep this round's already-carried
+                    // labels and fold in the ≤(k-1)-trip frontier.
+                    for stop in 0..n_stops {
+                        if prev_k[stop].is_reached() {
+                            for lab in prev_k[stop].iter() {
+                                curr_k[stop].insert(*lab, buckets);
+                            }
+                        }
+                    }
+                } else {
+                    curr_k.copy_from_slice(prev_k);
+                }
+            }
+
+            self.collect_routes(marked, queue, queue_pos);
+            marked.clear();
+            is_marked.fill(false);
+
+            if queue.is_empty() {
+                break;
+            }
+
+            let cutoff = Self::target_cutoff(best, targets, slack);
+
+            {
+                let (prev, rest) = labels.split_at_mut(k);
+                let prev_slice = &prev[k - 1];
+                let curr_slice = &mut rest[0];
+
+                for &pat in queue.iter() {
+                    self.scan_route(
+                        pat,
+                        queue_pos[pat],
+                        date,
+                        weekday,
+                        cutoff,
+                        prev_slice,
+                        curr_slice,
+                        best,
+                        buckets,
+                        rt,
+                        marked,
+                        is_marked,
+                        stamp,
+                        arena,
+                    );
+                }
+            }
+
+            for &p in queue.iter() {
+                queue_pos[p] = u32::MAX;
+            }
+            queue.clear();
+
+            self.apply_transfers(
+                &mut labels[k],
+                best,
+                buckets,
+                marked,
+                is_marked,
+                cutoff,
+                stamp,
+                arena,
+            );
+
+            if marked.is_empty() {
+                break;
+            }
+        }
     }
 
     /// Follows RAPTOR traces backward from `stop_idx` at `round` and builds the
@@ -654,7 +780,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt,
+                    buckets, slack, rt, true,
                 );
                 if plans.is_empty() { None } else { Some((plans, cands, stops)) }
             },
@@ -725,7 +851,7 @@ impl Graph {
                     raw_stops.iter().map(|&(s, w)| (s, start_time + w)).collect();
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     &sources, targets, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt,
+                    buckets, slack, rt, true,
                 );
                 if probe.is_empty() {
                     return None;
@@ -750,7 +876,7 @@ impl Graph {
                         raw_stops.iter().map(|&(s, w)| (s, t + w)).collect();
                     let (plans_t, mut cands_t, _stops_t) = self.raptor_inner_with_debug(
                         &sources_t, targets, t, access_secs, date, weekday, origin, destination,
-                        buckets, slack, rt,
+                        buckets, slack, rt, true,
                     );
                     all_plans.extend(plans_t);
                     all_candidates.append(&mut cands_t);
@@ -810,6 +936,8 @@ impl Graph {
         rt: &RealtimeIndex,
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
+        stamp: u32,
+        arena: &mut Vec<Label>,
     ) {
         let pat_stops = self.raptor.transit_idx_pattern_stops[pattern].of(&self.raptor.transit_pattern_stops);
         let n_trips = self.raptor.transit_patterns[pattern].num_trips as usize;
@@ -861,9 +989,23 @@ impl Graph {
                         from_stop: u32::MAX,
                         from_bucket: r.from_bucket,
                     },
+                    created_by: stamp,
+                    at_stop: stop as u32,
+                    parent: r.from_arena,
+                    arena_id: u32::MAX,
                 };
-                if best[stop].insert(cand, buckets) {
-                    curr[stop].insert(cand, buckets);
+                // `best` is THIS pass's cross-round bound: it drives `target_cutoff`
+                // and the local prune, so it must always capture what this departure
+                // can reach (independent of the carried grid) — otherwise the cutoff
+                // degrades and the pass explores the whole network. Only *marking* is
+                // gated on the carried per-round set, which is what self-prunes earlier
+                // departures against later ones.
+                if best[stop].dominates(cand, buckets) {
+                    continue;
+                }
+                let cand = Label::arena_push(arena, cand);
+                best[stop].insert(cand, buckets);
+                if curr[stop].insert(cand, buckets) {
                     Self::mark(stop, marked, is_marked);
                 }
             }
@@ -875,6 +1017,14 @@ impl Graph {
             let max_bucket = buckets.bucket(1.0);
             if prev[stop].is_reached() {
                 for pl in prev[stop].iter() {
+                    // Build only from THIS pass's labels: an `i`-journey must descend
+                    // from the `i`-source (departure d_i). Boarding from a later
+                    // departure's label would fabricate `i`'s journey out of `j`'s.
+                    // The carried grid still PRUNES across departures (curr.insert),
+                    // it just isn't a build source. Single-pass stamps all 0 → no-op.
+                    if pl.created_by != stamp {
+                        continue;
+                    }
                     let from_bucket = buckets.bucket(pl.reliability);
                     let min_dep = pl.bag.earliest() as u32;
                     let t_start = col.partition_point(|st| st.departure < min_dep);
@@ -932,6 +1082,7 @@ impl Graph {
                                 hit_prob,
                                 reliability: rel,
                                 from_bucket,
+                                from_arena: pl.arena_id,
                             },
                             buckets,
                         );
@@ -1015,6 +1166,8 @@ impl Graph {
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
         cutoff: u32,
+        stamp: u32,
+        arena: &mut Vec<Label>,
     ) {
         let n = marked.len();
         for i in 0..n {
@@ -1029,6 +1182,11 @@ impl Graph {
                 let target = self.raptor.transit_node_to_stop[target_node.0] as usize;
 
                 for l in src.iter() {
+                    // Transfer only this pass's labels (see scan_route): an `i`-journey
+                    // descends from the `i`-source. Single-pass stamps all 0 → no-op.
+                    if l.created_by != stamp {
+                        continue;
+                    }
                     let bag = l.bag.shifted_by(walk);
                     if bag.earliest() >= cutoff {
                         continue;
@@ -1045,9 +1203,17 @@ impl Graph {
                             from_stop: stop as u32,
                             from_bucket: buckets.bucket(l.reliability),
                         },
+                        created_by: stamp,
+                        at_stop: target as u32,
+                        parent: l.arena_id,
+                        arena_id: u32::MAX,
                     };
-                    if best[target].insert(cand, buckets) {
-                        labels[target].insert(cand, buckets);
+                    if best[target].dominates(cand, buckets) {
+                        continue;
+                    }
+                    let cand = Label::arena_push(arena, cand);
+                    best[target].insert(cand, buckets);
+                    if labels[target].insert(cand, buckets) {
                         Self::mark(target, marked, is_marked);
                     }
                 }
@@ -1090,7 +1256,7 @@ impl Graph {
     /// Collect every origin-departure time in `[earliest, latest]` such that
     /// a transit vehicle departs from some access stop at `T + walk_secs`.
     ///
-    /// Returns times sorted **descending** (latest first).
+    /// Returns times sorted **ascending** (earliest first).
     fn collect_interesting_times(
         &self,
         raw_stops: &[(usize, u32)],
@@ -1197,6 +1363,91 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
+        // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
+        // interesting departures, which are processed **latest → earliest** so a
+        // later-departing journey prunes earlier ones. `best` is reset per pass (it
+        // gives the per-pass cross-round local prune + `target_cutoff`); `labels` is
+        // carried, and marking is gated on per-round `labels[k]` improvement — the
+        // round-stratified bound that preserves the transfers axis across departures.
+        // Each pass reconstructs its own plans (filtered by `created_by`) before the
+        // next pass mutates the grid. Output is the 4-D Pareto set
+        // (departure ↑, arrival ↓, transfers ↓, reliability ↑); walk is an attribute.
+        self.with_access_search(origin, destination, start_time, min_access_secs,
+            |raw_stops, targets, access_secs| {
+                let sources: Vec<(usize, u32)> = raw_stops.iter()
+                    .map(|&(s, w)| (s, start_time + w))
+                    .collect();
+                let probe = self.raptor_inner(
+                    &sources, targets, start_time, access_secs, date, weekday, origin, destination,
+                    buckets, slack, rt,
+                );
+                if probe.is_empty() {
+                    return vec![];
+                }
+
+                let departure_times = self.collect_interesting_times(
+                    raw_stops,
+                    start_time,
+                    start_time.saturating_add(window_secs),
+                    date,
+                    weekday,
+                );
+                if departure_times.is_empty() {
+                    return probe;
+                }
+
+                let n_stops = self.raptor.transit_stop_to_node.len();
+                let n_patterns = self.raptor.transit_patterns.len();
+                let mut best = vec![LabelSet::EMPTY; n_stops];
+                let mut labels = vec![vec![LabelSet::EMPTY; n_stops]; MAX_ROUNDS + 1];
+                let mut marked = Vec::with_capacity(2048);
+                let mut is_marked = vec![false; n_stops];
+                let mut queue = Vec::with_capacity(512);
+                let mut queue_pos = vec![u32::MAX; n_patterns];
+                let mut arena: Vec<Label> = Vec::new();
+
+                let mut times = departure_times;
+                times.sort_unstable_by(|a, b| b.cmp(a)); // latest first
+
+                let mut all_plans = Vec::new();
+                for (i, t) in times.into_iter().enumerate() {
+                    let stamp = i as u32;
+                    let sources_t: Vec<(usize, u32)> = raw_stops.iter()
+                        .map(|&(s, w)| (s, t + w))
+                        .collect();
+                    self.run_departure_into(
+                        &sources_t, targets, t, access_secs, date, weekday, buckets, slack, rt,
+                        stamp, true,
+                        &mut best, &mut labels, &mut marked, &mut is_marked, &mut queue, &mut queue_pos,
+                        &mut arena,
+                    );
+                    let plans = self.extract_with_debug(
+                        &sources_t, targets, t, date, weekday, &labels, buckets, origin, destination, rt,
+                        None, stamp, &arena,
+                    );
+                    all_plans.extend(plans);
+                }
+                Self::pareto_filter(all_plans, buckets)
+            })
+    }
+
+    /// Reference range driver: each interesting departure runs as an independent
+    /// from-scratch RAPTOR pass. Kept as the correctness oracle for the self-pruning
+    /// `raptor_range_tuned_rt` (their 4-D Pareto outputs must be set-equal).
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_independent_rt(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs,
             |raw_stops, targets, access_secs| {
                 let sources: Vec<(usize, u32)> = raw_stops.iter()
@@ -1235,6 +1486,146 @@ impl Graph {
                 Self::pareto_filter(all_plans, buckets)
             })
     }
+
+    /// Public reference range query (default buckets / no realtime), mirroring
+    /// `raptor_range` but using the independent-passes oracle. For tests.
+    pub fn raptor_range_independent(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+    ) -> Vec<Plan> {
+        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
+        self.raptor_range_independent_rt(origin, destination, start_time, window_secs, date, weekday,
+            min_access_secs, &buckets, self.raptor.arrival_slack_secs, &RealtimeIndex::new())
+    }
+    /// Trips departing between midnight and this threshold may actually be
+    /// overnight extensions of the previous service day (GTFS times > 86400).
+    const OVERNIGHT_THRESHOLD_SECS: u32 = 5 * 3600;
+
+    /// Rotate a 7-bit weekday bitmask one day backward (Mon=0x01 → Sun=0x40).
+    fn prev_weekday(wd: u8) -> u8 {
+        ((wd >> 1) | ((wd & 1) << 6)) & 0x7F
+    }
+
+    /// Subtract `shift` from every time field in a Plan (departure/arrival/step times).
+    /// `date`/`weekday` in leg steps are left untouched — they remain the previous
+    /// service day's values, which is correct for previous/next departure lookups.
+    fn shift_plan(mut plan: Plan, shift: u32) -> Plan {
+        plan.start = plan.start.saturating_sub(shift);
+        plan.end = plan.end.saturating_sub(shift);
+        plan.expected_end = plan.expected_end.saturating_sub(shift);
+        for s in &mut plan.arrival_distribution {
+            s.time = s.time.saturating_sub(shift);
+        }
+        for leg in &mut plan.legs {
+            match leg {
+                PlanLeg::Walk(w) => {
+                    w.start = w.start.saturating_sub(shift);
+                    w.end = w.end.saturating_sub(shift);
+                    for step in &mut w.steps {
+                        *step = match *step {
+                            PlanLegStep::Walk(mut ws) => { ws.time = ws.time.saturating_sub(shift); PlanLegStep::Walk(ws) }
+                            PlanLegStep::Transit(mut ts) => { ts.time = ts.time.saturating_sub(shift); PlanLegStep::Transit(ts) }
+                        };
+                    }
+                }
+                PlanLeg::Transit(t) => {
+                    t.start = t.start.saturating_sub(shift);
+                    t.end = t.end.saturating_sub(shift);
+                    t.scheduled_start = t.scheduled_start.saturating_sub(shift);
+                    t.scheduled_end = t.scheduled_end.saturating_sub(shift);
+                    if let Some(tr) = &mut t.transfer_risk {
+                        tr.scheduled_departure = tr.scheduled_departure.saturating_sub(shift);
+                        tr.next_departure = tr.next_departure.map(|d| d.saturating_sub(shift));
+                    }
+                    t.preceding_arrival = t.preceding_arrival.map(|a| a.saturating_sub(shift));
+                    for step in &mut t.steps {
+                        *step = match *step {
+                            PlanLegStep::Walk(mut ws) => { ws.time = ws.time.saturating_sub(shift); PlanLegStep::Walk(ws) }
+                            PlanLegStep::Transit(mut ts) => { ts.time = ts.time.saturating_sub(shift); PlanLegStep::Transit(ts) }
+                        };
+                    }
+                    t.time_shift = shift;
+                }
+            }
+        }
+        plan
+    }
+
+    /// Like `raptor_tuned_rt` but also finds overnight trips from the previous
+    /// service day when querying in the early-morning window (before 05:00).
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_tuned_rt_overnight(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
+        let mut plans = self.raptor_tuned_rt(origin, destination, start_time, date, weekday, min_access_secs, buckets, slack, rt);
+
+        if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
+            let overnight = self.raptor_tuned_rt(
+                origin, destination,
+                start_time + 86400,
+                date - 1, Self::prev_weekday(weekday),
+                min_access_secs, buckets, slack, rt,
+            );
+            let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
+            if !normalized.is_empty() {
+                plans.extend(normalized);
+                plans = Self::pareto_filter(plans, buckets);
+            }
+        }
+
+        plans
+    }
+
+    /// Like `raptor_range_tuned_rt` but also finds overnight trips from the
+    /// previous service day when querying in the early-morning window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_tuned_rt_overnight(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
+        let mut plans = self.raptor_range_tuned_rt(origin, destination, start_time, window_secs, date, weekday, min_access_secs, buckets, slack, rt);
+
+        if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
+            let overnight = self.raptor_range_tuned_rt(
+                origin, destination,
+                start_time + 86400,
+                window_secs,
+                date - 1, Self::prev_weekday(weekday),
+                min_access_secs, buckets, slack, rt,
+            );
+            let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
+            if !normalized.is_empty() {
+                plans.extend(normalized);
+                plans = Self::pareto_filter(plans, buckets);
+            }
+        }
+
+        plans
+    }
 }
 
 #[cfg(test)]
@@ -1247,6 +1638,10 @@ mod label_tests {
             route_type: None,
             reliability: rel,
             trace: Trace::NONE,
+            created_by: 0,
+            at_stop: u32::MAX,
+            parent: u32::MAX,
+            arena_id: u32::MAX,
         }
     }
 
@@ -1296,6 +1691,10 @@ mod label_tests {
             route_type: None,
             reliability: 1.0,
             trace: Trace::NONE,
+            created_by: 0,
+            at_stop: u32::MAX,
+            parent: u32::MAX,
+            arena_id: u32::MAX,
         };
         assert_eq!(risky_early.bag.earliest(), 100);
         assert!(s.insert(risky_early, &b));

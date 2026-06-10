@@ -99,6 +99,8 @@ impl Graph {
         destination: NodeID,
         rt: &RealtimeIndex,
         mut debug_sink: Option<&mut Vec<PlanCandidate>>,
+        departure_stamp: u32,
+        arena: &[Label],
     ) -> Vec<Plan> {
         use super::MAX_ROUNDS;
 
@@ -117,6 +119,9 @@ impl Graph {
             let mut per_bucket: Vec<Option<(u32, usize, u32)>> = vec![None; n_buckets];
             for &(s, w) in targets {
                 for l in labels[k][s].iter() {
+                    if l.created_by != departure_stamp {
+                        continue;
+                    }
                     let b = buckets.bucket(l.reliability) as usize;
                     let arr = l.bag.earliest().saturating_add(w);
                     match per_bucket[b] {
@@ -145,8 +150,16 @@ impl Graph {
                 }
                 bucket_best[b] = best_arr;
 
-                let (mut legs, origin_stop) =
-                    self.reconstruct(k, best_stop, b as u8, date, weekday, labels, buckets);
+                // The destination-stop label this candidate was built from; its arena
+                // chain is the EXACT journey (no grid re-lookup → no bucket drift).
+                let chosen = Self::pick_label(labels, buckets, k, best_stop, b as u8, departure_stamp);
+                let chosen_bag = chosen.map(|l| l.bag).unwrap_or(ScenarioBag::EMPTY);
+                let chosen_rt = chosen.and_then(|l| l.route_type);
+
+                let (mut legs, origin_stop) = match chosen {
+                    Some(l) => self.reconstruct(arena, l.arena_id, date, weekday),
+                    None => (Vec::new(), best_stop),
+                };
 
                 if legs.is_empty() {
                 if let Some(ref mut sink) = debug_sink {
@@ -159,11 +172,6 @@ impl Graph {
                 }
                 continue;
             }
-
-            // The destination-stop label this candidate was built from.
-            let chosen = Self::pick_label(labels, buckets, k, best_stop, b as u8);
-            let chosen_bag = chosen.map(|l| l.bag).unwrap_or(ScenarioBag::EMPTY);
-            let chosen_rt = chosen.and_then(|l| l.route_type);
 
             let transit_count =
                 legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count();
@@ -385,54 +393,66 @@ impl Graph {
     }
 
     /// Picks the label in bucket `b` at `(k, stop)`, falling back to the fastest label.
+    /// Selects the reconstruction label at `(k, stop)` for bucket `b`, considering
+    /// only labels created by departure `stamp`. Single-pass queries stamp every
+    /// label `0` and pass `stamp = 0`, so the filter is a no-op there; the range
+    /// driver passes the current departure index so reconstruction follows only
+    /// that departure's traces through the grid shared across departures.
     fn pick_label<'a>(
         labels: &'a [Vec<LabelSet>],
         buckets: &ReliabilityBuckets,
         k: usize,
         stop: usize,
         b: u8,
+        stamp: u32,
     ) -> Option<&'a Label> {
-        labels[k][stop]
-            .get_by_bucket(buckets, b)
-            .or_else(|| labels[k][stop].min_arrival_label())
+        let set = &labels[k][stop];
+        set.iter()
+            .find(|l| l.created_by == stamp && buckets.bucket(l.reliability) == b)
+            .or_else(|| {
+                set.iter()
+                    .filter(|l| l.created_by == stamp)
+                    .min_by_key(|l| l.bag.earliest())
+            })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Rebuilds the ordered legs of a journey by following EXACT parent pointers
+    /// through the per-pass `arena` from the destination label `start_id`. Unlike the
+    /// old grid re-lookup (which re-found predecessors by `(round, stop, bucket)` and
+    /// could drift to an overwritten label), this reproduces the precise trips the
+    /// search used, so the reconstructed reliability matches the search reliability.
     pub(super) fn reconstruct(
         &self,
-        round: usize,
-        target_stop: usize,
-        start_bucket: u8,
+        arena: &[Label],
+        start_id: u32,
         date: u32,
         weekday: u8,
-        labels: &[Vec<LabelSet>],
-        buckets: &ReliabilityBuckets,
     ) -> (Vec<PlanLeg>, usize) {
         let mut legs = Vec::new();
-        let mut stop = target_stop;
-        let mut k = round;
-        let mut cur_bucket = start_bucket;
+        let mut origin_stop = 0usize;
+        let mut cur = start_id;
 
-        loop {
-            let trace = match Self::pick_label(labels, buckets, k, stop, cur_bucket) {
-                Some(l) => l.trace,
-                None => break,
-            };
+        while cur != u32::MAX {
+            let node = &arena[cur as usize];
+            let trace = node.trace;
             if !trace.is_transit() && !trace.is_transfer() {
-                break;
+                break; // reached the source / root
             }
+            let parent = node.parent;
+            let parent_node = if parent != u32::MAX {
+                Some(&arena[parent as usize])
+            } else {
+                None
+            };
 
             if trace.is_transfer() {
                 let from = trace.from_stop as usize;
-                let start = Self::pick_label(labels, buckets, k, from, trace.from_bucket)
-                    .map(|l| l.bag.earliest())
-                    .unwrap_or(0);
-                let end = Self::pick_label(labels, buckets, k, stop, cur_bucket)
-                    .map(|l| l.bag.earliest())
-                    .unwrap_or(start);
-                let duration = end - start;
+                let to = node.at_stop as usize;
+                let start = parent_node.map(|l| l.bag.earliest()).unwrap_or(0);
+                let end = node.bag.earliest();
+                let duration = end.saturating_sub(start);
                 let from_node = self.raptor.transit_stop_to_node[from];
-                let to_node = self.raptor.transit_stop_to_node[stop];
+                let to_node = self.raptor.transit_stop_to_node[to];
                 let length = (duration as f64 * self.raptor.walking_speed_mps) as usize;
 
                 let to_place = PlanPlace {
@@ -461,8 +481,8 @@ impl Graph {
                     })],
                     geometry: self.walk_path(from_node, to_node),
                 }));
-                stop = from;
-                cur_bucket = trace.from_bucket;
+                origin_stop = from;
+                cur = parent;
                 continue;
             }
 
@@ -482,14 +502,9 @@ impl Graph {
             let bs = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
             let boarding_col = &times[bp * n_trips..(bp + 1) * n_trips];
 
-            // Predecessor label this leg boarded from (its bucket recorded in the trace).
-            let preceding = if k == 0 {
-                None
-            } else {
-                Self::pick_label(labels, buckets, k - 1, bs, trace.from_bucket)
-            };
-            let preceding_rt = preceding.and_then(|l| l.route_type);
-            let preceding_arr = preceding.map(|l| l.bag.earliest());
+            // EXACT predecessor label this leg boarded from (the arena parent).
+            let preceding_rt = parent_node.and_then(|l| l.route_type);
+            let preceding_arr = parent_node.map(|l| l.bag.earliest());
 
             let transfer_risk = if preceding_rt.is_none() {
                 None
@@ -623,16 +638,16 @@ impl Graph {
                 following_route_type: None,
                 following_margin_secs: None,
                 bikes_allowed: self.get_trip(trip_ids[t]).and_then(|t| t.bikes_allowed),
+                time_shift: 0,
             }));
 
-            stop = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
-            cur_bucket = trace.from_bucket;
-            k -= 1;
+            origin_stop = bs;
+            cur = parent;
         }
 
         legs.reverse();
 
-        (legs, stop)
+        (legs, origin_stop)
     }
 
     /// Fills `following_route_type` / `following_margin_secs` on each transit leg
@@ -962,12 +977,12 @@ impl Graph {
 
     /// Remove dominated plans from `plans`.
     ///
-    /// Plan A dominates plan B when A is at least as good in all four dimensions
-    /// (departure time, arrival time, transfer count, walking duration) and strictly
-    /// better in at least one.
+    /// Plan A dominates plan B when A is at least as good on all four Pareto axes
+    /// (departure ↑, arrival ↓, transfer count ↓, reliability bucket ↑) and strictly
+    /// better in at least one; walking duration is a tie-break attribute, not an axis.
     /// Plan reliability = product of each transit leg's `transfer_risk.reliability`
     /// (legs without a risk count as 1.0). Walk-only plans = 1.0.
-    pub(super) fn plan_reliability(plan: &Plan) -> f32 {
+    pub fn plan_reliability(plan: &Plan) -> f32 {
         plan.legs
             .iter()
             .filter_map(|l| {
@@ -997,31 +1012,41 @@ impl Graph {
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
 
+        // 4-D Pareto: (transfers ↓, end ↓, start ↑, reliability_bucket ↑). Walk is NOT
+        // an axis — the self-pruning range search keys on (arrival, bucket) per round and
+        // cannot preserve a walk frontier, so walk creates no alternatives. It only breaks
+        // exact 4-axis ties: the lower-walk plan dominates an otherwise-identical one.
+        let dominates = |a: &Plan, b: &Plan| {
+            let (tc_a, tc_b) = (transfer_count(a), transfer_count(b));
+            let (rb_a, rb_b) = (rel_bucket(a), rel_bucket(b));
+            tc_a <= tc_b
+                && a.end <= b.end
+                && a.start >= b.start
+                && rb_a >= rb_b
+                && (tc_a < tc_b
+                    || a.end < b.end
+                    || a.start > b.start
+                    || rb_a > rb_b
+                    || walk_secs(a) < walk_secs(b))
+        };
+        let equal_4 = |a: &Plan, b: &Plan| {
+            transfer_count(a) == transfer_count(b)
+                && a.end == b.end
+                && a.start == b.start
+                && rel_bucket(a) == rel_bucket(b)
+        };
+
         let mut result: Vec<Plan> = Vec::new();
 
         'outer: for plan in plans {
-            let tc_p = transfer_count(&plan);
-            let ws_p = walk_secs(&plan);
-            let rb_p = rel_bucket(&plan);
             for existing in &result {
-                let tc_e = transfer_count(existing);
-                let ws_e = walk_secs(existing);
-                let rb_e = rel_bucket(existing);
-                if tc_e <= tc_p && existing.end <= plan.end && existing.start >= plan.start && ws_e <= ws_p && rb_e >= rb_p {
+                if dominates(existing, &plan)
+                    || (equal_4(existing, &plan) && walk_secs(existing) <= walk_secs(&plan))
+                {
                     continue 'outer;
                 }
             }
-            result.retain(|existing| {
-                let tc_e = transfer_count(existing);
-                let ws_e = walk_secs(existing);
-                let rb_e = rel_bucket(existing);
-                !(tc_p <= tc_e
-                    && plan.end <= existing.end
-                    && plan.start >= existing.start
-                    && ws_p <= ws_e
-                    && rb_p >= rb_e
-                    && (tc_p < tc_e || plan.end < existing.end || plan.start > existing.start || ws_p < ws_e || rb_p > rb_e))
-            });
+            result.retain(|existing| !dominates(&plan, existing));
             result.push(plan);
         }
 
@@ -1030,6 +1055,7 @@ impl Graph {
                 .cmp(&b.end)
                 .then(b.start.cmp(&a.start))
                 .then(rel_bucket(b).cmp(&rel_bucket(a)))
+                .then(walk_secs(a).cmp(&walk_secs(b)))
         });
         result
     }
@@ -1060,20 +1086,41 @@ impl Graph {
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
 
+        // 4-D Pareto with walk as a tie-break only (see `pareto_filter`).
+        let dominates = |a: &Plan, b: &Plan| {
+            let (tc_a, tc_b) = (transfer_count(a), transfer_count(b));
+            let (rb_a, rb_b) = (rel_bucket(a), rel_bucket(b));
+            tc_a <= tc_b
+                && a.end <= b.end
+                && a.start >= b.start
+                && rb_a >= rb_b
+                && (tc_a < tc_b
+                    || a.end < b.end
+                    || a.start > b.start
+                    || rb_a > rb_b
+                    || walk_secs(a) < walk_secs(b))
+        };
+        let equal_4 = |a: &Plan, b: &Plan| {
+            transfer_count(a) == transfer_count(b)
+                && a.end == b.end
+                && a.start == b.start
+                && rel_bucket(a) == rel_bucket(b)
+        };
+
         let mut result: Vec<Plan> = Vec::new();
         let mut result_sink_idx: Vec<usize> = Vec::new();
 
         'outer: for (plan, &sink_idx) in plans.into_iter().zip(plan_to_sink_idx.iter()) {
             let tc_p = transfer_count(&plan);
-            let ws_p = walk_secs(&plan);
             let rb_p = rel_bucket(&plan);
 
-            // Check if `plan` is dominated by any existing result.
+            // Check if `plan` is dominated by (or a higher-walk twin of) any result.
             for (i, existing) in result.iter().enumerate() {
-                let tc_e = transfer_count(existing);
-                let ws_e = walk_secs(existing);
-                let rb_e = rel_bucket(existing);
-                if tc_e <= tc_p && existing.end <= plan.end && existing.start >= plan.start && ws_e <= ws_p && rb_e >= rb_p {
+                if dominates(existing, &plan)
+                    || (equal_4(existing, &plan) && walk_secs(existing) <= walk_secs(&plan))
+                {
+                    let tc_e = transfer_count(existing);
+                    let rb_e = rel_bucket(existing);
                     sink[sink_idx].status = CandidateStatus::ParetoDominated {
                         dominator_index: result_sink_idx[i],
                         departure_worse: existing.start > plan.start,
@@ -1088,16 +1135,9 @@ impl Graph {
             // Mark result members dominated by `plan`.
             let mut dominated = vec![false; result.len()];
             for (i, existing) in result.iter().enumerate() {
-                let tc_e = transfer_count(existing);
-                let ws_e = walk_secs(existing);
-                let rb_e = rel_bucket(existing);
-                if tc_p <= tc_e
-                    && plan.end <= existing.end
-                    && plan.start >= existing.start
-                    && ws_p <= ws_e
-                    && rb_p >= rb_e
-                    && (tc_p < tc_e || plan.end < existing.end || plan.start > existing.start || ws_p < ws_e || rb_p > rb_e)
-                {
+                if dominates(&plan, existing) {
+                    let tc_e = transfer_count(existing);
+                    let rb_e = rel_bucket(existing);
                     dominated[i] = true;
                     sink[result_sink_idx[i]].status = CandidateStatus::ParetoDominated {
                         dominator_index: sink_idx,
@@ -1127,6 +1167,7 @@ impl Graph {
                 .cmp(&b.end)
                 .then(b.start.cmp(&a.start))
                 .then(rel_bucket(b).cmp(&rel_bucket(a)))
+                .then(walk_secs(a).cmp(&walk_secs(b)))
         });
         result
     }

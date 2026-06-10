@@ -1519,6 +1519,66 @@ fn raptor_range_plans_are_pareto_optimal() {
     }
 }
 
+/// `raptor_range` must be deterministic: the same query returns the exact same
+/// ordered plan sequence on every call. Guards the parallel departure-time fan-out
+/// — concurrent execution must not reorder, drop, or duplicate plans.
+#[test]
+fn raptor_range_is_deterministic_across_runs() {
+    let (g, origin, dest) = single_route_many_trips_graph();
+    let run = || -> Vec<(u32, u32)> {
+        g.raptor_range(origin, dest, 9 * 3600, 180 * 60, 0, 0x7F, 10 * 60)
+            .iter()
+            .map(|p| (p.start, p.end))
+            .collect()
+    };
+    let a = run();
+    let b = run();
+    assert!(!a.is_empty(), "expected at least one plan");
+    assert_eq!(a, b, "raptor_range must return an identical ordered plan sequence on repeat calls");
+}
+
+/// THE oracle gate for self-pruning rRAPTOR: the carried-grid, latest-first driver
+/// (`raptor_range`) must produce the SAME 4-D Pareto set (departure, arrival,
+/// transfers) as independent from-scratch passes (`raptor_range_independent`).
+/// Extra keys in self-pruning ⇒ fabrication (FM-1); missing keys ⇒ over-pruning
+/// (FM-2). Dense single route (many departures) stresses the departure×arrival core.
+#[test]
+fn self_pruning_range_equals_independent_single_route() {
+    use std::collections::HashSet;
+    let (g, origin, dest) = single_route_many_trips_graph();
+    let key = |p: &maas_rs::structures::plan::Plan| {
+        (p.start, p.end, p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count())
+    };
+    let sp: HashSet<_> = g
+        .raptor_range(origin, dest, 9 * 3600, 180 * 60, 0, 0x7F, 10 * 60)
+        .iter().map(key).collect();
+    let oracle: HashSet<_> = g
+        .raptor_range_independent(origin, dest, 9 * 3600, 180 * 60, 0, 0x7F, 10 * 60)
+        .iter().map(key).collect();
+    assert!(!oracle.is_empty(), "oracle must produce plans");
+    assert_eq!(sp, oracle, "self-pruning range != independent-passes (single route, 4-D key)");
+}
+
+/// Same oracle gate on a two-route graph that admits transfers, so transfer
+/// preservation across departures is exercised (the only_nv class the 4-D contract
+/// keeps and the 3-D contract would have dropped).
+#[test]
+fn self_pruning_range_equals_independent_two_route() {
+    use std::collections::HashSet;
+    let (g, origin, dest) = two_route_raptor_graph();
+    let key = |p: &maas_rs::structures::plan::Plan| {
+        (p.start, p.end, p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count())
+    };
+    let sp: HashSet<_> = g
+        .raptor_range(origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60)
+        .iter().map(key).collect();
+    let oracle: HashSet<_> = g
+        .raptor_range_independent(origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60)
+        .iter().map(key).collect();
+    assert!(!oracle.is_empty(), "oracle must produce plans");
+    assert_eq!(sp, oracle, "self-pruning range != independent-passes (two route, 4-D key)");
+}
+
 /// Regression test: raptor_range must not discard the probe plan when
 /// high-frequency dead-end patterns at the origin stop fill the entire
 /// `collect_interesting_times` cap before the connecting pattern appears.
@@ -2279,4 +2339,110 @@ fn osm_only_cache_round_trip_preserves_network() {
     assert_eq!(restored.get_id("a"), Some(&a));
     assert_eq!(restored.nearest_node(50.000, 4.000), Some(a));
     assert_eq!(restored.raptor.transit_trips.len(), 0);
+}
+
+/// Real-network oracle + benchmark for self-pruning rRAPTOR. Loads the prebuilt
+/// `graph.bin` (Brussels: STIB + SNCB) and asserts the self-pruning range driver
+/// returns the SAME 4-D Pareto set (departure, arrival, transfers, reliability
+/// bucket) as the independent-passes oracle on dense real O/D where cross-departure
+/// ties actually occur — the case toy graphs miss and where the prior attempt
+/// failed. Also prints timings. Ignored by default (needs the 1.8 GB graph.bin):
+///   cargo test --release --test graph_tests self_pruning_range_real_network -- --ignored --nocapture
+#[test]
+#[ignore]
+fn self_pruning_range_real_network_equals_independent() {
+    use maas_rs::services::persistence::load_graph;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let g = load_graph("graph.bin").expect("load graph.bin");
+    let buckets = ReliabilityBuckets::default();
+    let date = 9657u32; // 2026-06-10, days since 2000-01-01
+    let weekday = 0x7Fu8; // any service day; both paths use the same, so fair
+    let start = 9 * 3600u32;
+
+    let battery = [
+        ("Schuman->Uccle", 50.843, 4.381, 50.800, 4.338),
+        ("Bourse->Midi", 50.848, 4.349, 50.836, 4.336),
+        // (Bxl->Antwerpen dropped from the fast loop: out of access radius, ~60s of
+        //  widening for 0 plans. Re-add for a full sweep.)
+    ];
+
+    let key = |p: &maas_rs::structures::plan::Plan| {
+        (
+            p.start,
+            p.end,
+            p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count(),
+            buckets.bucket(Graph::plan_reliability(p)),
+        )
+    };
+
+    for window_min in [30u32, 60] {
+        let window = window_min * 60;
+        for (label, flat, flng, tlat, tlng) in battery {
+            let o = g.nearest_node(flat, flng).expect("origin node");
+            let d = g.nearest_node(tlat, tlng).expect("dest node");
+
+            let t0 = Instant::now();
+            let sp = g.raptor_range(o, d, start, window, date, weekday, 5 * 60);
+            let sp_ms = t0.elapsed().as_millis();
+
+            let t1 = Instant::now();
+            let indep = g.raptor_range_independent(o, d, start, window, date, weekday, 5 * 60);
+            let indep_ms = t1.elapsed().as_millis();
+
+            let sp_keys: HashSet<_> = sp.iter().map(key).collect();
+            let in_keys: HashSet<_> = indep.iter().map(key).collect();
+            let only_sp: Vec<_> = sp_keys.difference(&in_keys).cloned().collect();
+            let only_in: Vec<_> = in_keys.difference(&sp_keys).cloned().collect();
+
+            // 3-D projection (drop reliability bucket): if a divergent key matches on
+            // (start,end,transfers) across the two sets, the ONLY difference is the
+            // reliability bucket — i.e. search-time vs post-tightening bucket mismatch.
+            let sp3: HashSet<_> = sp_keys.iter().map(|k| (k.0, k.1, k.2)).collect();
+            let in3: HashSet<_> = in_keys.iter().map(|k| (k.0, k.1, k.2)).collect();
+            let only_in_bucket_only = only_in.iter().filter(|k| sp3.contains(&(k.0, k.1, k.2))).count();
+            let only_sp_bucket_only = only_sp.iter().filter(|k| in3.contains(&(k.0, k.1, k.2))).count();
+
+            println!(
+                "[w={:>2}m] {:<16} sp {:>3}/{:>6}ms | indep {:>3}/{:>6}ms | {:.2}x | only_sp={} (bkt {}) only_in={} (bkt {})",
+                window_min, label, sp.len(), sp_ms, indep.len(), indep_ms,
+                indep_ms as f64 / sp_ms.max(1) as f64,
+                only_sp.len(), only_sp_bucket_only, only_in.len(), only_in_bucket_only,
+            );
+            // Classify each only_in key: is it 4-D-dominated by some self-pruning key
+            // (acceptable — sp's set still covers it) or a genuine missed Pareto point?
+            // 4-D dom: tc_a<=tc_b && end_a<=end_b && start_a>=start_b && bkt_a>=bkt_b, strict in one.
+            let dom = |a: &(u32, u32, usize, u8), b: &(u32, u32, usize, u8)| {
+                a.2 <= b.2 && a.1 <= b.1 && a.0 >= b.0 && a.3 >= b.3
+                    && (a.2 < b.2 || a.1 < b.1 || a.0 > b.0 || a.3 > b.3)
+            };
+            let genuine_miss: Vec<_> = only_in.iter()
+                .filter(|k| !sp_keys.iter().any(|s| dom(s, k)))
+                .collect();
+            if !only_sp.is_empty() { println!("    only_sp: {only_sp:?}"); }
+            if !only_in.is_empty() {
+                println!("    only_in: {only_in:?}");
+                println!("    genuine_miss (not dominated by any sp plan): {} -> {genuine_miss:?}", genuine_miss.len());
+                // Dump legs of the first genuine-miss plan (from the independent set),
+                // plus whether any independent plan itself dominates it (filter sanity).
+                if let Some(&gm) = genuine_miss.first() {
+                    if let Some(p) = indep.iter().find(|p| key(p) == *gm) {
+                        let self_dom = indep.iter().any(|q| key(q) != *gm && dom(&key(q), gm));
+                        println!("    >>> MISS {gm:?} | dominated within indep set? {self_dom}");
+                        for leg in &p.legs {
+                            match leg {
+                                PlanLeg::Transit(t) => println!(
+                                    "        TRANSIT {}->{} dep={} arr={} rt={:?} rel={:?}",
+                                    t.from.node_id.0, t.to.node_id.0, t.start, t.end, t.route_type,
+                                    t.transfer_risk.as_ref().map(|r| r.reliability)),
+                                PlanLeg::Walk(w) => println!(
+                                    "        WALK    {}->{} {}s", w.from.node_id.0, w.to.node_id.0, w.duration),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -416,9 +416,9 @@ mod tests {
 
     #[test]
     fn test_nearest_nodes_returns_multiple_candidates() {
-        let rg = make_chain(&[(50.0, 4.0), (50.0001, 4.0), (50.0002, 4.0)]);
+        let rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
         // All three nodes are within 2 km; we should get up to SNAP_CANDIDATES
-        let result = rg.nearest_nodes(50.0001, 4.0);
+        let result = rg.nearest_nodes(50.001, 4.0);
         assert!(result.len() <= SNAP_CANDIDATES);
         assert!(!result.is_empty());
     }
@@ -427,11 +427,11 @@ mod tests {
 
     #[test]
     fn test_dijkstra_linear() {
-        let rg = make_chain(&[(50.0, 4.0), (50.0001, 4.0), (50.0002, 4.0)]);
+        let rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
         let path = rg.dijkstra(0, 2).expect("should be reachable");
         assert_eq!(path.len(), 3);
         assert!((path[0].latitude - 50.0).abs() < 1e-9);
-        assert!((path[2].latitude - 50.0002).abs() < 1e-9);
+        assert!((path[2].latitude - 50.002).abs() < 1e-9);
     }
 
     #[test]

@@ -318,8 +318,8 @@ fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
     let mut g = Graph::new();
     // OSM node close to origin
     let _osm0 = g.add_node(osm_node("n0", 50.0, 4.0));
-    // Transit stop ~50m from origin, snapped to n0
-    g.add_node(transit_stop("Test Stop", 50.0004, 4.0));
+    // Transit stop ~111m from origin (within MAX_TRANSFER_DISTANCE_M=1000), snapped to n0
+    g.add_node(transit_stop("Test Stop", 50.001, 4.0));
     g.build_raptor_index();
 
     let schema = build_schema(shared(g));

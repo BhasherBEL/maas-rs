@@ -73,9 +73,9 @@ pub fn route(
 
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_tuned_rt(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
+            graph.raptor_range_tuned_rt_overnight(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
         }
-        _ => graph.raptor_tuned_rt(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
+        _ => graph.raptor_tuned_rt_overnight(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
     };
 
     if plans.is_empty() {
@@ -96,6 +96,8 @@ pub fn route_explain(
         resolve_query_params(graph, query)?;
     let (buckets, slack) = resolve_tuning(graph, query)?;
 
+    // Note: the explain path does not apply the overnight pass — it's a debug view
+    // of a single RAPTOR run and overnight merging would complicate candidate provenance.
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
             graph.raptor_range_explain_tuned_rt(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
