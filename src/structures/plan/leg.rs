@@ -136,6 +136,12 @@ pub struct PlanTransitLeg {
     /// Whether bikes are allowed on this transit leg.
     /// `None` = no information available.
     pub bikes_allowed: Option<bool>,
+
+    /// Seconds subtracted from raw timetable times when this leg was built from an
+    /// overnight RAPTOR pass (86400 for prev-day trips, 0 otherwise). Used by the
+    /// `previousDepartures`/`nextDepartures` resolvers to normalize returned times.
+    #[graphql(skip)]
+    pub time_shift: u32,
 }
 
 #[ComplexObject]
@@ -192,17 +198,21 @@ impl PlanTransitLeg {
             ),
             count,
         )?;
+        // Use raw timetable reference time for cross-route search.
         let cross = graph.cross_route_departures(
             self.from.node_id,
             self.to.node_id,
             first.timetable_segment,
-            self.start,
+            self.start + self.time_shift,
             first.date,
             first.weekday,
             false,
             count,
         );
         results.extend(self.build_cross_route_legs(graph, cross, self.from.node_id, self.to.node_id));
+        if self.time_shift > 0 {
+            results = results.into_iter().map(|l| shift_transit_leg(l, self.time_shift)).collect();
+        }
         results.sort_by_key(|l| l.start);
         results.reverse();
         results.truncate(count);
@@ -235,21 +245,46 @@ impl PlanTransitLeg {
             ),
             count,
         )?;
+        // Use raw timetable reference time for cross-route search.
         let cross = graph.cross_route_departures(
             self.from.node_id,
             self.to.node_id,
             first.timetable_segment,
-            self.start,
+            self.start + self.time_shift,
             first.date,
             first.weekday,
             true,
             count,
         );
         results.extend(self.build_cross_route_legs(graph, cross, self.from.node_id, self.to.node_id));
+        if self.time_shift > 0 {
+            results = results.into_iter().map(|l| shift_transit_leg(l, self.time_shift)).collect();
+        }
         results.sort_by_key(|l| l.start);
         results.truncate(count);
         Ok(results)
     }
+}
+
+/// Subtract `s` from raw-timetable times in a result leg to normalize it to
+/// wall-clock time. Used when returning alternatives for an overnight-shifted leg.
+fn shift_transit_leg(mut l: PlanTransitLeg, s: u32) -> PlanTransitLeg {
+    l.start = l.start.saturating_sub(s);
+    l.end = l.end.saturating_sub(s);
+    l.scheduled_start = l.scheduled_start.saturating_sub(s);
+    l.scheduled_end = l.scheduled_end.saturating_sub(s);
+    l.from.departure = l.from.departure.map(|d| d.saturating_sub(s));
+    l.to.arrival = l.to.arrival.map(|a| a.saturating_sub(s));
+    if let Some(tr) = &mut l.transfer_risk {
+        tr.scheduled_departure = tr.scheduled_departure.saturating_sub(s);
+        tr.next_departure = tr.next_departure.map(|d| d.saturating_sub(s));
+    }
+    for step in &mut l.steps {
+        if let PlanLegStep::Transit(ts) = step {
+            ts.time = ts.time.saturating_sub(s);
+        }
+    }
+    l
 }
 
 impl PlanTransitLeg {
@@ -273,10 +308,13 @@ impl PlanTransitLeg {
         alt_end: u32,
     ) -> Option<TransferRisk> {
         let alt_rt = graph.route_type_of_trip(alt_trip_id);
+        // `self` times were shifted by -time_shift during overnight normalization.
+        // Add it back to compare in the same raw timetable domain as alt_dep/alt_end.
+        let s = self.time_shift;
 
         let (p_in, in_margin) = match (self.preceding_arrival, self.preceding_route_type) {
             (Some(pa), Some(prt)) => {
-                let margin = alt_dep as i32 - pa as i32;
+                let margin = alt_dep as i32 - (pa + s) as i32;
                 let board = alt_rt.and_then(|rt| graph.get_delay_model(rt));
                 let p = match graph.get_delay_model(prt) {
                     Some(cdf) => cdf.prob_on_time_vs(board, margin),
@@ -296,7 +334,7 @@ impl PlanTransitLeg {
             alt_rt,
             self.following_route_type,
             self.following_margin_secs,
-            self.scheduled_end as i32 - alt_end as i32,
+            (self.scheduled_end + s) as i32 - alt_end as i32,
         );
 
         Some(TransferRisk {
@@ -349,6 +387,7 @@ impl PlanTransitLeg {
                     following_route_type: self.following_route_type,
                     following_margin_secs: self.following_margin_secs,
                     bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
+                    time_shift: 0,
                 }
             })
             .collect()
@@ -453,6 +492,7 @@ impl PlanTransitLeg {
                     following_route_type: self.following_route_type,
                     following_margin_secs: self.following_margin_secs,
                     bikes_allowed: graph.get_trip(trip_id).and_then(|t| t.bikes_allowed),
+                    time_shift: 0,
                 })
             })
             .take(count)

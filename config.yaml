@@ -15,6 +15,13 @@ build:
         Cache-Control: "no-cache"
         bmc-partner-key: "${BMC_PARTNER_KEY}"
 
+    - ingestor: gtfs/generic
+      name: DeLijn
+      url: https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/static/
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+
     - ingestor: osm/pbf
       url: path:data/belgium-latest.osm.pbf
 

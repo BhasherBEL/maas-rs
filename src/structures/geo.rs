@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn dist_same_point_is_zero() {
-        let loc = LatLng { latitude: 48.8566, longitude: 2.3522 };
+        let loc = LatLng { latitude: 50.0, longitude: 4.0 };
         assert!(loc.dist(loc) < EPSILON);
     }
 

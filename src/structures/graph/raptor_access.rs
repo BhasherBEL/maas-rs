@@ -160,6 +160,11 @@ impl Graph {
                 stops.push((compact as usize, walk_secs));
             }
         }
+        // `walk_times` is a HashMap (random per-process seed), so its iteration order
+        // varies between runs. RAPTOR seeds sources in this order and `LabelSet::insert`
+        // keeps the first label on ties, so unsorted output makes routing results
+        // nondeterministic across processes. Sort by stop id for a stable order.
+        stops.sort_unstable_by_key(|&(stop, _)| stop);
         stops
     }
 }
