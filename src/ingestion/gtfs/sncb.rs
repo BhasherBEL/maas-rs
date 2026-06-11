@@ -518,11 +518,9 @@ mod tests {
         // Stop 2 has no valid candidates — simulates "no railway nearby"
         let candidates: &[&[usize]] = &[&[0], &[2], &[]];
 
-        let stop_coords = vec![
-            LatLng { latitude: 50.0,  longitude: 4.0 },
+        let stop_coords = [LatLng { latitude: 50.0,  longitude: 4.0 },
             LatLng { latitude: 50.01, longitude: 4.0 },
-            LatLng { latitude: 50.02, longitude: 4.0 },
-        ];
+            LatLng { latitude: 50.02, longitude: 4.0 }];
 
         let mut all_pts: Vec<LatLng> = Vec::new();
         let mut stop_idx: Vec<u32> = Vec::new();

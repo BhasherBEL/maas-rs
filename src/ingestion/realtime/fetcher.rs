@@ -53,8 +53,8 @@ impl RateLimiter {
     /// Block until the next request is permitted (only delays while throttled).
     fn acquire(&self) {
         let mut st = self.state.lock().unwrap();
-        if st.throttled {
-            if let Some(last) = st.last_request {
+        if st.throttled
+            && let Some(last) = st.last_request {
                 let elapsed = last.elapsed();
                 if elapsed < self.cfg.throttled_min_interval {
                     let wait = self.cfg.throttled_min_interval - elapsed;
@@ -63,7 +63,6 @@ impl RateLimiter {
                     st = self.state.lock().unwrap();
                 }
             }
-        }
         st.last_request = Some(Instant::now());
     }
 

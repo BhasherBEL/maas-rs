@@ -4,7 +4,7 @@ use osmpbf::{Element, ElementReader, Way};
 
 use crate::structures::{EdgeData, Graph, NodeData, OsmNodeData, StreetEdgeData};
 
-pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf::Error> {
+pub fn load_pbf_file(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
     let mut valid_node_ids = HashSet::new();
 
@@ -46,22 +46,22 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
     let mut failed = 0;
 
     reader.for_each(|element| {
-        if let Element::Way(w) = element {
-            if validate_way(&w) {
+        if let Element::Way(w) = element
+            && validate_way(&w) {
                 let node_ids = w.refs().collect::<Vec<_>>();
 
                 let foot = w
                     .tags()
                     .find(|tag| tag.0 == "foot")
-                    .map_or(true, |tag| tag.1 != "no");
+                    .is_none_or(|tag| tag.1 != "no");
                 let bike = w
                     .tags()
                     .find(|tag| tag.0 == "bicycle")
-                    .map_or(true, |tag| tag.1 != "no");
+                    .is_none_or(|tag| tag.1 != "no");
                 let car = w
                     .tags()
                     .find(|tag| tag.0 == "motorcar")
-                    .map_or(true, |tag| tag.1 != "no");
+                    .is_none_or(|tag| tag.1 != "no");
 
                 for i in 0..node_ids.len().saturating_sub(1) {
                     n += 1;
@@ -80,7 +80,6 @@ pub fn load_pbf_file<'a>(pbf_path: &str, g: &mut Graph) -> result::Result<(), os
                     }
                 }
             }
-        }
     })?;
 
     tracing::info!(

@@ -71,12 +71,11 @@ async fn main() {
             }
         };
 
-        if save_mode {
-            if let Err(e) = save_osm_graph(&osm_graph, &config.build.osm_output) {
+        if save_mode
+            && let Err(e) = save_osm_graph(&osm_graph, &config.build.osm_output) {
                 tracing::error!("{e}");
                 return;
             }
-        }
 
         match build_gtfs_phase(osm_graph, &config.build, &cache_dir, false) {
             Some(g) => g,

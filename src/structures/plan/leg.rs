@@ -18,6 +18,9 @@ pub struct PlanCoordinate {
 }
 
 #[derive(Debug, Interface, Clone)]
+// clippy false positive: each #[graphql(field(...))] defines a distinct field,
+// but the lint keys on the repeated `ty` values.
+#[allow(clippy::duplicated_attributes)]
 #[graphql(field(name = "length", ty = "&usize"))]
 #[graphql(field(name = "start", ty = "&u32"))]
 #[graphql(field(name = "end", ty = "&u32"))]

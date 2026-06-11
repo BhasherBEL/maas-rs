@@ -325,7 +325,7 @@ fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
-        r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.1, toLng: 4.1) {
+        r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.02, toLng: 4.02) {
               stopsReached { stopIdx round name }
            } }"#,
     );

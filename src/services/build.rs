@@ -16,12 +16,11 @@ pub fn build_osm_phase(config: &BuildConfig, cache_dir: &str, force_download: bo
     let mut g = Graph::new();
     run_phase(config, &mut g, 0, cache_dir, force_download)?;
     for input in &config.inputs {
-        if input.phase() != 0 {
-            if let Err(e) = prepare_ingestor(input, &mut g) {
+        if input.phase() != 0
+            && let Err(e) = prepare_ingestor(input, &mut g) {
                 tracing::warn!("prepare step for '{}' failed: {e}", input.label());
                 // Non-fatal: GTFS phase will fall back to re-parsing
             }
-        }
     }
     Some(g)
 }
@@ -35,12 +34,6 @@ pub fn build_gtfs_phase(
 ) -> Option<Graph> {
     run_phase(config, &mut g, 1, cache_dir, force_download)?;
     finalize(g, config)
-}
-
-/// Convenience wrapper: full build without needing to manage osm.bin.
-pub fn build_graph(config: BuildConfig, cache_dir: &str, force_download: bool) -> Option<Graph> {
-    let g = build_osm_phase(&config, cache_dir, force_download)?;
-    build_gtfs_phase(g, &config, cache_dir, force_download)
 }
 
 fn prepare_ingestor(input: &Ingestor, g: &mut Graph) -> Result<(), String> {
@@ -149,6 +142,12 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     }
     if let Some(s) = routing.arrival_slack_secs {
         g.set_arrival_slack_secs(s);
+    }
+    if let Some(m) = routing.max_window_minutes {
+        g.set_max_window_secs(m.saturating_mul(60));
+    }
+    if let Some(m) = routing.max_snap_distance_m {
+        g.set_max_snap_distance_m(m);
     }
 }
 

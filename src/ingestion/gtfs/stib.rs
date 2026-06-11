@@ -38,7 +38,7 @@ fn is_stib_peak_hour(secs: u32) -> bool {
     const H9: u32 = 9 * 3600;
     const H16: u32 = 16 * 3600;
     const H1830: u32 = 16 * 3600 + 2 * 3600 + 30 * 60; // 66 600
-    (secs >= H7 && secs < H9) || (secs >= H16 && secs < H1830)
+    (H7..H9).contains(&secs) || (H16..H1830).contains(&secs)
 }
 
 #[cfg(test)]

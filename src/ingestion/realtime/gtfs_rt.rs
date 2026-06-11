@@ -103,22 +103,23 @@ mod tests {
         let mut tu = TripUpdate::default();
         tu.trip.trip_id = Some(trip_id.to_string());
         tu.stop_time_update = updates;
-        let mut e = FeedEntity::default();
-        e.id = trip_id.to_string();
-        e.trip_update = Some(tu);
-        e
+        FeedEntity {
+            id: trip_id.to_string(),
+            trip_update: Some(tu),
+            ..Default::default()
+        }
     }
 
     fn stop_update(seq: u32, arrival_delay: Option<i32>) -> StopTimeUpdate {
-        let mut stu = StopTimeUpdate::default();
-        stu.stop_sequence = Some(seq);
-        stu.stop_id = Some(format!("stop_{seq}"));
-        if let Some(d) = arrival_delay {
-            let mut ev = StopTimeEvent::default();
-            ev.delay = Some(d);
-            stu.arrival = Some(ev);
+        StopTimeUpdate {
+            stop_sequence: Some(seq),
+            stop_id: Some(format!("stop_{seq}")),
+            arrival: arrival_delay.map(|d| StopTimeEvent {
+                delay: Some(d),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
-        stu
     }
 
     #[test]

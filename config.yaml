@@ -41,7 +41,10 @@ build:
 # Minimum log level: trace | debug | info | warn | error
 log_level: info
 
-default_routing: {}
+# Routing defaults. Both caps below also have these values compiled in as defaults.
+default_routing:
+  max_window_minutes: 1440    # cap on the windowMinutes query argument (24 h)
+  max_snap_distance_m: 10000  # reject queries snapping farther than this (10 km)
 
 server:
   host: 127.0.0.1

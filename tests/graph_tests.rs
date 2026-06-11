@@ -2121,7 +2121,7 @@ fn raptor_returns_fast_risky_and_slow_safe() {
             (worst, p.end)
         })
         .collect();
-    summary.sort_by(|a, b| a.1.cmp(&b.1));
+    summary.sort_by_key(|a| a.1);
     eprintln!("plans (worst_rel, arrive): {:?}", summary);
 
     let risky = summary.iter().find(|(r, _)| *r < 0.5);
@@ -2426,8 +2426,8 @@ fn self_pruning_range_real_network_equals_independent() {
                 println!("    genuine_miss (not dominated by any sp plan): {} -> {genuine_miss:?}", genuine_miss.len());
                 // Dump legs of the first genuine-miss plan (from the independent set),
                 // plus whether any independent plan itself dominates it (filter sanity).
-                if let Some(&gm) = genuine_miss.first() {
-                    if let Some(p) = indep.iter().find(|p| key(p) == *gm) {
+                if let Some(&gm) = genuine_miss.first()
+                    && let Some(p) = indep.iter().find(|p| key(p) == *gm) {
                         let self_dom = indep.iter().any(|q| key(q) != *gm && dom(&key(q), gm));
                         println!("    >>> MISS {gm:?} | dominated within indep set? {self_dom}");
                         for leg in &p.legs {
@@ -2441,7 +2441,6 @@ fn self_pruning_range_real_network_equals_independent() {
                             }
                         }
                     }
-                }
             }
         }
     }

@@ -41,6 +41,32 @@ fn resolve_tuning(
     Ok((buckets, slack))
 }
 
+/// Range-RAPTOR window in seconds, clamped to the configured maximum.
+fn effective_window_secs(window_minutes: u32, max_window_secs: u32) -> u32 {
+    window_minutes.saturating_mul(60).min(max_window_secs)
+}
+
+/// Snap a query coordinate to the street network, rejecting coordinates that
+/// land farther than the configured snap-distance guard.
+fn snap_node(
+    graph: &Graph,
+    lat: f64,
+    lng: f64,
+    endpoint: &str,
+) -> Result<crate::structures::NodeID, async_graphql::Error> {
+    let (dist_m, node) = graph
+        .nearest_node_dist(lat, lng)
+        .ok_or_else(|| async_graphql::Error::new(format!("No node near {endpoint}")))?;
+    let max = graph.raptor.max_snap_distance_m;
+    if dist_m > max as f64 {
+        return Err(async_graphql::Error::new(format!(
+            "{endpoint} is too far from the network (nearest node {:.0} m away, max {} m)",
+            dist_m, max
+        )));
+    }
+    Ok(*node)
+}
+
 fn resolve_query_params(
     graph: &Graph,
     query: &RouteQuery,
@@ -49,13 +75,8 @@ fn resolve_query_params(
     let date = date_to_days(query.date);
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
 
-    let origin = graph
-        .nearest_node(query.from_lat, query.from_lng)
-        .ok_or_else(|| async_graphql::Error::new("No node near departure"))?;
-
-    let destination = graph
-        .nearest_node(query.to_lat, query.to_lng)
-        .ok_or_else(|| async_graphql::Error::new("No node near arrival"))?;
+    let origin = snap_node(graph, query.from_lat, query.from_lng, "departure")?;
+    let destination = snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
 
     let min_access = query.min_access_secs.unwrap_or(graph.raptor.min_access_secs);
 
@@ -73,7 +94,8 @@ pub fn route(
 
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_tuned_rt_overnight(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
+            let window = effective_window_secs(w, graph.raptor.max_window_secs);
+            graph.raptor_range_tuned_rt_overnight(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt)
         }
         _ => graph.raptor_tuned_rt_overnight(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
     };
@@ -100,10 +122,87 @@ pub fn route_explain(
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
-            graph.raptor_range_explain_tuned_rt(origin, destination, time, w * 60, date, weekday, min_access, &buckets, slack, rt)
+            let window = effective_window_secs(w, graph.raptor.max_window_secs);
+            graph.raptor_range_explain_tuned_rt(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt)
         }
         _ => graph.raptor_explain_tuned_rt(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
     };
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structures::{LatLng, NodeData, OsmNodeData};
+
+    fn graph_with_node_at(lat: f64, lon: f64) -> Graph {
+        let mut g = Graph::new();
+        g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "n1".to_string(),
+            lat_lng: LatLng { latitude: lat, longitude: lon },
+        }));
+        g.build_raptor_index();
+        g
+    }
+
+    fn query(from_lat: f64, from_lng: f64, to_lat: f64, to_lng: f64) -> RouteQuery {
+        RouteQuery {
+            from_lat,
+            from_lng,
+            to_lat,
+            to_lng,
+            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
+            time: NaiveTime::from_hms_opt(8, 30, 0).unwrap(),
+            window_minutes: None,
+            min_access_secs: None,
+            arrival_slack_secs: None,
+            reliability_bucket_edges: None,
+        }
+    }
+
+    #[test]
+    fn effective_window_secs_clamps_to_max() {
+        assert_eq!(effective_window_secs(30, 86_400), 1_800);
+        assert_eq!(effective_window_secs(10_000, 86_400), 86_400);
+        assert_eq!(effective_window_secs(1_440, 86_400), 86_400);
+    }
+
+    #[test]
+    fn route_rejects_origin_snapping_too_far() {
+        let graph = graph_with_node_at(50.85, 4.35);
+        let q = query(48.85, 2.35, 50.85, 4.35);
+        let err = route(&graph, &q, &RealtimeIndex::new()).unwrap_err();
+        assert!(
+            err.message.to_lowercase().contains("too far"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn route_rejects_destination_snapping_too_far() {
+        let graph = graph_with_node_at(50.85, 4.35);
+        let q = query(50.85, 4.35, 48.85, 2.35);
+        let err = route(&graph, &q, &RealtimeIndex::new()).unwrap_err();
+        assert!(
+            err.message.to_lowercase().contains("too far"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn route_accepts_origin_within_snap_distance() {
+        let graph = graph_with_node_at(50.85, 4.35);
+        let q = query(50.851, 4.351, 50.85, 4.35);
+        let res = route(&graph, &q, &RealtimeIndex::new());
+        if let Err(e) = res {
+            assert!(
+                !e.message.to_lowercase().contains("too far"),
+                "snap guard fired within range: {}",
+                e.message
+            );
+        }
+    }
 }

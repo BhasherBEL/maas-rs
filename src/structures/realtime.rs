@@ -52,10 +52,6 @@ impl RealtimeIndex {
 
     /// True if any realtime delay is known for `trip` at any stop. Used to flag a
     /// leg as realtime-backed even when the specific board/alight stops are 0.
-    pub fn has_trip(&self, trip: TripId) -> bool {
-        self.delays.keys().any(|(t, _)| *t == trip)
-    }
-
     pub fn len(&self) -> usize {
         self.delays.len()
     }

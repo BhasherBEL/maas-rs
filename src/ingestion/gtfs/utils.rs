@@ -7,6 +7,12 @@ pub struct IdMapper<T, U> {
     to_string: Vec<T>,
 }
 
+impl<T: Eq + Hash + Clone> Default for IdMapper<T, usize> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
     pub fn new() -> Self {
         Self {
@@ -19,7 +25,7 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
         if let Some(&idx) = self.to_index.get(&gtfs_id) {
             return idx;
         }
-        let idx = self.to_string.len() as usize;
+        let idx = self.to_string.len();
         self.to_string.push(gtfs_id.clone());
         self.to_index.insert(gtfs_id, idx);
         idx
@@ -31,6 +37,10 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
 
     pub fn len(&self) -> usize {
         self.to_string.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.to_string.is_empty()
     }
 
     /// The original ids in index order (index `i` is the id that maps to `i`).
