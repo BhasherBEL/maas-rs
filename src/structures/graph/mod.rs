@@ -56,6 +56,12 @@ pub static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
 pub const MAX_SCENARIOS: usize = 2;
 pub const MAX_ROUNDS: usize = 20;
 
+impl Default for Graph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Graph {
     pub fn new() -> Graph {
         Graph {
@@ -109,6 +115,14 @@ impl Graph {
 
     pub fn set_arrival_slack_secs(&mut self, secs: u32) {
         self.raptor.arrival_slack_secs = secs;
+    }
+
+    pub fn set_max_window_secs(&mut self, secs: u32) {
+        self.raptor.max_window_secs = secs;
+    }
+
+    pub fn set_max_snap_distance_m(&mut self, meters: u32) {
+        self.raptor.max_snap_distance_m = meters;
     }
 
     pub fn add_node(&mut self, node: NodeData) -> NodeID {
@@ -165,10 +179,7 @@ impl Graph {
             .nodes_tree
             .iter_nearest(&[lat, lon], &squared_euclidean)
         {
-            Ok(mut it) => match it.next() {
-                Some(v) => Some(*v.1),
-                None => None,
-            },
+            Ok(mut it) => it.next().map(|v| *v.1),
             Err(_) => {
                 tracing::warn!("KD-tree query failed (empty tree?)");
                 None
@@ -181,10 +192,7 @@ impl Graph {
     /// needed when the actual distance matters (e.g. GTFS stop snapping).
     pub fn nearest_node_dist(&self, lat: f64, lon: f64) -> Option<(f64, &NodeID)> {
         match self.nodes_tree.iter_nearest(&[lat, lon], &LatLng::distance) {
-            Ok(mut it) => match it.next() {
-                Some(v) => Some(v),
-                None => None,
-            },
+            Ok(mut it) => it.next(),
             Err(_) => {
                 tracing::warn!("KD-tree query failed (empty tree?)");
                 None

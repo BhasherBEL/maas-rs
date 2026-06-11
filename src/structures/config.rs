@@ -232,6 +232,14 @@ pub struct RoutingDefaultConfig {
     /// widening the explored band so safer-but-slower plans survive. Default 900 s.
     #[serde(default)]
     pub arrival_slack_secs: Option<u32>,
+    /// Upper bound on the `windowMinutes` query argument (Range-RAPTOR window).
+    /// Requests above it are clamped. When absent, defaults to 1440 (24 h).
+    #[serde(default)]
+    pub max_window_minutes: Option<u32>,
+    /// Maximum distance (meters) a query coordinate may snap to the street
+    /// network; farther queries are rejected. When absent, defaults to 10000.
+    #[serde(default)]
+    pub max_snap_distance_m: Option<u32>,
 }
 
 impl Ingestor {
@@ -283,7 +291,7 @@ impl Config {
     pub fn load(path: &str) -> Result<Self, String> {
         let content =
             fs::read_to_string(path).map_err(|e| format!("Failed to read config: {e}"))?;
-        serde_yml::from_str(&content).map_err(|e| format!("Failed to parse config: {e}"))
+        serde_yaml_ng::from_str(&content).map_err(|e| format!("Failed to parse config: {e}"))
     }
 }
 
@@ -293,7 +301,7 @@ mod tests {
 
     #[test]
     fn server_config_defaults() {
-        let cfg: ServerConfig = serde_yml::from_str("{}").unwrap();
+        let cfg: ServerConfig = serde_yaml_ng::from_str("{}").unwrap();
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 3000);
     }
@@ -301,7 +309,7 @@ mod tests {
     #[test]
     fn server_config_custom_values() {
         let yaml = "host: 127.0.0.1\nport: 8080";
-        let cfg: ServerConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg: ServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
     }
@@ -316,7 +324,7 @@ build:
   output: graph.bin
 default_routing: {}
 "#;
-        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.server.host, "0.0.0.0");
         assert_eq!(cfg.server.port, 3000);
     }
@@ -334,7 +342,7 @@ server:
   host: "127.0.0.1"
   port: 9090
 "#;
-        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 9090);
     }
@@ -342,7 +350,7 @@ server:
     #[test]
     fn routing_default_config_walking_speed_absent_is_none() {
         let yaml = "default_routing: {}";
-        let cfg: RoutingDefaultConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(cfg.walking_speed_mps.is_none());
         assert!(cfg.min_access_secs.is_none());
     }
@@ -350,8 +358,24 @@ server:
     #[test]
     fn routing_default_config_walking_speed_parses() {
         let yaml = "walking_speed_mps: 1.4";
-        let cfg: RoutingDefaultConfig = serde_yml::from_str(yaml).unwrap();
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.walking_speed_mps, Some(1.4));
+    }
+
+    #[test]
+    fn routing_default_config_caps_parse() {
+        let yaml = "max_window_minutes: 120\nmax_snap_distance_m: 5000";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.max_window_minutes, Some(120));
+        assert_eq!(cfg.max_snap_distance_m, Some(5000));
+    }
+
+    #[test]
+    fn routing_default_config_caps_absent_are_none() {
+        let yaml = "default_routing: {}";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(cfg.max_window_minutes.is_none());
+        assert!(cfg.max_snap_distance_m.is_none());
     }
 
     #[test]
@@ -364,7 +388,7 @@ headers:
   Authorization: "Bearer ${TOKEN}"
   X-Api-Key: "${file:/run/secrets/key}"
 "#;
-        let ing: Ingestor = serde_yml::from_str(yaml).unwrap();
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
         let h = ing.headers();
         assert_eq!(
             h.get("Authorization").map(|s| s.as_str()),
@@ -379,14 +403,14 @@ headers:
     #[test]
     fn ingestor_without_headers_is_empty() {
         let yaml = "ingestor: gtfs/generic\nname: x\nurl: \"path:data/x.zip\"";
-        let ing: Ingestor = serde_yml::from_str(yaml).unwrap();
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(ing.headers().is_empty());
     }
 
     #[test]
     fn auto_update_section_parses() {
         let yaml = "enabled: true\nschedule: \"0 5 * * *\"\ncache_dir: \"mycache\"";
-        let au: AutoUpdateConfig = serde_yml::from_str(yaml).unwrap();
+        let au: AutoUpdateConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(au.enabled);
         assert_eq!(au.schedule, "0 5 * * *");
         assert_eq!(au.cache_dir, "mycache");
@@ -395,7 +419,7 @@ headers:
     #[test]
     fn auto_update_cache_dir_defaults() {
         let yaml = "enabled: false\nschedule: \"0 5 * * *\"";
-        let au: AutoUpdateConfig = serde_yml::from_str(yaml).unwrap();
+        let au: AutoUpdateConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(au.cache_dir, "cache");
     }
 
@@ -414,7 +438,7 @@ feeds:
     name: stib
     waiting_time_url: "https://example.com/WaitingTimes/"
 "#;
-        let rt: RealtimeConfig = serde_yml::from_str(yaml).unwrap();
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(rt.enabled);
         assert_eq!(rt.poll_interval_secs, 45);
         assert_eq!(rt.request_timeout_secs, 20); // default
@@ -439,7 +463,7 @@ feeds:
     #[test]
     fn realtime_rate_limit_defaults() {
         let yaml = "enabled: true";
-        let rt: RealtimeConfig = serde_yml::from_str(yaml).unwrap();
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(rt.rate_limit.consecutive_429_threshold, 3);
         assert_eq!(rt.rate_limit.throttled_min_interval_secs, 60);
         assert_eq!(rt.poll_interval_secs, 30);

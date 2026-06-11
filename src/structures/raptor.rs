@@ -10,7 +10,7 @@ pub struct Lookup {
 
 impl Lookup {
     pub fn of<'a, T>(&self, data: &'a [T]) -> &'a [T] {
-        &data[self.start as usize..(self.start + self.len) as usize]
+        &data[self.start..(self.start + self.len)]
     }
 }
 

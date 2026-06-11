@@ -526,7 +526,7 @@ impl Graph {
                         None => continue,
                     };
 
-                if best.map_or(true, |(_, best_dep, _)| dep > best_dep) {
+                if best.is_none_or(|(_, best_dep, _)| dep > best_dep) {
                     best = Some((dep_abs_idx, dep, arr));
                 }
                 break; // Latest feasible trip for this pattern found.

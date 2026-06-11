@@ -174,7 +174,7 @@ where
             continue;
         }
 
-        let nearest_node = nearest_node_dist.1.clone();
+        let nearest_node = *nearest_node_dist.1;
         let distance = nearest_node_dist.0 as usize;
 
         g.add_edge(
@@ -305,7 +305,7 @@ where
             None => continue,
         };
 
-        route_infos.resize_with(route_id as usize + 1, || RouteInfo {
+        route_infos.resize_with(route_id + 1, || RouteInfo {
             agency_id: AgencyId(0),
             route_type: RouteType::Other(-1),
             route_short_name: String::new(),
@@ -447,11 +447,10 @@ where
             pattern_route_ids[pattern_id] = global_route_id;
         }
         pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
-        if pattern_shape_data[pattern_id].is_none() {
-            if let Some(ref shape_id) = trip.shape_id {
+        if pattern_shape_data[pattern_id].is_none()
+            && let Some(ref shape_id) = trip.shape_id {
                 pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));
             }
-        }
     }
 
     for pattern_id in 0..pattern_sequences.len() {

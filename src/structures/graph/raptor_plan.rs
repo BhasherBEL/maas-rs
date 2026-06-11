@@ -3,7 +3,8 @@ use super::raptor_route::{Label, LabelSet};
 use crate::{
     ingestion::gtfs::TimetableSegment,
     structures::{
-        EdgeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
+        EdgeData, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
+        delay::DelayCDF,
         plan::{
             ArrivalScenario, CandidateStatus, Plan, PlanCandidate, PlanLeg, PlanLegStep, PlanPlace,
             PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep, TransferRisk,
@@ -70,19 +71,71 @@ impl Graph {
 
     pub(super) fn is_extreme_risk(plan: &Plan) -> bool {
         plan.legs.iter().any(|leg| {
-            if let PlanLeg::Transit(t) = leg {
-                if let Some(ref risk) = t.transfer_risk {
-                    if risk.reliability < Self::EXTREME_RISK_RELIABILITY {
+            if let PlanLeg::Transit(t) = leg
+                && let Some(ref risk) = t.transfer_risk
+                    && risk.reliability < Self::EXTREME_RISK_RELIABILITY {
                         let wait = risk
                             .next_departure
                             .map(|nd| nd.saturating_sub(risk.scheduled_departure))
                             .unwrap_or(u32::MAX);
                         return wait > Self::EXTREME_RISK_WAIT_SECS;
                     }
-                }
-            }
             false
         })
+    }
+
+    /// Arrival distribution and expected arrival from a scenario bag.
+    ///
+    /// Scenarios with `time == u32::MAX` mean "connection missed, no later trip
+    /// today": they carry probability but no finite arrival, so they are excluded
+    /// from the published distribution *before* the delay-CDF convolution (which
+    /// would otherwise shift the sentinel to a bogus finite time). `expected_end`
+    /// is the expectation conditioned on actually arriving; when no scenario is
+    /// reachable it falls back to `fallback_end`.
+    pub(crate) fn arrival_stats(
+        bag: &ScenarioBag,
+        cdf: Option<&DelayCDF>,
+        fallback_end: u32,
+    ) -> (Vec<ArrivalScenario>, u32) {
+        let reachable: Vec<Scenario> = bag
+            .scenarios()
+            .iter()
+            .copied()
+            .filter(|s| s.time != u32::MAX)
+            .collect();
+
+        let dist: Vec<ArrivalScenario> = match cdf {
+            Some(cdf) if !cdf.bins.is_empty() => {
+                let mut dist = Vec::with_capacity(reachable.len() * cdf.bins.len());
+                let mut prev_cum = 0.0f32;
+                for &(delay, cum_prob) in &cdf.bins {
+                    let bin_mass = cum_prob - prev_cum;
+                    if bin_mass > 0.0 {
+                        for s in &reachable {
+                            dist.push(ArrivalScenario {
+                                time: s.time.saturating_add_signed(delay),
+                                probability: s.prob * bin_mass,
+                            });
+                        }
+                    }
+                    prev_cum = cum_prob;
+                }
+                dist.sort_by_key(|s| s.time);
+                dist
+            }
+            _ => reachable
+                .iter()
+                .map(|s| ArrivalScenario { time: s.time, probability: s.prob })
+                .collect(),
+        };
+
+        let mass: f64 = dist.iter().map(|s| s.probability as f64).sum();
+        let expected_end = if mass > 0.0 {
+            (dist.iter().map(|s| s.time as f64 * s.probability as f64).sum::<f64>() / mass) as u32
+        } else {
+            fallback_end
+        };
+        (dist, expected_end)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -280,38 +333,11 @@ impl Graph {
                 .unwrap_or(start_time);
 
             let arrival_bag = chosen_bag.shifted_by(best_walk);
-            let arrival_distribution: Vec<ArrivalScenario> =
-                match chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)) {
-                    Some(cdf) if !cdf.bins.is_empty() => {
-                        let mut dist =
-                            Vec::with_capacity(arrival_bag.scenarios().len() * cdf.bins.len());
-                        let mut prev_cum = 0.0f32;
-                        for &(delay, cum_prob) in &cdf.bins {
-                            let bin_mass = cum_prob - prev_cum;
-                            if bin_mass > 0.0 {
-                                for s in arrival_bag.scenarios() {
-                                    dist.push(ArrivalScenario {
-                                        time: s.time.saturating_add_signed(delay),
-                                        probability: s.prob * bin_mass,
-                                    });
-                                }
-                            }
-                            prev_cum = cum_prob;
-                        }
-                        dist.sort_by_key(|s| s.time);
-                        dist
-                    }
-                    _ => arrival_bag
-                        .scenarios()
-                        .iter()
-                        .map(|s| ArrivalScenario { time: s.time, probability: s.prob })
-                        .collect(),
-                };
-
-            let expected_end = arrival_distribution
-                .iter()
-                .map(|s| s.time as f64 * s.probability as f64)
-                .sum::<f64>() as u32;
+            let (arrival_distribution, expected_end) = Self::arrival_stats(
+                &arrival_bag,
+                chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)),
+                best_arr,
+            );
             let plan = Plan {
                 legs: Self::merge_consecutive_walks(legs),
                 start: departure,
@@ -337,7 +363,7 @@ impl Graph {
 
         if candidates.iter().any(|p| !Self::is_extreme_risk(p)) {
             let mut new_candidates = Vec::new();
-            for (plan, si) in candidates.into_iter().zip(sink_indices.into_iter()) {
+            for (plan, si) in candidates.into_iter().zip(sink_indices) {
                 if Self::is_extreme_risk(&plan) {
                     if let Some(ref mut sink) = debug_sink {
                         sink[si].status = CandidateStatus::ExtremeRisk;
@@ -506,11 +532,7 @@ impl Graph {
             let preceding_rt = parent_node.and_then(|l| l.route_type);
             let preceding_arr = parent_node.map(|l| l.bag.earliest());
 
-            let transfer_risk = if preceding_rt.is_none() {
-                None
-            } else {
-                let rt = preceding_rt.unwrap();
-                let arrival_at_bs = preceding_arr.unwrap();
+            let transfer_risk = if let (Some(rt), Some(arrival_at_bs)) = (preceding_rt, preceding_arr) {
                 let margin = board_dep as i32 - arrival_at_bs as i32;
                 let next_departure =
                     self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
@@ -534,6 +556,8 @@ impl Graph {
                     next_reliability,
                     margin_secs: Some(margin),
                 })
+            } else {
+                None
             };
 
             let route_id = self.raptor.transit_patterns[p].route;
@@ -724,13 +748,12 @@ impl Graph {
                     t.to.arrival = Some(t.end);
 
                     for step in t.steps.iter_mut() {
-                        if let PlanLegStep::Transit(s) = step {
-                            if let Some(sc) = compact(s.place.node_id) {
+                        if let PlanLegStep::Transit(s) = step
+                            && let Some(sc) = compact(s.place.node_id) {
                                 let d = rt.delay(t.trip_id, sc);
                                 s.place.arrival = s.place.arrival.map(|a| apply_signed_delay(a, d));
                                 s.place.departure = s.place.departure.map(|x| apply_signed_delay(x, d));
                             }
-                        }
                     }
 
                     // Recompute the transfer onto this leg from the realtime arrival.
@@ -822,7 +845,7 @@ impl Graph {
 
     pub(super) fn tighten_with_backward_labels(
         &self,
-        legs: &mut Vec<PlanLeg>,
+        legs: &mut [PlanLeg],
         lambda: &[Vec<u32>],
         date: u32,
         weekday: u8,
@@ -896,8 +919,8 @@ impl Graph {
                     max_alighting,
                     date,
                     weekday,
-                ) {
-                    if new_dep > leg_start {
+                )
+                    && new_dep > leg_start {
                         let cloned = match &legs[ti] {
                             PlanLeg::Transit(t) => t.clone(),
                             _ => unreachable!(),
@@ -906,13 +929,11 @@ impl Graph {
                             self,
                             std::iter::once((dep_idx, &self.raptor.transit_departures[dep_idx])),
                             1,
-                        ) {
-                            if let Some(new_leg) = alts.pop() {
+                        )
+                            && let Some(new_leg) = alts.pop() {
                                 legs[ti] = PlanLeg::Transit(new_leg);
                             }
-                        }
                     }
-                }
             }
 
             let new_leg_end =
@@ -1067,7 +1088,7 @@ impl Graph {
     pub(super) fn pareto_filter_with_debug(
         plans: Vec<Plan>,
         plan_to_sink_idx: &[usize],
-        sink: &mut Vec<PlanCandidate>,
+        sink: &mut [PlanCandidate],
         buckets: &ReliabilityBuckets,
     ) -> Vec<Plan> {
         fn transfer_count(plan: &Plan) -> usize {
@@ -1151,7 +1172,7 @@ impl Graph {
 
             let (new_result, new_result_sink_idx): (Vec<Plan>, Vec<usize>) = result
                 .into_iter()
-                .zip(result_sink_idx.into_iter())
+                .zip(result_sink_idx)
                 .zip(dominated.iter())
                 .filter_map(|((p, si), &dom)| if dom { None } else { Some((p, si)) })
                 .unzip();
@@ -1170,5 +1191,46 @@ impl Graph {
                 .then(walk_secs(a).cmp(&walk_secs(b)))
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structures::delay::{DelayCDF, ScenarioBag};
+
+    #[test]
+    fn arrival_stats_excludes_unreachable_miss_scenarios() {
+        let bag = ScenarioBag::with_scenarios(36000, 0.6, u32::MAX, 0.4);
+        let (dist, expected_end) = Graph::arrival_stats(&bag, None, 37000);
+        assert_eq!(dist.len(), 1);
+        assert_eq!(dist[0].time, 36000);
+        assert!((dist[0].probability - 0.6).abs() < 1e-6);
+        assert_eq!(expected_end, 36000);
+    }
+
+    #[test]
+    fn arrival_stats_unreachable_survives_negative_delay_convolution() {
+        let bag = ScenarioBag::with_scenarios(36000, 0.5, u32::MAX, 0.5);
+        let cdf = DelayCDF { bins: vec![(-180, 0.2), (0, 0.8), (120, 1.0)] };
+        let (dist, expected_end) = Graph::arrival_stats(&bag, Some(&cdf), 37000);
+        assert!(dist.iter().all(|s| s.time < 200_000), "sentinel leaked: {dist:?}");
+        assert!((35820..=36120).contains(&expected_end), "got {expected_end}");
+    }
+
+    #[test]
+    fn arrival_stats_all_unreachable_falls_back_to_best_arrival() {
+        let bag = ScenarioBag::with_scenarios(u32::MAX, 0.6, u32::MAX, 0.4);
+        let (dist, expected_end) = Graph::arrival_stats(&bag, None, 37000);
+        assert!(dist.is_empty());
+        assert_eq!(expected_end, 37000);
+    }
+
+    #[test]
+    fn arrival_stats_pure_bag_keeps_full_expectation() {
+        let bag = ScenarioBag::with_scenarios(36000, 0.75, 36600, 0.25);
+        let (dist, expected_end) = Graph::arrival_stats(&bag, None, 36000);
+        assert_eq!(dist.len(), 2);
+        assert_eq!(expected_end, 36150);
     }
 }

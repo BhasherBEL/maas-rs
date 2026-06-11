@@ -15,14 +15,6 @@ pub enum SourceLocation {
     Remote(String),
 }
 
-/// Local-only resolution kept for callers without a cache directory.
-pub fn resolve_path(input: &Ingestor) -> Result<String, String> {
-    match input.location()? {
-        SourceLocation::Local(path) => Ok(path),
-        SourceLocation::Remote(url) => Err(format!("Remote source requires a cache dir: {url}")),
-    }
-}
-
 /// Resolve an ingestor's source to a local file path. Remote sources are
 /// downloaded into `cache_dir/<label>.zip`; an existing cache file is reused
 /// unless `force_download` is set.
@@ -106,7 +98,7 @@ pub fn load_feed_hashes(cache_dir: &str) -> BTreeMap<String, String> {
     let path = format!("{cache_dir}/feeds.yml");
     fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_yml::from_str(&s).ok())
+        .and_then(|s| serde_yaml_ng::from_str(&s).ok())
         .unwrap_or_default()
 }
 
@@ -114,7 +106,7 @@ pub fn save_feed_hashes(cache_dir: &str, hashes: &BTreeMap<String, String>) -> R
     fs::create_dir_all(cache_dir)
         .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
     let path = format!("{cache_dir}/feeds.yml");
-    let s = serde_yml::to_string(hashes).map_err(|e| format!("serialize feed hashes: {e}"))?;
+    let s = serde_yaml_ng::to_string(hashes).map_err(|e| format!("serialize feed hashes: {e}"))?;
     fs::write(&path, s).map_err(|e| format!("write feed hashes: {e}"))
 }
 

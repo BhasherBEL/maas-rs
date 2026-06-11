@@ -119,8 +119,8 @@ impl Graph {
                     }
 
                     // Step B: update t_star — find latest trip arriving ≤ lambda[round-1].
-                    if lambda[round - 1][stop] > 0 {
-                        if let Some(t) = self.latest_trip_arriving_at_stop_before(
+                    if lambda[round - 1][stop] > 0
+                        && let Some(t) = self.latest_trip_arriving_at_stop_before(
                             col,
                             trip_ids,
                             lambda[round - 1][stop],
@@ -135,7 +135,6 @@ impl Graph {
                                 t_star = Some(t);
                             }
                         }
-                    }
                 }
             }
 
@@ -153,9 +152,9 @@ impl Graph {
     /// Only iterates the stops present in `marked` at call time (one hop).
     pub(super) fn apply_reverse_footpaths(
         &self,
-        lambda_k: &mut Vec<u32>,
+        lambda_k: &mut [u32],
         marked: &mut Vec<usize>,
-        is_marked: &mut Vec<bool>,
+        is_marked: &mut [bool],
     ) {
         let n = marked.len(); // snapshot: only process original entries
         for i in 0..n {

@@ -85,6 +85,12 @@ pub struct RaptorIndex {
 
     #[serde(skip, default = "RaptorIndex::default_arrival_slack_secs")]
     pub arrival_slack_secs: u32,
+
+    #[serde(skip, default = "RaptorIndex::default_max_window_secs")]
+    pub max_window_secs: u32,
+
+    #[serde(skip, default = "RaptorIndex::default_max_snap_distance_m")]
+    pub max_snap_distance_m: u32,
 }
 
 impl Default for RaptorIndex {
@@ -139,6 +145,8 @@ impl RaptorIndex {
             walking_speed_mps: Self::default_walking_speed_mps(),
             reliability_bucket_edges: Self::default_reliability_bucket_edges(),
             arrival_slack_secs: Self::default_arrival_slack_secs(),
+            max_window_secs: Self::default_max_window_secs(),
+            max_snap_distance_m: Self::default_max_snap_distance_m(),
         }
     }
 
@@ -156,6 +164,14 @@ impl RaptorIndex {
 
     pub fn default_arrival_slack_secs() -> u32 {
         900
+    }
+
+    pub fn default_max_window_secs() -> u32 {
+        24 * 3600
+    }
+
+    pub fn default_max_snap_distance_m() -> u32 {
+        10_000
     }
 
     /// Rebuild non-serialized runtime indices from serialized data. Must be
@@ -246,6 +262,13 @@ mod tests {
     use super::*;
     use crate::ingestion::gtfs::{RouteId, ServiceId, TripInfo};
     use crate::structures::raptor::PatternID;
+
+    #[test]
+    fn new_index_has_default_query_caps() {
+        let idx = RaptorIndex::new();
+        assert_eq!(idx.max_window_secs, 24 * 3600);
+        assert_eq!(idx.max_snap_distance_m, 10_000);
+    }
 
     fn make_trip(route_id: u32, service_id: u32) -> TripInfo {
         TripInfo {

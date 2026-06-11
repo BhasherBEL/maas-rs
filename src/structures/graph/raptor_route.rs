@@ -35,6 +35,8 @@ pub(super) struct Riding {
     reliability: f32,
     /// Reliability bucket of the prev label this was boarded from (for reconstruction).
     from_bucket: u8,
+    /// Transit-leg count of the prev label (alight labels get `from_round + 1`).
+    from_round: u8,
     /// Arena index of the prev label this trip was boarded from (the alight label's parent).
     from_arena: u32,
 }
@@ -54,6 +56,10 @@ pub(super) struct Label {
     /// Compact stop id this label resides at (needed to recover a footpath leg's
     /// destination during reconstruction, which the trace alone does not record).
     pub at_stop: u32,
+    /// Number of transit legs used to create this label (footpaths don't count).
+    /// More precise than the grid round index under carry-forward; cross-stamp
+    /// pruning compares it so a many-leg ghost can't prune a fewer-leg label.
+    pub round: u8,
     /// Arena index of the predecessor label (`u32::MAX` = source/root). Reconstruction
     /// follows these exact pointers instead of re-looking-up grid cells by bucket,
     /// which would drift to a different (overwritten) label and mis-score the plan.
@@ -70,6 +76,7 @@ impl Label {
         trace: Trace::NONE,
         created_by: 0,
         at_stop: u32::MAX,
+        round: 0,
         parent: u32::MAX,
         arena_id: u32::MAX,
     };
@@ -136,21 +143,41 @@ impl LabelSet {
     }
 
     /// Pareto-inserts `cand`. Returns true if the set changed (i.e. `cand` was kept).
-    /// Dominance over (scheduled arrival ↓, reliability bucket ↑): an existing label
-    /// dominates `cand` if it has a `>=` bucket AND a `<=` earliest arrival. At most
-    /// one label survives per bucket (the earliest-arriving one). A label is never
-    /// overridden by a later-arriving one in the same bucket.
+    ///
+    /// Same-stamp dominance is bucket-level (scheduled arrival ↓, reliability
+    /// bucket ↑) — it matches the bucketed per-pass output, so at most one label
+    /// per bucket survives within a departure.
+    ///
+    /// Cross-stamp (carried labels from later departures, the self-pruning range
+    /// driver) dominance requires `>=` PRECISE reliability: two prefixes in the
+    /// same bucket carry different precise reliabilities that can quantize to
+    /// different final buckets downstream, so a bucket-level cross-stamp prune
+    /// drops genuinely Pareto-optimal plans (the historical ~4% range misses).
+    /// Precise-rel + arrival domination IS sound: an extension of the dominator
+    /// has `<=` arrival (same trips catchable, `>=` transfer margins) and `>=`
+    /// precise reliability at every downstream step.
     pub fn insert(&mut self, cand: Label, buckets: &ReliabilityBuckets) -> bool {
         let cb = buckets.bucket(cand.reliability);
         let ce = cand.bag.earliest();
 
         for l in self.iter() {
-            if buckets.bucket(l.reliability) >= cb && l.bag.earliest() <= ce {
+            let dominates = if l.created_by == cand.created_by {
+                buckets.bucket(l.reliability) >= cb
+            } else {
+                // Cross-stamp: precise reliability AND no extra transit legs —
+                // a many-leg ghost pruning a fewer-leg label would lose plans
+                // that win the output filter on the transfers axis.
+                l.reliability >= cand.reliability && l.round <= cand.round
+            };
+            if dominates && l.bag.earliest() <= ce {
                 return false;
             }
         }
 
-        // Drop existing labels dominated by `cand`.
+        // Drop existing labels dominated by `cand`. Same-stamp: bucket-level (one
+        // label per bucket per departure). Cross-stamp: ghosts are pruning-only
+        // (their departure is already extracted), so evicting on bucket level only
+        // weakens future pruning — never output correctness.
         let mut w = 0usize;
         for i in 0..self.len as usize {
             let e = self.labels[i];
@@ -170,8 +197,31 @@ impl LabelSet {
             return true;
         }
 
-        // Full (only possible with very fine custom bucket edges): replace the worst
-        // label (lowest bucket, then latest arrival) if `cand` beats it.
+        // Full cell. Prefer evicting an old-stamp ghost: ghosts can never reach the
+        // output again, while `cand` (the newest stamp) may be needed for it. Among
+        // ghosts evict the weakest pruner (lowest precise reliability, then latest
+        // arrival).
+        let mut ghost: Option<usize> = None;
+        for i in 0..self.len as usize {
+            if self.labels[i].created_by == cand.created_by {
+                continue;
+            }
+            ghost = Some(match ghost {
+                None => i,
+                Some(g) => {
+                    let (gr, ge) = (self.labels[g].reliability, self.labels[g].bag.earliest());
+                    let (ir, ie) = (self.labels[i].reliability, self.labels[i].bag.earliest());
+                    if ir < gr || (ir == gr && ie > ge) { i } else { g }
+                }
+            });
+        }
+        if let Some(g) = ghost {
+            self.labels[g] = cand;
+            return true;
+        }
+
+        // All same-stamp (only possible with very fine custom bucket edges): replace
+        // the worst label (lowest bucket, then latest arrival) if `cand` beats it.
         let mut worst = 0usize;
         for i in 1..self.len as usize {
             let wb = buckets.bucket(self.labels[worst].reliability);
@@ -239,15 +289,14 @@ impl Graph {
                 );
             }
 
-            if let Some(actual) = walk_only_secs {
-                if access_secs >= actual {
+            if let Some(actual) = walk_only_secs
+                && access_secs >= actual {
                     return if actual < u32::MAX {
                         vec![self.build_walk_plan(origin, destination, start_time, actual)]
                     } else {
                         vec![]
                     };
                 }
-            }
         }
     }
 
@@ -472,6 +521,7 @@ impl Graph {
                 trace: Trace::NONE,
                 created_by: stamp,
                 at_stop: stop as u32,
+                round: 0,
                 parent: u32::MAX,
                 arena_id: u32::MAX,
             });
@@ -526,23 +576,51 @@ impl Graph {
                 let prev_slice = &prev[k - 1];
                 let curr_slice = &mut rest[0];
 
-                for &pat in queue.iter() {
-                    self.scan_route(
-                        pat,
-                        queue_pos[pat],
-                        date,
-                        weekday,
-                        cutoff,
-                        prev_slice,
-                        curr_slice,
-                        best,
-                        buckets,
-                        rt,
-                        marked,
-                        is_marked,
-                        stamp,
-                        arena,
+                let qp: &[u32] = queue_pos;
+                let chunks = Self::scan_chunks(queue.len());
+                if chunks <= 1 {
+                    let mut cands: Vec<Label> = Vec::new();
+                    for &pat in queue.iter() {
+                        self.scan_route_collect(
+                            pat, qp[pat], date, weekday, cutoff,
+                            prev_slice, best, buckets, rt, stamp, &mut cands,
+                        );
+                    }
+                    self.apply_scan_candidates(
+                        &cands, curr_slice, best, buckets, marked, is_marked, arena,
                     );
+                } else {
+                    // Phase A: read-only scans in parallel over contiguous queue
+                    // chunks (each thread emits candidates in scan order). Phase B
+                    // applies them in queue order against the live `best`/grid —
+                    // the exact consideration stream the sequential loop produces,
+                    // so output (and arena ids) are identical regardless of
+                    // thread scheduling.
+                    let chunk_size = queue.len().div_ceil(chunks);
+                    let best_ro: &[LabelSet] = best;
+                    let collected: Vec<Vec<Label>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = queue
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(move || {
+                                    let mut cands: Vec<Label> = Vec::new();
+                                    for &pat in chunk {
+                                        self.scan_route_collect(
+                                            pat, qp[pat], date, weekday, cutoff,
+                                            prev_slice, best_ro, buckets, rt, stamp, &mut cands,
+                                        );
+                                    }
+                                    cands
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    for cands in &collected {
+                        self.apply_scan_candidates(
+                            cands, curr_slice, best, buckets, marked, is_marked, arena,
+                        );
+                    }
                 }
             }
 
@@ -582,11 +660,8 @@ impl Graph {
         let mut stop = stop_idx;
         let mut k = round;
 
-        loop {
-            let trace = match labels[k][stop].min_arrival_label() {
-                Some(l) => l.trace,
-                None => break,
-            };
+        while let Some(l) = labels[k][stop].min_arrival_label() {
+            let trace = l.trace;
             let to_node = self.raptor.transit_stop_to_node[stop];
             let to_loc = self.nodes[to_node.0].loc();
 
@@ -673,8 +748,8 @@ impl Graph {
             let raw_stops = self.nearby_stops(origin, access_secs);
             let targets = self.nearby_stops(destination, access_secs);
 
-            if !raw_stops.is_empty() && !targets.is_empty() {
-                if let Some((plans, candidates, stops)) = try_routing(&raw_stops, &targets, access_secs) {
+            if !raw_stops.is_empty() && !targets.is_empty()
+                && let Some((plans, candidates, stops)) = try_routing(&raw_stops, &targets, access_secs) {
                     let access = AccessInfo {
                         walk_radius_secs: access_secs,
                         walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
@@ -685,7 +760,6 @@ impl Graph {
                     };
                     return (plans, candidates, access, stops);
                 }
-            }
 
             access_secs = access_secs.saturating_mul(2);
             attempts += 1;
@@ -699,8 +773,8 @@ impl Graph {
                 );
             }
 
-            if let Some(actual) = walk_only_secs {
-                if access_secs >= actual {
+            if let Some(actual) = walk_only_secs
+                && access_secs >= actual {
                     let (plans, candidates) = if actual < u32::MAX {
                         let plan = self.build_walk_plan(origin, destination, start_time, actual);
                         let candidate = PlanCandidate {
@@ -723,7 +797,6 @@ impl Graph {
                     };
                     return (plans, candidates, access, vec![]);
                 }
-            }
         }
     }
 
@@ -793,21 +866,6 @@ impl Graph {
             origin: self.node_coord(origin),
             destination: self.node_coord(destination),
         }
-    }
-
-    pub fn raptor_range_explain(
-        &self,
-        origin: NodeID,
-        destination: NodeID,
-        start_time: u32,
-        window_secs: u32,
-        date: u32,
-        weekday: u8,
-        min_access_secs: u32,
-    ) -> ExplainResult {
-        let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
-        self.raptor_range_explain_tuned(origin, destination, start_time, window_secs, date, weekday,
-            min_access_secs, &buckets, self.raptor.arrival_slack_secs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -921,8 +979,14 @@ impl Graph {
         }
     }
 
+    /// Read-only route scan: walks `pattern` building the riding set from `prev`
+    /// and pushes every surviving candidate label into `out` in scan order.
+    /// `best` is the round-start snapshot used only as a domination *prefilter*
+    /// (it can lag the live set — `apply_scan_candidates` re-checks against the
+    /// live one, so stale pruning here is sound and merely less aggressive).
+    /// Being free of writes to the shared grids, route scans can run in parallel.
     #[allow(clippy::too_many_arguments)]
-    fn scan_route(
+    fn scan_route_collect(
         &self,
         pattern: usize,
         first_pos: u32,
@@ -930,14 +994,11 @@ impl Graph {
         weekday: u8,
         cutoff: u32,
         prev: &[LabelSet],
-        curr: &mut [LabelSet],
-        best: &mut [LabelSet],
+        best: &[LabelSet],
         buckets: &ReliabilityBuckets,
         rt: &RealtimeIndex,
-        marked: &mut Vec<usize>,
-        is_marked: &mut [bool],
         stamp: u32,
-        arena: &mut Vec<Label>,
+        out: &mut Vec<Label>,
     ) {
         let pat_stops = self.raptor.transit_idx_pattern_stops[pattern].of(&self.raptor.transit_pattern_stops);
         let n_trips = self.raptor.transit_patterns[pattern].num_trips as usize;
@@ -991,23 +1052,14 @@ impl Graph {
                     },
                     created_by: stamp,
                     at_stop: stop as u32,
+                    round: r.from_round.saturating_add(1),
                     parent: r.from_arena,
                     arena_id: u32::MAX,
                 };
-                // `best` is THIS pass's cross-round bound: it drives `target_cutoff`
-                // and the local prune, so it must always capture what this departure
-                // can reach (independent of the carried grid) — otherwise the cutoff
-                // degrades and the pass explores the whole network. Only *marking* is
-                // gated on the carried per-round set, which is what self-prunes earlier
-                // departures against later ones.
                 if best[stop].dominates(cand, buckets) {
                     continue;
                 }
-                let cand = Label::arena_push(arena, cand);
-                best[stop].insert(cand, buckets);
-                if curr[stop].insert(cand, buckets) {
-                    Self::mark(stop, marked, is_marked);
-                }
+                out.push(cand);
             }
 
             // 2. Board from each prev label at this stop. We board the earliest
@@ -1026,7 +1078,7 @@ impl Graph {
                         continue;
                     }
                     let from_bucket = buckets.bucket(pl.reliability);
-                    let min_dep = pl.bag.earliest() as u32;
+                    let min_dep = pl.bag.earliest();
                     let t_start = col.partition_point(|st| st.departure < min_dep);
                     let mut best_bucket_seen: Option<u8> = None;
                     for t in t_start..n_trips {
@@ -1049,7 +1101,7 @@ impl Graph {
 
                         // Only board this trip if it reaches a bucket we haven't covered
                         // yet for this prev label (the earliest trip per bucket level).
-                        if best_bucket_seen.map_or(false, |bs| cb <= bs) {
+                        if best_bucket_seen.is_some_and(|bs| cb <= bs) {
                             continue;
                         }
                         best_bucket_seen = Some(cb);
@@ -1082,6 +1134,7 @@ impl Graph {
                                 hit_prob,
                                 reliability: rel,
                                 from_bucket,
+                                from_round: pl.round,
                                 from_arena: pl.arena_id,
                             },
                             buckets,
@@ -1093,6 +1146,59 @@ impl Graph {
                 }
             }
         }
+    }
+
+    /// Applies collected scan candidates in order against the live grids: re-checks
+    /// domination on the up-to-date `best` (the collect-time snapshot may lag), then
+    /// arena-pushes and inserts. Replaying candidates in queue order makes the
+    /// result — including arena ids — identical to a fully sequential scan.
+    fn apply_scan_candidates(
+        &self,
+        cands: &[Label],
+        curr: &mut [LabelSet],
+        best: &mut [LabelSet],
+        buckets: &ReliabilityBuckets,
+        marked: &mut Vec<usize>,
+        is_marked: &mut [bool],
+        arena: &mut Vec<Label>,
+    ) {
+        for &cand in cands {
+            let stop = cand.at_stop as usize;
+            // `best` is THIS pass's cross-round bound: it drives `target_cutoff`
+            // and the local prune, so it must always capture what this departure
+            // can reach (independent of the carried grid) — otherwise the cutoff
+            // degrades and the pass explores the whole network. Only *marking* is
+            // gated on the carried per-round set, which is what self-prunes earlier
+            // departures against later ones.
+            if best[stop].dominates(cand, buckets) {
+                continue;
+            }
+            let cand = Label::arena_push(arena, cand);
+            best[stop].insert(cand, buckets);
+            if curr[stop].insert(cand, buckets) {
+                Self::mark(stop, marked, is_marked);
+            }
+        }
+    }
+
+    /// Number of parallel chunks for a round's route-scan queue. 1 = stay
+    /// sequential (small queues are not worth the spawn cost).
+    /// `MAAS_SCAN_THREADS` overrides the thread budget (1 = force sequential).
+    fn scan_chunks(queue_len: usize) -> usize {
+        static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let threads = *THREADS.get_or_init(|| {
+            std::env::var("MAAS_SCAN_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+                })
+        });
+        if queue_len < 32 || threads == 1 {
+            return 1;
+        }
+        threads.min(queue_len / 8).max(1)
     }
 
     /// Pareto-inserts a riding label into the route bag over (trip index ↓, bucket ↑).
@@ -1205,6 +1311,7 @@ impl Graph {
                         },
                         created_by: stamp,
                         at_stop: target as u32,
+                        round: l.round,
                         parent: l.arena_id,
                         arena_id: u32::MAX,
                     };
@@ -1640,6 +1747,7 @@ mod label_tests {
             trace: Trace::NONE,
             created_by: 0,
             at_stop: u32::MAX,
+            round: 0,
             parent: u32::MAX,
             arena_id: u32::MAX,
         }
@@ -1693,6 +1801,7 @@ mod label_tests {
             trace: Trace::NONE,
             created_by: 0,
             at_stop: u32::MAX,
+            round: 0,
             parent: u32::MAX,
             arena_id: u32::MAX,
         };
@@ -1702,5 +1811,97 @@ mod label_tests {
         assert!(!s.insert(lbl(200, 1.0), &b));
         assert_eq!(s.iter().count(), 1);
         assert_eq!(s.earliest(), 100, "earliest-scheduled label must survive");
+    }
+
+    fn lbl_stamped(time: u32, rel: f32, stamp: u32) -> Label {
+        let mut l = lbl(time, rel);
+        l.created_by = stamp;
+        l
+    }
+
+    /// Cross-departure pruning must compare PRECISE reliability, not buckets.
+    /// A carried label from a later departure (older stamp) with the same bucket
+    /// but lower precise reliability must NOT suppress the new label — their
+    /// extensions can quantize to different final buckets (the ~4% range misses).
+    #[test]
+    fn labelset_cross_stamp_prune_requires_precise_reliability() {
+        let b = ReliabilityBuckets::default(); // edges [0.5, 0.8, 0.95]
+        let mut s = LabelSet::EMPTY;
+        // Carried ghost from stamp 0: bucket 2 (0.80..0.95), arrival 100.
+        assert!(s.insert(lbl_stamped(100, 0.81, 0), &b));
+        // New pass (stamp 1), same bucket & arrival but HIGHER precise reliability:
+        // must be inserted, not bucket-pruned.
+        assert!(
+            s.insert(lbl_stamped(100, 0.94, 1), &b),
+            "cross-stamp bucket prune dropped a higher-precise-reliability label"
+        );
+        // Same situation but the ghost's precise reliability is >= the candidate's:
+        // the prune IS sound and must still fire.
+        let mut s2 = LabelSet::EMPTY;
+        assert!(s2.insert(lbl_stamped(100, 0.94, 0), &b));
+        assert!(!s2.insert(lbl_stamped(100, 0.81, 1), &b));
+    }
+
+    /// Cross-stamp pruning must respect the transfers axis: a ghost that used MORE
+    /// transit legs (higher creation round) must not prune a label with fewer legs,
+    /// even at better arrival/reliability — the pruned label's extensions can win
+    /// the output Pareto filter on the transfers axis.
+    #[test]
+    fn labelset_cross_stamp_prune_respects_transfer_count() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        // Ghost from stamp 0: 3 transit legs, arrival 100, reliability 0.99.
+        let mut ghost = lbl_stamped(100, 0.99, 0);
+        ghost.round = 3;
+        assert!(s.insert(ghost, &b));
+        // Carried label from stamp 1 with only 1 leg, worse arrival/rel: must coexist.
+        let mut cand = lbl_stamped(120, 0.85, 1);
+        cand.round = 1;
+        assert!(
+            s.insert(cand, &b),
+            "ghost with more transit legs pruned a fewer-leg label (transfers axis)"
+        );
+        // Same ghost but with <= legs soundly dominates.
+        let mut s2 = LabelSet::EMPTY;
+        let mut g2 = lbl_stamped(100, 0.99, 0);
+        g2.round = 1;
+        assert!(s2.insert(g2, &b));
+        let mut c2 = lbl_stamped(120, 0.85, 1);
+        c2.round = 1;
+        assert!(!s2.insert(c2, &b));
+    }
+
+    /// Within one departure (same stamp) bucket-level domination is the contract
+    /// (it matches the bucketed output) and must keep working unchanged.
+    #[test]
+    fn labelset_same_stamp_prune_stays_bucketed() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        assert!(s.insert(lbl_stamped(100, 0.81, 1), &b));
+        assert!(!s.insert(lbl_stamped(100, 0.94, 1), &b), "same-stamp same-bucket same-arrival must stay pruned");
+    }
+
+    /// When a cell is full, old-stamp ghosts (pruning-only, already extracted)
+    /// must be evicted before a non-dominated current-stamp label is sacrificed.
+    #[test]
+    fn labelset_full_cell_evicts_ghost_before_current_stamp() {
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        // Fill the cell with ghosts from MAX_LABELS earlier departures, all in the
+        // top bucket, arrival and precise reliability both increasing — pairwise
+        // non-dominated cross-stamp, so they all coexist.
+        for i in 0..MAX_LABELS {
+            let g = lbl_stamped(100 + i as u32, 0.951 + 0.003 * i as f32, i as u32);
+            assert!(s.insert(g, &b), "ghost {i} should coexist");
+        }
+        assert_eq!(s.iter().count(), MAX_LABELS);
+        // Current-stamp candidate: latest arrival but the highest precise reliability
+        // in the cell — no ghost soundly dominates it. The bucket-based worst-
+        // replacement would reject it (same bucket, latest arrival); it must instead
+        // displace a ghost, because ghosts can never appear in output again.
+        let stamp = MAX_LABELS as u32;
+        let cand = lbl_stamped(100 + MAX_LABELS as u32 + 5, 0.9999, stamp);
+        assert!(s.insert(cand, &b), "current-stamp label lost to ghosts in a full cell");
+        assert!(s.iter().any(|l| l.created_by == stamp), "current-stamp label must be present");
     }
 }

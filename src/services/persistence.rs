@@ -81,7 +81,7 @@ pub fn load_osm_graph(path: &str) -> Result<Graph, String> {
 /// Save `graph` to `path` while preserving the previous good copy.
 /// 1. serialize to `<path>.new`, 2. rotate existing `<path>` → `<path>.prev`,
 /// 3. atomically rename `<path>.new` → `<path>`. A crash between steps always
-/// leaves a valid `<path>` or `<path>.prev` for a later `--restore`.
+///    leaves a valid `<path>` or `<path>.prev` for a later `--restore`.
 pub fn save_graph_with_rollback(graph: &Graph, path: &str) -> Result<(), String> {
     let payload = to_allocvec(graph).map_err(|e| format!("Failed to serialize graph: {e}"))?;
     let bytes = with_header(GRAPH_SCHEMA_VERSION, &payload);
