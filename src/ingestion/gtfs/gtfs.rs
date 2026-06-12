@@ -533,6 +533,14 @@ where
         );
     }
 
+    let (bikes_set, bikes_total) = bikes_allowed_coverage(&trip_infos);
+    if bikes_total > 0 && bikes_set == 0 {
+        tracing::warn!(
+            "GTFS feed '{gtfs_path}' defines bikes_allowed on 0/{bikes_total} trips; \
+             bike-on-transit modes will not use this feed (unknown = not allowed)"
+        );
+    }
+
     g.add_transit_trip_ids(trip_mapper.strings().to_vec());
     g.add_transit_trips(trip_infos);
     g.add_transit_routes(route_infos);
@@ -540,6 +548,12 @@ where
     g.add_transit_agencies(agencies);
 
     Ok(())
+}
+
+/// (trips with an explicit bikes_allowed value, total trips).
+fn bikes_allowed_coverage(trips: &[TripInfo]) -> (usize, usize) {
+    let set = trips.iter().filter(|t| t.bikes_allowed.is_some()).count();
+    (set, trips.len())
 }
 
 fn haversine_sq(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -642,6 +656,30 @@ pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    // ── bikes_allowed_coverage ────────────────────────────────────────────────
+
+    fn trip_with_bikes(bikes_allowed: Option<bool>) -> TripInfo {
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed,
+        }
+    }
+
+    #[test]
+    fn bikes_allowed_coverage_counts_set_and_total() {
+        let trips = vec![
+            trip_with_bikes(Some(true)),
+            trip_with_bikes(Some(false)),
+            trip_with_bikes(None),
+        ];
+        assert_eq!(bikes_allowed_coverage(&trips), (2, 3));
+        assert_eq!(bikes_allowed_coverage(&[]), (0, 0));
+        let unset = vec![trip_with_bikes(None), trip_with_bikes(None)];
+        assert_eq!(bikes_allowed_coverage(&unset), (0, 2));
+    }
 
     // ── compute_pattern_shape ─────────────────────────────────────────────────
 

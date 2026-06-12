@@ -149,6 +149,7 @@
       </label>
       <label>Date <input id="date" type="date" /></label>
       <label>Time <input id="time" type="time" /></label>
+      <label>Modes <input id="modes" type="text" placeholder="WALK,WALK_TRANSIT" title="Comma-separated: WALK, BIKE, WALK_TRANSIT, BIKE_TRANSIT, BIKE_ON_TRANSIT" /></label>
       <p class="hint">Right-click the map to set origin or destination</p>
       <button id="go-btn">Plan</button>
       <div id="error-banner"></div>
@@ -270,13 +271,13 @@ function marginLabel(secs) {
 // ── GraphQL query ───────────────────────────────────────────────
 const QUERY = `query MapExplain(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
-  $date: String, $time: String, $windowMinutes: Int
+  $date: String, $time: String, $windowMinutes: Int, $modes: [Mode!]
 ) {
   raptorExplain(
     fromLat: $fromLat, fromLng: $fromLng,
     toLat: $toLat, toLng: $toLng,
     date: $date, time: $time,
-    windowMinutes: $windowMinutes
+    windowMinutes: $windowMinutes, modes: $modes
   ) {
     origin { lat lon }
     destination { lat lon }
@@ -758,6 +759,8 @@ async function runQuery() {
 
   const date = document.getElementById('date').value || null;
   const time = document.getElementById('time').value || null;
+  const modesRaw = document.getElementById('modes').value.trim();
+  const modes = modesRaw ? modesRaw.split(',').map(m => m.trim().toUpperCase()).filter(Boolean) : null;
 
   doSyncUrl();
   showError('');
@@ -768,7 +771,7 @@ async function runQuery() {
     const resp = await fetch(GRAPHQL_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: QUERY, variables: { fromLat, fromLng, toLat, toLng, date, time } }),
+      body: JSON.stringify({ query: QUERY, variables: { fromLat, fromLng, toLat, toLng, date, time, modes } }),
     });
     const json = await resp.json();
     if (json.errors?.length) { showError(json.errors.map(e => e.message).join('\n')); return; }

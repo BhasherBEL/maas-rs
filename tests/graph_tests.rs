@@ -14,8 +14,9 @@ use maas_rs::{
         TimetableSegment, TripId, TripInfo, TripSegment,
     },
     structures::{
-        DelayCDF, EdgeData, Graph, LatLng, NodeData, NodeID, OsmNodeData, RealtimeIndex,
-        ReliabilityBuckets, StreetEdgeData, TransitEdgeData, TransitStopData,
+        ActiveModes, DelayCDF, EdgeData, Graph, LatLng, Mode, NodeData, NodeID, OsmNodeData,
+        RealtimeIndex, ReliabilityBuckets, StreetEdgeData, StreetProfile, TransitEdgeData,
+        TransitStopData,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
     },
@@ -567,6 +568,83 @@ fn nearby_stops_finds_connected_stop() {
     assert_eq!(stops[0].0, 0); // compact stop index
 }
 
+// ── Street profiles (foot / bike) ─────────────────────────────────────────────
+
+fn street_edge_flags(
+    origin: NodeID,
+    destination: NodeID,
+    length_m: usize,
+    foot: bool,
+    bike: bool,
+) -> EdgeData {
+    EdgeData::Street(StreetEdgeData {
+        origin,
+        destination,
+        length: length_m,
+        partial: false,
+        foot,
+        bike,
+        car: false,
+    })
+}
+
+#[test]
+fn bike_dijkstra_uses_bike_edges_at_bike_speed() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    g.add_edge(a, street_edge_flags(a, b, 420, false, true));
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Bike);
+    // 420 m at 4.2 m/s = 100 s
+    assert_eq!(dist[&b], 100);
+}
+
+#[test]
+fn bike_dijkstra_falls_back_to_foot_edges_at_walk_speed() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    g.add_edge(a, street_edge_flags(a, b, 120, true, false));
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Bike);
+    // foot-only edge pushed at walking speed: 120 m at 1.2 m/s = 100 s
+    assert_eq!(dist[&b], 100);
+}
+
+#[test]
+fn foot_dijkstra_ignores_bike_only_edges() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    g.add_edge(a, street_edge_flags(a, b, 100, false, true));
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Foot);
+    assert!(!dist.contains_key(&b));
+    // And the legacy wrapper behaves identically.
+    let dist_legacy = g.walk_dijkstra(a, 99999);
+    assert!(!dist_legacy.contains_key(&b));
+}
+
+#[test]
+fn nearby_stops_bike_profile_reaches_farther() {
+    let mut g = Graph::new();
+    let street = g.add_node(osm_node("s1", 50.000, 4.000));
+    let stop = g.add_node(transit_stop("A", 50.000, 4.001));
+    // 504 m: 120 s by bike (4.2 m/s), 420 s on foot (1.2 m/s).
+    g.add_edge(street, street_edge(street, stop, 504));
+    g.build_raptor_index();
+
+    let by_foot = g.nearby_stops_profile(street, 200, StreetProfile::Foot);
+    let by_bike = g.nearby_stops_profile(street, 200, StreetProfile::Bike);
+    assert!(by_foot.is_empty());
+    assert_eq!(by_bike.len(), 1);
+    assert_eq!(by_bike[0], (0, 120));
+}
+
 // ── RAPTOR transfer_risk ───────────────────────────────────────────────────────
 
 /// Builds a minimal 2-route graph:
@@ -586,6 +664,13 @@ fn nearby_stops_finds_connected_stop() {
 /// to reach stop_B is via the Bus in round 1. That guarantees labels_rt[1][stop_C]
 /// is set to Some(Bus) after the B→C transfer, making the Tram leg's transfer_risk non-null.
 fn two_route_raptor_graph() -> (Graph, NodeID, NodeID) {
+    two_route_raptor_graph_with_bikes(None, None)
+}
+
+fn two_route_raptor_graph_with_bikes(
+    bus_bikes: Option<bool>,
+    tram_bikes: Option<bool>,
+) -> (Graph, NodeID, NodeID) {
     let mut g = Graph::new();
 
     // OSM nodes (auto-added to nodes_tree for nearest_node lookup)
@@ -716,13 +801,13 @@ fn two_route_raptor_graph() -> (Graph, NodeID, NodeID) {
             trip_headsign: None,
             route_id: RouteId(0),
             service_id: ServiceId(0),
-            bikes_allowed: None,
+            bikes_allowed: bus_bikes,
         }, // TripId(0) = bus
         TripInfo {
             trip_headsign: None,
             route_id: RouteId(1),
             service_id: ServiceId(0),
-            bikes_allowed: None,
+            bikes_allowed: tram_bikes,
         }, // TripId(1) = tram
     ]);
 
@@ -806,6 +891,626 @@ fn two_route_raptor_graph() -> (Graph, NodeID, NodeID) {
     g.build_raptor_index();
 
     (g, osm_origin, osm_dest)
+}
+
+// ── Multi-state RAPTOR (bike modes) ───────────────────────────────────────────
+
+/// Two express legs spanning ~10 km each, so transit genuinely beats direct
+/// cycling (the precondition for any bike+transit plan to be Pareto-optimal):
+///   Leg 1 (route 0): stop_P → stop_Q, dep 09:00, arr 09:08
+///   Leg 2 (route 1): stop_R → stop_S, dep 09:15, arr 09:23
+/// stop_Q/stop_R are 143 m apart (a footpath transfer). Streets run the whole
+/// way (foot+bike), so direct cycling is possible but takes ~80 min.
+fn express_two_leg_graph(
+    leg1_bikes: Option<bool>,
+    leg2_bikes: Option<bool>,
+) -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_o = g.add_node(osm_node("o", 50.000, 4.000));
+    let osm_q = g.add_node(osm_node("q", 50.000, 4.139));
+    let osm_d = g.add_node(osm_node("d", 50.000, 4.281));
+
+    let stop_p = g.add_node(transit_stop("Stop P", 50.000, 4.001));
+    let stop_q = g.add_node(transit_stop("Stop Q", 50.000, 4.140));
+    let stop_r = g.add_node(transit_stop("Stop R", 50.000, 4.142));
+    let stop_s = g.add_node(transit_stop("Stop S", 50.000, 4.280));
+
+    // Streets are car-navigable too (the `car` flag is inert for foot/bike
+    // routing, so this leaves the walk/bike tests unchanged while enabling the
+    // car-mode tests to drive the same network).
+    let both = |g: &mut Graph, a: NodeID, b: NodeID, m: usize, foot: bool, bike: bool| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m, partial: false, foot, bike, car: true,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m, partial: false, foot, bike, car: true,
+        }));
+    };
+    both(&mut g, osm_o, osm_q, 9967, true, true);
+    both(&mut g, osm_q, osm_d, 10182, true, true);
+    both(&mut g, stop_p, osm_o, 72, true, false);
+    both(&mut g, stop_q, osm_q, 72, true, false);
+    both(&mut g, stop_r, osm_q, 215, true, false);
+    both(&mut g, stop_s, osm_d, 72, true, false);
+
+    g.add_edge(stop_p, EdgeData::Transit(TransitEdgeData {
+        origin: stop_p, destination: stop_q, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 9967,
+    }));
+    g.add_edge(stop_r, EdgeData::Transit(TransitEdgeData {
+        origin: stop_r, destination: stop_s, route_id: RouteId(1),
+        timetable_segment: TimetableSegment { start: 1, len: 1 }, length: 9895,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "X1".into(), route_long_name: "Express 1".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "X2".into(), route_long_name: "Express 2".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo {
+            trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0),
+            bikes_allowed: leg1_bikes,
+        },
+        TripInfo {
+            trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0),
+            bikes_allowed: leg2_bikes,
+        },
+    ]);
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600, arrival: 9 * 3600 + 480, service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600 + 900, arrival: 9 * 3600 + 1380, service_id: ServiceId(0),
+        },
+    ]);
+
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_p, stop_q]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600 });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 480,
+            departure: 9 * 3600 + 480,
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_r, stop_s]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 900,
+            departure: 9 * 3600 + 900,
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 1380,
+            departure: 9 * 3600 + 1380,
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 1 });
+    }
+
+    g.build_raptor_index();
+
+    (g, osm_o, osm_d)
+}
+
+fn transit_leg_count(p: &maas_rs::structures::plan::Plan) -> usize {
+    p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count()
+}
+
+fn street_modes(p: &maas_rs::structures::plan::Plan) -> Vec<Mode> {
+    p.legs
+        .iter()
+        .filter_map(|l| match l {
+            PlanLeg::Walk(w) => Some(w.street_mode),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn default_modes_match_legacy_raptor() {
+    let (g, origin, dest) = two_route_raptor_graph();
+    let legacy = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    let modes = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &ActiveModes::default());
+
+    assert_eq!(legacy.len(), modes.len());
+    for (a, b) in legacy.iter().zip(modes.iter()) {
+        assert_eq!(a.start, b.start);
+        assert_eq!(a.end, b.end);
+        assert_eq!(a.legs.len(), b.legs.len());
+        assert_eq!(b.mode, Mode::WalkTransit);
+    }
+}
+
+#[test]
+fn bike_on_transit_requires_bikes_allowed_chain() {
+    // Leg 1 allows bikes, leg 2's bikes_allowed is unknown (= not allowed).
+    let (g, origin, dest) = express_two_leg_graph(Some(true), None);
+    let am = ActiveModes::new(&[Mode::BikeOnTransit]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    for p in &plans {
+        assert!(
+            transit_leg_count(p) <= 1,
+            "BIKE_ON_TRANSIT must not board the no-bikes tram (got {} transit legs)",
+            transit_leg_count(p)
+        );
+    }
+}
+
+#[test]
+fn bike_transit_drops_bike_between_legs() {
+    // Leg 1 allows bikes, leg 2 does not: ride to stop P, bike on leg 1, drop it
+    // at the transfer, continue on leg 2.
+    let (g, origin, dest) = express_two_leg_graph(Some(true), None);
+    let am = ActiveModes::new(&[Mode::BikeTransit]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    let two_leg = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 2)
+        .expect("BIKE_TRANSIT should still produce the 2-leg plan by dropping the bike");
+    assert_eq!(two_leg.mode, Mode::BikeTransit);
+
+    let sm = street_modes(two_leg);
+    assert_eq!(
+        sm.first().copied(),
+        Some(Mode::Bike),
+        "access leg should be ridden (street modes: {sm:?})"
+    );
+    assert_eq!(
+        sm.last().copied(),
+        Some(Mode::Walk),
+        "egress after dropping the bike must be walked (street modes: {sm:?})"
+    );
+}
+
+#[test]
+fn bike_on_transit_rides_egress() {
+    let (g, origin, dest) = express_two_leg_graph(Some(true), Some(true));
+    let am = ActiveModes::new(&[Mode::BikeOnTransit]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    let two_leg = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 2)
+        .expect("both legs allow bikes: BIKE_ON_TRANSIT should produce the 2-leg plan");
+    assert_eq!(two_leg.mode, Mode::BikeOnTransit);
+
+    let sm = street_modes(two_leg);
+    assert_eq!(
+        sm.first().copied(),
+        Some(Mode::Bike),
+        "access leg should be ridden (street modes: {sm:?})"
+    );
+    assert_eq!(
+        sm.last().copied(),
+        Some(Mode::Bike),
+        "egress must keep the bike (street modes: {sm:?})"
+    );
+}
+
+#[test]
+fn bike_access_seeds_dropped_state() {
+    // No trip allows bikes: the only bike-mode option is park & ride (bike to
+    // the first stop, drop it there, transit unrestricted afterwards).
+    let (g, origin, dest) = express_two_leg_graph(None, None);
+    let am = ActiveModes::new(&[Mode::BikeTransit]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    let transit_plan = plans
+        .iter()
+        .find(|p| transit_leg_count(p) >= 1)
+        .expect("park & ride plan expected even when no trip allows bikes");
+    assert_eq!(transit_plan.mode, Mode::BikeTransit);
+    assert_eq!(street_modes(transit_plan).first().copied(), Some(Mode::Bike));
+}
+
+#[test]
+fn car_dijkstra_drives_car_edges_and_walks_foot_connectors() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    let c = g.add_node(osm_node("c", 50.001, 4.000));
+    // a→b is a road (driven at car speed). a→c is a foot-only stop connector,
+    // crossed at walking speed (park & walk the last bit).
+    g.add_edge(a, EdgeData::Street(StreetEdgeData {
+        origin: a, destination: b, length: 1100, partial: false, foot: true, bike: false, car: true,
+    }));
+    g.add_edge(a, EdgeData::Street(StreetEdgeData {
+        origin: a, destination: c, length: 120, partial: false, foot: true, bike: true, car: false,
+    }));
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Car);
+    assert_eq!(dist[&b], 100, "1100 m at 11.0 m/s = 100 s by car");
+    assert_eq!(dist[&c], 100, "120 m foot-only connector at 1.2 m/s = 100 s");
+}
+
+#[test]
+fn transit_modes_never_emit_zero_transit_plans() {
+    // With a wide bike access radius, bike-access + a stop-to-stop transfer +
+    // bike-egress can reach the destination using NO transit. Such a degenerate
+    // path is just a direct ride and must not be emitted as a BIKE_ON_TRANSIT
+    // plan (it also dodges the direct-duration filter, since it has 0 transit).
+    let mut g = Graph::new();
+    let osm_o = g.add_node(osm_node("o", 50.000, 4.000));
+    let osm_d = g.add_node(osm_node("d", 50.000, 4.008)); // ~570 m away
+    let stop_a = g.add_node(transit_stop("A", 50.000, 4.0011));
+    let stop_b = g.add_node(transit_stop("B", 50.000, 4.0071)); // ~430 m from A: transferable
+    let stop_far = g.add_node(transit_stop("Far", 50.000, 4.050));
+
+    let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: false,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: false,
+        }));
+    };
+    let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+    };
+    road(&mut g, osm_o, osm_d, 570);
+    connector(&mut g, osm_o, stop_a);
+    connector(&mut g, osm_d, stop_b);
+
+    // A real (but useless here) transit route, so the mode has something to scan.
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_far, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 5000,
+    }));
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "X".into(), route_long_name: "Express".into(),
+        route_type: RouteType::Bus, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: Some(true),
+    }]);
+    g.add_transit_departures(vec![TripSegment {
+        trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+        departure: 9 * 3600 + 600, arrival: 9 * 3600 + 900, service_id: ServiceId(0),
+    }]);
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_far]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 900, departure: 9 * 3600 + 900 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    g.build_raptor_index();
+
+    let am = ActiveModes::new(&[Mode::BikeOnTransit]);
+    // A range query: the degenerate 0-transit path departs later than the direct
+    // bike, so it survives Pareto on the departure axis (single-departure
+    // dominance would otherwise hide the bug).
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+    let plans = g.raptor_range_tuned_rt_modes(
+        osm_o, osm_d, 9 * 3600, 1800, 0, 0x7F, 10 * 60, &buckets, 300, &RealtimeIndex::new(), &am,
+    );
+    // Direct modes (Walk/Bike/Car) are legitimately 0-transit; transit-labelled
+    // modes must use transit.
+    let is_transit_mode = |m: Mode| {
+        matches!(
+            m,
+            Mode::WalkTransit
+                | Mode::BikeTransit
+                | Mode::BikeToTransit
+                | Mode::BikeOnTransit
+                | Mode::CarDropOff
+                | Mode::CarPickup
+        )
+    };
+    for p in &plans {
+        if is_transit_mode(p.mode) {
+            assert!(
+                transit_leg_count(p) >= 1,
+                "a transit-mode plan must use transit; got {:?} with {} transit legs",
+                p.mode, transit_leg_count(p)
+            );
+        }
+    }
+    assert!(
+        plans.iter().any(|p| is_transit_mode(p.mode)) || !plans.is_empty(),
+        "sanity: some plan returned"
+    );
+}
+
+#[test]
+fn car_drop_off_not_poisoned_when_car_reaches_destination() {
+    // When the car-access radius is wide enough to also reach a stop near the
+    // destination, that stop is an egress stop too. A round-0 "drove there"
+    // label there must NOT suppress the genuine park&ride transit journey.
+    let mut g = Graph::new();
+    let osm_o = g.add_node(osm_node("o", 50.000, 4.000));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.010)); // boarding area, ~1.1 km
+    let osm_d = g.add_node(osm_node("d", 50.000, 4.100)); // destination, ~10 km on
+    let stop_board = g.add_node(transit_stop("Board", 50.000, 4.0101));
+    let stop_dest = g.add_node(transit_stop("Dest", 50.000, 4.1001)); // near dest
+
+    let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+    };
+    let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+    };
+    road(&mut g, osm_o, osm_b, 1100); // short drive to the boarding area
+    road(&mut g, osm_b, osm_d, 9900); // road continues all the way to the dest
+    connector(&mut g, osm_b, stop_board);
+    connector(&mut g, osm_d, stop_dest);
+
+    g.add_edge(stop_board, EdgeData::Transit(TransitEdgeData {
+        origin: stop_board, destination: stop_dest, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 9900,
+    }));
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "X".into(), route_long_name: "Express".into(),
+        route_type: RouteType::Bus, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None,
+    }]);
+    g.add_transit_departures(vec![TripSegment {
+        trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+        departure: 9 * 3600 + 600, arrival: 9 * 3600 + 1800, service_id: ServiceId(0),
+    }]);
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_board, stop_dest]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1800, departure: 9 * 3600 + 1800 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    g.build_raptor_index();
+
+    let am = ActiveModes::new(&[Mode::CarDropOff]);
+    let plans = g.raptor_modes(osm_o, osm_d, 9 * 3600, 0, 0x7F, 10 * 60, &am);
+    assert!(
+        plans.iter().any(|p| p.mode == Mode::CarDropOff && transit_leg_count(p) >= 1),
+        "park&ride must survive even though the car can reach a near-destination stop; got {:?}",
+        plans.iter().map(|p| (p.mode, transit_leg_count(p))).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn car_drop_off_with_foot_only_connectors() {
+    // Real-data topology: stops join the street network with foot-only connectors.
+    // Park & ride must drive the road, walk the connector to board, transit, then
+    // walk the egress connector.
+    let mut g = Graph::new();
+    let osm_o = g.add_node(osm_node("o", 50.000, 4.000));
+    let osm_p = g.add_node(osm_node("p", 50.000, 4.090)); // ~6.4 km east, by car
+    let osm_d = g.add_node(osm_node("d", 50.000, 4.181));
+    let stop_p = g.add_node(transit_stop("P", 50.000, 4.0901));
+    let stop_q = g.add_node(transit_stop("Q", 50.000, 4.1809));
+
+    let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+        }));
+    };
+    let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
+        g.add_edge(a, EdgeData::Street(StreetEdgeData {
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+        g.add_edge(b, EdgeData::Street(StreetEdgeData {
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+        }));
+    };
+    road(&mut g, osm_o, osm_p, 6400);
+    road(&mut g, osm_p, osm_d, 6450);
+    connector(&mut g, osm_p, stop_p); // foot-only, as gtfs builds it
+    connector(&mut g, osm_d, stop_q);
+
+    g.add_edge(stop_p, EdgeData::Transit(TransitEdgeData {
+        origin: stop_p, destination: stop_q, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 6400,
+    }));
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "X".into(), route_long_name: "Express".into(),
+        route_type: RouteType::Bus, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None,
+    }]);
+    g.add_transit_departures(vec![TripSegment {
+        trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+        departure: 9 * 3600 + 600, arrival: 9 * 3600 + 900, service_id: ServiceId(0),
+    }]);
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_p, stop_q]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 900, departure: 9 * 3600 + 900 });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    g.build_raptor_index();
+
+    let am = ActiveModes::new(&[Mode::CarDropOff]);
+    let plans = g.raptor_modes(osm_o, osm_d, 9 * 3600, 0, 0x7F, 10 * 60, &am);
+    let pr = plans.iter().find(|p| transit_leg_count(p) >= 1);
+    assert!(
+        pr.is_some(),
+        "park & ride must work with foot-only stop connectors; got {:?}",
+        plans.iter().map(|p| (p.mode, p.legs.len())).collect::<Vec<_>>()
+    );
+    assert_eq!(pr.unwrap().mode, Mode::CarDropOff);
+}
+
+#[test]
+fn car_cannot_resume_driving_after_walking() {
+    // a --road--> b --foot only--> c --car-only road--> d
+    // A car may drive a→b, then park and walk b→c, but it can NEVER pick the car
+    // back up to drive c→d. So d must be unreachable by car.
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    let c = g.add_node(osm_node("c", 50.000, 4.002));
+    let d = g.add_node(osm_node("d", 50.000, 4.003));
+    let edge = |g: &mut Graph, x: NodeID, y: NodeID, foot: bool, car: bool| {
+        g.add_edge(x, EdgeData::Street(StreetEdgeData {
+            origin: x, destination: y, length: 110, partial: false, foot, bike: false, car,
+        }));
+    };
+    edge(&mut g, a, b, true, true);   // road
+    edge(&mut g, b, c, true, false);  // foot-only connector (park & walk)
+    edge(&mut g, c, d, false, true);  // car-only road
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Car);
+    assert!(dist.contains_key(&b), "b reachable by car");
+    assert!(dist.contains_key(&c), "c reachable by parking and walking");
+    assert!(!dist.contains_key(&d), "a parked car cannot be resumed to drive c→d");
+}
+
+#[test]
+fn car_dijkstra_reaches_stop_via_foot_connector() {
+    // Real GTFS connects stops to the street network with foot-only edges. A car
+    // must still reach the stop by driving the road, then walking the connector.
+    let mut g = Graph::new();
+    let o = g.add_node(osm_node("o", 50.000, 4.000));
+    let p = g.add_node(osm_node("p", 50.000, 4.010));
+    let stop = g.add_node(transit_stop("S", 50.000, 4.0101));
+    // o→p road (car), p→stop foot-only connector (as gtfs ingestion builds it).
+    g.add_edge(o, EdgeData::Street(StreetEdgeData {
+        origin: o, destination: p, length: 1100, partial: false, foot: true, bike: false, car: true,
+    }));
+    g.add_edge(p, EdgeData::Street(StreetEdgeData {
+        origin: p, destination: stop, length: 12, partial: true, foot: true, bike: false, car: false,
+    }));
+    g.build_raptor_index();
+
+    let near = g.nearby_stops_profile(o, 9600, StreetProfile::Car);
+    assert!(
+        !near.is_empty(),
+        "car must reach the stop by driving then walking the foot connector: {near:?}"
+    );
+}
+
+#[test]
+fn foot_dijkstra_ignores_car_only_edges() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.000, 4.000));
+    let b = g.add_node(osm_node("b", 50.000, 4.001));
+    g.add_edge(a, EdgeData::Street(StreetEdgeData {
+        origin: a, destination: b, length: 100, partial: false, foot: false, bike: false, car: true,
+    }));
+    g.build_raptor_index();
+
+    let dist = g.street_dijkstra(a, 99999, StreetProfile::Foot);
+    assert!(!dist.contains_key(&b), "pedestrians must not use car-only roads");
+}
+
+#[test]
+fn car_direct_drives_the_whole_way() {
+    let (g, origin, dest) = express_two_leg_graph(None, None);
+    let am = ActiveModes::new(&[Mode::Car]);
+    let plans = g.raptor_modes(origin, dest, 9 * 3600, 0, 0x7F, 10 * 60, &am);
+
+    assert_eq!(plans.len(), 1, "CAR alone should yield exactly the direct drive");
+    assert_eq!(plans[0].mode, Mode::Car);
+    assert_eq!(street_modes(&plans[0]), vec![Mode::Car]);
+}
+
+#[test]
+fn car_drop_off_is_park_and_ride() {
+    // Drive to the first station, park, ride transit, then walk to the door.
+    let (g, origin, dest) = express_two_leg_graph(None, None);
+    let am = ActiveModes::new(&[Mode::CarDropOff]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    let pr = plans
+        .iter()
+        .find(|p| transit_leg_count(p) >= 1)
+        .expect("park & ride plan expected");
+    assert_eq!(pr.mode, Mode::CarDropOff);
+    let sm = street_modes(pr);
+    assert_eq!(sm.first().copied(), Some(Mode::Car), "access must be driven ({sm:?})");
+    assert_eq!(sm.last().copied(), Some(Mode::Walk), "egress must be walked ({sm:?})");
+}
+
+#[test]
+fn car_pickup_is_kiss_and_ride() {
+    // Walk to the first station, ride transit, then get picked up by car.
+    let (g, origin, dest) = express_two_leg_graph(None, None);
+    let am = ActiveModes::new(&[Mode::CarPickup]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &am);
+
+    let kr = plans
+        .iter()
+        .find(|p| transit_leg_count(p) >= 1)
+        .expect("kiss & ride plan expected");
+    assert_eq!(kr.mode, Mode::CarPickup);
+    let sm = street_modes(kr);
+    assert_eq!(sm.first().copied(), Some(Mode::Walk), "access must be walked ({sm:?})");
+    assert_eq!(sm.last().copied(), Some(Mode::Car), "egress must be driven ({sm:?})");
 }
 
 #[test]
@@ -2444,4 +3149,98 @@ fn self_pruning_range_real_network_equals_independent() {
             }
         }
     }
+}
+
+// ── Direct (no-transit) plans ─────────────────────────────────────────────────
+
+#[test]
+fn direct_bike_plan_uses_cycling_speed() {
+    let (mut g, a, _, c) = three_node_street_graph();
+    g.build_raptor_index();
+    let am = ActiveModes::new(&[Mode::Bike]);
+    let plans = g.raptor_modes(a, c, 8 * 3600, 0, 0x7F, 10 * 60, &am);
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].mode, Mode::Bike);
+    // 200 m at 4.2 m/s = 47 s (integer ms math truncates per edge: 2 × 23 s).
+    let expected = 2 * (100 * 1000 / 4200);
+    assert_eq!(plans[0].end - plans[0].start, expected);
+    assert_eq!(street_modes(&plans[0]), vec![Mode::Bike]);
+}
+
+#[test]
+fn walk_and_bike_direct_both_returned_when_selected() {
+    let (mut g, a, _, c) = three_node_street_graph();
+    g.build_raptor_index();
+    let am = ActiveModes::new(&[Mode::Walk, Mode::Bike]);
+    let plans = g.raptor_modes(a, c, 8 * 3600, 0, 0x7F, 10 * 60, &am);
+
+    let modes: Vec<Mode> = plans.iter().map(|p| p.mode).collect();
+    assert!(modes.contains(&Mode::Walk), "modes: {modes:?}");
+    assert!(modes.contains(&Mode::Bike), "modes: {modes:?}");
+}
+
+#[test]
+fn direct_bike_absent_with_default_modes() {
+    let (mut g, a, _, c) = three_node_street_graph();
+    g.build_raptor_index();
+    let plans = g.raptor_modes(a, c, 8 * 3600, 0, 0x7F, 10 * 60, &ActiveModes::default());
+    assert!(plans.iter().all(|p| p.mode != Mode::Bike));
+}
+
+/// When cycling the whole way beats every bike+transit combination, the only
+/// bike-mode result is the direct ride — "no improvement → no transit plan".
+#[test]
+fn direct_bike_returned_when_transit_brings_no_improvement() {
+    let (g, origin, dest) = two_route_raptor_graph_with_bikes(Some(true), Some(true));
+    let am = ActiveModes::new(&[Mode::BikeTransit]);
+    let plans = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &am);
+
+    assert!(
+        plans.iter().any(|p| p.mode == Mode::Bike && transit_leg_count(p) == 0),
+        "expected the direct ride, got: {:?}",
+        plans.iter().map(|p| (p.mode, transit_leg_count(p))).collect::<Vec<_>>()
+    );
+}
+
+/// Range soundness with bike states: the self-pruning range driver must return
+/// the same Pareto set as independent from-scratch passes, with all modes on.
+#[test]
+fn raptor_range_modes_matches_independent_oracle() {
+    let (g, origin, dest) = express_two_leg_graph(Some(true), None);
+    let am = ActiveModes::new(&[Mode::WalkTransit, Mode::BikeTransit, Mode::BikeOnTransit]);
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let rt = RealtimeIndex::new();
+
+    let pruned = g.raptor_range_tuned_rt_modes(
+        origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
+    );
+    let indep = g.raptor_range_independent_rt_modes(
+        origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
+    );
+
+    let key = |p: &maas_rs::structures::plan::Plan| {
+        (p.mode, p.start, p.end, transit_leg_count(p))
+    };
+    let mut a: Vec<_> = pruned.iter().map(key).collect();
+    let mut b: Vec<_> = indep.iter().map(key).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b, "self-pruning range diverged from the independent oracle");
+}
+
+/// Bike modes flow through the explain (debug) path too: same plans, plus
+/// candidate/stop instrumentation, without falling back to direct plans.
+#[test]
+fn raptor_explain_supports_bike_modes() {
+    let (g, origin, dest) = express_two_leg_graph(Some(true), Some(true));
+    let am = ActiveModes::new(&[Mode::BikeOnTransit]);
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let res = g.raptor_explain_tuned_rt_modes(
+        origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &buckets, 900,
+        &RealtimeIndex::new(), &am,
+    );
+    assert!(!res.access.fell_back_to_walk_only);
+    assert!(res.plans.iter().any(|p| transit_leg_count(p) == 2));
+    assert!(!res.stops_reached.is_empty());
 }

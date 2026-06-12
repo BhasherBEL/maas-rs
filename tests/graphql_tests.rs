@@ -92,6 +92,71 @@ fn graphql_raptor_accepts_tuning_overrides() {
 }
 
 #[test]
+fn graphql_raptor_accepts_modes_argument() {
+    let schema = build_schema(shared(Graph::new()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01,
+                    modes: [WALK, WALK_TRANSIT, BIKE, BIKE_TRANSIT, BIKE_ON_TRANSIT])
+             { start mode accessAlternatives { mode start } } }"#,
+    );
+    assert!(
+        resp.errors.iter().all(|e| {
+            let m = e.message.to_lowercase();
+            !m.contains("unknown") && !m.contains("invalid value")
+        }),
+        "modes argument / mode fields should be part of the schema: {:?}",
+        resp.errors
+    );
+}
+
+#[test]
+fn graphql_raptor_rejects_empty_modes() {
+    let mut g = Graph::new();
+    g.add_node(osm_node("n0", 50.0, 4.0));
+    g.build_raptor_index();
+    let schema = build_schema(shared(g));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.001, toLng: 4.001, modes: []) { start } }"#,
+    );
+    assert!(!resp.errors.is_empty(), "expected an error for empty modes");
+    assert!(
+        resp.errors[0].message.to_lowercase().contains("modes"),
+        "unexpected error: {}",
+        resp.errors[0].message
+    );
+}
+
+#[test]
+fn graphql_walk_only_plan_exposes_walk_mode() {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.0, 4.0));
+    let b = g.add_node(osm_node("b", 50.0, 4.001));
+    g.add_edge(a, maas_rs::structures::EdgeData::Street(maas_rs::structures::StreetEdgeData {
+        origin: a, destination: b, length: 80, partial: false, foot: true, bike: false, car: false,
+    }));
+    g.build_raptor_index();
+    let schema = build_schema(shared(g));
+    let resp = execute_sync(
+        &schema,
+        r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001) { mode } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    match &data["raptor"] {
+        Value::List(plans) => {
+            assert!(!plans.is_empty());
+            match &plans[0] {
+                Value::Object(p) => assert_eq!(p["mode"], Value::Enum(Name::new("WALK"))),
+                other => panic!("expected plan object, got {other:?}"),
+            }
+        }
+        other => panic!("expected plan list, got {other:?}"),
+    }
+}
+
+#[test]
 fn graphql_raptor_invalid_date_returns_error() {
     let mut g = Graph::new();
     g.add_node(osm_node("n0", 50.0, 4.0));

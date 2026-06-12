@@ -224,6 +224,15 @@ pub struct RoutingDefaultConfig {
     /// Pedestrian walking speed in m/s. When absent, defaults to 1.2 m/s (4.32 km/h).
     #[serde(default)]
     pub walking_speed_mps: Option<f64>,
+    /// Cycling speed in m/s. When absent, defaults to 4.2 m/s (~15 km/h).
+    #[serde(default)]
+    pub cycling_speed_mps: Option<f64>,
+    /// Driving speed in m/s. When absent, defaults to 11.0 m/s (~40 km/h).
+    #[serde(default)]
+    pub driving_speed_mps: Option<f64>,
+    /// Access-radius floor (seconds) for bike/car modes. When absent, 1200 s.
+    #[serde(default)]
+    pub vehicle_access_secs: Option<u32>,
     /// Reliability bucket edges (sorted, strictly increasing, each in (0,1)) used to
     /// quantize plan reliability. When absent, defaults to [0.50, 0.80, 0.95].
     #[serde(default)]
@@ -360,6 +369,20 @@ server:
         let yaml = "walking_speed_mps: 1.4";
         let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.walking_speed_mps, Some(1.4));
+    }
+
+    #[test]
+    fn routing_default_config_cycling_speed_parses() {
+        let yaml = "cycling_speed_mps: 5.0";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.cycling_speed_mps, Some(5.0));
+    }
+
+    #[test]
+    fn routing_default_config_cycling_speed_absent_is_none() {
+        let yaml = "default_routing: {}";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(cfg.cycling_speed_mps.is_none());
     }
 
     #[test]

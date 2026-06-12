@@ -5,11 +5,46 @@ use std::{
 
 use kdtree::distance::squared_euclidean;
 
-use crate::structures::{EdgeData, NodeID, degrees_to_meters, plan::PlanCoordinate};
+use crate::structures::{
+    EdgeData, NodeID, StreetEdgeData, degrees_to_meters, plan::PlanCoordinate,
+};
 
 use super::Graph;
 
+/// Street traversal profile for access/egress/direct routing.
+/// `Bike` rides `bike` edges at cycling speed and falls back to `foot` edges
+/// at walking speed (dismount and push), so pedestrian-only shortcuts stay usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreetProfile {
+    Foot,
+    Bike,
+    Car,
+}
+
 impl Graph {
+    /// Traversal time of a street edge under `profile` in integer milliseconds
+    /// per meter math (same arithmetic as the historical walk path), or `None`
+    /// when the profile cannot use the edge.
+    #[inline]
+    fn edge_secs(&self, street: &StreetEdgeData, profile: StreetProfile) -> Option<u32> {
+        let speed_mps = match profile {
+            StreetProfile::Foot if street.foot => self.raptor.walking_speed_mps,
+            StreetProfile::Foot => return None,
+            StreetProfile::Bike if street.bike => self.raptor.cycling_speed_mps,
+            StreetProfile::Bike if street.foot => self.raptor.walking_speed_mps,
+            StreetProfile::Bike => return None,
+            // Car drives car edges, and falls back to foot edges at walking speed
+            // (park near the station and walk the last stretch) — the stop→street
+            // snap connectors are foot-only, so without this a car could never
+            // reach a platform for park & ride / kiss & ride.
+            StreetProfile::Car if street.car => self.raptor.driving_speed_mps,
+            StreetProfile::Car if street.foot => self.raptor.walking_speed_mps,
+            StreetProfile::Car => return None,
+        };
+        let speed_mms = (speed_mps * 1000.0) as u32;
+        Some((street.length as u64 * 1000 / speed_mms as u64) as u32)
+    }
+
     pub(super) fn node_coord(&self, id: NodeID) -> PlanCoordinate {
         let loc = self.nodes[id.0].loc();
         PlanCoordinate { lat: loc.latitude, lon: loc.longitude }
@@ -20,12 +55,19 @@ impl Graph {
     ///
     /// Falls back to a two-point straight line if no path is found.
     pub(super) fn walk_path(&self, origin: NodeID, destination: NodeID) -> Vec<PlanCoordinate> {
+        self.street_path(origin, destination, StreetProfile::Foot)
+    }
+
+    pub(super) fn street_path(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        profile: StreetProfile,
+    ) -> Vec<PlanCoordinate> {
         if origin == destination {
             let c = self.node_coord(origin);
             return vec![c];
         }
-
-        let walk_mms = (self.raptor.walking_speed_mps * 1000.0) as u32;
 
         let mut dist: HashMap<NodeID, u32> = HashMap::new();
         let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
@@ -50,7 +92,9 @@ impl Graph {
                 for edge in neighbors {
                     match edge {
                         EdgeData::Street(street) => {
-                            let t = (street.length as u64 * 1000 / walk_mms as u64) as u32;
+                            let Some(t) = self.edge_secs(street, profile) else {
+                                continue;
+                            };
                             let nd = d.saturating_add(t);
                             let entry = dist.entry(street.destination).or_insert(u32::MAX);
                             if nd < *entry {
@@ -92,16 +136,28 @@ impl Graph {
     }
 
     pub fn walk_dijkstra(&self, origin: NodeID, max_seconds: u32) -> HashMap<NodeID, u32> {
-        let walk_mms = (self.raptor.walking_speed_mps * 1000.0) as u32;
+        self.street_dijkstra(origin, max_seconds, StreetProfile::Foot)
+    }
 
-        let mut dist: HashMap<NodeID, u32> = HashMap::new();
-        let mut pq: BinaryHeap<Reverse<(u32, NodeID)>> = BinaryHeap::new();
+    pub fn street_dijkstra(
+        &self,
+        origin: NodeID,
+        max_seconds: u32,
+        profile: StreetProfile,
+    ) -> HashMap<NodeID, u32> {
+        // Car routing is phased: a car may go Driving → (park) → Walking, but
+        // never Walking → Driving (a car left at the kerb can't be picked back
+        // up). The phase is carried in the search state; `walking == false` means
+        // still in the car. Foot/Bike are single-phase (the flag stays false).
+        let car = matches!(profile, StreetProfile::Car);
+        let mut dist: HashMap<(NodeID, bool), u32> = HashMap::new();
+        let mut pq: BinaryHeap<Reverse<(u32, (NodeID, bool))>> = BinaryHeap::new();
 
-        dist.insert(origin, 0);
-        pq.push(Reverse((0, origin)));
+        dist.insert((origin, false), 0);
+        pq.push(Reverse((0, (origin, false))));
 
-        while let Some(Reverse((d, node))) = pq.pop() {
-            if d > *dist.get(&node).unwrap_or(&u32::MAX) {
+        while let Some(Reverse((d, (node, walking)))) = pq.pop() {
+            if d > *dist.get(&(node, walking)).unwrap_or(&u32::MAX) {
                 continue;
             }
 
@@ -109,32 +165,62 @@ impl Graph {
                 continue;
             }
 
-            if let Some(neighbors) = self.edges.get(node.0) {
-                for edge in neighbors {
-                    match edge {
-                        EdgeData::Street(street) => {
-                            let t = (street.length as u64 * 1000 / walk_mms as u64) as u32;
-                            let nd = d.saturating_add(t);
-                            if nd <= max_seconds {
-                                let entry = dist.entry(street.destination).or_insert(u32::MAX);
-                                if nd < *entry {
-                                    *entry = nd;
-                                    pq.push(Reverse((nd, street.destination)));
-                                }
+            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            for edge in neighbors {
+                match edge {
+                    EdgeData::Street(street) => {
+                        // (time, next-phase) for this edge under the profile.
+                        let step = if car {
+                            self.car_edge_step(street, walking)
+                        } else {
+                            self.edge_secs(street, profile).map(|t| (t, false))
+                        };
+                        let Some((t, next_walking)) = step else { continue };
+                        let nd = d.saturating_add(t);
+                        if nd <= max_seconds {
+                            let entry =
+                                dist.entry((street.destination, next_walking)).or_insert(u32::MAX);
+                            if nd < *entry {
+                                *entry = nd;
+                                pq.push(Reverse((nd, (street.destination, next_walking))));
                             }
                         }
-                        EdgeData::Transit(transit) => {
-                            let entry = dist.entry(transit.destination).or_insert(u32::MAX);
-                            if d < *entry {
-                                *entry = d;
-                            }
+                    }
+                    EdgeData::Transit(transit) => {
+                        let entry = dist.entry((transit.destination, walking)).or_insert(u32::MAX);
+                        if d < *entry {
+                            *entry = d;
                         }
                     }
                 }
             }
         }
 
-        dist
+        // Collapse the (node, phase) distances to the best arrival per node.
+        let mut best: HashMap<NodeID, u32> = HashMap::new();
+        for (&(node, _), &d) in &dist {
+            let e = best.entry(node).or_insert(u32::MAX);
+            *e = (*e).min(d);
+        }
+        best
+    }
+
+    /// One car step: `(seconds, next-phase)` or `None` if impassable. Driving may
+    /// stay on car edges or *park and walk* onto a foot edge (→ Walking); once
+    /// Walking, only foot edges are usable (the car has been left behind).
+    #[inline]
+    fn car_edge_step(&self, street: &StreetEdgeData, walking: bool) -> Option<(u32, bool)> {
+        let secs = |speed_mps: f64| {
+            let speed_mms = (speed_mps * 1000.0) as u32;
+            (street.length as u64 * 1000 / speed_mms as u64) as u32
+        };
+        if !walking && street.car {
+            Some((secs(self.raptor.driving_speed_mps), false))
+        } else if street.foot {
+            Some((secs(self.raptor.walking_speed_mps), true))
+        } else {
+            None
+        }
     }
 
     pub(super) fn nearest_stop_secs(&self, node: NodeID, straight_line_secs: u32) -> u32 {
@@ -151,7 +237,16 @@ impl Graph {
     }
 
     pub fn nearby_stops(&self, origin: NodeID, max_walk_secs: u32) -> Vec<(usize, u32)> {
-        let walk_times = self.walk_dijkstra(origin, max_walk_secs);
+        self.nearby_stops_profile(origin, max_walk_secs, StreetProfile::Foot)
+    }
+
+    pub fn nearby_stops_profile(
+        &self,
+        origin: NodeID,
+        max_secs: u32,
+        profile: StreetProfile,
+    ) -> Vec<(usize, u32)> {
+        let walk_times = self.street_dijkstra(origin, max_secs, profile);
 
         let mut stops = Vec::new();
         for (&node, &walk_secs) in &walk_times {

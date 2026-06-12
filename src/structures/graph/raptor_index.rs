@@ -78,6 +78,18 @@ pub struct RaptorIndex {
     #[serde(default = "RaptorIndex::default_walking_speed_mps")]
     pub walking_speed_mps: f64,
 
+    #[serde(skip, default = "RaptorIndex::default_cycling_speed_mps")]
+    pub cycling_speed_mps: f64,
+
+    #[serde(skip, default = "RaptorIndex::default_driving_speed_mps")]
+    pub driving_speed_mps: f64,
+
+    // Access-radius floor (seconds) used when a bike/car access or egress mode is
+    // active, so the search reaches a better-connected hub farther than the
+    // nearest stops instead of stopping at the first local result.
+    #[serde(skip, default = "RaptorIndex::default_vehicle_access_secs")]
+    pub vehicle_access_secs: u32,
+
     // Runtime tuning params, applied from config.yaml at startup — not serialized,
     // so adding them does not change the `graph.bin` (postcard) layout.
     #[serde(skip, default = "RaptorIndex::default_reliability_bucket_edges")]
@@ -143,6 +155,9 @@ impl RaptorIndex {
 
             min_access_secs: Self::default_min_access_secs(),
             walking_speed_mps: Self::default_walking_speed_mps(),
+            cycling_speed_mps: Self::default_cycling_speed_mps(),
+            driving_speed_mps: Self::default_driving_speed_mps(),
+            vehicle_access_secs: Self::default_vehicle_access_secs(),
             reliability_bucket_edges: Self::default_reliability_bucket_edges(),
             arrival_slack_secs: Self::default_arrival_slack_secs(),
             max_window_secs: Self::default_max_window_secs(),
@@ -156,6 +171,18 @@ impl RaptorIndex {
 
     pub fn default_walking_speed_mps() -> f64 {
         1.2
+    }
+
+    pub fn default_cycling_speed_mps() -> f64 {
+        4.2
+    }
+
+    pub fn default_driving_speed_mps() -> f64 {
+        11.0 // ~40 km/h urban driving
+    }
+
+    pub fn default_vehicle_access_secs() -> u32 {
+        20 * 60 // 20 min budget: ~5 km by bike, ~13 km by car, to reach a real hub
     }
 
     pub fn default_reliability_bucket_edges() -> Vec<f32> {
@@ -404,6 +431,9 @@ mod tests {
         assert!(idx.railway_adj.is_empty());
         assert_eq!(idx.min_access_secs, 600);
         assert_eq!(idx.walking_speed_mps, 1.2);
+        assert_eq!(idx.cycling_speed_mps, 4.2);
+        assert_eq!(idx.driving_speed_mps, 11.0);
+        assert_eq!(idx.vehicle_access_secs, 1200);
         assert_eq!(idx.reliability_bucket_edges, vec![0.50, 0.80, 0.95]);
         assert_eq!(idx.arrival_slack_secs, 900);
     }
