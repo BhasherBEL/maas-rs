@@ -137,6 +137,15 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(v) = routing.walking_speed_mps {
         g.set_walking_speed_mps(v);
     }
+    if let Some(v) = routing.cycling_speed_mps {
+        g.set_cycling_speed_mps(v);
+    }
+    if let Some(v) = routing.driving_speed_mps {
+        g.set_driving_speed_mps(v);
+    }
+    if let Some(v) = routing.vehicle_access_secs {
+        g.set_vehicle_access_secs(v);
+    }
     if let Some(edges) = routing.reliability_bucket_edges.clone() {
         g.set_reliability_bucket_edges(edges);
     }

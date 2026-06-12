@@ -20,6 +20,7 @@ mod railway;
 mod realtime_match;
 mod transit;
 
+pub use raptor_access::StreetProfile;
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +102,18 @@ impl Graph {
 
     pub fn set_walking_speed_mps(&mut self, mps: f64) {
         self.raptor.walking_speed_mps = mps;
+    }
+
+    pub fn set_cycling_speed_mps(&mut self, mps: f64) {
+        self.raptor.cycling_speed_mps = mps;
+    }
+
+    pub fn set_driving_speed_mps(&mut self, mps: f64) {
+        self.raptor.driving_speed_mps = mps;
+    }
+
+    pub fn set_vehicle_access_secs(&mut self, secs: u32) {
+        self.raptor.vehicle_access_secs = secs;
     }
 
     /// Sets reliability bucket edges after validating they are sorted, strictly

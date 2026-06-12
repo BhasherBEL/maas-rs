@@ -1,18 +1,20 @@
-use super::raptor_route::{Label, LabelSet};
+use super::raptor_route::{Label, LabelSet, ModeContext};
 
 use crate::{
     ingestion::gtfs::TimetableSegment,
     structures::{
-        EdgeData, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
+        EdgeData, Mode, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
+        VehicleState,
         delay::DelayCDF,
         plan::{
-            ArrivalScenario, CandidateStatus, Plan, PlanCandidate, PlanLeg, PlanLegStep, PlanPlace,
-            PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg, PlanWalkLegStep, TransferRisk,
+            AccessAlternative, ArrivalScenario, CandidateStatus, Plan, PlanCandidate, PlanLeg,
+            PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg,
+            PlanWalkLegStep, TransferRisk,
         },
     },
 };
 
-use super::Graph;
+use super::{Graph, raptor_access::StreetProfile};
 
 /// Apply a signed realtime delay (seconds) to a time, clamped at 0.
 #[inline]
@@ -28,8 +30,25 @@ impl Graph {
         start_time: u32,
         walk_secs: u32,
     ) -> Plan {
-        let end = start_time + walk_secs;
-        let length = (walk_secs as f64 * self.raptor.walking_speed_mps) as usize;
+        self.build_street_plan(origin, destination, start_time, walk_secs, StreetProfile::Foot)
+    }
+
+    /// Direct street-only plan (the whole journey walked or ridden).
+    pub(super) fn build_street_plan(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        secs: u32,
+        profile: StreetProfile,
+    ) -> Plan {
+        let end = start_time + secs;
+        let (speed, mode) = match profile {
+            StreetProfile::Foot => (self.raptor.walking_speed_mps, Mode::Walk),
+            StreetProfile::Bike => (self.raptor.cycling_speed_mps, Mode::Bike),
+            StreetProfile::Car => (self.raptor.driving_speed_mps, Mode::Car),
+        };
+        let length = (secs as f64 * speed) as usize;
 
         let to_place = PlanPlace {
             node_id: destination,
@@ -49,17 +68,20 @@ impl Graph {
                 to: to_place,
                 start: start_time,
                 end,
-                duration: walk_secs,
+                duration: secs,
                 length,
+                street_mode: mode,
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                     length,
-                    time: walk_secs,
+                    time: secs,
                     place: to_place,
                 })],
-                geometry: self.walk_path(origin, destination),
+                geometry: self.street_path(origin, destination, profile),
             })],
             start: start_time,
             end,
+            mode,
+            access_alternatives: vec![],
             arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
             expected_end: end,
         }
@@ -141,8 +163,7 @@ impl Graph {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn extract_with_debug(
         &self,
-        sources: &[(usize, u32)],
-        targets: &[(usize, u32)],
+        mc: &ModeContext,
         start_time: u32,
         date: u32,
         weekday: u8,
@@ -157,40 +178,59 @@ impl Graph {
     ) -> Vec<Plan> {
         use super::MAX_ROUNDS;
 
+        let n_states = mc.n_states();
+        // Mode class: walk-rooted plans must not be suppressed by faster
+        // bike-state arrivals — the burden comparison happens at plan level.
+        let class_of = |vs: VehicleState| -> usize {
+            match vs {
+                VehicleState::Walked => 0,
+                VehicleState::BikeInHand | VehicleState::BikeDropped => 1,
+                VehicleState::CarParked | VehicleState::CarEgress => 2,
+            }
+        };
+        let n_classes = 3;
+
         let mut candidates: Vec<Plan> = Vec::new();
         // Parallel to `candidates`: index of each candidate in `debug_sink`.
         // Populated even when debug_sink is None (dummy values) so the zip works.
         let mut sink_indices: Vec<usize> = Vec::new();
-        // Best arrival seen so far per reliability bucket (cross-round pruning, the
-        // multi-criteria analogue of the old single `pareto_best`).
+        // Best arrival seen so far per (mode class, reliability bucket) — the
+        // cross-round pruning, the multi-criteria analogue of the old single
+        // `pareto_best`.
         let n_buckets = buckets.bucket(1.0) as usize + 1;
-        let mut bucket_best = vec![u32::MAX; n_buckets];
+        let n_keys = n_classes * n_buckets;
+        let mut bucket_best = vec![u32::MAX; n_keys];
 
         for k in 0..=MAX_ROUNDS {
-            // For this round, the earliest arrival (incl. egress walk) per bucket,
-            // and which (stop, walk) achieves it.
-            let mut per_bucket: Vec<Option<(u32, usize, u32)>> = vec![None; n_buckets];
-            for &(s, w) in targets {
-                for l in labels[k][s].iter() {
-                    if l.created_by != departure_stamp {
-                        continue;
-                    }
-                    let b = buckets.bucket(l.reliability) as usize;
-                    let arr = l.bag.earliest().saturating_add(w);
-                    match per_bucket[b] {
-                        Some((cur, ..)) if cur <= arr => {}
-                        _ => per_bucket[b] = Some((arr, s, w)),
+            // For this round, the earliest arrival (incl. egress walk/ride) per
+            // (class, bucket), and which (stop, walk, state) achieves it.
+            let mut per_key: Vec<Option<(u32, usize, u32, usize)>> = vec![None; n_keys];
+            for (sidx, vs) in mc.am.states() {
+                let class = class_of(vs);
+                for &(s, w) in &mc.egress[sidx] {
+                    for l in labels[k][s * n_states + sidx].iter() {
+                        if l.created_by != departure_stamp {
+                            continue;
+                        }
+                        let b = buckets.bucket(l.reliability) as usize;
+                        let key = class * n_buckets + b;
+                        let arr = l.bag.earliest().saturating_add(w);
+                        match per_key[key] {
+                            Some((cur, ..)) if cur <= arr => {}
+                            _ => per_key[key] = Some((arr, s, w, sidx)),
+                        }
                     }
                 }
             }
 
-            for b in 0..n_buckets {
-                let (best_arr, best_stop, best_walk) = match per_bucket[b] {
+            for key in 0..n_keys {
+                let b = key % n_buckets;
+                let (best_arr, best_stop, best_walk, dest_sidx) = match per_key[key] {
                     Some(t) => t,
                     None => continue,
                 };
 
-                if best_arr >= bucket_best[b] {
+                if best_arr >= bucket_best[key] {
                     if let Some(ref mut sink) = debug_sink {
                         sink.push(PlanCandidate {
                             round: k,
@@ -201,17 +241,43 @@ impl Graph {
                     }
                     continue;
                 }
-                bucket_best[b] = best_arr;
+                bucket_best[key] = best_arr;
 
                 // The destination-stop label this candidate was built from; its arena
                 // chain is the EXACT journey (no grid re-lookup → no bucket drift).
-                let chosen = Self::pick_label(labels, buckets, k, best_stop, b as u8, departure_stamp);
+                let cell = best_stop * n_states + dest_sidx;
+                let chosen =
+                    Self::pick_label(&labels[k][cell], buckets, b as u8, departure_stamp);
                 let chosen_bag = chosen.map(|l| l.bag).unwrap_or(ScenarioBag::EMPTY);
                 let chosen_rt = chosen.and_then(|l| l.route_type);
 
-                let (mut legs, origin_stop) = match chosen {
+                let (mut legs, origin_stop, root_state) = match chosen {
                     Some(l) => self.reconstruct(arena, l.arena_id, date, weekday),
-                    None => (Vec::new(), best_stop),
+                    None => (Vec::new(), best_stop, 0),
+                };
+
+                let root_vs = mc.am.state_at(root_state as usize);
+                let dest_vs = mc.am.state_at(dest_sidx);
+                let mode = match root_vs {
+                    VehicleState::Walked => Mode::WalkTransit,
+                    // Car states never transition, so the root state names the mode:
+                    // CarParked = drove & parked (park & ride); CarEgress = picked
+                    // up by car at the destination station (kiss & ride).
+                    VehicleState::CarParked => Mode::CarDropOff,
+                    VehicleState::CarEgress => Mode::CarPickup,
+                    // Bike-rooted: the egress state tells park-and-ride apart from
+                    // carry-on-board. BikeInHand egress = bike ridden to the
+                    // destination; BikeDropped egress = parked at the station and
+                    // walked. The explicit BikeToTransit label takes precedence
+                    // over the BikeTransit union when selected.
+                    VehicleState::BikeInHand | VehicleState::BikeDropped => match dest_vs {
+                        VehicleState::BikeInHand if mc.am.selected(Mode::BikeOnTransit) => {
+                            Mode::BikeOnTransit
+                        }
+                        VehicleState::BikeInHand => Mode::BikeTransit,
+                        _ if mc.am.selected(Mode::BikeToTransit) => Mode::BikeToTransit,
+                        _ => Mode::BikeTransit,
+                    },
                 };
 
                 if legs.is_empty() {
@@ -228,7 +294,26 @@ impl Graph {
 
             let transit_count =
                 legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count();
-            if transit_count > 0 {
+            // A transit-mode candidate must actually use transit. With a wide
+            // vehicle access radius the search can reach the destination via
+            // access + transfer + egress with zero transit legs — a degenerate
+            // direct ride that also dodges the direct-duration filter (it looks
+            // "direct"). Direct rides are emitted by the direct-plan machinery, so
+            // drop any zero-transit candidate here.
+            if transit_count == 0 {
+                if let Some(ref mut sink) = debug_sink {
+                    sink.push(PlanCandidate {
+                        round: k,
+                        origin_departure: start_time,
+                        plan: None,
+                        status: CandidateStatus::ReconstructionEmpty,
+                    });
+                }
+                continue;
+            }
+            // The backward pass is bike-unaware (it would re-board trips a carried
+            // bike is not allowed on), so only walk-rooted plans are tightened.
+            if transit_count > 0 && mode == Mode::WalkTransit {
                 let lambda = self.raptor_backward(
                     best_stop,
                     best_arr.saturating_sub(best_walk),
@@ -248,11 +333,25 @@ impl Graph {
             // margin used to score alternatives matches the leg's actual arrival.
             Self::link_following_connections(&mut legs);
 
-            if let Some(&(_, stop_arrival)) = sources.iter().find(|&&(s, _)| s == origin_stop) {
-                let first_walk = stop_arrival.saturating_sub(start_time);
+            let (access_profile, access_mode) = match root_vs {
+                VehicleState::Walked | VehicleState::CarEgress => (StreetProfile::Foot, Mode::Walk),
+                VehicleState::BikeInHand | VehicleState::BikeDropped => {
+                    (StreetProfile::Bike, Mode::Bike)
+                }
+                VehicleState::CarParked => (StreetProfile::Car, Mode::Car),
+            };
+            if let Some(&(_, first_walk)) = mc.access[root_state as usize]
+                .iter()
+                .find(|&&(s, _)| s == origin_stop)
+            {
                 if first_walk > 0 {
                     let stop_node = self.raptor.transit_stop_to_node[origin_stop];
-                    let length = (first_walk as f64 * self.raptor.walking_speed_mps) as usize;
+                    let speed = match access_profile {
+                        StreetProfile::Foot => self.raptor.walking_speed_mps,
+                        StreetProfile::Bike => self.raptor.cycling_speed_mps,
+                        StreetProfile::Car => self.raptor.driving_speed_mps,
+                    };
+                    let length = (first_walk as f64 * speed) as usize;
                     let walk_start = legs
                         .first()
                         .map(|l| match l {
@@ -282,21 +381,32 @@ impl Graph {
                             end: walk_end,
                             duration: first_walk,
                             length,
+                            street_mode: access_mode,
                             steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                                 length,
                                 time: first_walk,
                                 place: to_place,
                             })],
-                            geometry: self.walk_path(origin, stop_node),
+                            geometry: self.street_path(origin, stop_node, access_profile),
                         }),
                     );
                 }
             }
 
             if best_walk > 0 {
+                let (egress_profile, egress_mode) = match dest_vs {
+                    VehicleState::BikeInHand => (StreetProfile::Bike, Mode::Bike),
+                    VehicleState::CarEgress => (StreetProfile::Car, Mode::Car),
+                    _ => (StreetProfile::Foot, Mode::Walk),
+                };
                 let walk_start = chosen_bag.earliest();
                 let stop_node = self.raptor.transit_stop_to_node[best_stop];
-                let length = (best_walk as f64 * self.raptor.walking_speed_mps) as usize;
+                let speed = match egress_profile {
+                    StreetProfile::Foot => self.raptor.walking_speed_mps,
+                    StreetProfile::Bike => self.raptor.cycling_speed_mps,
+                    StreetProfile::Car => self.raptor.driving_speed_mps,
+                };
+                let length = (best_walk as f64 * speed) as usize;
                 let to_place = PlanPlace {
                     node_id: destination,
                     stop_position: None,
@@ -315,33 +425,36 @@ impl Graph {
                     end: best_arr,
                     duration: best_walk,
                     length,
+                    street_mode: egress_mode,
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                         length,
                         time: best_walk,
                         place: to_place,
                     })],
-                    geometry: self.walk_path(stop_node, destination),
+                    geometry: self.street_path(stop_node, destination, egress_profile),
                 }));
             }
 
-            let departure = legs
-                .first()
-                .map(|l| match l {
-                    PlanLeg::Walk(w) => w.start,
-                    PlanLeg::Transit(t) => t.start,
-                })
-                .unwrap_or(start_time);
+            // Re-chain trailing walks onto the realtime-settled legs and read the
+            // plan bounds off the final timeline, so a live delay can never leave
+            // `end` lagging behind `start` (the historical negative-duration bug).
+            let (departure, arrival) = Self::plan_timeline(&mut legs);
 
             let arrival_bag = chosen_bag.shifted_by(best_walk);
             let (arrival_distribution, expected_end) = Self::arrival_stats(
                 &arrival_bag,
                 chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)),
-                best_arr,
+                arrival,
             );
+            // The expected (mean) arrival must never precede the deterministic
+            // realtime arrival the legs actually show.
+            let expected_end = expected_end.max(arrival);
             let plan = Plan {
                 legs: Self::merge_consecutive_walks(legs),
                 start: departure,
-                end: best_arr,
+                end: arrival,
+                mode,
+                access_alternatives: vec![],
                 arrival_distribution,
                 expected_end,
             };
@@ -378,12 +491,60 @@ impl Graph {
         candidates
     }
 
+    /// Re-chains any walk leg that *follows* another leg onto that leg's end
+    /// (preserving its duration), then returns `(plan.start, plan.end)` read off
+    /// the final legs. The first leg is the anchor and is never shifted.
+    ///
+    /// The realtime post-pass (`apply_realtime`) settles the transit/transfer
+    /// chain, but the egress walk is attached afterwards from the *scheduled*
+    /// alight time. Under a live delay this leaves the egress (and the plan's
+    /// `end`) lagging the realtime arrival, which can make the displayed
+    /// duration negative. Re-chaining trailing walks here keeps the timeline
+    /// monotonic; for schedule-only plans every leg already chains, so it is a
+    /// no-op.
+    pub(super) fn plan_timeline(legs: &mut [PlanLeg]) -> (u32, u32) {
+        let mut cursor: Option<u32> = None;
+        for leg in legs.iter_mut() {
+            match leg {
+                PlanLeg::Walk(w) => {
+                    if let Some(prev_end) = cursor {
+                        let dur = w.duration;
+                        w.start = prev_end;
+                        w.end = prev_end + dur;
+                        w.from.departure = Some(w.start);
+                        w.to.arrival = Some(w.end);
+                        for step in w.steps.iter_mut() {
+                            if let PlanLegStep::Walk(ws) = step {
+                                ws.place.arrival = Some(w.end);
+                            }
+                        }
+                    }
+                    cursor = Some(w.end);
+                }
+                PlanLeg::Transit(t) => cursor = Some(t.end),
+            }
+        }
+        let leg_start = |l: &PlanLeg| match l {
+            PlanLeg::Walk(w) => w.start,
+            PlanLeg::Transit(t) => t.start,
+        };
+        let leg_end = |l: &PlanLeg| match l {
+            PlanLeg::Walk(w) => w.end,
+            PlanLeg::Transit(t) => t.end,
+        };
+        let start = legs.first().map(leg_start).unwrap_or(0);
+        let end = legs.last().map(leg_end).unwrap_or(start);
+        (start, end)
+    }
+
     /// Merge any two consecutive `PlanLeg::Walk` segments into one.
     pub(super) fn merge_consecutive_walks(legs: Vec<PlanLeg>) -> Vec<PlanLeg> {
         let mut out: Vec<PlanLeg> = Vec::with_capacity(legs.len());
         for leg in legs {
             match (out.last_mut(), &leg) {
-                (Some(PlanLeg::Walk(prev)), PlanLeg::Walk(next)) => {
+                (Some(PlanLeg::Walk(prev)), PlanLeg::Walk(next))
+                    if prev.street_mode == next.street_mode =>
+                {
                     let mut merged_geo = prev.geometry.clone();
                     if merged_geo.last().map(|c| (c.lat, c.lon))
                         == next.geometry.first().map(|c| (c.lat, c.lon))
@@ -408,6 +569,7 @@ impl Graph {
                         end: new_end,
                         duration: new_duration,
                         length: new_length,
+                        street_mode: prev.street_mode,
                         steps: vec![step],
                         geometry: merged_geo,
                     };
@@ -425,14 +587,11 @@ impl Graph {
     /// driver passes the current departure index so reconstruction follows only
     /// that departure's traces through the grid shared across departures.
     fn pick_label<'a>(
-        labels: &'a [Vec<LabelSet>],
+        set: &'a LabelSet,
         buckets: &ReliabilityBuckets,
-        k: usize,
-        stop: usize,
         b: u8,
         stamp: u32,
     ) -> Option<&'a Label> {
-        let set = &labels[k][stop];
         set.iter()
             .find(|l| l.created_by == stamp && buckets.bucket(l.reliability) == b)
             .or_else(|| {
@@ -453,7 +612,7 @@ impl Graph {
         start_id: u32,
         date: u32,
         weekday: u8,
-    ) -> (Vec<PlanLeg>, usize) {
+    ) -> (Vec<PlanLeg>, usize, u8) {
         let mut legs = Vec::new();
         let mut origin_stop = 0usize;
         let mut cur = start_id;
@@ -500,6 +659,7 @@ impl Graph {
                     end,
                     duration,
                     length,
+                    street_mode: Mode::Walk,
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                         length,
                         time: duration,
@@ -671,7 +831,14 @@ impl Graph {
 
         legs.reverse();
 
-        (legs, origin_stop)
+        // `cur` is now the source/root label this journey was seeded from; its
+        // state identifies the access profile (walk vs bike).
+        let root_state = arena
+            .get(cur as usize)
+            .map(|l| l.state)
+            .unwrap_or(0);
+
+        (legs, origin_stop, root_state)
     }
 
     /// Fills `following_route_type` / `following_margin_secs` on each transit leg
@@ -1016,6 +1183,133 @@ impl Graph {
             .product::<f32>()
     }
 
+    /// Total street (non-transit) seconds of a plan.
+    fn plan_street_secs(plan: &Plan) -> u32 {
+        plan.legs
+            .iter()
+            .filter_map(|l| if let PlanLeg::Walk(w) = l { Some(w.duration) } else { None })
+            .sum()
+    }
+
+    /// The plan's transit core: the exact sequence of boarded trip segments.
+    /// Plans sharing a core are the same journey with different street legs.
+    fn transit_core(plan: &Plan) -> Vec<(u32, usize, usize)> {
+        plan.legs
+            .iter()
+            .filter_map(|l| match l {
+                PlanLeg::Transit(t) => Some((t.trip_id.0, t.from.node_id.0, t.to.node_id.0)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collapses same-transit-core plans that differ only in street access/egress
+    /// into one plan with `access_alternatives`. The primary is the
+    /// lightest-burden member; a member stays a standalone plan when it arrives
+    /// strictly earlier than the primary (a genuine Pareto endpoint, e.g. a
+    /// ridden egress) — otherwise its only possible advantage is departure time
+    /// or street comfort, which is exactly what the alternatives convey.
+    /// Same-mode non-primary members are exact time-duplicates and are dropped.
+    /// Direct plans (empty core) pass through untouched.
+    pub(super) fn group_access_alternatives(plans: Vec<Plan>) -> Vec<Plan> {
+        use std::collections::HashMap;
+
+        let keys: Vec<Vec<(u32, usize, usize)>> = plans.iter().map(Self::transit_core).collect();
+        let mut groups: HashMap<&[(u32, usize, usize)], Vec<usize>> = HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            if !key.is_empty() {
+                groups.entry(key.as_slice()).or_default().push(i);
+            }
+        }
+
+        let mut slots: Vec<Option<Plan>> = plans.into_iter().map(Some).collect();
+
+        for members in groups.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let &primary_idx = members
+                .iter()
+                .min_by_key(|&&i| {
+                    let p = slots[i].as_ref().unwrap();
+                    (p.mode.burden(), p.end, std::cmp::Reverse(p.start), Self::plan_street_secs(p))
+                })
+                .unwrap();
+            let primary_end = slots[primary_idx].as_ref().unwrap().end;
+
+            let mut alternatives: Vec<AccessAlternative> = Vec::new();
+            for &i in members {
+                if i == primary_idx {
+                    continue;
+                }
+                if slots[i].as_ref().unwrap().end < primary_end {
+                    continue; // genuinely earlier arrival: stays a standalone plan
+                }
+                let member = slots[i].take().unwrap();
+                let alt = AccessAlternative {
+                    mode: member.mode,
+                    start: member.start,
+                    end: member.end,
+                    expected_end: member.expected_end,
+                    street_secs: Self::plan_street_secs(&member),
+                };
+                alternatives.extend(member.access_alternatives);
+                if member.mode != slots[primary_idx].as_ref().unwrap().mode {
+                    alternatives.push(alt);
+                }
+            }
+
+            let primary = slots[primary_idx].as_mut().unwrap();
+            for alt in alternatives {
+                let dup = primary.access_alternatives.iter_mut().find(|a| a.mode == alt.mode);
+                match dup {
+                    // Keep the latest-departing variant per mode.
+                    Some(existing) if existing.start >= alt.start => {}
+                    Some(existing) => *existing = alt,
+                    None => primary.access_alternatives.push(alt),
+                }
+            }
+            primary.access_alternatives.sort_by_key(|a| (a.mode.burden(), a.start));
+        }
+
+        slots.into_iter().flatten().collect()
+    }
+
+    /// Final plan pipeline: collapse access twins, drop transit plans no faster
+    /// than an equal-or-lighter-burden direct ride, then burden-aware Pareto.
+    pub(super) fn finalize_plans(plans: Vec<Plan>, buckets: &ReliabilityBuckets) -> Vec<Plan> {
+        let grouped = Self::group_access_alternatives(plans);
+        Self::pareto_filter(Self::prune_slower_than_direct(grouped), buckets)
+    }
+
+    /// Drops any transit plan whose total duration is *strictly longer* than a
+    /// direct street plan of equal-or-lighter burden. In a windowed search a
+    /// later-departing transit plan can survive Pareto on the departure axis
+    /// even though just walking/cycling/driving straight there is quicker; such
+    /// a plan is never worth showing. A lighter-burden direct ride suppresses a
+    /// heavier transit plan, but never the reverse (cycling-direct cannot bump a
+    /// walk+transit option).
+    pub(super) fn prune_slower_than_direct(plans: Vec<Plan>) -> Vec<Plan> {
+        let is_direct = |p: &Plan| !p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_)));
+        let dur = |p: &Plan| p.end.saturating_sub(p.start);
+
+        // best_direct[b] = shortest direct duration available at burden <= b.
+        let mut best_direct = [u32::MAX; 3];
+        for p in &plans {
+            if is_direct(p) {
+                let d = dur(p);
+                for slot in best_direct.iter_mut().skip(p.mode.burden() as usize) {
+                    *slot = (*slot).min(d);
+                }
+            }
+        }
+
+        plans
+            .into_iter()
+            .filter(|p| is_direct(p) || dur(p) <= best_direct[p.mode.burden() as usize])
+            .collect()
+    }
+
     pub(super) fn pareto_filter(plans: Vec<Plan>, buckets: &ReliabilityBuckets) -> Vec<Plan> {
         fn transfer_count(plan: &Plan) -> usize {
             plan.legs
@@ -1033,14 +1327,17 @@ impl Graph {
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
 
-        // 4-D Pareto: (transfers ↓, end ↓, start ↑, reliability_bucket ↑). Walk is NOT
-        // an axis — the self-pruning range search keys on (arrival, bucket) per round and
-        // cannot preserve a walk frontier, so walk creates no alternatives. It only breaks
-        // exact 4-axis ties: the lower-walk plan dominates an otherwise-identical one.
+        // 4-D Pareto: (transfers ↓, end ↓, start ↑, reliability_bucket ↑), guarded
+        // by mode burden: a plan may only dominate plans of equal-or-heavier
+        // burden, so a bike/car plan must strictly beat every lighter-mode plan
+        // on some axis to survive, while a walk plan can never be deleted by a
+        // heavier one. Walk seconds and burden are NOT axes — they only break
+        // exact 4-axis ties: lower burden first, then lower walk.
         let dominates = |a: &Plan, b: &Plan| {
             let (tc_a, tc_b) = (transfer_count(a), transfer_count(b));
             let (rb_a, rb_b) = (rel_bucket(a), rel_bucket(b));
-            tc_a <= tc_b
+            a.mode.burden() <= b.mode.burden()
+                && tc_a <= tc_b
                 && a.end <= b.end
                 && a.start >= b.start
                 && rb_a >= rb_b
@@ -1048,6 +1345,7 @@ impl Graph {
                     || a.end < b.end
                     || a.start > b.start
                     || rb_a > rb_b
+                    || a.mode.burden() < b.mode.burden()
                     || walk_secs(a) < walk_secs(b))
         };
         let equal_4 = |a: &Plan, b: &Plan| {
@@ -1056,13 +1354,17 @@ impl Graph {
                 && a.start == b.start
                 && rel_bucket(a) == rel_bucket(b)
         };
+        let tie_break_wins = |a: &Plan, b: &Plan| {
+            a.mode.burden() < b.mode.burden()
+                || (a.mode.burden() == b.mode.burden() && walk_secs(a) <= walk_secs(b))
+        };
 
         let mut result: Vec<Plan> = Vec::new();
 
         'outer: for plan in plans {
             for existing in &result {
                 if dominates(existing, &plan)
-                    || (equal_4(existing, &plan) && walk_secs(existing) <= walk_secs(&plan))
+                    || (equal_4(existing, &plan) && tie_break_wins(existing, &plan))
                 {
                     continue 'outer;
                 }
@@ -1076,6 +1378,7 @@ impl Graph {
                 .cmp(&b.end)
                 .then(b.start.cmp(&a.start))
                 .then(rel_bucket(b).cmp(&rel_bucket(a)))
+                .then(a.mode.burden().cmp(&b.mode.burden()))
                 .then(walk_secs(a).cmp(&walk_secs(b)))
         });
         result
@@ -1107,11 +1410,12 @@ impl Graph {
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
 
-        // 4-D Pareto with walk as a tie-break only (see `pareto_filter`).
+        // Burden-guarded 4-D Pareto with burden/walk tie-breaks (see `pareto_filter`).
         let dominates = |a: &Plan, b: &Plan| {
             let (tc_a, tc_b) = (transfer_count(a), transfer_count(b));
             let (rb_a, rb_b) = (rel_bucket(a), rel_bucket(b));
-            tc_a <= tc_b
+            a.mode.burden() <= b.mode.burden()
+                && tc_a <= tc_b
                 && a.end <= b.end
                 && a.start >= b.start
                 && rb_a >= rb_b
@@ -1119,6 +1423,7 @@ impl Graph {
                     || a.end < b.end
                     || a.start > b.start
                     || rb_a > rb_b
+                    || a.mode.burden() < b.mode.burden()
                     || walk_secs(a) < walk_secs(b))
         };
         let equal_4 = |a: &Plan, b: &Plan| {
@@ -1126,6 +1431,10 @@ impl Graph {
                 && a.end == b.end
                 && a.start == b.start
                 && rel_bucket(a) == rel_bucket(b)
+        };
+        let tie_break_wins = |a: &Plan, b: &Plan| {
+            a.mode.burden() < b.mode.burden()
+                || (a.mode.burden() == b.mode.burden() && walk_secs(a) <= walk_secs(b))
         };
 
         let mut result: Vec<Plan> = Vec::new();
@@ -1138,7 +1447,7 @@ impl Graph {
             // Check if `plan` is dominated by (or a higher-walk twin of) any result.
             for (i, existing) in result.iter().enumerate() {
                 if dominates(existing, &plan)
-                    || (equal_4(existing, &plan) && walk_secs(existing) <= walk_secs(&plan))
+                    || (equal_4(existing, &plan) && tie_break_wins(existing, &plan))
                 {
                     let tc_e = transfer_count(existing);
                     let rb_e = rel_bucket(existing);
@@ -1188,6 +1497,7 @@ impl Graph {
                 .cmp(&b.end)
                 .then(b.start.cmp(&a.start))
                 .then(rel_bucket(b).cmp(&rel_bucket(a)))
+                .then(a.mode.burden().cmp(&b.mode.burden()))
                 .then(walk_secs(a).cmp(&walk_secs(b)))
         });
         result
@@ -1232,5 +1542,236 @@ mod tests {
         let (dist, expected_end) = Graph::arrival_stats(&bag, None, 36000);
         assert_eq!(dist.len(), 2);
         assert_eq!(expected_end, 36150);
+    }
+
+    // ── grouping + burden-aware pareto ───────────────────────────────────────
+
+    use crate::ingestion::gtfs::TripId;
+    use crate::structures::Mode;
+
+    fn place(node: usize) -> PlanPlace {
+        PlanPlace {
+            node_id: NodeID(node),
+            stop_position: None,
+            arrival: None,
+            departure: None,
+        }
+    }
+
+    fn walk_leg(street_mode: Mode, start: u32, end: u32) -> PlanLeg {
+        PlanLeg::Walk(PlanWalkLeg {
+            length: 0,
+            start,
+            end,
+            duration: end - start,
+            street_mode,
+            from: place(0),
+            to: place(1),
+            steps: vec![],
+            geometry: vec![],
+        })
+    }
+
+    fn transit_leg(trip: u32, from: usize, to: usize, start: u32, end: u32) -> PlanLeg {
+        PlanLeg::Transit(PlanTransitLeg {
+            length: 0,
+            start,
+            end,
+            duration: end - start,
+            scheduled_start: start,
+            scheduled_end: end,
+            realtime: false,
+            from: place(from),
+            to: place(to),
+            steps: vec![],
+            geometry: vec![],
+            transfer_risk: None,
+            trip_id: TripId(trip),
+            preceding_arrival: None,
+            preceding_route_type: None,
+            route_type: None,
+            following_route_type: None,
+            following_margin_secs: None,
+            bikes_allowed: None,
+            time_shift: 0,
+        })
+    }
+
+    fn plan(mode: Mode, start: u32, end: u32, legs: Vec<PlanLeg>) -> Plan {
+        Plan {
+            legs,
+            start,
+            end,
+            mode,
+            access_alternatives: vec![],
+            arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            expected_end: end,
+        }
+    }
+
+    fn buckets() -> ReliabilityBuckets {
+        ReliabilityBuckets::new(&[0.50, 0.80, 0.95])
+    }
+
+    #[test]
+    fn plan_timeline_rechains_trailing_walk_after_realtime_shift() {
+        // Transit leg delayed to 720..800 by realtime; the egress walk still
+        // carries its stale scheduled times (200..260). The plan summary must
+        // follow the realtime legs, not the stale ones.
+        let mut legs = vec![
+            walk_leg(Mode::Walk, 100, 120),   // access (anchor — not re-chained)
+            transit_leg(7, 10, 11, 720, 800), // realtime-delayed boarding
+            walk_leg(Mode::Walk, 200, 260),   // egress, stale 60s walk
+        ];
+        let (start, end) = Graph::plan_timeline(&mut legs);
+        assert_eq!(start, 100);
+        assert_eq!(end, 860, "egress must chain off the realtime arrival (800 + 60)");
+        assert!(end >= start);
+        match &legs[2] {
+            PlanLeg::Walk(w) => {
+                assert_eq!(w.start, 800);
+                assert_eq!(w.end, 860);
+            }
+            _ => panic!("expected egress walk"),
+        }
+    }
+
+    #[test]
+    fn plan_timeline_is_noop_when_already_chained() {
+        let mut legs = vec![
+            walk_leg(Mode::Walk, 100, 120),
+            transit_leg(7, 10, 11, 120, 200),
+            walk_leg(Mode::Walk, 200, 260),
+        ];
+        let (start, end) = Graph::plan_timeline(&mut legs);
+        assert_eq!((start, end), (100, 260));
+    }
+
+    #[test]
+    fn burden_tie_goes_to_lighter_mode() {
+        let core = || vec![transit_leg(7, 10, 11, 100, 200)];
+        // Different cores would be needed to dodge grouping; use pareto directly.
+        let walk = plan(Mode::WalkTransit, 90, 210, core());
+        let bike = plan(Mode::BikeTransit, 90, 210, core());
+        let out = Graph::pareto_filter(vec![bike, walk], &buckets());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mode, Mode::WalkTransit);
+    }
+
+    #[test]
+    fn heavier_mode_survives_on_strict_improvement() {
+        let walk = plan(Mode::WalkTransit, 90, 250, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let bike = plan(Mode::BikeTransit, 90, 210, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let out = Graph::pareto_filter(vec![walk, bike], &buckets());
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn lighter_mode_never_dominated_by_heavier() {
+        // Bike strictly better on every axis — the walk plan must still survive.
+        let walk = plan(Mode::WalkTransit, 80, 300, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let bike = plan(Mode::BikeTransit, 90, 210, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let out = Graph::pareto_filter(vec![walk, bike], &buckets());
+        assert_eq!(out.len(), 2, "{:?}", out.iter().map(|p| p.mode).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn same_core_groups_into_alternatives() {
+        let walk = plan(
+            Mode::WalkTransit,
+            80,
+            260,
+            vec![
+                walk_leg(Mode::Walk, 80, 100),
+                transit_leg(7, 10, 11, 100, 200),
+                walk_leg(Mode::Walk, 200, 260),
+            ],
+        );
+        let bike = plan(
+            Mode::BikeTransit,
+            94,
+            260,
+            vec![
+                walk_leg(Mode::Bike, 94, 100),
+                transit_leg(7, 10, 11, 100, 200),
+                walk_leg(Mode::Walk, 200, 260),
+            ],
+        );
+        let out = Graph::group_access_alternatives(vec![walk, bike]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mode, Mode::WalkTransit);
+        assert_eq!(out[0].access_alternatives.len(), 1);
+        let alt = &out[0].access_alternatives[0];
+        assert_eq!(alt.mode, Mode::BikeTransit);
+        assert_eq!(alt.start, 94);
+    }
+
+    #[test]
+    fn same_core_earlier_arrival_stays_standalone() {
+        // Ridden egress arrives earlier: a genuine Pareto endpoint, not a twin.
+        let walk = plan(Mode::WalkTransit, 80, 260, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let bike = plan(Mode::BikeOnTransit, 94, 220, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let out = Graph::group_access_alternatives(vec![walk, bike]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn different_core_not_grouped() {
+        let a = plan(Mode::WalkTransit, 80, 260, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let b = plan(Mode::BikeTransit, 94, 260, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let out = Graph::group_access_alternatives(vec![a, b]);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|p| p.access_alternatives.is_empty()));
+    }
+
+    #[test]
+    fn direct_shorter_duration_suppresses_longer_same_burden_transit() {
+        // Bike-direct: 21 min, leave now (burden 1). Bike+transit: 24 min but
+        // departs later (burden 1) — it only survived Pareto on the later
+        // departure. Since cycling straight there is shorter, drop it.
+        let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
+        let bike_transit =
+            plan(Mode::BikeOnTransit, 300, 1740, vec![transit_leg(7, 10, 11, 400, 1700)]);
+        let out = Graph::finalize_plans(vec![bike_direct, bike_transit], &buckets());
+        assert!(
+            out.iter().all(|p| p.mode != Mode::BikeOnTransit),
+            "a bike+transit slower than cycling direct must be dropped: {:?}",
+            out.iter().map(|p| (p.mode, p.end - p.start)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_does_not_suppress_lighter_burden_transit() {
+        // Bike-direct (burden 1) must NOT suppress a longer WALK+transit (burden
+        // 0) — a lighter mode is always worth offering.
+        let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
+        let walk_transit =
+            plan(Mode::WalkTransit, 300, 1740, vec![transit_leg(7, 10, 11, 400, 1700)]);
+        let out = Graph::finalize_plans(vec![bike_direct, walk_transit], &buckets());
+        assert!(
+            out.iter().any(|p| p.mode == Mode::WalkTransit),
+            "lighter-burden walk+transit must survive a heavier bike-direct"
+        );
+    }
+
+    #[test]
+    fn direct_does_not_suppress_faster_transit() {
+        // Transit beats cycling direct on duration here — it must survive.
+        let bike_direct = plan(Mode::Bike, 0, 1500, vec![walk_leg(Mode::Bike, 0, 1500)]);
+        let bike_transit =
+            plan(Mode::BikeOnTransit, 0, 1320, vec![transit_leg(7, 10, 11, 100, 1300)]);
+        let out = Graph::finalize_plans(vec![bike_direct, bike_transit], &buckets());
+        assert!(
+            out.iter().any(|p| p.mode == Mode::BikeOnTransit),
+            "a bike+transit faster than cycling direct must survive"
+        );
+    }
+
+    #[test]
+    fn direct_plans_never_grouped() {
+        let a = plan(Mode::Walk, 80, 260, vec![walk_leg(Mode::Walk, 80, 260)]);
+        let b = plan(Mode::Bike, 80, 140, vec![walk_leg(Mode::Bike, 80, 140)]);
+        let out = Graph::group_access_alternatives(vec![a, b]);
+        assert_eq!(out.len(), 2);
     }
 }

@@ -299,6 +299,17 @@ pub fn prepare_sncb(osm_path: &str, g: &mut Graph) -> Result<(), osmpbf::Error> 
     Ok(())
 }
 
+/// SNCB bike-allowance rule: honour an explicit GTFS `bikes_allowed` value, and
+/// otherwise default to allowed — SNCB permits bikes on all of its trains.
+fn sncb_bikes_decision(explicit: gtfs_structures::BikesAllowedType) -> Option<bool> {
+    use gtfs_structures::BikesAllowedType;
+    match explicit {
+        BikesAllowedType::AtLeastOneBike => Some(true),
+        BikesAllowedType::NoBikesAllowed => Some(false),
+        BikesAllowedType::NoBikeInfo | BikesAllowedType::Unknown(_) => Some(true),
+    }
+}
+
 pub fn load_gtfs_sncb(
     gtfs_path: &str,
     osm_path: &str,
@@ -319,7 +330,7 @@ pub fn load_gtfs_sncb(
     };
 
     let patterns_before = g.transit_pattern_count();
-    load_gtfs_with_hook(gtfs_path, g, |_, _| None)?;
+    load_gtfs_with_hook(gtfs_path, g, |trip, _| sncb_bikes_decision(trip.bikes_allowed))?;
     let patterns_after = g.transit_pattern_count();
 
     let mut n_computed = 0usize;
@@ -354,6 +365,21 @@ pub fn load_gtfs_sncb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtfs_structures::BikesAllowedType;
+
+    #[test]
+    fn sncb_allows_bikes_by_default() {
+        // SNCB permits bikes on all trains, so a trip with no GTFS bike info
+        // must still resolve to allowed.
+        assert_eq!(sncb_bikes_decision(BikesAllowedType::NoBikeInfo), Some(true));
+        assert_eq!(sncb_bikes_decision(BikesAllowedType::Unknown(7)), Some(true));
+    }
+
+    #[test]
+    fn sncb_respects_explicit_gtfs_bike_info() {
+        assert_eq!(sncb_bikes_decision(BikesAllowedType::AtLeastOneBike), Some(true));
+        assert_eq!(sncb_bikes_decision(BikesAllowedType::NoBikesAllowed), Some(false));
+    }
 
     /// Build a RailwayGraph where consecutive nodes are connected in a chain.
     fn make_chain(coords: &[(f64, f64)]) -> RailwayGraph {

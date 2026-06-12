@@ -1,7 +1,9 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 
 use crate::ingestion::gtfs::date_to_days;
-use crate::structures::{Graph, RealtimeIndex, ReliabilityBuckets, valid_reliability_edges};
+use crate::structures::{
+    ActiveModes, Graph, Mode, RealtimeIndex, ReliabilityBuckets, valid_reliability_edges,
+};
 use crate::structures::plan::{ExplainResult, Plan};
 
 pub struct RouteQuery {
@@ -20,6 +22,9 @@ pub struct RouteQuery {
     pub arrival_slack_secs: Option<u32>,
     /// Per-query override for reliability bucket edges. `None`/invalid → graph default.
     pub reliability_bucket_edges: Option<Vec<f32>>,
+    /// Travel modes the router may use. `None` → `[WALK, WALK_TRANSIT]`
+    /// (the historical behavior). Empty is rejected.
+    pub modes: Option<Vec<Mode>>,
 }
 
 /// Resolves the effective buckets + slack for a query, honouring per-request overrides
@@ -39,6 +44,17 @@ fn resolve_tuning(
     };
     let slack = query.arrival_slack_secs.unwrap_or(graph.raptor.arrival_slack_secs);
     Ok((buckets, slack))
+}
+
+/// Resolves the mode selection, rejecting an explicitly empty list.
+fn resolve_modes(query: &RouteQuery) -> Result<ActiveModes, async_graphql::Error> {
+    match &query.modes {
+        None => Ok(ActiveModes::default()),
+        Some(m) if m.is_empty() => {
+            Err(async_graphql::Error::new("modes must not be empty"))
+        }
+        Some(m) => Ok(ActiveModes::new(m)),
+    }
 }
 
 /// Range-RAPTOR window in seconds, clamped to the configured maximum.
@@ -91,13 +107,14 @@ pub fn route(
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
     let (buckets, slack) = resolve_tuning(graph, query)?;
+    let am = resolve_modes(query)?;
 
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_tuned_rt_overnight(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt)
+            graph.raptor_range_tuned_rt_overnight_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am)
         }
-        _ => graph.raptor_tuned_rt_overnight(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
+        _ => graph.raptor_tuned_rt_overnight_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am),
     };
 
     if plans.is_empty() {
@@ -117,15 +134,16 @@ pub fn route_explain(
     let (origin, destination, time, date, weekday, min_access) =
         resolve_query_params(graph, query)?;
     let (buckets, slack) = resolve_tuning(graph, query)?;
+    let am = resolve_modes(query)?;
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_explain_tuned_rt(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt)
+            graph.raptor_range_explain_tuned_rt_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am)
         }
-        _ => graph.raptor_explain_tuned_rt(origin, destination, time, date, weekday, min_access, &buckets, slack, rt),
+        _ => graph.raptor_explain_tuned_rt_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am),
     };
 
     Ok(result)
@@ -158,6 +176,7 @@ mod tests {
             min_access_secs: None,
             arrival_slack_secs: None,
             reliability_bucket_edges: None,
+            modes: None,
         }
     }
 

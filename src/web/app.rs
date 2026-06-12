@@ -13,7 +13,7 @@ use crate::{
     services::realtime_poller::{self, SharedRealtime},
     services::scheduler::{self, SharedGraph},
     structures::{
-        Config, RealtimeIndex,
+        Config, Mode, RealtimeIndex,
         plan::{CandidateStatus, Plan, PlanCoordinate, PlanLeg},
     },
 };
@@ -258,6 +258,8 @@ impl QueryRoot {
         // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
         // Finer edges surface more reliability-distinct alternatives. Falls back to config.
         reliability_bucket_edges: Option<Vec<f64>>,
+        // Travel modes the router may use. Defaults to [WALK, WALK_TRANSIT].
+        modes: Option<Vec<Mode>>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -274,6 +276,7 @@ impl QueryRoot {
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
+            modes,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -295,6 +298,7 @@ impl QueryRoot {
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
         reliability_bucket_edges: Option<Vec<f64>>,
+        modes: Option<Vec<Mode>>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -311,6 +315,7 @@ impl QueryRoot {
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
+            modes,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -364,6 +369,7 @@ impl QueryRoot {
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
         reliability_bucket_edges: Option<Vec<f64>>,
+        modes: Option<Vec<Mode>>,
         plan_index: i32,
         leg_index: i32,
         #[graphql(default = 0)] prev_count: i32,
@@ -384,6 +390,7 @@ impl QueryRoot {
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
+            modes,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();

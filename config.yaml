@@ -45,6 +45,9 @@ log_level: info
 default_routing:
   max_window_minutes: 1440    # cap on the windowMinutes query argument (24 h)
   max_snap_distance_m: 10000  # reject queries snapping farther than this (10 km)
+  cycling_speed_mps: 4.2      # cycling speed for bike modes (~15 km/h)
+  driving_speed_mps: 11.0     # driving speed for car modes (~40 km/h)
+  vehicle_access_secs: 1200   # access-radius floor for bike/car modes (reach a hub)
 
 server:
   host: 127.0.0.1

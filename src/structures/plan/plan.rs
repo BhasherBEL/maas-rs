@@ -1,5 +1,6 @@
 use async_graphql::SimpleObject;
 
+use crate::structures::Mode;
 use crate::structures::plan::{PlanCoordinate, PlanLeg};
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -10,11 +11,28 @@ pub struct ArrivalScenario {
     pub probability: f32,
 }
 
+/// A same-transit-core variant of a plan that differs only in how the street
+/// (access/egress) portions are traversed — e.g. bike to the station instead
+/// of walking, departing later for the same trips.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct AccessAlternative {
+    pub mode: Mode,
+    pub start: u32,
+    pub end: u32,
+    pub expected_end: u32,
+    /// Total street (non-transit) seconds of the variant.
+    pub street_secs: u32,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct Plan {
     pub legs: Vec<PlanLeg>,
     pub start: u32,
     pub end: u32,
+    /// The travel mode that produced this plan.
+    pub mode: Mode,
+    /// Same-journey variants differing only in street-mode access/egress.
+    pub access_alternatives: Vec<AccessAlternative>,
     /// Possible arrival times and their probabilities, sorted earliest first.
     /// Single entry with probability 1.0 for deterministic routes.
     pub arrival_distribution: Vec<ArrivalScenario>,

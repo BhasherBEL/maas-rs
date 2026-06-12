@@ -5,7 +5,7 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{TripId, TripSegment},
     structures::{
-        Graph, NodeID,
+        Graph, Mode, NodeID,
         plan::{PlanLegStep, PlanPlace, PlanTransitLegStep, PlanTrip},
     },
 };
@@ -40,6 +40,9 @@ pub struct PlanWalkLeg {
     pub start: u32,
     pub end: u32,
     pub duration: u32,
+
+    /// How this street leg is traversed: `Walk` or `Bike`.
+    pub street_mode: Mode,
 
     pub from: PlanPlace,
     pub to: PlanPlace,
