@@ -1,3 +1,5 @@
+mod bike_attrs;
+mod bike_profile;
 mod config;
 mod delay;
 mod edge;
@@ -9,6 +11,8 @@ pub mod plan;
 pub mod raptor;
 mod realtime;
 
+pub use bike_attrs::{BikeAttrs, HighwayClass, Surface};
+pub use bike_profile::{BikeProfile, HighwayFactors};
 pub use config::*;
 pub use delay::*;
 pub use edge::*;

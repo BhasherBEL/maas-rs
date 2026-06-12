@@ -5,7 +5,7 @@ use crate::{
     ingestion::{
         cache::resolve_source,
         gtfs::{load_gtfs, load_gtfs_sncb, load_gtfs_stib, prepare_sncb},
-        osm,
+        osm::{self, Dem},
     },
     structures::{BuildConfig, DelayCDF, Graph, Ingestor, RoutingDefaultConfig},
 };
@@ -60,6 +60,21 @@ fn run_phase(
         .filter(|i| i.phase() == phase)
         .collect();
 
+    // Load the elevation DEM once for this phase, only if it ingests OSM streets.
+    let dem = if ordered.iter().any(|i| matches!(i, Ingestor::OsmPbf(_))) {
+        config.elevation.as_deref()
+            .map(|u| u.strip_prefix("path:").unwrap_or(u))
+            .and_then(|p| match Dem::load(p) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::warn!("elevation disabled: {e}");
+                    None
+                }
+            })
+    } else {
+        None
+    };
+
     for input in ordered {
         tracing::info!("loading '{}'...", input.label());
         let before = SystemTime::now();
@@ -73,7 +88,7 @@ fn run_phase(
         };
 
         let result = match input {
-            Ingestor::OsmPbf(_) => osm::load_pbf_file(&path, g).map_err(|e| e.to_string()),
+            Ingestor::OsmPbf(_) => osm::load_pbf_file(&path, dem.as_ref(), g).map_err(|e| e.to_string()),
             Ingestor::GtfsGeneric(_) => load_gtfs(&path, g).map_err(|e| e.to_string()),
             Ingestor::GtfsStib(_) => load_gtfs_stib(&path, g).map_err(|e| e.to_string()),
             Ingestor::GtfsSncb(c) => {
@@ -140,6 +155,9 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(v) = routing.cycling_speed_mps {
         g.set_cycling_speed_mps(v);
     }
+    if let Some(bp) = routing.bike_profile {
+        g.set_bike_profile(bp);
+    }
     if let Some(v) = routing.driving_speed_mps {
         g.set_driving_speed_mps(v);
     }
@@ -169,6 +187,7 @@ mod tests {
             inputs: vec![],
             output: "out.bin".into(),
             osm_output: "osm.bin".into(),
+            elevation: None,
             delay_models: vec![],
         }
     }

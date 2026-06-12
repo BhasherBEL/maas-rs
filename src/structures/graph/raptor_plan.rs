@@ -87,6 +87,56 @@ impl Graph {
         }
     }
 
+    /// Cost-routed direct bike plan: geometry follows the minimum-cost route and
+    /// the duration is its accumulated kinematic time. Returns `None` if the
+    /// destination is unreachable within `max_secs`.
+    pub(super) fn build_bike_plan(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        max_secs: u32,
+        bike: &crate::structures::BikeCost,
+    ) -> Option<Plan> {
+        let (nodes, secs, length) = self.bike_cost_path(origin, destination, max_secs, bike)?;
+        let end = start_time + secs;
+        let geometry = nodes.iter().map(|&n| self.node_coord(n)).collect();
+        let to_place = PlanPlace {
+            node_id: destination,
+            stop_position: None,
+            arrival: Some(end),
+            departure: None,
+        };
+        Some(Plan {
+            legs: vec![PlanLeg::Walk(PlanWalkLeg {
+                from: PlanPlace {
+                    node_id: origin,
+                    stop_position: None,
+                    arrival: None,
+                    departure: Some(start_time),
+                },
+                to: to_place,
+                start: start_time,
+                end,
+                duration: secs,
+                length,
+                street_mode: Mode::Bike,
+                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
+                    length,
+                    time: secs,
+                    place: to_place,
+                })],
+                geometry,
+            })],
+            start: start_time,
+            end,
+            mode: Mode::Bike,
+            access_alternatives: vec![],
+            arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            expected_end: end,
+        })
+    }
+
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
     const EXTREME_RISK_WAIT_SECS: u32 = 7200;
     const TIGHTEN_MIN_RELIABILITY: f32 = 0.80;

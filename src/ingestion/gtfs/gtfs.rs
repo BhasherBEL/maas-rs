@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ingestion::gtfs::IdMapper,
     structures::{
-        EdgeData, Graph, LatLng, NodeData, NodeID, StreetEdgeData, TransitEdgeData,
+        BikeAttrs, EdgeData, Graph, LatLng, NodeData, NodeID, StreetEdgeData, TransitEdgeData,
         TransitStopData,
         raptor::{Lookup, PatternInfo},
     },
@@ -187,6 +187,8 @@ where
                 foot: true,
                 bike: false,
                 car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
             }),
         );
         g.add_edge(
@@ -199,6 +201,8 @@ where
                 foot: true,
                 bike: false,
                 car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
             }),
         );
     }

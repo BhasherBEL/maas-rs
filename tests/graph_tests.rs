@@ -14,9 +14,9 @@ use maas_rs::{
         TimetableSegment, TripId, TripInfo, TripSegment,
     },
     structures::{
-        ActiveModes, DelayCDF, EdgeData, Graph, LatLng, Mode, NodeData, NodeID, OsmNodeData,
-        RealtimeIndex, ReliabilityBuckets, StreetEdgeData, StreetProfile, TransitEdgeData,
-        TransitStopData,
+        ActiveModes, BikeAttrs, BikeCost, BikeProfile, DelayCDF, EdgeData, Graph, HighwayClass,
+        LatLng, Mode, NodeData, NodeID, OsmNodeData, RealtimeIndex, ReliabilityBuckets,
+        StreetEdgeData, StreetProfile, Surface, TransitEdgeData, TransitStopData,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
     },
@@ -55,7 +55,7 @@ fn street_edge(origin: NodeID, destination: NodeID, length_m: usize) -> EdgeData
         partial: false,
         foot: true,
         bike: true,
-        car: true,
+        car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
     })
 }
 
@@ -584,7 +584,7 @@ fn street_edge_flags(
         partial: false,
         foot,
         bike,
-        car: false,
+        car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
     })
 }
 
@@ -697,7 +697,7 @@ fn two_route_raptor_graph_with_bikes(
                 partial: false,
                 foot: true,
                 bike: true,
-                car: true,
+                car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }),
         );
         g.add_edge(
@@ -709,7 +709,7 @@ fn two_route_raptor_graph_with_bikes(
                 partial: false,
                 foot: true,
                 bike: true,
-                car: true,
+                car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }),
         );
     };
@@ -729,7 +729,7 @@ fn two_route_raptor_graph_with_bikes(
                 partial: true,
                 foot: true,
                 bike: false,
-                car: false,
+                car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }),
         );
         g.add_edge(
@@ -741,7 +741,7 @@ fn two_route_raptor_graph_with_bikes(
                 partial: true,
                 foot: true,
                 bike: false,
-                car: false,
+                car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }),
         );
     };
@@ -921,10 +921,10 @@ fn express_two_leg_graph(
     // car-mode tests to drive the same network).
     let both = |g: &mut Graph, a: NodeID, b: NodeID, m: usize, foot: bool, bike: bool| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot, bike, car: true,
+            origin: a, destination: b, length: m, partial: false, foot, bike, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot, bike, car: true,
+            origin: b, destination: a, length: m, partial: false, foot, bike, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     both(&mut g, osm_o, osm_q, 9967, true, true);
@@ -1140,10 +1140,10 @@ fn car_dijkstra_drives_car_edges_and_walks_foot_connectors() {
     // a→b is a road (driven at car speed). a→c is a foot-only stop connector,
     // crossed at walking speed (park & walk the last bit).
     g.add_edge(a, EdgeData::Street(StreetEdgeData {
-        origin: a, destination: b, length: 1100, partial: false, foot: true, bike: false, car: true,
+        origin: a, destination: b, length: 1100, partial: false, foot: true, bike: false, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.add_edge(a, EdgeData::Street(StreetEdgeData {
-        origin: a, destination: c, length: 120, partial: false, foot: true, bike: true, car: false,
+        origin: a, destination: c, length: 120, partial: false, foot: true, bike: true, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.build_raptor_index();
 
@@ -1167,18 +1167,18 @@ fn transit_modes_never_emit_zero_transit_plans() {
 
     let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: false,
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: false,
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     road(&mut g, osm_o, osm_d, 570);
@@ -1225,6 +1225,7 @@ fn transit_modes_never_emit_zero_transit_plans() {
     let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
     let plans = g.raptor_range_tuned_rt_modes(
         osm_o, osm_d, 9 * 3600, 1800, 0, 0x7F, 10 * 60, &buckets, 300, &RealtimeIndex::new(), &am,
+        &BikeCost::new(BikeProfile::default()),
     );
     // Direct modes (Walk/Bike/Car) are legitimately 0-transit; transit-labelled
     // modes must use transit.
@@ -1268,18 +1269,18 @@ fn car_drop_off_not_poisoned_when_car_reaches_destination() {
 
     let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     road(&mut g, osm_o, osm_b, 1100); // short drive to the boarding area
@@ -1342,18 +1343,18 @@ fn car_drop_off_with_foot_only_connectors() {
 
     let road = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     let connector = |g: &mut Graph, a: NodeID, b: NodeID| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: a, destination: b, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false,
+            origin: b, destination: a, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     road(&mut g, osm_o, osm_p, 6400);
@@ -1416,7 +1417,7 @@ fn car_cannot_resume_driving_after_walking() {
     let d = g.add_node(osm_node("d", 50.000, 4.003));
     let edge = |g: &mut Graph, x: NodeID, y: NodeID, foot: bool, car: bool| {
         g.add_edge(x, EdgeData::Street(StreetEdgeData {
-            origin: x, destination: y, length: 110, partial: false, foot, bike: false, car,
+            origin: x, destination: y, length: 110, partial: false, foot, bike: false, car, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     edge(&mut g, a, b, true, true);   // road
@@ -1440,10 +1441,10 @@ fn car_dijkstra_reaches_stop_via_foot_connector() {
     let stop = g.add_node(transit_stop("S", 50.000, 4.0101));
     // o→p road (car), p→stop foot-only connector (as gtfs ingestion builds it).
     g.add_edge(o, EdgeData::Street(StreetEdgeData {
-        origin: o, destination: p, length: 1100, partial: false, foot: true, bike: false, car: true,
+        origin: o, destination: p, length: 1100, partial: false, foot: true, bike: false, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.add_edge(p, EdgeData::Street(StreetEdgeData {
-        origin: p, destination: stop, length: 12, partial: true, foot: true, bike: false, car: false,
+        origin: p, destination: stop, length: 12, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.build_raptor_index();
 
@@ -1460,7 +1461,7 @@ fn foot_dijkstra_ignores_car_only_edges() {
     let a = g.add_node(osm_node("a", 50.000, 4.000));
     let b = g.add_node(osm_node("b", 50.000, 4.001));
     g.add_edge(a, EdgeData::Street(StreetEdgeData {
-        origin: a, destination: b, length: 100, partial: false, foot: false, bike: false, car: true,
+        origin: a, destination: b, length: 100, partial: false, foot: false, bike: false, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.build_raptor_index();
 
@@ -1704,11 +1705,11 @@ fn two_route_multi_trip_graph() -> (Graph, NodeID, NodeID) {
     let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
             origin: a, destination: b, length: m,
-            partial: false, foot: true, bike: true, car: true,
+            partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
             origin: b, destination: a, length: m,
-            partial: false, foot: true, bike: true, car: true,
+            partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_street(&mut g, osm_origin, osm_ab, 718);
@@ -1719,11 +1720,11 @@ fn two_route_multi_trip_graph() -> (Graph, NodeID, NodeID) {
     let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
         g.add_edge(stop, EdgeData::Street(StreetEdgeData {
             origin: stop, destination: osm, length: m,
-            partial: true, foot: true, bike: false, car: false,
+            partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(osm, EdgeData::Street(StreetEdgeData {
             origin: osm, destination: stop, length: m,
-            partial: true, foot: true, bike: false, car: false,
+            partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_snap(&mut g, stop_a, osm_origin, 72);
@@ -2068,7 +2069,7 @@ fn single_route_many_trips_graph() -> (Graph, NodeID, NodeID) {
         for (o, d) in [(a, b), (b, a)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: false, foot: true, bike: true, car: true,
+                partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2079,7 +2080,7 @@ fn single_route_many_trips_graph() -> (Graph, NodeID, NodeID) {
         for (o, d) in [(stop, osm), (osm, stop)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: true, foot: true, bike: false, car: false,
+                partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2314,7 +2315,7 @@ fn raptor_range_connecting_pattern_not_starved_by_dead_end_pattern() {
         for (o, d) in [(a, b), (b, a)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: false, foot: true, bike: true, car: true,
+                partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2324,7 +2325,7 @@ fn raptor_range_connecting_pattern_not_starved_by_dead_end_pattern() {
         for (o, d) in [(stop, osm), (osm, stop)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: true, foot: true, bike: false, car: false,
+                partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2517,7 +2518,7 @@ fn backward_walk_graph() -> (Graph, NodeID, NodeID, NodeID, NodeID) {
         for (o, d) in [(a, b), (b, a)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: false, foot: true, bike: true, car: true,
+                partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2528,7 +2529,7 @@ fn backward_walk_graph() -> (Graph, NodeID, NodeID, NodeID, NodeID) {
         for (o, d) in [(stop, osm), (osm, stop)] {
             g.add_edge(o, EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, length: m,
-                partial: true, foot: true, bike: false, car: false,
+                partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
             }));
         }
     };
@@ -2705,10 +2706,10 @@ fn reliability_tradeoff_graph() -> (Graph, NodeID, NodeID) {
 
     let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_street(&mut g, osm_origin, osm_ab, 718);
@@ -2718,10 +2719,10 @@ fn reliability_tradeoff_graph() -> (Graph, NodeID, NodeID) {
 
     let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
         g.add_edge(stop, EdgeData::Street(StreetEdgeData {
-            origin: stop, destination: osm, length: m, partial: true, foot: true, bike: false, car: false,
+            origin: stop, destination: osm, length: m, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(osm, EdgeData::Street(StreetEdgeData {
-            origin: osm, destination: stop, length: m, partial: true, foot: true, bike: false, car: false,
+            origin: osm, destination: stop, length: m, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_snap(&mut g, stop_a, osm_origin, 72);
@@ -2879,10 +2880,10 @@ fn feeder_tightening_reliability_graph() -> (Graph, NodeID, NodeID) {
 
     let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
         g.add_edge(a, EdgeData::Street(StreetEdgeData {
-            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: a, destination: b, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(b, EdgeData::Street(StreetEdgeData {
-            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true,
+            origin: b, destination: a, length: m, partial: false, foot: true, bike: true, car: true, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_street(&mut g, osm_origin, osm_ab, 718);
@@ -2892,10 +2893,10 @@ fn feeder_tightening_reliability_graph() -> (Graph, NodeID, NodeID) {
 
     let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
         g.add_edge(stop, EdgeData::Street(StreetEdgeData {
-            origin: stop, destination: osm, length: m, partial: true, foot: true, bike: false, car: false,
+            origin: stop, destination: osm, length: m, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
         g.add_edge(osm, EdgeData::Street(StreetEdgeData {
-            origin: osm, destination: stop, length: m, partial: true, foot: true, bike: false, car: false,
+            origin: osm, destination: stop, length: m, partial: true, foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(), elev_delta: 0,
         }));
     };
     add_snap(&mut g, stop_a, osm_origin, 72);
@@ -3154,7 +3155,7 @@ fn self_pruning_range_real_network_equals_independent() {
 // ── Direct (no-transit) plans ─────────────────────────────────────────────────
 
 #[test]
-fn direct_bike_plan_uses_cycling_speed() {
+fn direct_bike_plan_uses_kinematic_time() {
     let (mut g, a, _, c) = three_node_street_graph();
     g.build_raptor_index();
     let am = ActiveModes::new(&[Mode::Bike]);
@@ -3162,8 +3163,15 @@ fn direct_bike_plan_uses_cycling_speed() {
 
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].mode, Mode::Bike);
-    // 200 m at 4.2 m/s = 47 s (integer ms math truncates per edge: 2 × 23 s).
-    let expected = 2 * (100 * 1000 / 4200);
+    // Direct bike now reports the kinematic ETA of the cost-optimal route: two
+    // flat 100 m road edges (the chain a→b→c), each solved by the power model.
+    let bc = BikeCost::new(BikeProfile::default());
+    let edge100 = StreetEdgeData {
+        origin: NodeID(0), destination: NodeID(1), length: 100,
+        partial: false, foot: true, bike: true, car: true,
+        attrs: BikeAttrs::road_default(), elev_delta: 0,
+    };
+    let expected = 2 * bc.edge_time(&edge100);
     assert_eq!(plans[0].end - plans[0].start, expected);
     assert_eq!(street_modes(&plans[0]), vec![Mode::Bike]);
 }
@@ -3214,6 +3222,7 @@ fn raptor_range_modes_matches_independent_oracle() {
 
     let pruned = g.raptor_range_tuned_rt_modes(
         origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
+        &BikeCost::new(BikeProfile::default()),
     );
     let indep = g.raptor_range_independent_rt_modes(
         origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
@@ -3239,8 +3248,102 @@ fn raptor_explain_supports_bike_modes() {
     let res = g.raptor_explain_tuned_rt_modes(
         origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &buckets, 900,
         &RealtimeIndex::new(), &am,
+        &BikeCost::new(BikeProfile::default()),
     );
     assert!(!res.access.fell_back_to_walk_only);
     assert!(res.plans.iter().any(|p| transit_leg_count(p) == 2));
     assert!(!res.stops_reached.is_empty());
+}
+
+// ── Bike cost-routing (Approach A: minimize weighted cost, carry kinematic time) ─
+
+fn bike_attrs(hw: HighwayClass, isbike: bool, surface: Surface) -> BikeAttrs {
+    let mut a = BikeAttrs::road_default();
+    a.highway = hw;
+    a.isbike = isbike;
+    a.surface = surface;
+    a
+}
+
+/// A cheap-but-long cycleway corridor and a costly-but-short unsafe primary both
+/// reach the same stop. Cost-routing must take the cycleway, so the reported
+/// access time matches the (longer) cycleway ride, not the short primary.
+#[test]
+fn bike_prefers_cycleway() {
+    let mut g = Graph::new();
+    let o = g.add_node(osm_node("o", 50.000, 4.000));
+    let a = g.add_node(osm_node("a", 50.005, 4.005));
+    let d = g.add_node(osm_node("d", 50.000, 4.010));
+    let stop = g.add_node(transit_stop("S", 50.000, 4.0101));
+
+    let cyc = bike_attrs(HighwayClass::Cycleway, true, Surface::Paved);
+    let prim = bike_attrs(HighwayClass::Primary, false, Surface::Paved);
+    let snap = BikeAttrs::road_default();
+
+    let edge = |g: &mut Graph, from: NodeID, to: NodeID, len: usize, attrs: BikeAttrs| {
+        for (o2, d2) in [(from, to), (to, from)] {
+            g.add_edge(
+                o2,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o2,
+                    destination: d2,
+                    length: len,
+                    partial: false,
+                    foot: true,
+                    bike: true,
+                    car: false,
+                    attrs,
+                    elev_delta: 0,
+                }),
+            );
+        }
+    };
+    edge(&mut g, o, a, 600, cyc); // cycleway O–A–D = 1200 m, low cost
+    edge(&mut g, a, d, 600, cyc);
+    edge(&mut g, o, d, 715, prim); // unsafe primary O–D = 715 m, high cost
+    edge(&mut g, d, stop, 8, snap); // foot connector to the platform
+    g.build_raptor_index();
+
+    let bc = BikeCost::new(BikeProfile::default());
+    let mk = |len: usize, attrs: BikeAttrs| StreetEdgeData {
+        origin: NodeID(0),
+        destination: NodeID(1),
+        length: len,
+        partial: false,
+        foot: true,
+        bike: true,
+        car: false,
+        attrs,
+        elev_delta: 0,
+    };
+    let t_cyc = bc.edge_time(&mk(600, cyc)) * 2 + bc.edge_time(&mk(8, snap));
+    let t_prim = bc.edge_time(&mk(715, prim)) + bc.edge_time(&mk(8, snap));
+    assert!(t_cyc > t_prim, "test setup: cycleway must be the slower corridor");
+
+    let stops = g.bike_nearby_stops(o, 600, &bc);
+    assert_eq!(stops.len(), 1, "exactly the one stop is reachable");
+    let (_, secs) = stops[0];
+    assert!(
+        secs.abs_diff(t_cyc) <= 2,
+        "access time {secs}s should match the cost-optimal cycleway ride {t_cyc}s"
+    );
+    assert!(
+        secs > t_prim,
+        "cost-routing took the short unsafe primary ({t_prim}s) instead of the cycleway"
+    );
+
+    // A profile that does not penalize unsafe roads and downweights the cycleway
+    // base must instead take the short primary — proving the profile parameter
+    // (the basis for the per-request override) actually steers route choice.
+    let mut prof = BikeProfile::default();
+    prof.avoid_unsafe = false;
+    prof.stick_to_cycleroutes = false;
+    prof.highway.primary = 1.0;
+    let bc2 = BikeCost::new(prof);
+    let stops2 = g.bike_nearby_stops(o, 600, &bc2);
+    let (_, secs2) = stops2[0];
+    assert!(
+        secs2.abs_diff(t_prim) <= 2,
+        "permissive profile should take the short primary ({t_prim}s), got {secs2}s"
+    );
 }

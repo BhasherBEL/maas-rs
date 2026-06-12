@@ -25,6 +25,14 @@ pub struct RouteQuery {
     /// Travel modes the router may use. `None` → `[WALK, WALK_TRANSIT]`
     /// (the historical behavior). Empty is rejected.
     pub modes: Option<Vec<Mode>>,
+    /// Per-query bike cost profile. `None` → the graph's configured default.
+    pub bike_profile: Option<crate::structures::BikeProfile>,
+}
+
+/// Effective bike cost profile for a query: the per-request override if present,
+/// else the graph's configured default.
+fn resolve_bike_profile(graph: &Graph, query: &RouteQuery) -> crate::structures::BikeProfile {
+    query.bike_profile.unwrap_or(graph.raptor.bike_profile)
 }
 
 /// Resolves the effective buckets + slack for a query, honouring per-request overrides
@@ -109,12 +117,13 @@ pub fn route(
     let (buckets, slack) = resolve_tuning(graph, query)?;
     let am = resolve_modes(query)?;
 
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_tuned_rt_overnight_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am)
+            graph.raptor_range_tuned_rt_overnight_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am, &bike)
         }
-        _ => graph.raptor_tuned_rt_overnight_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am),
+        _ => graph.raptor_tuned_rt_overnight_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am, &bike),
     };
 
     if plans.is_empty() {
@@ -138,12 +147,13 @@ pub fn route_explain(
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_explain_tuned_rt_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am)
+            graph.raptor_range_explain_tuned_rt_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am, &bike)
         }
-        _ => graph.raptor_explain_tuned_rt_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am),
+        _ => graph.raptor_explain_tuned_rt_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am, &bike),
     };
 
     Ok(result)
@@ -177,6 +187,7 @@ mod tests {
             arrival_slack_secs: None,
             reliability_bucket_edges: None,
             modes: None,
+            bike_profile: None,
         }
     }
 

@@ -6,7 +6,7 @@ use std::{
 use kdtree::distance::squared_euclidean;
 
 use crate::structures::{
-    EdgeData, NodeID, StreetEdgeData, degrees_to_meters, plan::PlanCoordinate,
+    BikeCost, EdgeData, NodeID, StreetEdgeData, degrees_to_meters, plan::PlanCoordinate,
 };
 
 use super::Graph;
@@ -234,6 +234,149 @@ impl Graph {
                 (dist_m / self.raptor.walking_speed_mps) as u32
             })
             .unwrap_or(straight_line_secs)
+    }
+
+    /// Unit direction vector from `from` to `to` in lat/lon space (adequate for
+    /// turn-angle dot products at Belgian latitudes; not great-circle exact).
+    fn dir_between(&self, from: NodeID, to: NodeID) -> (f64, f64) {
+        let a = self.nodes[from.0].loc();
+        let b = self.nodes[to.0].loc();
+        let (dx, dy) = (b.longitude - a.longitude, b.latitude - a.latitude);
+        let n = (dx * dx + dy * dy).sqrt().max(1e-12);
+        (dx / n, dy / n)
+    }
+
+    /// Cost-minimizing bike search. Each label carries accumulated kinematic time
+    /// (for the access-radius budget + reported ETA) but the priority is the
+    /// BRouter-style weighted cost, so routes prefer nicer/safer ways. Returns the
+    /// min-cost-route arrival time (seconds) per reachable node.
+    pub fn bike_cost_dijkstra(
+        &self,
+        origin: NodeID,
+        max_seconds: u32,
+        bike: &BikeCost,
+    ) -> HashMap<NodeID, u32> {
+        // Cost is scaled to integer bits for a total order in the heap.
+        let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
+        let mut arrival: HashMap<NodeID, u32> = HashMap::new();
+        // heap tuple: (cost_bits, node, time_secs, prev_node_index_or_MAX)
+        let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
+        best_cost.insert(origin, 0);
+        arrival.insert(origin, 0);
+        pq.push(Reverse((0, origin, 0, u64::MAX)));
+
+        while let Some(Reverse((cost_bits, node, time_secs, prev))) = pq.pop() {
+            if cost_bits > *best_cost.get(&node).unwrap_or(&u64::MAX) {
+                continue;
+            }
+            // Do not expand through transit stop nodes (except the origin).
+            if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
+                continue;
+            }
+            let incoming = (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
+            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            for edge in neighbors {
+                let EdgeData::Street(street) = edge else { continue };
+                let this_dir = self.dir_between(node, street.destination);
+                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else { continue };
+                let nt = time_secs.saturating_add(bike.edge_time(street));
+                if nt > max_seconds {
+                    continue;
+                }
+                let nc = cost_bits.saturating_add((step_cost * 1000.0) as u64);
+                let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
+                if nc < *entry {
+                    *entry = nc;
+                    arrival.insert(street.destination, nt);
+                    pq.push(Reverse((nc, street.destination, nt, node.0 as u64)));
+                }
+            }
+        }
+        arrival
+    }
+
+    /// Cost-routed bike path `origin → destination`: returns the node sequence on
+    /// the minimum-cost route, its accumulated kinematic time (seconds) and total
+    /// length (meters), or `None` if the destination is unreachable within the
+    /// time budget. Mirrors `bike_cost_dijkstra` but tracks parents for backtrack.
+    pub(super) fn bike_cost_path(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        max_seconds: u32,
+        bike: &BikeCost,
+    ) -> Option<(Vec<NodeID>, u32, usize)> {
+        if origin == destination {
+            return Some((vec![origin], 0, 0));
+        }
+        let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
+        let mut arrival: HashMap<NodeID, u32> = HashMap::new();
+        let mut length: HashMap<NodeID, usize> = HashMap::new();
+        let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
+        let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
+        best_cost.insert(origin, 0);
+        arrival.insert(origin, 0);
+        length.insert(origin, 0);
+        pq.push(Reverse((0, origin, 0, u64::MAX)));
+
+        while let Some(Reverse((cost_bits, node, time_secs, prev))) = pq.pop() {
+            if cost_bits > *best_cost.get(&node).unwrap_or(&u64::MAX) {
+                continue;
+            }
+            if node == destination {
+                break;
+            }
+            // Stop expansion at intermediate transit stops (except origin/destination).
+            if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
+                continue;
+            }
+            let incoming = (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
+            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            for edge in neighbors {
+                let EdgeData::Street(street) = edge else { continue };
+                let this_dir = self.dir_between(node, street.destination);
+                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else { continue };
+                let nt = time_secs.saturating_add(bike.edge_time(street));
+                if nt > max_seconds {
+                    continue;
+                }
+                let nc = cost_bits.saturating_add((step_cost * 1000.0) as u64);
+                let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
+                if nc < *entry {
+                    *entry = nc;
+                    arrival.insert(street.destination, nt);
+                    length.insert(street.destination, length[&node] + street.length);
+                    parent.insert(street.destination, node);
+                    pq.push(Reverse((nc, street.destination, nt, node.0 as u64)));
+                }
+            }
+        }
+
+        best_cost.get(&destination)?;
+        let mut path = vec![destination];
+        let mut cur = destination;
+        while cur != origin {
+            let p = *parent.get(&cur)?;
+            path.push(p);
+            cur = p;
+        }
+        path.reverse();
+        Some((path, arrival[&destination], length[&destination]))
+    }
+
+    /// Bike variant of `nearby_stops`, cost-routed (carries kinematic time).
+    pub fn bike_nearby_stops(&self, origin: NodeID, max_secs: u32, bike: &BikeCost) -> Vec<(usize, u32)> {
+        let times = self.bike_cost_dijkstra(origin, max_secs, bike);
+        let mut stops = Vec::new();
+        for (&node, &secs) in &times {
+            let compact = self.raptor.transit_node_to_stop[node.0];
+            if compact != u32::MAX {
+                stops.push((compact as usize, secs));
+            }
+        }
+        // Stable order (see `nearby_stops_profile`).
+        stops.sort_unstable_by_key(|&(stop, _)| stop);
+        stops
     }
 
     pub fn nearby_stops(&self, origin: NodeID, max_walk_secs: u32) -> Vec<(usize, u32)> {

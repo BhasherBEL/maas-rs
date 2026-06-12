@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_graphql::{
-    Context, EmptyMutation, EmptySubscription, Error, Schema, SimpleObject,
+    Context, EmptyMutation, EmptySubscription, Error, InputObject, Schema, SimpleObject,
     http::GraphiQLSource,
 };
 use async_graphql_poem::GraphQL;
@@ -229,6 +229,119 @@ struct LegAlternatives {
     next: Vec<AltDeparture>,
 }
 
+/// Per-highway cost-factor overrides; every field optional (sparse merge).
+#[derive(InputObject, Default)]
+struct HighwayFactorsInput {
+    trunk: Option<f64>,
+    trunk_bike: Option<f64>,
+    primary: Option<f64>,
+    primary_bike: Option<f64>,
+    secondary: Option<f64>,
+    secondary_bike: Option<f64>,
+    tertiary: Option<f64>,
+    tertiary_bike: Option<f64>,
+    unclassified: Option<f64>,
+    unclassified_bike: Option<f64>,
+    residential_paved: Option<f64>,
+    residential_unpaved: Option<f64>,
+    service_paved: Option<f64>,
+    service_unpaved: Option<f64>,
+    cycleway: Option<f64>,
+    pedestrian: Option<f64>,
+    bridleway: Option<f64>,
+    other: Option<f64>,
+}
+
+impl HighwayFactorsInput {
+    fn merge_into(self, mut b: crate::structures::HighwayFactors) -> crate::structures::HighwayFactors {
+        if let Some(v) = self.trunk { b.trunk = v; }
+        if let Some(v) = self.trunk_bike { b.trunk_bike = v; }
+        if let Some(v) = self.primary { b.primary = v; }
+        if let Some(v) = self.primary_bike { b.primary_bike = v; }
+        if let Some(v) = self.secondary { b.secondary = v; }
+        if let Some(v) = self.secondary_bike { b.secondary_bike = v; }
+        if let Some(v) = self.tertiary { b.tertiary = v; }
+        if let Some(v) = self.tertiary_bike { b.tertiary_bike = v; }
+        if let Some(v) = self.unclassified { b.unclassified = v; }
+        if let Some(v) = self.unclassified_bike { b.unclassified_bike = v; }
+        if let Some(v) = self.residential_paved { b.residential_paved = v; }
+        if let Some(v) = self.residential_unpaved { b.residential_unpaved = v; }
+        if let Some(v) = self.service_paved { b.service_paved = v; }
+        if let Some(v) = self.service_unpaved { b.service_unpaved = v; }
+        if let Some(v) = self.cycleway { b.cycleway = v; }
+        if let Some(v) = self.pedestrian { b.pedestrian = v; }
+        if let Some(v) = self.bridleway { b.bridleway = v; }
+        if let Some(v) = self.other { b.other = v; }
+        b
+    }
+}
+
+/// Per-request bike cost profile override; every field optional. Provided fields
+/// overlay the graph's default `BikeProfile`, so a sparse object changes only
+/// what it names.
+#[derive(InputObject, Default)]
+struct BikeProfileInput {
+    allow_steps: Option<bool>,
+    ignore_cycleroutes: Option<bool>,
+    stick_to_cycleroutes: Option<bool>,
+    avoid_unsafe: Option<bool>,
+    highway: Option<HighwayFactorsInput>,
+    steps_cost: Option<f64>,
+    unsafe_penalty: Option<f64>,
+    oneway_roundabout: Option<f64>,
+    oneway_primary: Option<f64>,
+    oneway_secondary: Option<f64>,
+    oneway_tertiary: Option<f64>,
+    oneway_other: Option<f64>,
+    access_foot_only: Option<f64>,
+    access_cycleroute: Option<f64>,
+    access_forbidden: Option<f64>,
+    turncost: Option<f64>,
+    consider_elevation: Option<bool>,
+    uphillcost: Option<f64>,
+    uphillcutoff: Option<f64>,
+    downhillcost: Option<f64>,
+    downhillcutoff: Option<f64>,
+    total_mass: Option<f64>,
+    max_speed: Option<f64>,
+    s_c_x: Option<f64>,
+    c_r: Option<f64>,
+    biker_power: Option<f64>,
+}
+
+impl BikeProfileInput {
+    /// Overlay the provided fields onto a base profile.
+    fn merge_into(self, mut base: crate::structures::BikeProfile) -> crate::structures::BikeProfile {
+        if let Some(v) = self.allow_steps { base.allow_steps = v; }
+        if let Some(v) = self.ignore_cycleroutes { base.ignore_cycleroutes = v; }
+        if let Some(v) = self.stick_to_cycleroutes { base.stick_to_cycleroutes = v; }
+        if let Some(v) = self.avoid_unsafe { base.avoid_unsafe = v; }
+        if let Some(h) = self.highway { base.highway = h.merge_into(base.highway); }
+        if let Some(v) = self.steps_cost { base.steps_cost = v; }
+        if let Some(v) = self.unsafe_penalty { base.unsafe_penalty = v; }
+        if let Some(v) = self.oneway_roundabout { base.oneway_roundabout = v; }
+        if let Some(v) = self.oneway_primary { base.oneway_primary = v; }
+        if let Some(v) = self.oneway_secondary { base.oneway_secondary = v; }
+        if let Some(v) = self.oneway_tertiary { base.oneway_tertiary = v; }
+        if let Some(v) = self.oneway_other { base.oneway_other = v; }
+        if let Some(v) = self.access_foot_only { base.access_foot_only = v; }
+        if let Some(v) = self.access_cycleroute { base.access_cycleroute = v; }
+        if let Some(v) = self.access_forbidden { base.access_forbidden = v; }
+        if let Some(v) = self.turncost { base.turncost = v; }
+        if let Some(v) = self.consider_elevation { base.consider_elevation = v; }
+        if let Some(v) = self.uphillcost { base.uphillcost = v; }
+        if let Some(v) = self.uphillcutoff { base.uphillcutoff = v; }
+        if let Some(v) = self.downhillcost { base.downhillcost = v; }
+        if let Some(v) = self.downhillcutoff { base.downhillcutoff = v; }
+        if let Some(v) = self.total_mass { base.total_mass = v; }
+        if let Some(v) = self.max_speed { base.max_speed = v; }
+        if let Some(v) = self.s_c_x { base.s_c_x = v; }
+        if let Some(v) = self.c_r { base.c_r = v; }
+        if let Some(v) = self.biker_power { base.biker_power = v; }
+        base
+    }
+}
+
 pub struct QueryRoot;
 
 #[async_graphql::Object]
@@ -260,6 +373,8 @@ impl QueryRoot {
         reliability_bucket_edges: Option<Vec<f64>>,
         // Travel modes the router may use. Defaults to [WALK, WALK_TRANSIT].
         modes: Option<Vec<Mode>>,
+        // Bike cost profile override; sparse fields overlay the graph default.
+        bike_profile: Option<BikeProfileInput>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -277,6 +392,7 @@ impl QueryRoot {
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
+            bike_profile: bike_profile.map(|i| i.merge_into(graph.raptor.bike_profile)),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -299,6 +415,7 @@ impl QueryRoot {
         arrival_slack_secs: Option<i32>,
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
+        bike_profile: Option<BikeProfileInput>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -316,6 +433,7 @@ impl QueryRoot {
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
+            bike_profile: bike_profile.map(|i| i.merge_into(graph.raptor.bike_profile)),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -391,6 +509,7 @@ impl QueryRoot {
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
+            bike_profile: None,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
