@@ -2,9 +2,14 @@ use std::{collections::HashSet, result};
 
 use osmpbf::{Element, ElementReader, Way};
 
-use crate::structures::{EdgeData, Graph, NodeData, OsmNodeData, StreetEdgeData};
+use crate::ingestion::osm::{Dem, bike_class};
+use crate::structures::{BikeAttrs, EdgeData, Graph, NodeData, NodeID, OsmNodeData, StreetEdgeData};
 
-pub fn load_pbf_file(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf::Error> {
+pub fn load_pbf_file(
+    pbf_path: &str,
+    dem: Option<&Dem>,
+    g: &mut Graph,
+) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
     let mut valid_node_ids = HashSet::new();
 
@@ -63,6 +68,9 @@ pub fn load_pbf_file(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf
                     .find(|tag| tag.0 == "motorcar")
                     .is_none_or(|tag| tag.1 != "no");
 
+                let attrs_fwd = bike_class::classify(&w, true);
+                let attrs_rev = bike_class::classify(&w, false);
+
                 for i in 0..node_ids.len().saturating_sub(1) {
                     n += 1;
 
@@ -75,6 +83,9 @@ pub fn load_pbf_file(pbf_path: &str, g: &mut Graph) -> result::Result<(), osmpbf
                         foot,
                         bike,
                         car,
+                        attrs_fwd,
+                        attrs_rev,
+                        dem,
                     ) {
                         failed += 1;
                     }
@@ -131,6 +142,7 @@ fn validate_way(way: &Way) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_from_osm_ids(
     g: &mut Graph,
     from: i64,
@@ -140,6 +152,9 @@ fn insert_from_osm_ids(
     foot: bool,
     bike: bool,
     car: bool,
+    attrs_fwd: BikeAttrs,
+    attrs_rev: BikeAttrs,
+    dem: Option<&Dem>,
 ) -> bool {
     let from_eid = format!("map#osm#{}", from);
     let to_eid = format!("map#osm#{}", to);
@@ -172,6 +187,16 @@ fn insert_from_osm_ids(
 
     let distance = from_node.loc().dist(to_node.loc()) as usize;
 
+    // Signed elevation change from→to (meters), from the DEM if available.
+    let elev = |id: NodeID| -> Option<f32> {
+        let loc = g.get_node(id)?.loc();
+        dem.and_then(|d| d.elevation(loc.latitude, loc.longitude))
+    };
+    let delta = match (elev(from_id), elev(to_id)) {
+        (Some(a), Some(b)) => ((b - a).round() as i32).clamp(-30000, 30000) as i16,
+        _ => 0,
+    };
+
     g.add_edge(
         from_id,
         EdgeData::Street(StreetEdgeData {
@@ -182,6 +207,8 @@ fn insert_from_osm_ids(
             foot,
             bike,
             car,
+            attrs: attrs_fwd,
+            elev_delta: delta,
         }),
     );
     if bidirectional {
@@ -195,6 +222,8 @@ fn insert_from_osm_ids(
                 foot,
                 bike,
                 car,
+                attrs: attrs_rev,
+                elev_delta: -delta,
             }),
         );
     }

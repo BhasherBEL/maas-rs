@@ -240,6 +240,12 @@ header a.head-btn { text-decoration: none; }
 .advanced input[type=number], .advanced input[type=range], .advanced select { width: 110px; padding: 4px 6px; font-size: 12px; }
 .advanced input[type=range] { width: 130px; }
 .advanced .val { width: 44px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--fg); }
+.query-panel { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
+.query-panel textarea { width: 100%; box-sizing: border-box; margin-top: 6px; padding: 6px 8px;
+  font-family: var(--mono); font-size: 11px; line-height: 1.4; background: var(--panel);
+  color: var(--fg); border: 1px solid var(--border); border-radius: 4px; resize: vertical; }
+.query-panel textarea[disabled] { opacity: 0.55; }
+.query-panel code { font-family: var(--mono); font-size: 11px; }
 
 /* ── Plans panel ─────────────────────────────────────────────── */
 #plans-panel {
@@ -610,6 +616,16 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
           <option value="compact">Compact</option>
         </select>
       </div>
+      <div id="query-panel" class="query-panel">
+        <div class="row">
+          <label><input type="checkbox" id="query-manual"> Edit GraphQL query manually
+            <small>Send the query &amp; variables below verbatim (e.g. tune <code>bikeProfile</code>)</small>
+          </label>
+          <button type="button" id="query-resync" class="head-btn" disabled>Resync from UI</button>
+        </div>
+        <textarea id="query-text" rows="12" spellcheck="false"></textarea>
+        <textarea id="query-vars" rows="10" spellcheck="false"></textarea>
+      </div>
     </div>
 
     <div id="plans-panel">
@@ -678,13 +694,13 @@ const PLAN_FRAGMENT = `
 const QUERY = `query Plan(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
   $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int,
-  $modes: [Mode!]
+  $modes: [Mode!], $bikeProfile: BikeProfileInput
 ) {
   raptor(
     fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
     date: $date, time: $time,
     windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs,
-    modes: $modes
+    modes: $modes, bikeProfile: $bikeProfile
   ) { ${PLAN_FRAGMENT} }
 }`;
 
@@ -901,7 +917,20 @@ async function runQuery() {
   const walkRadiusSecs = parseInt(el('adv-walk-radius').value, 10) || null;
   const modes          = selectedModes();
   const vars = { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs,
-                 modes: modes.length ? modes : null };
+                 modes: modes.length ? modes : null, bikeProfile: null };
+
+  // Manual mode: send the user-edited query + variables verbatim.
+  let queryToSend = QUERY, varsToSend = vars;
+  if (queryManual()) {
+    try {
+      varsToSend = JSON.parse(el('query-vars').value || '{}');
+    } catch (e) {
+      errEl.textContent = 'Variables JSON is invalid: ' + e.message;
+      errEl.style.display = 'block';
+      return;
+    }
+    queryToSend = el('query-text').value || QUERY;
+  }
 
   const btn = el('go');
   btn.disabled = true;
@@ -910,7 +939,7 @@ async function runQuery() {
   el('plans-list').replaceChildren(mkEl('p', 'status-msg', 'Routing…'));
 
   try {
-    const data = await gql(QUERY, vars);
+    const data = await gql(queryToSend, varsToSend);
     state.plans = data.raptor || [];
     state.queryVars = vars;          // reused by lazy per-leg alternative fetches
     state.altCache.clear();
@@ -928,6 +957,43 @@ async function runQuery() {
   }
 }
 el('go').addEventListener('click', () => runQuery());
+
+// ── Manual GraphQL query panel ────────────────────────────────
+function queryManual() { return el('query-manual').checked; }
+
+// Write the current query string + a variables object (with bikeProfile: null,
+// ready to fill in) into the editable boxes.
+function fillQueryBoxes() {
+  el('query-text').value = QUERY.trim();
+  const modes = selectedModes();
+  const vars = {
+    fromLat: fromSearch.getLat(), fromLng: fromSearch.getLng(),
+    toLat: toSearch.getLat(),     toLng: toSearch.getLng(),
+    date: el('date').value || null, time: el('time').value || null,
+    windowMinutes: parseInt(el('adv-window').value, 10) || null,
+    walkRadiusSecs: parseInt(el('adv-walk-radius').value, 10) || null,
+    modes: modes.length ? modes : null,
+    bikeProfile: null,
+  };
+  el('query-vars').value = JSON.stringify(vars, null, 2);
+}
+
+// Auto mode mirrors UI state into the boxes; manual mode owns them.
+function renderQuery() { if (!queryManual()) fillQueryBoxes(); }
+
+function setManualMode(on) {
+  el('query-resync').disabled = !on;
+  el('query-text').disabled = !on;
+  el('query-vars').disabled = !on;
+  if (!on) fillQueryBoxes();
+}
+
+el('query-manual').addEventListener('change', e => setManualMode(e.target.checked));
+el('query-resync').addEventListener('click', fillQueryBoxes); // refresh from UI, keep editing
+// Keep the auto-mode boxes in sync as the user tweaks controls.
+document.addEventListener('input', renderQuery);
+document.addEventListener('change', renderQuery);
+setManualMode(false); // initial render of the auto-mode query/vars
 
 // Lazily load (and cache) earlier/later alternatives for one leg, then re-render.
 async function loadAlternatives(planIdx, legIdx, prevCount, nextCount) {

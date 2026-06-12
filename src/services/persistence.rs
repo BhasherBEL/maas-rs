@@ -7,9 +7,9 @@ use crate::structures::Graph;
 /// Magic prefix identifying a maas-rs cache file.
 const MAGIC: &[u8; 4] = b"MAAS";
 /// Bump when any OSM-side `Graph` field (nodes/edges/kdtree/id_mapper) changes layout.
-pub const OSM_SCHEMA_VERSION: u32 = 1;
+pub const OSM_SCHEMA_VERSION: u32 = 2;
 /// Bump when any `Graph`/`RaptorIndex` field changes layout.
-pub const GRAPH_SCHEMA_VERSION: u32 = 1;
+pub const GRAPH_SCHEMA_VERSION: u32 = 2;
 
 const HEADER_LEN: usize = 8;
 

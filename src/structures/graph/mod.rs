@@ -10,6 +10,7 @@ use crate::{
 
 use raptor_index::RaptorIndex;
 
+mod bike_cost;
 mod raptor_access;
 mod raptor_backward;
 mod raptor_build;
@@ -20,6 +21,7 @@ mod railway;
 mod realtime_match;
 mod transit;
 
+pub use bike_cost::BikeCost;
 pub use raptor_access::StreetProfile;
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 
@@ -106,6 +108,15 @@ impl Graph {
 
     pub fn set_cycling_speed_mps(&mut self, mps: f64) {
         self.raptor.cycling_speed_mps = mps;
+    }
+
+    pub fn set_bike_profile(&mut self, p: crate::structures::BikeProfile) {
+        self.raptor.bike_profile = p;
+    }
+
+    /// `BikeCost` built from the graph's configured default profile.
+    pub(super) fn default_bike_cost(&self) -> BikeCost {
+        BikeCost::new(self.raptor.bike_profile)
     }
 
     pub fn set_driving_speed_mps(&mut self, mps: f64) {

@@ -103,6 +103,11 @@ pub struct RaptorIndex {
 
     #[serde(skip, default = "RaptorIndex::default_max_snap_distance_m")]
     pub max_snap_distance_m: u32,
+
+    // Default bike cost profile (BRouter trekking). Not serialized — applied from
+    // config.yaml at startup; a per-request override merges over it.
+    #[serde(skip, default)]
+    pub bike_profile: crate::structures::BikeProfile,
 }
 
 impl Default for RaptorIndex {
@@ -162,6 +167,7 @@ impl RaptorIndex {
             arrival_slack_secs: Self::default_arrival_slack_secs(),
             max_window_secs: Self::default_max_window_secs(),
             max_snap_distance_m: Self::default_max_snap_distance_m(),
+            bike_profile: crate::structures::BikeProfile::default(),
         }
     }
 

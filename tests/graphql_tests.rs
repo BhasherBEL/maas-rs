@@ -53,6 +53,37 @@ fn data_obj(resp: async_graphql::Response) -> async_graphql::indexmap::IndexMap<
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
+fn bike_profile_input_is_exposed() {
+    let schema = build_schema(shared(Graph::new()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ __type(name: "BikeProfileInput") { name } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    match &data["__type"] {
+        Value::Object(o) => assert_eq!(o["name"], Value::String("BikeProfileInput".into())),
+        other => panic!("BikeProfileInput not in schema: {other:?}"),
+    }
+}
+
+#[test]
+fn raptor_accepts_bike_profile_input() {
+    // Empty graph: routing can't snap, but the bikeProfile argument must parse and
+    // validate (no "unknown argument/field" schema error) — proving it wires through.
+    let schema = build_schema(shared(Graph::new()));
+    let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
+                 modes: [BIKE],
+                 bikeProfile: { avoidUnsafe: false, highway: { primary: 1.0 } }) { mode } }"#;
+    let resp = execute_sync(&schema, q);
+    for e in &resp.errors {
+        let m = e.message.to_lowercase();
+        assert!(!m.contains("unknown"), "schema rejected bikeProfile: {}", e.message);
+        assert!(!m.contains("bikeprofile"), "bikeProfile not wired: {}", e.message);
+    }
+}
+
+#[test]
 fn graphql_ping_returns_pong() {
     let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(&schema, "{ ping }");
@@ -135,6 +166,7 @@ fn graphql_walk_only_plan_exposes_walk_mode() {
     let b = g.add_node(osm_node("b", 50.0, 4.001));
     g.add_edge(a, maas_rs::structures::EdgeData::Street(maas_rs::structures::StreetEdgeData {
         origin: a, destination: b, length: 80, partial: false, foot: true, bike: false, car: false,
+        attrs: maas_rs::structures::BikeAttrs::road_default(), elev_delta: 0,
     }));
     g.build_raptor_index();
     let schema = build_schema(shared(g));

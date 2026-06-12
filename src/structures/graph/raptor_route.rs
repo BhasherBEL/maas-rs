@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-use super::{Graph, MAX_ROUNDS, raptor_access::StreetProfile};
+use super::{BikeCost, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
 
 /// Per-query mode resolution: the active vehicle states plus per-state
 /// access/egress stop lists (walk/ride seconds, relative to the endpoint).
@@ -345,6 +345,7 @@ impl Graph {
         slack: u32,
         buckets: &ReliabilityBuckets,
         am: &ActiveModes,
+        bike: &BikeCost,
         mut try_routing: F,
     ) -> Vec<Plan>
     where
@@ -357,7 +358,7 @@ impl Graph {
                 .get(&destination)
                 .copied()
                 .unwrap_or(u32::MAX);
-            let mut plans = self.direct_fallback_plans(am, origin, destination, start_time, walk_secs);
+            let mut plans = self.direct_fallback_plans(am, origin, destination, start_time, walk_secs, bike);
             if !am.wants_direct_walk() {
                 plans.retain(|p| p.mode != crate::structures::Mode::Walk);
             }
@@ -373,13 +374,13 @@ impl Graph {
             .max(min_access_secs);
 
         loop {
-            let mc = self.build_mode_context(am, origin, destination, access_secs);
+            let mc = self.build_mode_context(am, origin, destination, access_secs, bike);
 
             if mc.any_access() && mc.any_egress() {
                 let mut results = try_routing(&mc, access_secs);
                 if !results.is_empty() {
                     self.append_bounded_direct_plans(
-                        am, origin, destination, start_time, slack, &mut results,
+                        am, origin, destination, start_time, slack, bike, &mut results,
                     );
                     return Self::finalize_plans(results, buckets);
                 }
@@ -399,7 +400,7 @@ impl Graph {
             if let Some(actual) = walk_only_secs
                 && access_secs >= actual {
                     let plans =
-                        self.direct_fallback_plans(am, origin, destination, start_time, actual);
+                        self.direct_fallback_plans(am, origin, destination, start_time, actual, bike);
                     return Self::finalize_plans(plans, buckets);
                 }
         }
@@ -416,6 +417,7 @@ impl Graph {
         origin: NodeID,
         destination: NodeID,
         access_secs: u32,
+        bike: &BikeCost,
     ) -> ModeContext<'a> {
         use VehicleState::*;
         let has = |s| am.state_of(s).is_some();
@@ -431,7 +433,7 @@ impl Graph {
             vec![]
         };
         let bike_access = if has(BikeInHand) || has(BikeDropped) {
-            self.nearby_stops_profile(origin, vehicle_secs, StreetProfile::Bike)
+            self.bike_nearby_stops(origin, vehicle_secs, bike)
         } else {
             vec![]
         };
@@ -446,7 +448,7 @@ impl Graph {
             vec![]
         };
         let bike_egress = if has(BikeInHand) {
-            self.nearby_stops_profile(destination, vehicle_secs, StreetProfile::Bike)
+            self.bike_nearby_stops(destination, vehicle_secs, bike)
         } else {
             vec![]
         };
@@ -495,6 +497,7 @@ impl Graph {
         destination: NodeID,
         start_time: u32,
         slack: u32,
+        bike: &BikeCost,
         results: &mut Vec<Plan>,
     ) {
         let best_end = match results.iter().map(|p| p.end).min() {
@@ -503,15 +506,10 @@ impl Graph {
         };
         let bound = best_end.saturating_sub(start_time).saturating_add(slack);
 
-        if am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some() {
-            if let Some(&secs) = self
-                .street_dijkstra(origin, bound, StreetProfile::Bike)
-                .get(&destination)
-            {
-                results.push(self.build_street_plan(
-                    origin, destination, start_time, secs, StreetProfile::Bike,
-                ));
-            }
+        if (am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some())
+            && let Some(plan) = self.build_bike_plan(origin, destination, start_time, bound, bike)
+        {
+            results.push(plan);
         }
         if am.wants_direct_car() {
             if let Some(&secs) = self
@@ -542,24 +540,16 @@ impl Graph {
         destination: NodeID,
         start_time: u32,
         walk_secs: u32,
+        bike: &BikeCost,
     ) -> Vec<Plan> {
         let mut plans = Vec::new();
         if walk_secs < u32::MAX {
             plans.push(self.build_walk_plan(origin, destination, start_time, walk_secs));
         }
-        if am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some() {
-            if let Some(&bike_secs) = self
-                .street_dijkstra(origin, u32::MAX, StreetProfile::Bike)
-                .get(&destination)
-            {
-                plans.push(self.build_street_plan(
-                    origin,
-                    destination,
-                    start_time,
-                    bike_secs,
-                    StreetProfile::Bike,
-                ));
-            }
+        if (am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some())
+            && let Some(plan) = self.build_bike_plan(origin, destination, start_time, u32::MAX, bike)
+        {
+            plans.push(plan);
         }
         if am.wants_direct_car() {
             if let Some(&car_secs) = self
@@ -606,7 +596,7 @@ impl Graph {
     ) -> Vec<Plan> {
         let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
         self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday, min_access_secs,
-            &buckets, self.raptor.arrival_slack_secs, &RealtimeIndex::new(), am)
+            &buckets, self.raptor.arrival_slack_secs, &RealtimeIndex::new(), am, &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -640,7 +630,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -656,8 +646,9 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> Vec<Plan> {
-        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am,
+        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am, bike,
             |mc, access_secs| {
                 self.raptor_inner(mc, start_time, access_secs, date, weekday, origin, destination, buckets, slack, rt)
             })
@@ -1075,6 +1066,7 @@ impl Graph {
         start_time: u32,
         min_access_secs: u32,
         am: &ActiveModes,
+        bike: &BikeCost,
         mut try_routing: F,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, AccessInfo, Vec<StopReach>)
     where
@@ -1090,7 +1082,7 @@ impl Graph {
         let mut attempts: u32 = 0;
 
         loop {
-            let mc = self.build_mode_context(am, origin, destination, access_secs);
+            let mc = self.build_mode_context(am, origin, destination, access_secs, bike);
 
             if mc.any_access() && mc.any_egress()
                 && let Some((plans, candidates, stops)) = try_routing(&mc, access_secs) {
@@ -1119,7 +1111,7 @@ impl Graph {
 
             if let Some(actual) = walk_only_secs
                 && access_secs >= actual {
-                    let plans = self.direct_fallback_plans(am, origin, destination, start_time, actual);
+                    let plans = self.direct_fallback_plans(am, origin, destination, start_time, actual, bike);
                     let candidates = plans
                         .iter()
                         .map(|plan| PlanCandidate {
@@ -1186,7 +1178,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> ExplainResult {
         self.raptor_explain_tuned_rt_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1202,6 +1194,7 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -1209,6 +1202,7 @@ impl Graph {
             start_time,
             min_access_secs,
             am,
+            bike,
             |mc, access_secs| {
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     mc, start_time, access_secs, date, weekday, origin, destination,
@@ -1259,7 +1253,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> ExplainResult {
         self.raptor_range_explain_tuned_rt_modes(origin, destination, start_time, window_secs,
-            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1276,6 +1270,7 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -1283,6 +1278,7 @@ impl Graph {
             start_time,
             min_access_secs,
             am,
+            bike,
             |mc, access_secs| {
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     mc, start_time, access_secs, date, weekday, origin, destination,
@@ -1912,7 +1908,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_range_tuned_rt_modes(origin, destination, start_time, window_secs, date,
-            weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1929,6 +1925,7 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> Vec<Plan> {
         // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
         // interesting departures, which are processed **latest → earliest** so a
@@ -1939,7 +1936,7 @@ impl Graph {
         // Each pass reconstructs its own plans (filtered by `created_by`) before the
         // next pass mutates the grid. Output is the 4-D Pareto set
         // (departure ↑, arrival ↓, transfers ↓, reliability ↑); walk is an attribute.
-        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am,
+        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am, bike,
             |mc, access_secs| {
                 let probe = self.raptor_inner(
                     mc, start_time, access_secs, date, weekday, origin, destination,
@@ -2029,7 +2026,7 @@ impl Graph {
         am: &ActiveModes,
     ) -> Vec<Plan> {
         self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets,
-            am,
+            am, &self.default_bike_cost(),
             |mc, access_secs| {
                 let probe = self.raptor_inner(
                     mc, start_time, access_secs, date, weekday, origin, destination,
@@ -2148,7 +2145,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_tuned_rt_overnight_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2164,15 +2161,16 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday, min_access_secs, buckets, slack, rt, am);
+        let mut plans = self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday, min_access_secs, buckets, slack, rt, am, bike);
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
             let overnight = self.raptor_tuned_rt_modes(
                 origin, destination,
                 start_time + 86400,
                 date - 1, Self::prev_weekday(weekday),
-                min_access_secs, buckets, slack, rt, am,
+                min_access_secs, buckets, slack, rt, am, bike,
             );
             let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
             if !normalized.is_empty() {
@@ -2201,7 +2199,7 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_range_tuned_rt_overnight_modes(origin, destination, start_time, window_secs,
-            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default())
+            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2218,8 +2216,9 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
         am: &ActiveModes,
+        bike: &BikeCost,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_range_tuned_rt_modes(origin, destination, start_time, window_secs, date, weekday, min_access_secs, buckets, slack, rt, am);
+        let mut plans = self.raptor_range_tuned_rt_modes(origin, destination, start_time, window_secs, date, weekday, min_access_secs, buckets, slack, rt, am, bike);
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
             let overnight = self.raptor_range_tuned_rt_modes(
@@ -2227,7 +2226,7 @@ impl Graph {
                 start_time + 86400,
                 window_secs,
                 date - 1, Self::prev_weekday(weekday),
-                min_access_secs, buckets, slack, rt, am,
+                min_access_secs, buckets, slack, rt, am, bike,
             );
             let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
             if !normalized.is_empty() {

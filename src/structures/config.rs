@@ -145,6 +145,9 @@ pub struct BuildConfig {
     pub output: String,
     #[serde(default = "default_osm_output")]
     pub osm_output: String,
+    /// Optional GeoTIFF DEM for bike elevation cost/time (e.g. "path:data/dem.tif").
+    #[serde(default)]
+    pub elevation: Option<String>,
     #[serde(default)]
     pub delay_models: Vec<DelayModelConfig>,
 }
@@ -249,6 +252,9 @@ pub struct RoutingDefaultConfig {
     /// network; farther queries are rejected. When absent, defaults to 10000.
     #[serde(default)]
     pub max_snap_distance_m: Option<u32>,
+    /// Default bike cost profile. Absent ⇒ compiled-in BRouter trekking defaults.
+    #[serde(default)]
+    pub bike_profile: Option<crate::structures::BikeProfile>,
 }
 
 impl Ingestor {
@@ -383,6 +389,23 @@ server:
         let yaml = "default_routing: {}";
         let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(cfg.cycling_speed_mps.is_none());
+    }
+
+    #[test]
+    fn routing_default_config_bike_profile_absent_is_none() {
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(cfg.bike_profile.is_none());
+    }
+
+    #[test]
+    fn routing_default_config_bike_profile_partial_parses() {
+        // A sparse profile keeps BikeProfile's serde-defaulted fields.
+        let yaml = "bike_profile:\n  allow_steps: false\n  biker_power: 150";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let bp = cfg.bike_profile.expect("bike_profile present");
+        assert!(!bp.allow_steps);
+        assert_eq!(bp.biker_power, 150.0);
+        assert_eq!(bp.downhillcost, 100.0); // untouched default
     }
 
     #[test]
