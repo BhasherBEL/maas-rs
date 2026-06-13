@@ -30,7 +30,13 @@ impl Graph {
         start_time: u32,
         walk_secs: u32,
     ) -> Plan {
-        self.build_street_plan(origin, destination, start_time, walk_secs, StreetProfile::Foot)
+        self.build_street_plan(
+            origin,
+            destination,
+            start_time,
+            walk_secs,
+            StreetProfile::Foot,
+        )
     }
 
     /// Direct street-only plan (the whole journey walked or ridden).
@@ -70,6 +76,7 @@ impl Graph {
                 end,
                 duration: secs,
                 length,
+                cycleroute_length: None,
                 street_mode: mode,
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                     length,
@@ -82,7 +89,10 @@ impl Graph {
             end,
             mode,
             access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            arrival_distribution: vec![ArrivalScenario {
+                time: end,
+                probability: 1.0,
+            }],
             expected_end: end,
         }
     }
@@ -98,7 +108,8 @@ impl Graph {
         max_secs: u32,
         bike: &crate::structures::BikeCost,
     ) -> Option<Plan> {
-        let (nodes, secs, length) = self.bike_cost_path(origin, destination, max_secs, bike)?;
+        let (nodes, secs, length, cycleroute_length) =
+            self.bike_cost_path(origin, destination, max_secs, bike)?;
         let end = start_time + secs;
         let geometry = nodes.iter().map(|&n| self.node_coord(n)).collect();
         let to_place = PlanPlace {
@@ -107,6 +118,7 @@ impl Graph {
             arrival: Some(end),
             departure: None,
         };
+
         Some(Plan {
             legs: vec![PlanLeg::Walk(PlanWalkLeg {
                 from: PlanPlace {
@@ -120,6 +132,7 @@ impl Graph {
                 end,
                 duration: secs,
                 length,
+                cycleroute_length: Some(cycleroute_length),
                 street_mode: Mode::Bike,
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                     length,
@@ -132,7 +145,10 @@ impl Graph {
             end,
             mode: Mode::Bike,
             access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            arrival_distribution: vec![ArrivalScenario {
+                time: end,
+                probability: 1.0,
+            }],
             expected_end: end,
         })
     }
@@ -145,13 +161,14 @@ impl Graph {
         plan.legs.iter().any(|leg| {
             if let PlanLeg::Transit(t) = leg
                 && let Some(ref risk) = t.transfer_risk
-                    && risk.reliability < Self::EXTREME_RISK_RELIABILITY {
-                        let wait = risk
-                            .next_departure
-                            .map(|nd| nd.saturating_sub(risk.scheduled_departure))
-                            .unwrap_or(u32::MAX);
-                        return wait > Self::EXTREME_RISK_WAIT_SECS;
-                    }
+                && risk.reliability < Self::EXTREME_RISK_RELIABILITY
+            {
+                let wait = risk
+                    .next_departure
+                    .map(|nd| nd.saturating_sub(risk.scheduled_departure))
+                    .unwrap_or(u32::MAX);
+                return wait > Self::EXTREME_RISK_WAIT_SECS;
+            }
             false
         })
     }
@@ -197,13 +214,20 @@ impl Graph {
             }
             _ => reachable
                 .iter()
-                .map(|s| ArrivalScenario { time: s.time, probability: s.prob })
+                .map(|s| ArrivalScenario {
+                    time: s.time,
+                    probability: s.prob,
+                })
                 .collect(),
         };
 
         let mass: f64 = dist.iter().map(|s| s.probability as f64).sum();
         let expected_end = if mass > 0.0 {
-            (dist.iter().map(|s| s.time as f64 * s.probability as f64).sum::<f64>() / mass) as u32
+            (dist
+                .iter()
+                .map(|s| s.time as f64 * s.probability as f64)
+                .sum::<f64>()
+                / mass) as u32
         } else {
             fallback_end
         };
@@ -296,8 +320,7 @@ impl Graph {
                 // The destination-stop label this candidate was built from; its arena
                 // chain is the EXACT journey (no grid re-lookup → no bucket drift).
                 let cell = best_stop * n_states + dest_sidx;
-                let chosen =
-                    Self::pick_label(&labels[k][cell], buckets, b as u8, departure_stamp);
+                let chosen = Self::pick_label(&labels[k][cell], buckets, b as u8, departure_stamp);
                 let chosen_bag = chosen.map(|l| l.bag).unwrap_or(ScenarioBag::EMPTY);
                 let chosen_rt = chosen.and_then(|l| l.route_type);
 
@@ -331,196 +354,202 @@ impl Graph {
                 };
 
                 if legs.is_empty() {
-                if let Some(ref mut sink) = debug_sink {
-                    sink.push(PlanCandidate {
-                        round: k,
-                        origin_departure: start_time,
-                        plan: None,
-                        status: CandidateStatus::ReconstructionEmpty,
-                    });
+                    if let Some(ref mut sink) = debug_sink {
+                        sink.push(PlanCandidate {
+                            round: k,
+                            origin_departure: start_time,
+                            plan: None,
+                            status: CandidateStatus::ReconstructionEmpty,
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            let transit_count =
-                legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count();
-            // A transit-mode candidate must actually use transit. With a wide
-            // vehicle access radius the search can reach the destination via
-            // access + transfer + egress with zero transit legs — a degenerate
-            // direct ride that also dodges the direct-duration filter (it looks
-            // "direct"). Direct rides are emitted by the direct-plan machinery, so
-            // drop any zero-transit candidate here.
-            if transit_count == 0 {
-                if let Some(ref mut sink) = debug_sink {
-                    sink.push(PlanCandidate {
-                        round: k,
-                        origin_departure: start_time,
-                        plan: None,
-                        status: CandidateStatus::ReconstructionEmpty,
-                    });
+                let transit_count = legs
+                    .iter()
+                    .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                    .count();
+                // A transit-mode candidate must actually use transit. With a wide
+                // vehicle access radius the search can reach the destination via
+                // access + transfer + egress with zero transit legs — a degenerate
+                // direct ride that also dodges the direct-duration filter (it looks
+                // "direct"). Direct rides are emitted by the direct-plan machinery, so
+                // drop any zero-transit candidate here.
+                if transit_count == 0 {
+                    if let Some(ref mut sink) = debug_sink {
+                        sink.push(PlanCandidate {
+                            round: k,
+                            origin_departure: start_time,
+                            plan: None,
+                            status: CandidateStatus::ReconstructionEmpty,
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // The backward pass is bike-unaware (it would re-board trips a carried
-            // bike is not allowed on), so only walk-rooted plans are tightened.
-            if transit_count > 0 && mode == Mode::WalkTransit {
-                let lambda = self.raptor_backward(
-                    best_stop,
-                    best_arr.saturating_sub(best_walk),
-                    transit_count,
-                    date,
-                    weekday,
-                );
-                self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday);
-            }
-
-            // Realtime post-pass: shift leg times by live delays, re-chain the
-            // timeline, and recompute transfer reliability on the new margins.
-            self.apply_realtime(&mut legs, rt);
-
-            // Record each transit leg's downstream connection *after* tighten and
-            // realtime have settled the final scheduled times, so the outbound
-            // margin used to score alternatives matches the leg's actual arrival.
-            Self::link_following_connections(&mut legs);
-
-            let (access_profile, access_mode) = match root_vs {
-                VehicleState::Walked | VehicleState::CarEgress => (StreetProfile::Foot, Mode::Walk),
-                VehicleState::BikeInHand | VehicleState::BikeDropped => {
-                    (StreetProfile::Bike, Mode::Bike)
+                // The backward pass is bike-unaware (it would re-board trips a carried
+                // bike is not allowed on), so only walk-rooted plans are tightened.
+                if transit_count > 0 && mode == Mode::WalkTransit {
+                    let lambda = self.raptor_backward(
+                        best_stop,
+                        best_arr.saturating_sub(best_walk),
+                        transit_count,
+                        date,
+                        weekday,
+                    );
+                    self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday);
                 }
-                VehicleState::CarParked => (StreetProfile::Car, Mode::Car),
-            };
-            if let Some(&(_, first_walk)) = mc.access[root_state as usize]
-                .iter()
-                .find(|&&(s, _)| s == origin_stop)
-            {
-                if first_walk > 0 {
-                    let stop_node = self.raptor.transit_stop_to_node[origin_stop];
-                    let speed = match access_profile {
+
+                // Realtime post-pass: shift leg times by live delays, re-chain the
+                // timeline, and recompute transfer reliability on the new margins.
+                self.apply_realtime(&mut legs, rt);
+
+                // Record each transit leg's downstream connection *after* tighten and
+                // realtime have settled the final scheduled times, so the outbound
+                // margin used to score alternatives matches the leg's actual arrival.
+                Self::link_following_connections(&mut legs);
+
+                let (access_profile, access_mode) = match root_vs {
+                    VehicleState::Walked | VehicleState::CarEgress => {
+                        (StreetProfile::Foot, Mode::Walk)
+                    }
+                    VehicleState::BikeInHand | VehicleState::BikeDropped => {
+                        (StreetProfile::Bike, Mode::Bike)
+                    }
+                    VehicleState::CarParked => (StreetProfile::Car, Mode::Car),
+                };
+                if let Some(&(_, first_walk)) = mc.access[root_state as usize]
+                    .iter()
+                    .find(|&&(s, _)| s == origin_stop)
+                {
+                    if first_walk > 0 {
+                        let stop_node = self.raptor.transit_stop_to_node[origin_stop];
+                        let speed = match access_profile {
+                            StreetProfile::Foot => self.raptor.walking_speed_mps,
+                            StreetProfile::Bike => self.raptor.cycling_speed_mps,
+                            StreetProfile::Car => self.raptor.driving_speed_mps,
+                        };
+                        let length = (first_walk as f64 * speed) as usize;
+                        let walk_start = legs
+                            .first()
+                            .map(|l| match l {
+                                PlanLeg::Transit(t) => t.start.saturating_sub(first_walk),
+                                PlanLeg::Walk(w) => w.start.saturating_sub(first_walk),
+                            })
+                            .unwrap_or(start_time)
+                            .max(start_time);
+                        let walk_end = walk_start + first_walk;
+                        let to_place = PlanPlace {
+                            node_id: stop_node,
+                            stop_position: None,
+                            arrival: Some(walk_end),
+                            departure: None,
+                        };
+                        legs.insert(
+                            0,
+                            PlanLeg::Walk(PlanWalkLeg {
+                                from: PlanPlace {
+                                    node_id: origin,
+                                    stop_position: None,
+                                    arrival: None,
+                                    departure: Some(walk_start),
+                                },
+                                to: to_place,
+                                start: walk_start,
+                                end: walk_end,
+                                duration: first_walk,
+                                length,
+                                cycleroute_length: None,
+                                street_mode: access_mode,
+                                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
+                                    length,
+                                    time: first_walk,
+                                    place: to_place,
+                                })],
+                                geometry: self.street_path(origin, stop_node, access_profile),
+                            }),
+                        );
+                    }
+                }
+
+                if best_walk > 0 {
+                    let (egress_profile, egress_mode) = match dest_vs {
+                        VehicleState::BikeInHand => (StreetProfile::Bike, Mode::Bike),
+                        VehicleState::CarEgress => (StreetProfile::Car, Mode::Car),
+                        _ => (StreetProfile::Foot, Mode::Walk),
+                    };
+                    let walk_start = chosen_bag.earliest();
+                    let stop_node = self.raptor.transit_stop_to_node[best_stop];
+                    let speed = match egress_profile {
                         StreetProfile::Foot => self.raptor.walking_speed_mps,
                         StreetProfile::Bike => self.raptor.cycling_speed_mps,
                         StreetProfile::Car => self.raptor.driving_speed_mps,
                     };
-                    let length = (first_walk as f64 * speed) as usize;
-                    let walk_start = legs
-                        .first()
-                        .map(|l| match l {
-                            PlanLeg::Transit(t) => t.start.saturating_sub(first_walk),
-                            PlanLeg::Walk(w) => w.start.saturating_sub(first_walk),
-                        })
-                        .unwrap_or(start_time)
-                        .max(start_time);
-                    let walk_end = walk_start + first_walk;
+                    let length = (best_walk as f64 * speed) as usize;
                     let to_place = PlanPlace {
-                        node_id: stop_node,
+                        node_id: destination,
                         stop_position: None,
-                        arrival: Some(walk_end),
+                        arrival: Some(best_arr),
                         departure: None,
                     };
-                    legs.insert(
-                        0,
-                        PlanLeg::Walk(PlanWalkLeg {
-                            from: PlanPlace {
-                                node_id: origin,
-                                stop_position: None,
-                                arrival: None,
-                                departure: Some(walk_start),
-                            },
-                            to: to_place,
-                            start: walk_start,
-                            end: walk_end,
-                            duration: first_walk,
-                            length,
-                            street_mode: access_mode,
-                            steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                                length,
-                                time: first_walk,
-                                place: to_place,
-                            })],
-                            geometry: self.street_path(origin, stop_node, access_profile),
-                        }),
-                    );
-                }
-            }
-
-            if best_walk > 0 {
-                let (egress_profile, egress_mode) = match dest_vs {
-                    VehicleState::BikeInHand => (StreetProfile::Bike, Mode::Bike),
-                    VehicleState::CarEgress => (StreetProfile::Car, Mode::Car),
-                    _ => (StreetProfile::Foot, Mode::Walk),
-                };
-                let walk_start = chosen_bag.earliest();
-                let stop_node = self.raptor.transit_stop_to_node[best_stop];
-                let speed = match egress_profile {
-                    StreetProfile::Foot => self.raptor.walking_speed_mps,
-                    StreetProfile::Bike => self.raptor.cycling_speed_mps,
-                    StreetProfile::Car => self.raptor.driving_speed_mps,
-                };
-                let length = (best_walk as f64 * speed) as usize;
-                let to_place = PlanPlace {
-                    node_id: destination,
-                    stop_position: None,
-                    arrival: Some(best_arr),
-                    departure: None,
-                };
-                legs.push(PlanLeg::Walk(PlanWalkLeg {
-                    from: PlanPlace {
-                        node_id: stop_node,
-                        stop_position: None,
-                        arrival: None,
-                        departure: Some(walk_start),
-                    },
-                    to: to_place,
-                    start: walk_start,
-                    end: best_arr,
-                    duration: best_walk,
-                    length,
-                    street_mode: egress_mode,
-                    steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
+                    legs.push(PlanLeg::Walk(PlanWalkLeg {
+                        from: PlanPlace {
+                            node_id: stop_node,
+                            stop_position: None,
+                            arrival: None,
+                            departure: Some(walk_start),
+                        },
+                        to: to_place,
+                        start: walk_start,
+                        end: best_arr,
+                        duration: best_walk,
                         length,
-                        time: best_walk,
-                        place: to_place,
-                    })],
-                    geometry: self.street_path(stop_node, destination, egress_profile),
-                }));
-            }
+                        street_mode: egress_mode,
+                        cycleroute_length: None,
+                        steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
+                            length,
+                            time: best_walk,
+                            place: to_place,
+                        })],
+                        geometry: self.street_path(stop_node, destination, egress_profile),
+                    }));
+                }
 
-            // Re-chain trailing walks onto the realtime-settled legs and read the
-            // plan bounds off the final timeline, so a live delay can never leave
-            // `end` lagging behind `start` (the historical negative-duration bug).
-            let (departure, arrival) = Self::plan_timeline(&mut legs);
+                // Re-chain trailing walks onto the realtime-settled legs and read the
+                // plan bounds off the final timeline, so a live delay can never leave
+                // `end` lagging behind `start` (the historical negative-duration bug).
+                let (departure, arrival) = Self::plan_timeline(&mut legs);
 
-            let arrival_bag = chosen_bag.shifted_by(best_walk);
-            let (arrival_distribution, expected_end) = Self::arrival_stats(
-                &arrival_bag,
-                chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)),
-                arrival,
-            );
-            // The expected (mean) arrival must never precede the deterministic
-            // realtime arrival the legs actually show.
-            let expected_end = expected_end.max(arrival);
-            let plan = Plan {
-                legs: Self::merge_consecutive_walks(legs),
-                start: departure,
-                end: arrival,
-                mode,
-                access_alternatives: vec![],
-                arrival_distribution,
-                expected_end,
-            };
+                let arrival_bag = chosen_bag.shifted_by(best_walk);
+                let (arrival_distribution, expected_end) = Self::arrival_stats(
+                    &arrival_bag,
+                    chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)),
+                    arrival,
+                );
+                // The expected (mean) arrival must never precede the deterministic
+                // realtime arrival the legs actually show.
+                let expected_end = expected_end.max(arrival);
+                let plan = Plan {
+                    legs: Self::merge_consecutive_walks(legs),
+                    start: departure,
+                    end: arrival,
+                    mode,
+                    access_alternatives: vec![],
+                    arrival_distribution,
+                    expected_end,
+                };
 
-            if let Some(ref mut sink) = debug_sink {
-                sink_indices.push(sink.len());
-                sink.push(PlanCandidate {
-                    round: k,
-                    origin_departure: start_time,
-                    plan: Some(plan.clone()),
-                    status: CandidateStatus::Kept,
-                });
-            } else {
-                sink_indices.push(candidates.len()); // dummy — never used to index sink
-            }
-            candidates.push(plan);
+                if let Some(ref mut sink) = debug_sink {
+                    sink_indices.push(sink.len());
+                    sink.push(PlanCandidate {
+                        round: k,
+                        origin_departure: start_time,
+                        plan: Some(plan.clone()),
+                        status: CandidateStatus::Kept,
+                    });
+                } else {
+                    sink_indices.push(candidates.len()); // dummy — never used to index sink
+                }
+                candidates.push(plan);
             }
         }
 
@@ -619,6 +648,7 @@ impl Graph {
                         end: new_end,
                         duration: new_duration,
                         length: new_length,
+                        cycleroute_length: None,
                         street_mode: prev.street_mode,
                         steps: vec![step],
                         geometry: merged_geo,
@@ -709,6 +739,7 @@ impl Graph {
                     end,
                     duration,
                     length,
+                    cycleroute_length: None,
                     street_mode: Mode::Walk,
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                         length,
@@ -727,10 +758,13 @@ impl Graph {
             let bp = trace.boarded_at as usize;
             let ap = trace.alighted_at as usize;
 
-            let pat_stops = self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
+            let pat_stops =
+                self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
             let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
-            let times = self.raptor.transit_idx_pattern_stop_times[p].of(&self.raptor.transit_pattern_stop_times);
-            let trip_ids = self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
+            let times = self.raptor.transit_idx_pattern_stop_times[p]
+                .of(&self.raptor.transit_pattern_stop_times);
+            let trip_ids =
+                self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
 
             let board_dep = times[bp * n_trips + t].departure;
             let alight_arr = times[ap * n_trips + t].arrival;
@@ -742,7 +776,9 @@ impl Graph {
             let preceding_rt = parent_node.and_then(|l| l.route_type);
             let preceding_arr = parent_node.map(|l| l.bag.earliest());
 
-            let transfer_risk = if let (Some(rt), Some(arrival_at_bs)) = (preceding_rt, preceding_arr) {
+            let transfer_risk = if let (Some(rt), Some(arrival_at_bs)) =
+                (preceding_rt, preceding_arr)
+            {
                 let margin = board_dep as i32 - arrival_at_bs as i32;
                 let next_departure =
                     self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
@@ -864,7 +900,11 @@ impl Graph {
                 steps,
                 geometry: transit_geometry,
                 transfer_risk,
-                preceding_arrival: if preceding_rt.is_none() { None } else { preceding_arr },
+                preceding_arrival: if preceding_rt.is_none() {
+                    None
+                } else {
+                    preceding_arr
+                },
                 preceding_route_type: preceding_rt,
                 route_type: self.route_type_of_trip(trip_ids[t]),
                 // Populated by `link_following_connections` once the legs are in
@@ -883,10 +923,7 @@ impl Graph {
 
         // `cur` is now the source/root label this journey was seeded from; its
         // state identifies the access profile (walk vs bike).
-        let root_state = arena
-            .get(cur as usize)
-            .map(|l| l.state)
-            .unwrap_or(0);
+        let root_state = arena.get(cur as usize).map(|l| l.state).unwrap_or(0);
 
         (legs, origin_stop, root_state)
     }
@@ -966,11 +1003,12 @@ impl Graph {
 
                     for step in t.steps.iter_mut() {
                         if let PlanLegStep::Transit(s) = step
-                            && let Some(sc) = compact(s.place.node_id) {
-                                let d = rt.delay(t.trip_id, sc);
-                                s.place.arrival = s.place.arrival.map(|a| apply_signed_delay(a, d));
-                                s.place.departure = s.place.departure.map(|x| apply_signed_delay(x, d));
-                            }
+                            && let Some(sc) = compact(s.place.node_id)
+                        {
+                            let d = rt.delay(t.trip_id, sc);
+                            s.place.arrival = s.place.arrival.map(|a| apply_signed_delay(a, d));
+                            s.place.departure = s.place.departure.map(|x| apply_signed_delay(x, d));
+                        }
                     }
 
                     // Recompute the transfer onto this leg from the realtime arrival.
@@ -983,8 +1021,9 @@ impl Graph {
                         let (rel, next_rel) = match self.raptor.transit_delay_models.get(&prt) {
                             Some(cdf) => (
                                 cdf.prob_on_time_vs(board, margin),
-                                next_dep
-                                    .map(|nd| cdf.prob_on_time_vs(board, nd as i32 - prev_arr as i32)),
+                                next_dep.map(|nd| {
+                                    cdf.prob_on_time_vs(board, nd as i32 - prev_arr as i32)
+                                }),
                             ),
                             None => (1.0, None),
                         };
@@ -1071,7 +1110,11 @@ impl Graph {
             .iter()
             .enumerate()
             .filter_map(|(i, l)| {
-                if matches!(l, PlanLeg::Transit(_)) { Some(i) } else { None }
+                if matches!(l, PlanLeg::Transit(_)) {
+                    Some(i)
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -1103,7 +1146,10 @@ impl Graph {
                 let next_ti = transit_indices[i + 1];
                 legs[ti + 1..next_ti]
                     .iter()
-                    .map(|l| match l { PlanLeg::Walk(w) => w.duration, _ => 0 })
+                    .map(|l| match l {
+                        PlanLeg::Walk(w) => w.duration,
+                        _ => 0,
+                    })
                     .sum()
             } else {
                 0
@@ -1120,7 +1166,11 @@ impl Graph {
                     _ => unreachable!(),
                 };
                 self.reliability_capped_alighting(
-                    feeder_rt, next_rt, walk_to_next, next_start, max_alighting,
+                    feeder_rt,
+                    next_rt,
+                    walk_to_next,
+                    next_start,
+                    max_alighting,
                 )
             } else {
                 max_alighting
@@ -1136,25 +1186,27 @@ impl Graph {
                     max_alighting,
                     date,
                     weekday,
-                )
-                    && new_dep > leg_start {
-                        let cloned = match &legs[ti] {
-                            PlanLeg::Transit(t) => t.clone(),
-                            _ => unreachable!(),
-                        };
-                        if let Ok(mut alts) = cloned.find_alternatives(
-                            self,
-                            std::iter::once((dep_idx, &self.raptor.transit_departures[dep_idx])),
-                            1,
-                        )
-                            && let Some(new_leg) = alts.pop() {
-                                legs[ti] = PlanLeg::Transit(new_leg);
-                            }
+                ) && new_dep > leg_start
+                {
+                    let cloned = match &legs[ti] {
+                        PlanLeg::Transit(t) => t.clone(),
+                        _ => unreachable!(),
+                    };
+                    if let Ok(mut alts) = cloned.find_alternatives(
+                        self,
+                        std::iter::once((dep_idx, &self.raptor.transit_departures[dep_idx])),
+                        1,
+                    ) && let Some(new_leg) = alts.pop()
+                    {
+                        legs[ti] = PlanLeg::Transit(new_leg);
                     }
+                }
             }
 
-            let new_leg_end =
-                match &legs[ti] { PlanLeg::Transit(t) => t.end, _ => unreachable!() };
+            let new_leg_end = match &legs[ti] {
+                PlanLeg::Transit(t) => t.end,
+                _ => unreachable!(),
+            };
 
             if i < k - 1 {
                 let next_ti = transit_indices[i + 1];
@@ -1182,8 +1234,7 @@ impl Graph {
                     next_t.preceding_arrival = Some(cursor);
                     if let Some(prt) = next_t.preceding_route_type {
                         let margin = next_t.start as i32 - cursor as i32;
-                        let next_dep =
-                            next_t.transfer_risk.as_ref().and_then(|r| r.next_departure);
+                        let next_dep = next_t.transfer_risk.as_ref().and_then(|r| r.next_departure);
                         let board = next_t
                             .route_type
                             .and_then(|brt| self.raptor.transit_delay_models.get(&brt));
@@ -1237,7 +1288,13 @@ impl Graph {
     fn plan_street_secs(plan: &Plan) -> u32 {
         plan.legs
             .iter()
-            .filter_map(|l| if let PlanLeg::Walk(w) = l { Some(w.duration) } else { None })
+            .filter_map(|l| {
+                if let PlanLeg::Walk(w) = l {
+                    Some(w.duration)
+                } else {
+                    None
+                }
+            })
             .sum()
     }
 
@@ -1282,7 +1339,12 @@ impl Graph {
                 .iter()
                 .min_by_key(|&&i| {
                     let p = slots[i].as_ref().unwrap();
-                    (p.mode.burden(), p.end, std::cmp::Reverse(p.start), Self::plan_street_secs(p))
+                    (
+                        p.mode.burden(),
+                        p.end,
+                        std::cmp::Reverse(p.start),
+                        Self::plan_street_secs(p),
+                    )
                 })
                 .unwrap();
             let primary_end = slots[primary_idx].as_ref().unwrap().end;
@@ -1311,7 +1373,10 @@ impl Graph {
 
             let primary = slots[primary_idx].as_mut().unwrap();
             for alt in alternatives {
-                let dup = primary.access_alternatives.iter_mut().find(|a| a.mode == alt.mode);
+                let dup = primary
+                    .access_alternatives
+                    .iter_mut()
+                    .find(|a| a.mode == alt.mode);
                 match dup {
                     // Keep the latest-departing variant per mode.
                     Some(existing) if existing.start >= alt.start => {}
@@ -1319,7 +1384,9 @@ impl Graph {
                     None => primary.access_alternatives.push(alt),
                 }
             }
-            primary.access_alternatives.sort_by_key(|a| (a.mode.burden(), a.start));
+            primary
+                .access_alternatives
+                .sort_by_key(|a| (a.mode.burden(), a.start));
         }
 
         slots.into_iter().flatten().collect()
@@ -1370,9 +1437,16 @@ impl Graph {
         }
 
         fn walk_secs(plan: &Plan) -> u32 {
-            plan.legs.iter().filter_map(|l| {
-                if let PlanLeg::Walk(w) = l { Some(w.duration) } else { None }
-            }).sum()
+            plan.legs
+                .iter()
+                .filter_map(|l| {
+                    if let PlanLeg::Walk(w) = l {
+                        Some(w.duration)
+                    } else {
+                        None
+                    }
+                })
+                .sum()
         }
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
@@ -1453,9 +1527,16 @@ impl Graph {
         }
 
         fn walk_secs(plan: &Plan) -> u32 {
-            plan.legs.iter().filter_map(|l| {
-                if let PlanLeg::Walk(w) = l { Some(w.duration) } else { None }
-            }).sum()
+            plan.legs
+                .iter()
+                .filter_map(|l| {
+                    if let PlanLeg::Walk(w) = l {
+                        Some(w.duration)
+                    } else {
+                        None
+                    }
+                })
+                .sum()
         }
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
@@ -1572,10 +1653,18 @@ mod tests {
     #[test]
     fn arrival_stats_unreachable_survives_negative_delay_convolution() {
         let bag = ScenarioBag::with_scenarios(36000, 0.5, u32::MAX, 0.5);
-        let cdf = DelayCDF { bins: vec![(-180, 0.2), (0, 0.8), (120, 1.0)] };
+        let cdf = DelayCDF {
+            bins: vec![(-180, 0.2), (0, 0.8), (120, 1.0)],
+        };
         let (dist, expected_end) = Graph::arrival_stats(&bag, Some(&cdf), 37000);
-        assert!(dist.iter().all(|s| s.time < 200_000), "sentinel leaked: {dist:?}");
-        assert!((35820..=36120).contains(&expected_end), "got {expected_end}");
+        assert!(
+            dist.iter().all(|s| s.time < 200_000),
+            "sentinel leaked: {dist:?}"
+        );
+        assert!(
+            (35820..=36120).contains(&expected_end),
+            "got {expected_end}"
+        );
     }
 
     #[test]
@@ -1611,6 +1700,7 @@ mod tests {
     fn walk_leg(street_mode: Mode, start: u32, end: u32) -> PlanLeg {
         PlanLeg::Walk(PlanWalkLeg {
             length: 0,
+            cycleroute_length: None,
             start,
             end,
             duration: end - start,
@@ -1654,7 +1744,10 @@ mod tests {
             end,
             mode,
             access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario { time: end, probability: 1.0 }],
+            arrival_distribution: vec![ArrivalScenario {
+                time: end,
+                probability: 1.0,
+            }],
             expected_end: end,
         }
     }
@@ -1675,7 +1768,10 @@ mod tests {
         ];
         let (start, end) = Graph::plan_timeline(&mut legs);
         assert_eq!(start, 100);
-        assert_eq!(end, 860, "egress must chain off the realtime arrival (800 + 60)");
+        assert_eq!(
+            end, 860,
+            "egress must chain off the realtime arrival (800 + 60)"
+        );
         assert!(end >= start);
         match &legs[2] {
             PlanLeg::Walk(w) => {
@@ -1710,8 +1806,18 @@ mod tests {
 
     #[test]
     fn heavier_mode_survives_on_strict_improvement() {
-        let walk = plan(Mode::WalkTransit, 90, 250, vec![transit_leg(7, 10, 11, 100, 200)]);
-        let bike = plan(Mode::BikeTransit, 90, 210, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let walk = plan(
+            Mode::WalkTransit,
+            90,
+            250,
+            vec![transit_leg(7, 10, 11, 100, 200)],
+        );
+        let bike = plan(
+            Mode::BikeTransit,
+            90,
+            210,
+            vec![transit_leg(8, 10, 11, 100, 200)],
+        );
         let out = Graph::pareto_filter(vec![walk, bike], &buckets());
         assert_eq!(out.len(), 2);
     }
@@ -1719,10 +1825,25 @@ mod tests {
     #[test]
     fn lighter_mode_never_dominated_by_heavier() {
         // Bike strictly better on every axis — the walk plan must still survive.
-        let walk = plan(Mode::WalkTransit, 80, 300, vec![transit_leg(7, 10, 11, 100, 200)]);
-        let bike = plan(Mode::BikeTransit, 90, 210, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let walk = plan(
+            Mode::WalkTransit,
+            80,
+            300,
+            vec![transit_leg(7, 10, 11, 100, 200)],
+        );
+        let bike = plan(
+            Mode::BikeTransit,
+            90,
+            210,
+            vec![transit_leg(8, 10, 11, 100, 200)],
+        );
         let out = Graph::pareto_filter(vec![walk, bike], &buckets());
-        assert_eq!(out.len(), 2, "{:?}", out.iter().map(|p| p.mode).collect::<Vec<_>>());
+        assert_eq!(
+            out.len(),
+            2,
+            "{:?}",
+            out.iter().map(|p| p.mode).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1759,16 +1880,36 @@ mod tests {
     #[test]
     fn same_core_earlier_arrival_stays_standalone() {
         // Ridden egress arrives earlier: a genuine Pareto endpoint, not a twin.
-        let walk = plan(Mode::WalkTransit, 80, 260, vec![transit_leg(7, 10, 11, 100, 200)]);
-        let bike = plan(Mode::BikeOnTransit, 94, 220, vec![transit_leg(7, 10, 11, 100, 200)]);
+        let walk = plan(
+            Mode::WalkTransit,
+            80,
+            260,
+            vec![transit_leg(7, 10, 11, 100, 200)],
+        );
+        let bike = plan(
+            Mode::BikeOnTransit,
+            94,
+            220,
+            vec![transit_leg(7, 10, 11, 100, 200)],
+        );
         let out = Graph::group_access_alternatives(vec![walk, bike]);
         assert_eq!(out.len(), 2);
     }
 
     #[test]
     fn different_core_not_grouped() {
-        let a = plan(Mode::WalkTransit, 80, 260, vec![transit_leg(7, 10, 11, 100, 200)]);
-        let b = plan(Mode::BikeTransit, 94, 260, vec![transit_leg(8, 10, 11, 100, 200)]);
+        let a = plan(
+            Mode::WalkTransit,
+            80,
+            260,
+            vec![transit_leg(7, 10, 11, 100, 200)],
+        );
+        let b = plan(
+            Mode::BikeTransit,
+            94,
+            260,
+            vec![transit_leg(8, 10, 11, 100, 200)],
+        );
         let out = Graph::group_access_alternatives(vec![a, b]);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|p| p.access_alternatives.is_empty()));
@@ -1780,13 +1921,19 @@ mod tests {
         // departs later (burden 1) — it only survived Pareto on the later
         // departure. Since cycling straight there is shorter, drop it.
         let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
-        let bike_transit =
-            plan(Mode::BikeOnTransit, 300, 1740, vec![transit_leg(7, 10, 11, 400, 1700)]);
+        let bike_transit = plan(
+            Mode::BikeOnTransit,
+            300,
+            1740,
+            vec![transit_leg(7, 10, 11, 400, 1700)],
+        );
         let out = Graph::finalize_plans(vec![bike_direct, bike_transit], &buckets());
         assert!(
             out.iter().all(|p| p.mode != Mode::BikeOnTransit),
             "a bike+transit slower than cycling direct must be dropped: {:?}",
-            out.iter().map(|p| (p.mode, p.end - p.start)).collect::<Vec<_>>()
+            out.iter()
+                .map(|p| (p.mode, p.end - p.start))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1795,8 +1942,12 @@ mod tests {
         // Bike-direct (burden 1) must NOT suppress a longer WALK+transit (burden
         // 0) — a lighter mode is always worth offering.
         let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
-        let walk_transit =
-            plan(Mode::WalkTransit, 300, 1740, vec![transit_leg(7, 10, 11, 400, 1700)]);
+        let walk_transit = plan(
+            Mode::WalkTransit,
+            300,
+            1740,
+            vec![transit_leg(7, 10, 11, 400, 1700)],
+        );
         let out = Graph::finalize_plans(vec![bike_direct, walk_transit], &buckets());
         assert!(
             out.iter().any(|p| p.mode == Mode::WalkTransit),
@@ -1808,8 +1959,12 @@ mod tests {
     fn direct_does_not_suppress_faster_transit() {
         // Transit beats cycling direct on duration here — it must survive.
         let bike_direct = plan(Mode::Bike, 0, 1500, vec![walk_leg(Mode::Bike, 0, 1500)]);
-        let bike_transit =
-            plan(Mode::BikeOnTransit, 0, 1320, vec![transit_leg(7, 10, 11, 100, 1300)]);
+        let bike_transit = plan(
+            Mode::BikeOnTransit,
+            0,
+            1320,
+            vec![transit_leg(7, 10, 11, 100, 1300)],
+        );
         let out = Graph::finalize_plans(vec![bike_direct, bike_transit], &buckets());
         assert!(
             out.iter().any(|p| p.mode == Mode::BikeOnTransit),

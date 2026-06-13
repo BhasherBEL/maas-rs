@@ -1,13 +1,37 @@
 //! Classify an OSM `Way`'s tags into `BikeAttrs` once at ingest. Mirrors the
 //! BRouter `way`-context logic for the tags we read (ferries excluded).
 
-use osmpbf::Way;
+use osmpbf::{Relation, Way};
 
 use crate::structures::{BikeAttrs, HighwayClass, Surface};
 
 /// Looks up a tag value on a way.
 fn tag<'a>(w: &'a Way, key: &str) -> Option<&'a str> {
     w.tags().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// Pure predicate: do these relation tags describe a signposted cycle route?
+/// In raw OSM, cycle-route membership lives on `type=route, route=bicycle`
+/// (and `mtb` / `superroute`) relations — not on the member ways — so the ways'
+/// `route_bicycle_*`/`lcn` tags are almost never present. This lets the ingester
+/// propagate membership from the relation onto its member ways.
+fn tags_are_cycle_route<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> bool {
+    let mut is_route = false;
+    let mut is_bike = false;
+    for (k, v) in tags {
+        match k {
+            "type" => is_route = matches!(v, "route" | "superroute"),
+            "route" => is_bike = matches!(v, "bicycle" | "mtb"),
+            _ => {}
+        }
+    }
+    is_route && is_bike
+}
+
+/// Whether a relation is a cycle route whose member ways should be treated as a
+/// signposted cycle route (BRouter's lcn/rcn/ncn/icn membership).
+pub fn is_cycle_route_relation(r: &Relation) -> bool {
+    tags_are_cycle_route(r.tags())
 }
 
 fn classify_highway(v: Option<&str>) -> HighwayClass {
@@ -100,9 +124,14 @@ fn foot_access(w: &Way, bikeaccess: bool) -> bool {
 /// `forward` = the edge runs along the way's node order.
 fn wrong_way(w: &Way, forward: bool) -> bool {
     let reversed = !forward;
-    let cycleway_opp = ["cycleway", "cycleway:left", "cycleway:right"].iter().any(|k| {
-        matches!(tag(w, k), Some("opposite" | "opposite_lane" | "opposite_track"))
-    });
+    let cycleway_opp = ["cycleway", "cycleway:left", "cycleway:right"]
+        .iter()
+        .any(|k| {
+            matches!(
+                tag(w, k),
+                Some("opposite" | "opposite_lane" | "opposite_track")
+            )
+        });
     let oneway_bicycle_no = tag(w, "oneway:bicycle") == Some("no");
     if cycleway_opp || oneway_bicycle_no {
         return false;
@@ -122,8 +151,10 @@ fn wrong_way(w: &Way, forward: bool) -> bool {
 }
 
 /// Classify a way for a directed edge. `forward` distinguishes the two emitted
-/// directions so oneway handling is direction-correct.
-pub fn classify(w: &Way, forward: bool) -> BikeAttrs {
+/// directions so oneway handling is direction-correct. `in_cycle_route` is true
+/// when the way belongs to a bicycle route relation (see
+/// [`is_cycle_route_relation`]); it's OR-ed with any way-level route tags.
+pub fn classify(w: &Way, forward: bool, in_cycle_route: bool) -> BikeAttrs {
     let bikeaccess = bike_access(w);
     BikeAttrs {
         highway: classify_highway(tag(w, "highway")),
@@ -137,9 +168,41 @@ pub fn classify(w: &Way, forward: bool) -> BikeAttrs {
             _ => 0,
         },
         isbike: is_bike(w),
-        cycleroute: any_cycleroute(w),
+        cycleroute: in_cycle_route || any_cycleroute(w),
         bikeaccess,
         footaccess: foot_access(w, bikeaccess),
         wrong_way: wrong_way(w, forward),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tags_are_cycle_route;
+
+    fn check(tags: &[(&str, &str)]) -> bool {
+        tags_are_cycle_route(tags.iter().copied())
+    }
+
+    #[test]
+    fn detects_bicycle_route_relation() {
+        assert!(check(&[
+            ("type", "route"),
+            ("route", "bicycle"),
+            ("network", "rcn"),
+            ("name", "Knooppuntnetwerk"),
+        ]));
+        assert!(check(&[("type", "route"), ("route", "mtb")]));
+        assert!(check(&[("type", "superroute"), ("route", "bicycle")]));
+    }
+
+    #[test]
+    fn rejects_non_bicycle_routes() {
+        assert!(!check(&[("type", "route"), ("route", "hiking")]));
+        assert!(!check(&[("type", "route"), ("route", "bus")]));
+        // A bicycle restriction relation, not a route.
+        assert!(!check(&[("type", "restriction"), ("route", "bicycle")]));
+        // Missing the route value entirely.
+        assert!(!check(&[("type", "route")]));
+        assert!(!check(&[]));
     }
 }

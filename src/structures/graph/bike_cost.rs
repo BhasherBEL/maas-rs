@@ -20,11 +20,18 @@ impl BikeCost {
     fn cost_factor(&self, a: &BikeAttrs) -> f64 {
         let p = &self.profile;
         // Hard exclusions.
-        if matches!(a.highway, HighwayClass::Motorway | HighwayClass::MotorwayLink | HighwayClass::Other) {
+        if matches!(
+            a.highway,
+            HighwayClass::Motorway | HighwayClass::MotorwayLink | HighwayClass::Other
+        ) {
             return IMPASSABLE;
         }
         if matches!(a.highway, HighwayClass::Steps) {
-            return if p.allow_steps { p.steps_cost } else { IMPASSABLE };
+            return if p.allow_steps {
+                p.steps_cost
+            } else {
+                IMPASSABLE
+            };
         }
         let unpaved = matches!(a.surface, Surface::Unpaved);
         let is_ldcr = !p.ignore_cycleroutes && a.cycleroute;
@@ -40,7 +47,11 @@ impl BikeCost {
             cf += p.unsafe_penalty;
         }
         // Oneway + access penalties (max of the two, BRouter-style).
-        let oneway = if a.wrong_way { self.oneway_penalty(a.highway) } else { 0.0 };
+        let oneway = if a.wrong_way {
+            self.oneway_penalty(a.highway)
+        } else {
+            0.0
+        };
         let access = self.access_penalty(a);
         cf + oneway.max(access)
     }
@@ -57,12 +68,48 @@ impl BikeCost {
     fn track_factor(&self, a: &BikeAttrs) -> f64 {
         let good = a.probably_good();
         match a.tracktype {
-            1 => if good { 1.0 } else { 1.3 },
-            2 => if good { 1.1 } else { 2.0 },
-            3 => if good { 1.5 } else { 3.0 },
-            4 => if good { 2.0 } else { 5.0 },
-            5 => if good { 3.0 } else { 5.0 },
-            _ => if good { 1.0 } else { 5.0 },
+            1 => {
+                if good {
+                    1.0
+                } else {
+                    1.3
+                }
+            }
+            2 => {
+                if good {
+                    1.1
+                } else {
+                    2.0
+                }
+            }
+            3 => {
+                if good {
+                    1.5
+                } else {
+                    3.0
+                }
+            }
+            4 => {
+                if good {
+                    2.0
+                } else {
+                    5.0
+                }
+            }
+            5 => {
+                if good {
+                    3.0
+                } else {
+                    5.0
+                }
+            }
+            _ => {
+                if good {
+                    1.0
+                } else {
+                    5.0
+                }
+            }
         }
     }
 
@@ -70,8 +117,15 @@ impl BikeCost {
         use HighwayClass::*;
         matches!(
             h,
-            Trunk | TrunkLink | Primary | PrimaryLink | Secondary | SecondaryLink
-                | Tertiary | TertiaryLink | Unclassified
+            Trunk
+                | TrunkLink
+                | Primary
+                | PrimaryLink
+                | Secondary
+                | SecondaryLink
+                | Tertiary
+                | TertiaryLink
+                | Unclassified
         )
     }
 
@@ -117,7 +171,12 @@ impl BikeCost {
 
     /// Routing cost of an edge given the incoming direction (unit vector) for
     /// turn cost, or `None` for the first edge. Returns `None` if impassable.
-    pub fn edge_cost(&self, e: &StreetEdgeData, incoming: Option<(f64, f64)>, this_dir: (f64, f64)) -> Option<f64> {
+    pub fn edge_cost(
+        &self,
+        e: &StreetEdgeData,
+        incoming: Option<(f64, f64)>,
+        this_dir: (f64, f64),
+    ) -> Option<f64> {
         let cf = self.cost_factor(&e.attrs);
         if cf >= IMPASSABLE {
             return None;
@@ -155,7 +214,11 @@ impl BikeCost {
             let (mut lo, mut hi) = (0.01_f64, v_max);
             for _ in 0..40 {
                 let mid = 0.5 * (lo + hi);
-                if power(mid) < p.biker_power { lo = mid } else { hi = mid }
+                if power(mid) < p.biker_power {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
             }
             0.5 * (lo + hi)
         };
@@ -170,29 +233,57 @@ mod tests {
 
     fn edge(attrs: BikeAttrs, length: usize, elev: i16) -> StreetEdgeData {
         StreetEdgeData {
-            origin: NodeID(0), destination: NodeID(1), partial: false,
-            length, foot: true, bike: true, car: false, attrs, elev_delta: elev,
+            origin: NodeID(0),
+            destination: NodeID(1),
+            partial: false,
+            length,
+            foot: true,
+            bike: true,
+            car: false,
+            attrs,
+            elev_delta: elev,
         }
     }
 
     fn attrs(h: HighwayClass, isbike: bool, surface: Surface) -> BikeAttrs {
         let mut a = BikeAttrs::road_default();
-        a.highway = h; a.isbike = isbike; a.surface = surface;
+        a.highway = h;
+        a.isbike = isbike;
+        a.surface = surface;
         a
     }
 
     #[test]
     fn cycleway_cheaper_than_unsafe_primary() {
         let bc = BikeCost::new(BikeProfile::default());
-        let cyc = bc.edge_cost(&edge(attrs(HighwayClass::Cycleway, true, Surface::Paved), 100, 0), None, (1.0, 0.0)).unwrap();
-        let prim = bc.edge_cost(&edge(attrs(HighwayClass::Primary, false, Surface::Paved), 100, 0), None, (1.0, 0.0)).unwrap();
+        let cyc = bc
+            .edge_cost(
+                &edge(attrs(HighwayClass::Cycleway, true, Surface::Paved), 100, 0),
+                None,
+                (1.0, 0.0),
+            )
+            .unwrap();
+        let prim = bc
+            .edge_cost(
+                &edge(attrs(HighwayClass::Primary, false, Surface::Paved), 100, 0),
+                None,
+                (1.0, 0.0),
+            )
+            .unwrap();
         assert!(cyc < prim, "cycleway {cyc} should beat primary {prim}");
     }
 
     #[test]
     fn motorway_is_impassable() {
         let bc = BikeCost::new(BikeProfile::default());
-        assert!(bc.edge_cost(&edge(attrs(HighwayClass::Motorway, false, Surface::Paved), 100, 0), None, (1.0, 0.0)).is_none());
+        assert!(
+            bc.edge_cost(
+                &edge(attrs(HighwayClass::Motorway, false, Surface::Paved), 100, 0),
+                None,
+                (1.0, 0.0)
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -200,20 +291,45 @@ mod tests {
         let mut prof = BikeProfile::default();
         prof.allow_steps = false;
         let bc = BikeCost::new(prof);
-        assert!(bc.edge_cost(&edge(attrs(HighwayClass::Steps, false, Surface::Paved), 20, 0), None, (1.0, 0.0)).is_none());
+        assert!(
+            bc.edge_cost(
+                &edge(attrs(HighwayClass::Steps, false, Surface::Paved), 20, 0),
+                None,
+                (1.0, 0.0)
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn uphill_costs_more_than_flat() {
         let bc = BikeCost::new(BikeProfile::default());
-        let flat = bc.edge_cost(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 0), None, (1.0, 0.0)).unwrap();
-        let up = bc.edge_cost(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10), None, (1.0, 0.0)).unwrap();
+        let flat = bc
+            .edge_cost(
+                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 0),
+                None,
+                (1.0, 0.0),
+            )
+            .unwrap();
+        let up = bc
+            .edge_cost(
+                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10),
+                None,
+                (1.0, 0.0),
+            )
+            .unwrap();
         // default uphillcost is 0, so equal; bump it to see the effect.
         assert!(up >= flat);
         let mut prof = BikeProfile::default();
         prof.uphillcost = 60.0;
         let bc2 = BikeCost::new(prof);
-        let up2 = bc2.edge_cost(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10), None, (1.0, 0.0)).unwrap();
+        let up2 = bc2
+            .edge_cost(
+                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10),
+                None,
+                (1.0, 0.0),
+            )
+            .unwrap();
         assert!(up2 > flat);
     }
 
@@ -221,15 +337,27 @@ mod tests {
     fn kinematic_time_flat_is_reasonable() {
         let bc = BikeCost::new(BikeProfile::default());
         // 100 m flat: with 100 W and the default drag/rolling, ~5-6 m/s → ~17-20 s.
-        let t = bc.edge_time(&edge(attrs(HighwayClass::Cycleway, true, Surface::Paved), 100, 0));
+        let t = bc.edge_time(&edge(
+            attrs(HighwayClass::Cycleway, true, Surface::Paved),
+            100,
+            0,
+        ));
         assert!((10..=40).contains(&t), "flat 100m time {t}s out of range");
     }
 
     #[test]
     fn kinematic_time_uphill_slower_than_downhill() {
         let bc = BikeCost::new(BikeProfile::default());
-        let up = bc.edge_time(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 200, 20));
-        let down = bc.edge_time(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 200, -20));
+        let up = bc.edge_time(&edge(
+            attrs(HighwayClass::Tertiary, true, Surface::Paved),
+            200,
+            20,
+        ));
+        let down = bc.edge_time(&edge(
+            attrs(HighwayClass::Tertiary, true, Surface::Paved),
+            200,
+            -20,
+        ));
         assert!(up > down, "uphill {up}s should exceed downhill {down}s");
     }
 
@@ -237,7 +365,11 @@ mod tests {
     fn kinematic_time_capped_at_max_speed() {
         let bc = BikeCost::new(BikeProfile::default());
         // Steep descent: speed capped at max_speed (45 km/h = 12.5 m/s) → 1000m ≥ 80s.
-        let t = bc.edge_time(&edge(attrs(HighwayClass::Secondary, true, Surface::Paved), 1000, -200));
+        let t = bc.edge_time(&edge(
+            attrs(HighwayClass::Secondary, true, Surface::Paved),
+            1000,
+            -200,
+        ));
         assert!(t >= 80, "capped descent time {t}s too low");
     }
 }

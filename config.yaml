@@ -39,18 +39,14 @@ build:
     - mode: rail
       bins: [[0, 0.455], [60, 0.747], [120, 0.855], [180, 0.903], [240, 0.937], [300, 0.952], [360, 0.963], [420, 0.97], [480, 0.975], [540, 0.979], [600, 0.983], [660, 0.985], [720, 0.986], [780, 0.987], [840, 0.988], [900, 0.991], [960, 0.992], [1020, 0.993], [1080, 0.993], [1140, 0.994], [1200, 0.995], [1320, 0.995], [1380, 1]]
 
-# Minimum log level: trace | debug | info | warn | error
 log_level: info
 
-# Routing defaults. Both caps below also have these values compiled in as defaults.
 default_routing:
-  max_window_minutes: 1440    # cap on the windowMinutes query argument (24 h)
-  max_snap_distance_m: 10000  # reject queries snapping farther than this (10 km)
-  cycling_speed_mps: 4.2      # cycling speed for bike modes (~15 km/h)
-  driving_speed_mps: 11.0     # driving speed for car modes (~40 km/h)
-  vehicle_access_secs: 1200   # access-radius floor for bike/car modes (reach a hub)
-  # Bike cost profile (BRouter "trekking"-inspired). Route choice minimizes a
-  # weighted cost from OSM tags + elevation; the reported ETA is kinematic.
+  max_window_minutes: 1440
+  max_snap_distance_m: 10000
+  cycling_speed_mps: 4.2
+  driving_speed_mps: 11.0
+  vehicle_access_secs: 1200
   bike_profile:
     allow_steps: true
     ignore_cycleroutes: false
@@ -73,11 +69,9 @@ server:
 
 auto_update:
   enabled: true
-  schedule: "0 * * * *"   # Update GTFS every hour
+  schedule: "0 * * * *"
   cache_dir: "cache"
 
-# Realtime delay feeds. Secrets use ${VAR} (env) or ${file:/path}; the partner
-# key is NEVER stored here — export BMC_PARTNER_KEY in the environment.
 realtime:
   enabled: true
   poll_interval_secs: 30
