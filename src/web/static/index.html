@@ -356,6 +356,13 @@ header a.head-btn { text-decoration: none; }
   background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3255; white-space: nowrap;
 }
 .leg-bike-lbl { color: #2e7d32; font-weight: 600; }
+.leg-bike-stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.bike-stat {
+  font-size: 11px; font-weight: 600; color: var(--ds-ink-3);
+  background: var(--ds-ink-1, #2e7d3211); border: 1px solid #2e7d3233;
+  border-radius: 999px; padding: 1px 8px; white-space: nowrap;
+}
+.bike-stat-cr { color: #2e7d32; background: #2e7d3218; }
 .access-alts { margin: 6px 0 2px; font-size: 12px; color: var(--fg-2); }
 .access-alts .alt { display: block; margin-top: 2px; }
 
@@ -663,7 +670,7 @@ const PLAN_FRAGMENT = `
   accessAlternatives { mode start end expectedEnd streetSecs }
   legs {
     ... on PlanWalkLeg {
-      __typename start end duration streetMode
+      __typename start end duration streetMode cyclerouteLength length
       from { node { name lat lon } }
       to   { node { name lat lon } }
       geometry { lat lon }
@@ -1094,6 +1101,34 @@ function mkWalkIcon(s) {
   ], s || 12);
 }
 
+// Distance in m / km, compactly.
+function fmtDist(m) {
+  return m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 0 : 1) + ' km' : Math.round(m) + ' m';
+}
+
+// Stats panel shown under an expanded bike leg: distance, average speed and the
+// share of the ride that follows a signposted cycle route.
+function mkBikeStats(leg) {
+  const stats = mkEl('div', 'leg-bike-stats');
+  const dist = leg.length || 0;
+  const dur  = leg.duration || Math.max(0, leg.end - leg.start);
+  const cr   = leg.cyclerouteLength || 0;
+  const pct  = dist > 0 ? Math.round((cr / dist) * 100) : 0;
+  const kmh  = dur > 0 ? (dist / dur) * 3.6 : 0;
+
+  const stat = (txt, title) => {
+    const s = mkEl('span', 'bike-stat', txt);
+    if (title) s.title = title;
+    stats.appendChild(s);
+  };
+  stat('📏 ' + fmtDist(dist), 'Total cycling distance');
+  stat('⚡ ' + kmh.toFixed(1) + ' km/h', 'Average speed (kinematic estimate)');
+  const cycle = mkEl('span', 'bike-stat bike-stat-cr', '🛤️ ' + pct + '% cycle route');
+  cycle.title = fmtDist(cr) + ' of ' + fmtDist(dist) + ' on signposted cycle routes';
+  stats.appendChild(cycle);
+  return stats;
+}
+
 function mkClockIcon(s) {
   return mkSvgIcon([
     ['circle', { cx: 12, cy: 12, r: 9 }],
@@ -1249,6 +1284,7 @@ function renderLegList(plan) {
       if (leg.to?.node?.name) desc.appendChild(mkEl('span', 'leg-to', 'to ' + leg.to.node.name));
       main.appendChild(desc);
       body.appendChild(main);
+      if (leg.streetMode === 'BIKE') body.appendChild(mkBikeStats(leg));
       row.appendChild(body);
       legsEl.appendChild(row);
       return;

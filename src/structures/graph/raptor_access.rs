@@ -47,7 +47,10 @@ impl Graph {
 
     pub(super) fn node_coord(&self, id: NodeID) -> PlanCoordinate {
         let loc = self.nodes[id.0].loc();
-        PlanCoordinate { lat: loc.latitude, lon: loc.longitude }
+        PlanCoordinate {
+            lat: loc.latitude,
+            lon: loc.longitude,
+        }
     }
 
     /// Returns the sequence of OSM nodes forming the shortest walking path
@@ -165,7 +168,9 @@ impl Graph {
                 continue;
             }
 
-            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            let Some(neighbors) = self.edges.get(node.0) else {
+                continue;
+            };
             for edge in neighbors {
                 match edge {
                     EdgeData::Street(street) => {
@@ -175,11 +180,14 @@ impl Graph {
                         } else {
                             self.edge_secs(street, profile).map(|t| (t, false))
                         };
-                        let Some((t, next_walking)) = step else { continue };
+                        let Some((t, next_walking)) = step else {
+                            continue;
+                        };
                         let nd = d.saturating_add(t);
                         if nd <= max_seconds {
-                            let entry =
-                                dist.entry((street.destination, next_walking)).or_insert(u32::MAX);
+                            let entry = dist
+                                .entry((street.destination, next_walking))
+                                .or_insert(u32::MAX);
                             if nd < *entry {
                                 *entry = nd;
                                 pq.push(Reverse((nd, (street.destination, next_walking))));
@@ -187,7 +195,9 @@ impl Graph {
                         }
                     }
                     EdgeData::Transit(transit) => {
-                        let entry = dist.entry((transit.destination, walking)).or_insert(u32::MAX);
+                        let entry = dist
+                            .entry((transit.destination, walking))
+                            .or_insert(u32::MAX);
                         if d < *entry {
                             *entry = d;
                         }
@@ -225,7 +235,8 @@ impl Graph {
 
     pub(super) fn nearest_stop_secs(&self, node: NodeID, straight_line_secs: u32) -> u32 {
         let loc = self.nodes[node.0].loc();
-        self.raptor.transit_stops_tree
+        self.raptor
+            .transit_stops_tree
             .nearest(&[loc.latitude, loc.longitude], 1, &squared_euclidean)
             .ok()
             .and_then(|v| v.into_iter().next())
@@ -273,12 +284,19 @@ impl Graph {
             if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
                 continue;
             }
-            let incoming = (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
-            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            let incoming =
+                (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
+            let Some(neighbors) = self.edges.get(node.0) else {
+                continue;
+            };
             for edge in neighbors {
-                let EdgeData::Street(street) = edge else { continue };
+                let EdgeData::Street(street) = edge else {
+                    continue;
+                };
                 let this_dir = self.dir_between(node, street.destination);
-                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else { continue };
+                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else {
+                    continue;
+                };
                 let nt = time_secs.saturating_add(bike.edge_time(street));
                 if nt > max_seconds {
                     continue;
@@ -305,18 +323,20 @@ impl Graph {
         destination: NodeID,
         max_seconds: u32,
         bike: &BikeCost,
-    ) -> Option<(Vec<NodeID>, u32, usize)> {
+    ) -> Option<(Vec<NodeID>, u32, usize, usize)> {
         if origin == destination {
-            return Some((vec![origin], 0, 0));
+            return Some((vec![origin], 0, 0, 0));
         }
         let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
         let mut arrival: HashMap<NodeID, u32> = HashMap::new();
         let mut length: HashMap<NodeID, usize> = HashMap::new();
+        let mut cycleroute_length: HashMap<NodeID, usize> = HashMap::new();
         let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
         let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
         best_cost.insert(origin, 0);
         arrival.insert(origin, 0);
         length.insert(origin, 0);
+        cycleroute_length.insert(origin, 0);
         pq.push(Reverse((0, origin, 0, u64::MAX)));
 
         while let Some(Reverse((cost_bits, node, time_secs, prev))) = pq.pop() {
@@ -330,12 +350,19 @@ impl Graph {
             if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
                 continue;
             }
-            let incoming = (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
-            let Some(neighbors) = self.edges.get(node.0) else { continue };
+            let incoming =
+                (prev != u64::MAX).then(|| self.dir_between(NodeID(prev as usize), node));
+            let Some(neighbors) = self.edges.get(node.0) else {
+                continue;
+            };
             for edge in neighbors {
-                let EdgeData::Street(street) = edge else { continue };
+                let EdgeData::Street(street) = edge else {
+                    continue;
+                };
                 let this_dir = self.dir_between(node, street.destination);
-                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else { continue };
+                let Some(step_cost) = bike.edge_cost(street, incoming, this_dir) else {
+                    continue;
+                };
                 let nt = time_secs.saturating_add(bike.edge_time(street));
                 if nt > max_seconds {
                     continue;
@@ -345,6 +372,15 @@ impl Graph {
                 if nc < *entry {
                     *entry = nc;
                     arrival.insert(street.destination, nt);
+                    let parent_cycleroute = cycleroute_length[&node];
+                    cycleroute_length.insert(
+                        street.destination,
+                        if street.attrs.cycleroute {
+                            parent_cycleroute + street.length
+                        } else {
+                            parent_cycleroute
+                        },
+                    );
                     length.insert(street.destination, length[&node] + street.length);
                     parent.insert(street.destination, node);
                     pq.push(Reverse((nc, street.destination, nt, node.0 as u64)));
@@ -361,11 +397,21 @@ impl Graph {
             cur = p;
         }
         path.reverse();
-        Some((path, arrival[&destination], length[&destination]))
+        Some((
+            path,
+            arrival[&destination],
+            length[&destination],
+            cycleroute_length[&destination],
+        ))
     }
 
     /// Bike variant of `nearby_stops`, cost-routed (carries kinematic time).
-    pub fn bike_nearby_stops(&self, origin: NodeID, max_secs: u32, bike: &BikeCost) -> Vec<(usize, u32)> {
+    pub fn bike_nearby_stops(
+        &self,
+        origin: NodeID,
+        max_secs: u32,
+        bike: &BikeCost,
+    ) -> Vec<(usize, u32)> {
         let times = self.bike_cost_dijkstra(origin, max_secs, bike);
         let mut stops = Vec::new();
         for (&node, &secs) in &times {
@@ -404,5 +450,78 @@ impl Graph {
         // nondeterministic across processes. Sort by stop id for a stable order.
         stops.sort_unstable_by_key(|&(stop, _)| stop);
         stops
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::structures::{
+        BikeAttrs, BikeCost, BikeProfile, EdgeData, Graph, HighwayClass, LatLng, NodeData,
+        NodeID, OsmNodeData, StreetEdgeData, Surface,
+    };
+
+    fn osm(id: &str, lat: f64, lon: f64) -> NodeData {
+        NodeData::OsmNode(OsmNodeData {
+            eid: id.to_string(),
+            lat_lng: LatLng { latitude: lat, longitude: lon },
+        })
+    }
+
+    fn cyc_attrs(cycleroute: bool) -> BikeAttrs {
+        let mut a = BikeAttrs::road_default();
+        a.highway = HighwayClass::Cycleway;
+        a.surface = Surface::Paved;
+        a.isbike = true;
+        a.cycleroute = cycleroute;
+        a
+    }
+
+    /// `cycleroute_length` must be the sum of *only* the cycleroute edges on the
+    /// chosen path — not the running total length. Regression test for the bug
+    /// where the accumulator read `length[&node]` (the total so far) instead of
+    /// the parent's `cycleroute_length`, reporting nearly the whole path as
+    /// cycleroute regardless of the actual tags.
+    #[test]
+    fn cycleroute_length_counts_only_cycleroute_edges() {
+        let mut g = Graph::new();
+        // A straight corridor O–A–B–C with one cycleroute segment (A–B = 100 m)
+        // sandwiched between two plain cycleway segments (200 m + 300 m).
+        let o = g.add_node(osm("o", 50.000, 4.000));
+        let a = g.add_node(osm("a", 50.000, 4.0010));
+        let b = g.add_node(osm("b", 50.000, 4.0020));
+        let c = g.add_node(osm("c", 50.000, 4.0030));
+
+        let mut edge = |from: NodeID, to: NodeID, len: usize, cycleroute: bool| {
+            for (o2, d2) in [(from, to), (to, from)] {
+                g.add_edge(
+                    o2,
+                    EdgeData::Street(StreetEdgeData {
+                        origin: o2,
+                        destination: d2,
+                        length: len,
+                        partial: false,
+                        foot: true,
+                        bike: true,
+                        car: false,
+                        attrs: cyc_attrs(cycleroute),
+                        elev_delta: 0,
+                    }),
+                );
+            }
+        };
+        edge(o, a, 200, false);
+        edge(a, b, 100, true);
+        edge(b, c, 300, false);
+        g.build_raptor_index();
+
+        let bc = BikeCost::new(BikeProfile::default());
+        let (_path, _secs, length, cycleroute_length) =
+            g.bike_cost_path(o, c, u32::MAX, &bc).expect("c reachable from o");
+
+        assert_eq!(length, 600, "total path length");
+        assert_eq!(
+            cycleroute_length, 100,
+            "only the 100 m A–B segment is a cycleroute"
+        );
     }
 }

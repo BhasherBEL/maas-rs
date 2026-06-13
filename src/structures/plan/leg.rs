@@ -1,4 +1,3 @@
-
 use async_graphql::{ComplexObject, Context, Interface, Result, SimpleObject};
 use gtfs_structures::RouteType;
 
@@ -37,6 +36,7 @@ pub enum PlanLeg {
 #[derive(Debug, SimpleObject, Clone)]
 pub struct PlanWalkLeg {
     pub length: usize,
+    pub cycleroute_length: Option<usize>,
     pub start: u32,
     pub end: u32,
     pub duration: u32,
@@ -153,7 +153,9 @@ pub struct PlanTransitLeg {
 #[ComplexObject]
 impl PlanTransitLeg {
     async fn trip(&self, ctx: &Context<'_>) -> Result<Option<PlanTrip>> {
-        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
         Ok(PlanTrip::from_trip_id(graph.as_ref(), self.trip_id))
     }
 
@@ -162,7 +164,9 @@ impl PlanTransitLeg {
         ctx: &Context<'_>,
         #[graphql(default = 0)] count: usize,
     ) -> Result<Vec<PlanTransitLeg>> {
-        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
         self.previous_departures_on(&graph, count)
     }
 
@@ -171,7 +175,9 @@ impl PlanTransitLeg {
         ctx: &Context<'_>,
         #[graphql(default = 0)] count: usize,
     ) -> Result<Vec<PlanTransitLeg>> {
-        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
         self.next_departures_on(&graph, count)
     }
 }
@@ -190,7 +196,9 @@ impl PlanTransitLeg {
         }
         let first = match self.steps[0] {
             PlanLegStep::Walk(_) => {
-                return Err(async_graphql::Error::new("Found a walk step in a transit leg"));
+                return Err(async_graphql::Error::new(
+                    "Found a walk step in a transit leg",
+                ));
             }
             PlanLegStep::Transit(first) => first,
         };
@@ -215,9 +223,17 @@ impl PlanTransitLeg {
             false,
             count,
         );
-        results.extend(self.build_cross_route_legs(graph, cross, self.from.node_id, self.to.node_id));
+        results.extend(self.build_cross_route_legs(
+            graph,
+            cross,
+            self.from.node_id,
+            self.to.node_id,
+        ));
         if self.time_shift > 0 {
-            results = results.into_iter().map(|l| shift_transit_leg(l, self.time_shift)).collect();
+            results = results
+                .into_iter()
+                .map(|l| shift_transit_leg(l, self.time_shift))
+                .collect();
         }
         results.sort_by_key(|l| l.start);
         results.reverse();
@@ -237,7 +253,9 @@ impl PlanTransitLeg {
         }
         let first = match self.steps[0] {
             PlanLegStep::Walk(_) => {
-                return Err(async_graphql::Error::new("Found a walk step in a transit leg"));
+                return Err(async_graphql::Error::new(
+                    "Found a walk step in a transit leg",
+                ));
             }
             PlanLegStep::Transit(first) => first,
         };
@@ -262,9 +280,17 @@ impl PlanTransitLeg {
             true,
             count,
         );
-        results.extend(self.build_cross_route_legs(graph, cross, self.from.node_id, self.to.node_id));
+        results.extend(self.build_cross_route_legs(
+            graph,
+            cross,
+            self.from.node_id,
+            self.to.node_id,
+        ));
         if self.time_shift > 0 {
-            results = results.into_iter().map(|l| shift_transit_leg(l, self.time_shift)).collect();
+            results = results
+                .into_iter()
+                .map(|l| shift_transit_leg(l, self.time_shift))
+                .collect();
         }
         results.sort_by_key(|l| l.start);
         results.truncate(count);
@@ -431,8 +457,10 @@ impl PlanTransitLeg {
                 // different segment/pattern — e.g. the backward-tightening path). If
                 // the trip isn't on this segment it isn't a valid alternative here.
                 let first_slice = graph.get_transit_departure_slice(first.timetable_segment);
-                let (first_local, first_seg) =
-                    first_slice.iter().enumerate().find(|(_, d)| d.trip_id == trip_id)?;
+                let (first_local, first_seg) = first_slice
+                    .iter()
+                    .enumerate()
+                    .find(|(_, d)| d.trip_id == trip_id)?;
 
                 new_steps.push(PlanLegStep::Transit(PlanTransitLegStep {
                     departure_index: first.timetable_segment.start + first_local,
@@ -465,8 +493,12 @@ impl PlanTransitLeg {
                     }));
                 }
 
-                let transfer_risk =
-                    self.alternative_transfer_risk(graph, trip_id, segment.departure, current_arrival);
+                let transfer_risk = self.alternative_transfer_risk(
+                    graph,
+                    trip_id,
+                    segment.departure,
+                    current_arrival,
+                );
 
                 Some(PlanTransitLeg {
                     steps: new_steps,
