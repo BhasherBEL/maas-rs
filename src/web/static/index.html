@@ -314,6 +314,20 @@ header a.head-btn { text-decoration: none; }
 .t-low  { color: var(--ds-rel-low); }
 .t-mid  { color: oklch(0.55 0.13 64); }
 .t-high { color: var(--ds-rel-high); }
+.rb-xt { flex-direction: column; align-items: center; gap: 0; line-height: 1.05; padding-bottom: 0; }
+.rb-rel { font-size: 12px; font-weight: 700; }
+.rb-waitm { font-size: 8.5px; font-weight: 600; color: var(--ds-ink-4); }
+.rb-transfer { position: relative; }
+.rb-transfer::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; }
+.rb-transfer.rel-high { border-color: color-mix(in oklab, var(--ds-rel-high) 55%, var(--ds-line)); }
+.rb-transfer.rel-high .rb-rel { color: var(--ds-rel-high); }
+.rb-transfer.rel-high::after { background: var(--ds-rel-high); }
+.rb-transfer.rel-mid { border-color: color-mix(in oklab, var(--ds-rel-mid) 60%, var(--ds-line)); }
+.rb-transfer.rel-mid .rb-rel { color: oklch(0.55 0.13 64); }
+.rb-transfer.rel-mid::after { background: var(--ds-rel-mid); }
+.rb-transfer.rel-low { border-color: var(--ds-rel-low); background: var(--ds-rel-low-soft); }
+.rb-transfer.rel-low .rb-rel { color: oklch(0.5 0.17 33); }
+.rb-transfer.rel-low::after { background: var(--ds-rel-low); }
 
 /* ── Card footer ─────────────────────────────────────────────── */
 .card-foot { display: flex; align-items: center; gap: 7px; margin-top: 11px; font-size: 11.5px; color: var(--ds-ink-3); }
@@ -344,13 +358,104 @@ header a.head-btn { text-decoration: none; }
 .donut[data-rel="mid"]  { --dc: var(--ds-rel-mid); }
 .donut[data-rel="low"]  { --dc: var(--ds-rel-low); }
 
-/* ── Travel-mode chips ──────────────────────────────────────── */
-#modes-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.mode-chip {
-  padding: 4px 10px; font-size: 12px; border-radius: 999px; cursor: pointer;
-  background: var(--panel-2); color: var(--fg-2); border: 1px solid var(--border);
+/* ── Travel-mode grid (foldable card) ───────────────────────── */
+#modes-card { border: 1px solid var(--border); border-radius: 12px;
+  background: var(--panel-2); margin-bottom: 10px; overflow: hidden; }
+#modes-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; cursor: pointer; padding: 9px 12px;
+  font-size: 13px; font-weight: 700; color: var(--fg);
 }
-.mode-chip.active { background: var(--accent, #1a73e8); color: #fff; border-color: transparent; }
+.mh-icons { font-size: 12px; opacity: 0.45; letter-spacing: 1px; }
+.mh-count { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--fg-2); }
+.mh-count b { color: var(--accent, #1a73e8); font-weight: 700; }
+.mh-chev { font-size: 12px; color: var(--fg-2); transition: transform .15s; }
+#modes-card.collapsed .mh-chev { transform: rotate(-180deg); }
+#modes-body { padding: 0 12px 12px; border-top: 1px solid var(--border); }
+#modes-card.collapsed #modes-body { display: none; }
+.modes-subhead { display: flex; align-items: center; margin: 10px 0 8px; }
+.msh-label { font-size: 10px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--fg-2); }
+.msh-actions { margin-left: auto; display: flex; gap: 6px; }
+.msh-actions button {
+  font-size: 11px; font-weight: 600; color: var(--fg-2); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px;
+}
+.msh-actions button:hover { color: var(--fg); }
+#modes-grid {
+  display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 6px;
+}
+.mg-corner { }
+.mg-col, .mg-row {
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; cursor: pointer;
+  background: none; border: none; padding: 2px 4px; color: var(--fg-2);
+  border-radius: 6px; line-height: 1.15;
+}
+.mg-col { text-transform: uppercase; text-align: center; align-self: end; padding-bottom: 4px; }
+.mg-row { text-align: left; white-space: nowrap; font-size: 13px; font-weight: 700;
+  color: var(--fg); display: flex; align-items: center; }
+.mg-col:hover, .mg-row:hover { color: var(--accent, #1a73e8); }
+.mode-cell {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 42px; border-radius: 10px; cursor: pointer;
+  background: var(--panel); color: transparent; border: 1px solid var(--border);
+}
+.mode-cell.active { background: var(--accent, #1a73e8); border-color: transparent; }
+.mode-cell.active::after { content: '✓'; color: #fff; font-size: 16px; font-weight: 700; }
+.mode-cell.disabled {
+  cursor: default; border: none; pointer-events: none;
+  background: repeating-linear-gradient(-45deg,
+    transparent 0 6px, color-mix(in srgb, var(--border) 60%, transparent) 6px 7px);
+  border: 1px solid var(--border);
+}
+.modes-caption { margin: 10px 0 0; font-size: 11px; color: var(--fg-2); line-height: 1.35; }
+
+/* ── Results grouping toggle + group headers ────────────────── */
+#group-toggle { display: inline-flex; gap: 2px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 999px; padding: 3px; }
+#group-toggle button {
+  font-size: 11.5px; font-weight: 600; color: var(--fg-2); cursor: pointer;
+  background: none; border: none; border-radius: 999px; padding: 3px 12px;
+}
+#group-toggle button.active { background: var(--accent, #1a73e8); color: #fff; }
+.plan-group-head {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin: 12px 0 6px; font-size: 13px; font-weight: 650; color: var(--fg);
+}
+.plan-group-head:first-child { margin-top: 2px; }
+.plan-group-head.pgh-right { justify-content: flex-end; text-align: right; }
+.pgh-time { color: var(--fg-2); font-weight: 600; }
+.pgh-stop { color: var(--fg-2); font-weight: 500; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+.pgh-count { margin-left: auto; color: var(--fg-2); font-weight: 500; font-size: 11px; }
+.pgh-right .pgh-count { margin-left: 0; margin-right: auto; }
+.pg-section { display: flex; justify-content: space-between; gap: 12px;
+  margin: 10px 2px 8px; font-size: 10px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--fg-2); }
+.pg-card { border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+  margin-bottom: 12px; overflow: hidden; }
+.pg-head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; }
+.pg-head.pgh-right { justify-content: flex-end; }
+.pg-time { font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 700;
+  color: var(--fg); display: inline-flex; align-items: baseline; gap: 8px; }
+.pg-head:not(.pgh-right) .rel { margin-left: auto; }
+.pg-head.pgh-right .rel { margin-right: auto; }
+.pg-arrow { color: var(--fg-2); font-weight: 400; }
+.pg-tag, .pg-time-sub { font-family: var(--font, inherit); font-size: 10px; font-weight: 700;
+  letter-spacing: .05em; text-transform: uppercase; align-self: center; }
+.pg-tag { color: var(--accent, #1a73e8); }
+.pg-time-sub { color: var(--fg-2); }
+.pg-opt { border-top: 1px solid var(--border); padding: 10px 14px; cursor: pointer; }
+.pg-opt.open { background: var(--panel-2); }
+.pg-opt.risky { background: var(--ds-rel-low-soft); }
+.pg-opt-lead { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.pg-opt-lbl { font-size: 10px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--fg-2); }
+.pg-opt-lbl.lead { color: var(--accent, #1a73e8); }
+.pg-opt-lbl.risky { color: var(--ds-rel-low); }
+.pg-opt-time { font-size: 14px; font-weight: 700; color: var(--fg); }
+.pg-opt-tk { font-size: 12px; font-weight: 500; color: var(--fg-2); margin-right: 2px; }
+.pg-opt-lead .rel { margin-left: auto; }
 .plan-mode-badge {
   font-size: 11px; padding: 1px 7px; border-radius: 999px; margin-left: 6px;
   background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3255; white-space: nowrap;
@@ -572,16 +677,24 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
         </div>
         <button class="now-btn" id="now-btn" title="Set to now (N)">Now</button>
       </div>
-      <div id="modes-row">
-        <button class="mode-chip active" data-mode="WALK" title="Walk the whole way">🚶 Walk</button>
-        <button class="mode-chip active" data-mode="WALK_TRANSIT" title="Walk + public transport">🚶+🚌</button>
-        <button class="mode-chip" data-mode="BIKE" title="Ride the whole way">🚲 Bike</button>
-        <button class="mode-chip" data-mode="BIKE_TRANSIT" title="Bike to/on transit, drop it anywhere">🚲+🚌</button>
-        <button class="mode-chip" data-mode="BIKE_TO_TRANSIT" title="Bike to the station, park it, then transit on foot">🚲🅿+🚌</button>
-        <button class="mode-chip" data-mode="BIKE_ON_TRANSIT" title="Keep the bike door-to-door (bike-friendly trips only)">🚲⇄🚌</button>
-        <button class="mode-chip" data-mode="CAR" title="Drive the whole way">🚗 Car</button>
-        <button class="mode-chip" data-mode="CAR_DROP_OFF" title="Drive to a station, park, then transit (park & ride)">🚗🅿+🚌</button>
-        <button class="mode-chip" data-mode="CAR_PICKUP" title="Transit, then a car picks you up at the station (kiss & ride)">🚌+🚗</button>
+      <div id="modes-card">
+        <button type="button" id="modes-head" aria-expanded="true">
+          <span class="mh-title">🚶 Travel modes</span>
+          <span class="mh-icons" aria-hidden="true">🚶 🚲 🚗</span>
+          <span class="mh-count"><b id="modes-count">2</b> of 9</span>
+          <span class="mh-chev" aria-hidden="true">▾</span>
+        </button>
+        <div id="modes-body">
+          <div class="modes-subhead">
+            <span class="msh-label">Mix any combination</span>
+            <span class="msh-actions">
+              <button type="button" id="modes-all">All</button>
+              <button type="button" id="modes-none">None</button>
+            </span>
+          </div>
+          <div id="modes-grid" role="group" aria-label="Travel modes"></div>
+          <p class="modes-caption">Every valid pairing is a cell — striped cells aren’t possible (you can’t take a car onto the train).</p>
+        </div>
       </div>
       <button id="go">
         <span>Plan journey</span>
@@ -639,6 +752,11 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
       <div class="plans-list-head">
         <span class="eyebrow">Results</span>
         <span class="eyebrow" id="plans-count"></span>
+        <div id="group-toggle" role="group" aria-label="Group results by">
+          <button type="button" data-group="departure" class="active" title="Group plans by their first transit vehicle">Leaving at</button>
+          <button type="button" data-group="none" title="Flat list, no grouping">Ungrouped</button>
+          <button type="button" data-group="arrival" title="Group plans by their last transit vehicle">Arrival at</button>
+        </div>
       </div>
       <div id="plans-list">
         <p class="status-msg">Set origin and destination above, or right-click the map.</p>
@@ -755,6 +873,8 @@ document.querySelectorAll('#view-toggle button').forEach(b =>
 const DEFAULT_ALT_COUNT = 1, DEPARTURE_STEP = 3;
 const state = {
   plans: [],
+  grouping: 'departure',        // 'departure' | 'none' | 'arrival'
+  displayOrder: [],             // plan indices in current render order (for kbd nav)
   selectedIdx: -1,
   selectedLegIdxMap: new Map(), // planIdx -> leg index within that plan
   legLayers: [],
@@ -813,6 +933,7 @@ function doSyncUrl() {
     walkRadius: parseInt(el('adv-walk-radius').value, 10) || null,
     advanced:   el('advanced').classList.contains('open') ? 1 : null,
     modes:      selectedModes().join(',') || null,
+    group:      state.grouping !== 'departure' ? state.grouping : null,
     sel:        state.selectedIdx >= 0 ? state.selectedIdx : null,
   });
 }
@@ -828,9 +949,10 @@ function loadFromUrl() {
   if (p.has('walkRadius')) el('adv-walk-radius').value = p.get('walkRadius');
   if (p.has('modes')) {
     const wanted = new Set(p.get('modes').split(','));
-    document.querySelectorAll('#modes-row .mode-chip').forEach(b =>
+    document.querySelectorAll('#modes-grid .mode-cell[data-mode]').forEach(b =>
       b.classList.toggle('active', wanted.has(b.dataset.mode)));
   }
+  if (p.has('group')) setGrouping(p.get('group'), false);
   if (p.get('advanced') === '1') {
     el('advanced').classList.add('open');
     el('advanced-btn').classList.add('active');
@@ -852,17 +974,109 @@ function loadFromUrl() {
   el(id).addEventListener('change', doSyncUrl);
 });
 
-// ── Travel-mode selection ─────────────────────────────────────
+// ── Travel-mode grid ──────────────────────────────────────────
+// Rows = vehicle, columns = how the vehicle relates to transit. Each populated
+// cell is one Mode enum value; null cells are impossible combos (e.g. car on
+// board) and render disabled. Headers toggle a whole row/column at once.
+const MODE_COLS = [
+  { col: 'SOLO', label: 'Solo' },
+  { col: 'ON',   label: 'On transit' },
+  { col: 'PARK', label: 'Park & ride' },
+  { col: 'BOTH', label: 'Both ends' },
+];
+const MODE_ROWS = [
+  { row: 'WALK', label: '🚶 Walk' },
+  { row: 'BIKE', label: '🚲 Bike' },
+  { row: 'CAR',  label: '🚗 Car' },
+];
+const MODE_GRID = {
+  WALK: { SOLO: 'WALK', ON: 'WALK_TRANSIT',    PARK: null,              BOTH: null },
+  BIKE: { SOLO: 'BIKE', ON: 'BIKE_ON_TRANSIT', PARK: 'BIKE_TO_TRANSIT', BOTH: 'BIKE_TRANSIT' },
+  CAR:  { SOLO: 'CAR',  ON: null,              PARK: 'CAR_DROP_OFF',    BOTH: 'CAR_PICKUP' },
+};
+const MODE_GLYPH = {
+  WALK: '🚶', WALK_TRANSIT: '🚶+🚌', BIKE: '🚲', BIKE_TRANSIT: '🚲+🚌',
+  BIKE_TO_TRANSIT: '🚲🅿+🚌', BIKE_ON_TRANSIT: '🚲⇄🚌',
+  CAR: '🚗', CAR_DROP_OFF: '🚗🅿+🚌', CAR_PICKUP: '🚌+🚗',
+};
+const MODE_TITLES = {
+  WALK: 'Walk — On foot the whole way',
+  WALK_TRANSIT: 'Walk + transit — Walk to stops, take public transport',
+  BIKE: 'Bike — Cycle door to door',
+  BIKE_ON_TRANSIT: 'Bike on board — Bring your bike on the train',
+  BIKE_TO_TRANSIT: 'Bike & Ride — Park your bike at the station',
+  BIKE_TRANSIT: 'Bike both ends — A bike at the start and the finish',
+  CAR: 'Car — Drive the whole way',
+  CAR_DROP_OFF: 'Park & Ride — Drive to a station, park, take transit',
+  CAR_PICKUP: 'Car at arrival — Transit, then a car for the last leg',
+};
+const DEFAULT_MODES = new Set(['WALK', 'WALK_TRANSIT', 'BIKE_ON_TRANSIT', 'BIKE_TO_TRANSIT', 'BIKE_TRANSIT', 'CAR', 'CAR_PICKUP']);
+
 function selectedModes() {
-  return [...document.querySelectorAll('#modes-row .mode-chip.active')]
-    .map(b => b.dataset.mode);
+  return [...document.querySelectorAll('#modes-grid .mode-cell.active')].map(b => b.dataset.mode);
 }
-document.querySelectorAll('#modes-row .mode-chip').forEach(btn => {
-  btn.addEventListener('click', () => {
-    btn.classList.toggle('active');
-    if (!selectedModes().length) btn.classList.add('active'); // never allow zero modes
-    doSyncUrl();
+
+function updateModeCount() {
+  el('modes-count').textContent = selectedModes().length;
+}
+
+// Apply `target` (on/off) to a set of cells, then enforce the never-zero rule by
+// reverting if nothing is left selected.
+function setModeCells(cells, target) {
+  cells.forEach(c => c.classList.toggle('active', target));
+  updateModeCount();
+  doSyncUrl();
+}
+
+function buildModeGrid() {
+  const grid = el('modes-grid');
+  grid.replaceChildren();
+  grid.appendChild(mkEl('span', 'mg-corner'));
+  MODE_COLS.forEach(({ col, label }) => {
+    const h = mkEl('button', 'mg-col', label);
+    h.type = 'button';
+    h.title = 'Toggle every ' + label.replace(/ /g, ' ') + ' option';
+    h.addEventListener('click', () => {
+      const cells = [...grid.querySelectorAll('.mode-cell:not(.disabled)[data-col="' + col + '"]')];
+      setModeCells(cells, !cells.every(c => c.classList.contains('active')));
+    });
+    grid.appendChild(h);
   });
+  MODE_ROWS.forEach(({ row, label }) => {
+    const h = mkEl('button', 'mg-row', label);
+    h.type = 'button';
+    h.title = 'Toggle every ' + label.replace(/^\S+\s/, '') + ' option';
+    h.addEventListener('click', () => {
+      const cells = [...grid.querySelectorAll('.mode-cell:not(.disabled)[data-row="' + row + '"]')];
+      setModeCells(cells, !cells.every(c => c.classList.contains('active')));
+    });
+    grid.appendChild(h);
+    MODE_COLS.forEach(({ col }) => {
+      const mode = MODE_GRID[row][col];
+      if (!mode) {
+        grid.appendChild(mkEl('span', 'mode-cell disabled'));
+        return;
+      }
+      const cell = mkEl('button', 'mode-cell' + (DEFAULT_MODES.has(mode) ? ' active' : ''));
+      cell.type = 'button';
+      cell.dataset.mode = mode;
+      cell.dataset.row = row;
+      cell.dataset.col = col;
+      cell.title = MODE_TITLES[mode];
+      cell.addEventListener('click', () => setModeCells([cell], !cell.classList.contains('active')));
+      grid.appendChild(cell);
+    });
+  });
+}
+buildModeGrid();
+updateModeCount();
+el('modes-all').addEventListener('click', () =>
+  setModeCells([...document.querySelectorAll('#modes-grid .mode-cell:not(.disabled)')], true));
+el('modes-none').addEventListener('click', () =>
+  setModeCells([...document.querySelectorAll('#modes-grid .mode-cell:not(.disabled)')], false));
+el('modes-head').addEventListener('click', () => {
+  const collapsed = el('modes-card').classList.toggle('collapsed');
+  el('modes-head').setAttribute('aria-expanded', String(!collapsed));
 });
 const MODE_LABEL = {
   WALK: '🚶 Walk', BIKE: '🚲 Bike', WALK_TRANSIT: '🚶+🚌',
@@ -912,6 +1126,11 @@ async function runQuery() {
   const errEl = el('error-msg');
   if (fromLat == null || toLat == null) {
     errEl.textContent = 'Set origin and destination first.';
+    errEl.style.display = 'block';
+    return;
+  }
+  if (!queryManual() && selectedModes().length === 0) {
+    errEl.textContent = 'Select at least one travel mode.';
     errEl.style.display = 'block';
     return;
   }
@@ -1212,8 +1431,9 @@ function renderRibbon(plan, openLeg, onLeg) {
       return;
     }
     if (s.type === 'transfer') {
-      const tc = tightClass(s.marginSecs);
-      const div = mkEl('div', 'rb-transfer' + (s.leg.transferRisk ? ' clickable' : '') +
+      const r = s.leg.transferRisk?.reliability;
+      const rc = r != null ? relClass(r) : tightClass(s.marginSecs);
+      const div = mkEl('div', 'rb-transfer rel-' + rc + (s.leg.transferRisk ? ' clickable' : '') +
         (openLeg === s.leg ? ' hi' : ''));
       div.style.flexBasis = basisOf(s);
       div.title = `${s.walkDist} m walk (${s.walkMins}′) · ${s.totalMins}′ to make the connection`;
@@ -1225,9 +1445,14 @@ function renderRibbon(plan, openLeg, onLeg) {
         xw.appendChild(mkEl('em', null, '(' + s.walkMins + '′)'));
         div.appendChild(xw);
       }
-      const xt = mkEl('span', 'rb-xt key t-' + tc);
-      xt.appendChild(mkClockIcon(12));
-      xt.appendChild(document.createTextNode(s.totalMins + '′'));
+      const xt = mkEl('span', 'rb-xt');
+      if (r != null) {
+        xt.appendChild(mkEl('b', 'rb-rel', relPct(r)));
+        if (s.totalMins >= 9) xt.appendChild(mkEl('span', 'rb-waitm', s.totalMins + '′ wait'));
+      } else {
+        xt.appendChild(mkClockIcon(12));
+        xt.appendChild(document.createTextNode(s.totalMins + '′'));
+      }
       div.appendChild(xt);
       track.appendChild(div);
       return;
@@ -1490,6 +1715,61 @@ function renderConnection(leg, planIdx, legIdx) {
 }
 
 // ── Trip card ─────────────────────────────────────────────────
+// Shared leg-click handler used by both ungrouped cards and grouped option rows.
+function buildLegHandler(plan, idx, isOpen, openLegIdx) {
+  return (e, clickedLeg) => {
+    e.stopPropagation();
+    if (clickedLeg.__typename === 'PlanWalkLeg') {
+      if (!isOpen) openCard(idx);
+      return;
+    }
+    const clickedIdx = plan.legs.indexOf(clickedLeg);
+    if (!isOpen) {
+      if (clickedIdx >= 0) state.selectedLegIdxMap.set(idx, clickedIdx);
+      openCard(idx);
+      return;
+    }
+    if (clickedIdx >= 0 && clickedIdx === openLegIdx) state.selectedLegIdxMap.set(idx, -1);
+    else if (clickedIdx >= 0) state.selectedLegIdxMap.set(idx, clickedIdx);
+    renderList();
+  };
+}
+
+// The expandable detail panel, shared by cards and option rows.
+function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
+  const detail = mkEl('div', 'card-detail');
+  detail.addEventListener('click', e => e.stopPropagation());
+  const xferLegs = plan.legs.filter(l => l.transferRisk);
+  if (xferLegs.length > 0) {
+    const pRel = mkEl('div', 'plan-rel');
+    pRel.appendChild(mkEl('span', 'pr-k', 'Plan reliability'));
+    pRel.appendChild(mkRelChip(rel));
+    const note = mkEl('span', 'pr-note');
+    note.textContent = xferLegs.length > 1
+      ? 'Chance of making every connection — ' + xferLegs.map(l => relPct(l.transferRisk.reliability)).join(' × ')
+      : "Chance of making this plan's single connection";
+    pRel.appendChild(note);
+    detail.appendChild(pRel);
+  }
+  if (plan.accessAlternatives?.length) {
+    const altsEl = mkEl('div', 'access-alts');
+    plan.accessAlternatives.forEach(a => {
+      const mins = Math.round((a.streetSecs || 0) / 60);
+      altsEl.appendChild(mkEl('span', 'alt',
+        `or ${MODE_LABEL[a.mode] || a.mode}: leave ${fmtTime(a.start)}` +
+        (a.end !== plan.end ? `, arrive ${fmtTime(a.end)}` : '') +
+        (mins ? ` (${mins}′ on street)` : '')));
+    });
+    detail.appendChild(altsEl);
+  }
+  detail.appendChild(renderLegList(plan));
+  if (openLeg) {
+    const connEl = renderConnection(openLeg, idx, openLegIdx);
+    if (connEl) detail.appendChild(connEl);
+  }
+  return detail;
+}
+
 function renderTripCard(plan, idx, isOpen) {
   const card = mkEl('div', 'card' + (isOpen ? ' open' : ''));
   card.id = 'plan-card-' + idx;
@@ -1507,9 +1787,7 @@ function renderTripCard(plan, idx, isOpen) {
   meta.appendChild(mkEl('span', 'm-dur', h > 0 ? h + 'h' + String(m).padStart(2, '0') : m + '′'));
   const rel = planReliability(plan);
   if (rel < 1) meta.appendChild(mkRelChip(rel));
-  if (BIKE_MODES.has(plan.mode)) {
-    meta.appendChild(mkEl('span', 'plan-mode-badge', MODE_LABEL[plan.mode] || plan.mode));
-  }
+  if (BIKE_MODES.has(plan.mode)) meta.appendChild(mkEl('span', 'plan-mode-badge', MODE_LABEL[plan.mode] || plan.mode));
   top.appendChild(meta);
   card.appendChild(top);
 
@@ -1521,34 +1799,9 @@ function renderTripCard(plan, idx, isOpen) {
   }
   card.appendChild(tagEl);
 
-  // Resolve which transit leg is currently selected for the detail panel
-  // -1 means no leg is open (user hasn't clicked one yet)
-  let openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
+  const openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
   const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
-
-  const onLeg = (e, clickedLeg) => {
-    e.stopPropagation();
-    if (clickedLeg.__typename === 'PlanWalkLeg') {
-      if (!isOpen) openCard(idx);
-      return;
-    }
-    const clickedIdx = plan.legs.indexOf(clickedLeg);
-    if (!isOpen) {
-      if (clickedIdx >= 0) state.selectedLegIdxMap.set(idx, clickedIdx);
-      openCard(idx);
-      return;
-    }
-    // Card already open — toggle or switch leg detail
-    if (clickedIdx >= 0 && clickedIdx === openLegIdx) {
-      // Same leg clicked again — close the detail panel
-      state.selectedLegIdxMap.set(idx, -1);
-    } else if (clickedIdx >= 0) {
-      // Different leg — switch to it
-      state.selectedLegIdxMap.set(idx, clickedIdx);
-    }
-    renderList();
-  };
-
+  const onLeg = buildLegHandler(plan, idx, isOpen, openLegIdx);
   card.appendChild(renderRibbon(plan, openLeg, onLeg));
 
   const foot = mkEl('div', 'card-foot');
@@ -1561,60 +1814,139 @@ function renderTripCard(plan, idx, isOpen) {
   if (walkMin > 0 || (bikeMin === 0 && carMin === 0)) streetParts.push(walkMin + '′ walk');
   if (bikeMin > 0) streetParts.push(bikeMin + '′ bike');
   if (carMin > 0)  streetParts.push(carMin + '′ car');
-  streetParts.forEach(p => {
-    foot.appendChild(mkEl('span', 'sep', '·'));
-    foot.appendChild(document.createTextNode(p));
-  });
+  streetParts.forEach(part => { foot.appendChild(mkEl('span', 'sep', '·')); foot.appendChild(document.createTextNode(part)); });
   foot.appendChild(mkEl('span', 'expand', isOpen ? (openLeg ? 'Hide detail ▴' : 'Tap a transit leg ▾') : 'Tap a transit leg ▾'));
   card.appendChild(foot);
 
-  if (isOpen) {
-    const detail = mkEl('div', 'card-detail');
-    detail.addEventListener('click', e => e.stopPropagation());
-
-    // Plan reliability banner — only when there are risky connections
-    const xferLegs = plan.legs.filter(l => l.transferRisk);
-    if (xferLegs.length > 0) {
-      const pRel = mkEl('div', 'plan-rel');
-      pRel.appendChild(mkEl('span', 'pr-k', 'Plan reliability'));
-      pRel.appendChild(mkRelChip(rel));
-      const note = mkEl('span', 'pr-note');
-      note.textContent = xferLegs.length > 1
-        ? 'Chance of making every connection — ' + xferLegs.map(l => relPct(l.transferRisk.reliability)).join(' × ')
-        : "Chance of making this plan's single connection";
-      pRel.appendChild(note);
-      detail.appendChild(pRel);
-    }
-
-    if (plan.accessAlternatives?.length) {
-      const altsEl = mkEl('div', 'access-alts');
-      plan.accessAlternatives.forEach(a => {
-        const mins = Math.round((a.streetSecs || 0) / 60);
-        altsEl.appendChild(mkEl('span', 'alt',
-          `or ${MODE_LABEL[a.mode] || a.mode}: leave ${fmtTime(a.start)}` +
-          (a.end !== plan.end ? `, arrive ${fmtTime(a.end)}` : '') +
-          (mins ? ` (${mins}′ on street)` : '')));
-      });
-      detail.appendChild(altsEl);
-    }
-
-    detail.appendChild(renderLegList(plan));
-
-    // Connection card for the selected transit leg
-    if (openLeg) {
-      const connEl = renderConnection(openLeg, idx, openLegIdx);
-      if (connEl) detail.appendChild(connEl);
-    }
-
-    card.appendChild(detail);
-  }
+  if (isOpen) card.appendChild(buildPlanDetail(plan, idx, openLegIdx, openLeg, rel));
 
   card.addEventListener('click', e => {
     if (e.target.closest('button')) return;
     if (isOpen) { closeCard(); return; }
     openCard(idx);
   });
+  return card;
+}
 
+// ── Result grouping ───────────────────────────────────────────
+function transitLegsOf(plan) {
+  return plan.legs.filter(l => l.__typename === 'PlanTransitLeg');
+}
+
+// Group plans for the current mode. Returns ordered [{ header, indices }].
+// Departure groups share the first boarded vehicle (route+scheduled time+stop);
+// arrival groups share the last alighted vehicle. Direct (no-transit) plans
+// collapse into one "Direct" group on departure, one group each on arrival.
+function groupPlans(plans, mode) {
+  if (mode === 'none') {
+    return [{ header: null, indices: plans.map((_, i) => i) }];
+  }
+  const dep = mode === 'departure';
+  const map = new Map();
+  plans.forEach((plan, i) => {
+    const tls = transitLegsOf(plan);
+    let key, group;
+    if (!tls.length) {
+      key = dep ? 'DIRECT' : 'DIRECT|' + i;
+      group = { direct: true, sortT: dep ? plan.start : plan.end, planMode: plan.mode };
+    } else {
+      const tl = dep ? tls[0] : tls[tls.length - 1];
+      const t = dep ? (tl.scheduledStart ?? tl.start) : (tl.scheduledEnd ?? tl.end);
+      const stop = dep ? tl.from?.node?.name : tl.to?.node?.name;
+      const route = tl.trip?.route;
+      key = (route?.shortName || route?.mode || '?') + '|' + t + '|' + (stop || '');
+      group = { direct: false, sortT: t, route, time: t, stop };
+    }
+    if (!map.has(key)) map.set(key, { ...group, indices: [] });
+    map.get(key).indices.push(i);
+  });
+  const groups = [...map.values()];
+  groups.sort((a, b) => a.sortT - b.sortT);
+  groups.forEach(g => g.indices.sort((x, y) =>
+    dep ? (plans[x].end - plans[y].end) : (plans[y].start - plans[x].start)));
+  return groups.map(g => ({ header: g, indices: g.indices }));
+}
+
+function setGrouping(mode, rerender = true) {
+  if (!['departure', 'none', 'arrival'].includes(mode)) return;
+  state.grouping = mode;
+  document.querySelectorAll('#group-toggle button').forEach(b =>
+    b.classList.toggle('active', b.dataset.group === mode));
+  if (rerender) { renderList(); doSyncUrl(); }
+}
+document.querySelectorAll('#group-toggle button').forEach(btn => {
+  btn.addEventListener('click', () => setGrouping(btn.dataset.group));
+});
+
+// One compact, expandable option row inside a group card. The shared time lives
+// in the group header, so each row leads with the *varying* time: where it lands
+// (Leaving-at) or when to leave (Arrival-at).
+function renderOptionRow(plan, idx, mode, pos) {
+  const rel    = planReliability(plan);
+  const isOpen = idx === state.selectedIdx;
+  const risky  = rel < 0.5;
+  const row = mkEl('div', 'pg-opt' + (isOpen ? ' open' : '') + (risky ? ' risky' : ''));
+  row.id = 'plan-card-' + idx;
+
+  const lead = mkEl('div', 'pg-opt-lead');
+  const lbl = mode === 'arrival'
+    ? (risky ? 'Risky' : (pos === 0 ? 'Take this' : 'Or'))
+    : (risky ? 'Tight' : (pos === 0 ? 'Soonest' : 'Safer · later'));
+  lead.appendChild(mkEl('span', 'pg-opt-lbl' + (risky ? ' risky' : (pos === 0 ? ' lead' : '')), lbl));
+  const time = mkEl('span', 'pg-opt-time');
+  time.appendChild(mkEl('span', 'pg-opt-tk', mode === 'arrival' ? 'leave ' : 'land '));
+  time.appendChild(document.createTextNode(fmtTime(mode === 'arrival' ? plan.start : plan.end)));
+  lead.appendChild(time);
+  if (rel < 1) lead.appendChild(mkRelChip(rel));
+  row.appendChild(lead);
+
+  const openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
+  const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
+  const onLeg = buildLegHandler(plan, idx, isOpen, openLegIdx);
+  row.appendChild(renderRibbon(plan, openLeg, onLeg));
+  if (isOpen) row.appendChild(buildPlanDetail(plan, idx, openLegIdx, openLeg, rel));
+
+  row.addEventListener('click', e => {
+    if (e.target.closest('button')) return;
+    if (isOpen) closeCard(); else openCard(idx);
+  });
+  return row;
+}
+
+// A group of plans sharing the same first (Leaving-at) or last (Arrival-at)
+// vehicle, drawn as a bordered card with a prominent shared-time header.
+function renderGroupCard(group, mode, isFirst) {
+  const g = group.header;
+  const right = mode === 'arrival';
+  const card = mkEl('div', 'pg-card');
+
+  const head = mkEl('div', 'pg-head' + (right ? ' pgh-right' : ''));
+  const bestRel = Math.max(...group.indices.map(i => planReliability(state.plans[i])));
+  const relEl = bestRel < 1 ? mkRelChip(bestRel) : null;
+
+  const timeWrap = mkEl('span', 'pg-time');
+  if (g.direct) {
+    timeWrap.appendChild(mkEl('b', null, 'Direct'));
+    if (right) {
+      timeWrap.appendChild(mkEl('span', 'pg-time-sub', 'arrive'));
+      timeWrap.appendChild(mkEl('b', null, fmtTime(g.sortT)));
+    }
+  } else if (right) {
+    timeWrap.appendChild(mkEl('b', null, fmtTime(g.time)));
+    if (isFirst) timeWrap.appendChild(mkEl('span', 'pg-time-sub', 'earliest'));
+  } else {
+    const bestArr = Math.min(...group.indices.map(i => state.plans[i].end));
+    timeWrap.appendChild(mkEl('b', null, fmtTime(g.time)));
+    timeWrap.appendChild(mkEl('span', 'pg-arrow', '→'));
+    timeWrap.appendChild(mkEl('b', null, fmtTime(bestArr)));
+    if (isFirst) timeWrap.appendChild(mkEl('span', 'pg-tag', 'Recommended'));
+  }
+
+  if (right) { if (relEl) head.appendChild(relEl); head.appendChild(timeWrap); }
+  else { head.appendChild(timeWrap); if (relEl) head.appendChild(relEl); }
+  card.appendChild(head);
+
+  group.indices.forEach((idx, pos) => card.appendChild(renderOptionRow(state.plans[idx], idx, mode, pos)));
   return card;
 }
 
@@ -1625,15 +1957,33 @@ function renderList() {
   el('plans-count').textContent = state.plans.length
     ? state.plans.length + ' option' + (state.plans.length === 1 ? '' : 's')
     : '';
+  el('group-toggle').style.display = state.plans.length ? '' : 'none';
 
   if (!state.plans.length) {
     listEl.appendChild(mkEl('p', 'status-msg', 'No results found.'));
+    state.displayOrder = [];
     return;
   }
 
-  state.plans.forEach((plan, idx) => {
-    listEl.appendChild(renderTripCard(plan, idx, idx === state.selectedIdx));
-  });
+  const groups = groupPlans(state.plans, state.grouping);
+  const order = [];
+  if (state.grouping === 'none') {
+    groups[0].indices.forEach(idx => {
+      order.push(idx);
+      listEl.appendChild(renderTripCard(state.plans[idx], idx, idx === state.selectedIdx));
+    });
+  } else {
+    const right = state.grouping === 'arrival';
+    const sec = mkEl('div', 'pg-section');
+    sec.appendChild(mkEl('span', null, right ? 'Arrivals · soonest first' : 'Departures · soonest first'));
+    sec.appendChild(mkEl('span', null, right ? 'best option first' : 'where each one lands you'));
+    listEl.appendChild(sec);
+    groups.forEach((grp, gi) => {
+      grp.indices.forEach(idx => order.push(idx));
+      listEl.appendChild(renderGroupCard(grp, state.grouping, gi === 0));
+    });
+  }
+  state.displayOrder = order;
 }
 
 function openCard(idx) {
@@ -1775,12 +2125,16 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { el('trip-modal').classList.remove('open'); return; }
   if ((e.key === 'ArrowDown' || e.key === 'j') && state.plans.length) {
     e.preventDefault();
-    state.selectedIdx = Math.min(state.plans.length - 1, state.selectedIdx + 1);
+    const ord = state.displayOrder.length ? state.displayOrder : state.plans.map((_, i) => i);
+    const cur = ord.indexOf(state.selectedIdx);
+    state.selectedIdx = cur < 0 ? ord[0] : ord[Math.min(ord.length - 1, cur + 1)];
     renderList(); renderPlanOnMap(state.selectedIdx); doSyncUrl();
   }
   if ((e.key === 'ArrowUp' || e.key === 'k') && state.plans.length) {
     e.preventDefault();
-    state.selectedIdx = Math.max(0, state.selectedIdx - 1);
+    const ord = state.displayOrder.length ? state.displayOrder : state.plans.map((_, i) => i);
+    const cur = ord.indexOf(state.selectedIdx);
+    state.selectedIdx = cur < 0 ? ord[0] : ord[Math.max(0, cur - 1)];
     renderList(); renderPlanOnMap(state.selectedIdx); doSyncUrl();
   }
 });
