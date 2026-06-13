@@ -406,6 +406,19 @@ impl Graph {
         }
     }
 
+    /// Inflate access-leg seconds to the conservative percentile (buffer the
+    /// connection). Stop ids are unchanged; only the seconds are transformed.
+    pub(crate) fn access_times(&self, stops: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
+        let m = &self.raptor.street_time;
+        stops.into_iter().map(|(s, t)| (s, m.access_secs(t))).collect()
+    }
+
+    /// Adjust egress-leg seconds to the distribution mean (honest arrival).
+    pub(crate) fn egress_times(&self, stops: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
+        let m = &self.raptor.street_time;
+        stops.into_iter().map(|(s, t)| (s, m.egress_secs(t))).collect()
+    }
+
     /// Per-profile access/egress stop discovery for the active states. Each list
     /// is computed only when some active state needs it: foot access for
     /// `Walked`/`CarEgress`, bike access for the bike states, car access for
@@ -428,32 +441,32 @@ impl Graph {
         let vehicle_secs = access_secs.max(self.raptor.vehicle_access_secs);
 
         let foot_access = if has(Walked) || has(CarEgress) {
-            self.nearby_stops(origin, access_secs)
+            self.access_times(self.nearby_stops(origin, access_secs))
         } else {
             vec![]
         };
         let bike_access = if has(BikeInHand) || has(BikeDropped) {
-            self.bike_nearby_stops(origin, vehicle_secs, bike)
+            self.access_times(self.bike_nearby_stops(origin, vehicle_secs, bike))
         } else {
             vec![]
         };
         let car_access = if has(CarParked) {
-            self.nearby_stops_profile(origin, vehicle_secs, StreetProfile::Car)
+            self.access_times(self.nearby_stops_profile(origin, vehicle_secs, StreetProfile::Car))
         } else {
             vec![]
         };
         let foot_egress = if has(Walked) || has(BikeDropped) || has(CarParked) {
-            self.nearby_stops(destination, access_secs)
+            self.egress_times(self.nearby_stops(destination, access_secs))
         } else {
             vec![]
         };
         let bike_egress = if has(BikeInHand) {
-            self.bike_nearby_stops(destination, vehicle_secs, bike)
+            self.egress_times(self.bike_nearby_stops(destination, vehicle_secs, bike))
         } else {
             vec![]
         };
         let car_egress = if has(CarEgress) {
-            self.nearby_stops_profile(destination, vehicle_secs, StreetProfile::Car)
+            self.egress_times(self.nearby_stops_profile(destination, vehicle_secs, StreetProfile::Car))
         } else {
             vec![]
         };
@@ -2429,5 +2442,36 @@ mod label_tests {
         let cand = lbl_stamped(100 + MAX_LABELS as u32 + 5, 0.9999, stamp);
         assert!(s.insert(cand, &b), "current-stamp label lost to ghosts in a full cell");
         assert!(s.iter().any(|l| l.created_by == stamp), "current-stamp label must be present");
+    }
+}
+
+#[cfg(test)]
+mod street_time_tests {
+    use crate::structures::{Graph, StreetTimeModel};
+
+    #[test]
+    fn access_buffers_egress_is_mean() {
+        let mut g = Graph::new();
+        g.set_street_time(StreetTimeModel::default());
+        let acc = g.access_times(vec![(0, 120), (1, 600)]);
+        let egr = g.egress_times(vec![(0, 120), (1, 600)]);
+        assert!(acc[0].1 > 120 && acc[1].1 > 600, "access is buffered above median");
+        assert!(egr[0].1 > 120 && egr[1].1 > 600, "egress mean is strictly above the median");
+        assert!(egr[0].1 < acc[0].1, "egress mean is below the p85 access buffer");
+        assert_eq!(acc[0].0, 0);
+        assert_eq!(acc[1].0, 1);
+    }
+
+    #[test]
+    fn null_model_is_identity_for_both_legs() {
+        let mut g = Graph::new();
+        g.set_street_time(StreetTimeModel {
+            access_percentile: 0.5,
+            sigma_alpha: 0.0,
+            sigma_floor: 0.0,
+            sigma_cap: 0.0,
+        });
+        assert_eq!(g.access_times(vec![(0, 300)]), vec![(0, 300)]);
+        assert_eq!(g.egress_times(vec![(0, 300)]), vec![(0, 300)]);
     }
 }

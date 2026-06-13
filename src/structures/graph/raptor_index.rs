@@ -108,6 +108,12 @@ pub struct RaptorIndex {
     // config.yaml at startup; a per-request override merges over it.
     #[serde(skip, default)]
     pub bike_profile: crate::structures::BikeProfile,
+
+    /// Stochastic street-time model for access/egress legs. Tuning, not derived
+    /// data — `#[serde(skip)]` like `bike_profile`, so it is NOT in graph.bin and
+    /// needs no schema bump; set from config at build time.
+    #[serde(skip, default = "RaptorIndex::default_street_time")]
+    pub street_time: crate::structures::StreetTimeModel,
 }
 
 impl Default for RaptorIndex {
@@ -168,6 +174,7 @@ impl RaptorIndex {
             max_window_secs: Self::default_max_window_secs(),
             max_snap_distance_m: Self::default_max_snap_distance_m(),
             bike_profile: crate::structures::BikeProfile::default(),
+            street_time: Self::default_street_time(),
         }
     }
 
@@ -205,6 +212,10 @@ impl RaptorIndex {
 
     pub fn default_max_snap_distance_m() -> u32 {
         10_000
+    }
+
+    pub fn default_street_time() -> crate::structures::StreetTimeModel {
+        crate::structures::StreetTimeModel::default()
     }
 
     /// Rebuild non-serialized runtime indices from serialized data. Must be

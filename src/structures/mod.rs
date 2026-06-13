@@ -1,5 +1,6 @@
 mod bike_attrs;
 mod bike_profile;
+mod street_time;
 mod config;
 mod delay;
 mod edge;
@@ -13,6 +14,7 @@ mod realtime;
 
 pub use bike_attrs::{BikeAttrs, HighwayClass, Surface};
 pub use bike_profile::{BikeProfile, HighwayFactors};
+pub use street_time::StreetTimeModel;
 pub use config::*;
 pub use delay::*;
 pub use edge::*;

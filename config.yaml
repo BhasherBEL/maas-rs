@@ -62,9 +62,17 @@ default_routing:
     s_c_x: 0.225
     c_r: 0.01
     biker_power: 100
+  # Stochastic access/egress times. Walk/bike/drive times are log-normal: the
+  # routed time is the median; access legs are planned at access_percentile to
+  # buffer the connection, egress at the mean for an honest arrival estimate.
+  street_time:
+    access_percentile: 0.85   # buffer to catch the scheduled departure
+    sigma_alpha: 3.8          # spread scale; sigma = alpha / sqrt(seconds)
+    sigma_floor: 0.12         # min spread (long trips never become over-confident)
+    sigma_cap: 0.5            # max spread (very short trips)
 
 server:
-  host: 127.0.0.1
+  host: 192.168.0.211
   port: 8000
 
 auto_update:

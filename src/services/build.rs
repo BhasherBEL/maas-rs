@@ -158,6 +158,9 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(bp) = routing.bike_profile {
         g.set_bike_profile(bp);
     }
+    if let Some(st) = routing.street_time {
+        g.set_street_time(st);
+    }
     if let Some(v) = routing.driving_speed_mps {
         g.set_driving_speed_mps(v);
     }

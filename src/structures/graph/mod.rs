@@ -114,6 +114,10 @@ impl Graph {
         self.raptor.bike_profile = p;
     }
 
+    pub fn set_street_time(&mut self, m: crate::structures::StreetTimeModel) {
+        self.raptor.street_time = m;
+    }
+
     /// `BikeCost` built from the graph's configured default profile.
     pub(super) fn default_bike_cost(&self) -> BikeCost {
         BikeCost::new(self.raptor.bike_profile)
