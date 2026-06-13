@@ -5,7 +5,7 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
-        ActiveModes, NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
+        ALL_STATES, ActiveModes, NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
         VehicleState,
         plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, PlanLeg, PlanLegStep, StopPathLeg, StopReach},
         raptor::Trace,
@@ -857,7 +857,8 @@ impl Graph {
             buckets,
             marked,
             is_marked,
-            start_time + access_secs,
+            // Round-0 access footpaths share one uniform bound across states.
+            [start_time + access_secs; ALL_STATES.len()],
             stamp,
             arena,
             n_states,
@@ -1370,7 +1371,7 @@ impl Graph {
         first_pos: u32,
         date: u32,
         weekday: u8,
-        cutoff: u32,
+        cutoff: [u32; ALL_STATES.len()],
         prev: &[LabelSet],
         best: &[LabelSet],
         buckets: &ReliabilityBuckets,
@@ -1408,7 +1409,7 @@ impl Graph {
                 // Realtime: shift the scheduled arrival by the live delay for this
                 // trip at this stop (0 when no realtime info — inert default).
                 let arr = apply_delay(col[r.t].arrival, rt.delay(trip_ids[r.t], stop as u32));
-                if arr >= cutoff {
+                if arr >= cutoff[r.state as usize] {
                     continue;
                 }
                 let bag = if r.hit_prob < 1.0 {
@@ -1708,7 +1709,7 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         marked: &mut Vec<usize>,
         is_marked: &mut [bool],
-        cutoff: u32,
+        cutoff: [u32; ALL_STATES.len()],
         stamp: u32,
         arena: &mut Vec<Label>,
         n_states: usize,
@@ -1719,8 +1720,9 @@ impl Graph {
             let cell = marked[i];
             let stop = cell / n_states;
             let sidx = (cell % n_states) as u8;
+            let state_cutoff = cutoff[sidx as usize];
             let src = labels[cell]; // Copy; releases the borrow on `labels`.
-            if !src.is_reached() || src.earliest() >= cutoff {
+            if !src.is_reached() || src.earliest() >= state_cutoff {
                 continue;
             }
 
@@ -1735,7 +1737,7 @@ impl Graph {
                         continue;
                     }
                     let bag = l.bag.shifted_by(walk);
-                    if bag.earliest() >= cutoff {
+                    if bag.earliest() >= state_cutoff {
                         continue;
                     }
                     let cand = Label {
@@ -1775,18 +1777,36 @@ impl Graph {
     /// over every active state's egress list. `slack` widens the explored arrival
     /// band so safer-but-slower plans survive.
     #[inline]
-    fn target_cutoff(best: &[LabelSet], mc: &ModeContext, slack: u32) -> u32 {
+    /// Per-compact-state arrival cutoff, indexed by `state` (compact idx). A
+    /// label of burden `b` is bounded only by the best egress arrival across
+    /// states of burden `≤ b` (+ `slack`): a heavier state (e.g. a fast park&ride
+    /// drive) must never tighten the cutoff that prunes a lighter state's
+    /// exploration, or the lighter plan is starved before the plan-level burden
+    /// Pareto can protect it. Unreached burdens leave `u32::MAX` (no pruning).
+    fn target_cutoff(best: &[LabelSet], mc: &ModeContext, slack: u32) -> [u32; ALL_STATES.len()] {
         let n_states = mc.n_states();
-        let mut min = u32::MAX;
-        for (sidx, _) in mc.am.states() {
+        let mut per_burden = [u32::MAX; 3];
+        for (sidx, vs) in mc.am.states() {
+            let b = vs.burden() as usize;
             for &(s, w) in &mc.egress[sidx] {
                 let cell = s * n_states + sidx;
                 if best[cell].is_reached() {
-                    min = min.min(best[cell].earliest().saturating_add(w));
+                    per_burden[b] = per_burden[b].min(best[cell].earliest().saturating_add(w));
                 }
             }
         }
-        min.saturating_add(slack)
+        // Prefix-min over burden: cutoff for burden b sees burdens 0..=b only.
+        let mut prefix = [u32::MAX; 3];
+        let mut acc = u32::MAX;
+        for b in 0..3 {
+            acc = acc.min(per_burden[b]);
+            prefix[b] = acc.saturating_add(slack);
+        }
+        let mut out = [u32::MAX; ALL_STATES.len()];
+        for (sidx, vs) in mc.am.states() {
+            out[sidx] = prefix[vs.burden() as usize];
+        }
+        out
     }
 
     #[inline]

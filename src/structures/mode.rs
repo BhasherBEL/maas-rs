@@ -43,6 +43,20 @@ pub enum VehicleState {
     CarEgress,
 }
 
+impl VehicleState {
+    /// Vehicle burden of a label's state: 0 on foot, 1 bike, 2 car — matching
+    /// `Mode::burden`. The RAPTOR arrival cutoff is computed per burden so a
+    /// heavier state (e.g. a fast park&ride drive) can never prune a lighter
+    /// state's exploration, mirroring the plan-level burden Pareto guard.
+    pub fn burden(self) -> u8 {
+        match self {
+            VehicleState::Walked => 0,
+            VehicleState::BikeInHand | VehicleState::BikeDropped => 1,
+            VehicleState::CarParked | VehicleState::CarEgress => 2,
+        }
+    }
+}
+
 pub const ALL_STATES: [VehicleState; 5] = [
     VehicleState::Walked,
     VehicleState::BikeInHand,
