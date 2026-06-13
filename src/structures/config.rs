@@ -255,6 +255,9 @@ pub struct RoutingDefaultConfig {
     /// Default bike cost profile. Absent ⇒ compiled-in BRouter trekking defaults.
     #[serde(default)]
     pub bike_profile: Option<crate::structures::BikeProfile>,
+    /// Stochastic street-time model for access/egress. Absent ⇒ compiled-in defaults.
+    #[serde(default)]
+    pub street_time: Option<crate::structures::StreetTimeModel>,
 }
 
 impl Ingestor {
@@ -406,6 +409,23 @@ server:
         assert!(!bp.allow_steps);
         assert_eq!(bp.biker_power, 150.0);
         assert_eq!(bp.downhillcost, 100.0); // untouched default
+    }
+
+    #[test]
+    fn parses_street_time_block() {
+        let yaml = "street_time:\n  access_percentile: 0.9\n  sigma_floor: 0.1";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let st = cfg.street_time.unwrap();
+        assert_eq!(st.access_percentile, 0.9);
+        assert_eq!(st.sigma_floor, 0.1);
+        assert_eq!(st.sigma_cap, 0.5);
+        assert_eq!(st.sigma_alpha, 3.8);
+    }
+
+    #[test]
+    fn street_time_absent_is_none() {
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(cfg.street_time.is_none());
     }
 
     #[test]

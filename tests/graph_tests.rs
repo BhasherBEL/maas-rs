@@ -1377,7 +1377,7 @@ fn car_drop_off_with_foot_only_connectors() {
     }]);
     g.add_transit_departures(vec![TripSegment {
         trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
-        departure: 9 * 3600 + 600, arrival: 9 * 3600 + 900, service_id: ServiceId(0),
+        departure: 9 * 3600 + 1000, arrival: 9 * 3600 + 1300, service_id: ServiceId(0),
     }]);
     {
         let ss = g.transit_pattern_stops_len();
@@ -1387,8 +1387,8 @@ fn car_drop_off_with_foot_only_connectors() {
         g.push_transit_pattern_trip(TripId(0));
         g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
         let sts = g.transit_pattern_stop_times_len();
-        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
-        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 900, departure: 9 * 3600 + 900 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1000, departure: 9 * 3600 + 1000 });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1300, departure: 9 * 3600 + 1300 });
         g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
         g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
     }
