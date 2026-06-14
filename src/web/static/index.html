@@ -788,7 +788,7 @@ const PLAN_FRAGMENT = `
   accessAlternatives { mode start end expectedEnd streetSecs }
   legs {
     ... on PlanWalkLeg {
-      __typename start end duration streetMode cyclerouteLength length
+      __typename start end duration streetMode cyclerouteLength elevationGain length
       from { node { name lat lon } }
       to   { node { name lat lon } }
       geometry { lat lon }
@@ -1342,6 +1342,7 @@ function mkBikeStats(leg) {
   };
   stat('📏 ' + fmtDist(dist), 'Total cycling distance');
   stat('⚡ ' + kmh.toFixed(1) + ' km/h', 'Average speed (kinematic estimate)');
+  if (leg.elevationGain != null) stat('⛰️ ' + Math.round(leg.elevationGain) + ' m D+', 'Total ascent (sum of climbs)');
   const cycle = mkEl('span', 'bike-stat bike-stat-cr', '🛤️ ' + pct + '% cycle route');
   cycle.title = fmtDist(cr) + ' of ' + fmtDist(dist) + ' on signposted cycle routes';
   stats.appendChild(cycle);

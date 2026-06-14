@@ -270,6 +270,9 @@ impl Graph {
         // Cost is scaled to integer bits for a total order in the heap.
         let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
         let mut arrival: HashMap<NodeID, u32> = HashMap::new();
+        // Signed elevation hysteresis buffer (meters) of the min-cost path to each
+        // node; threaded so elevation cost reflects sustained net climbs/descents.
+        let mut elev_buf: HashMap<NodeID, f64> = HashMap::new();
         // heap tuple: (cost_bits, node, time_secs, prev_node_index_or_MAX)
         let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
         best_cost.insert(origin, 0);
@@ -301,11 +304,17 @@ impl Graph {
                 if nt > max_seconds {
                     continue;
                 }
-                let nc = cost_bits.saturating_add((step_cost * 1000.0) as u64);
+                let (elev_cost, new_buf) = bike.elevation_step(
+                    elev_buf.get(&node).copied().unwrap_or(0.0),
+                    street.elev_delta as f64,
+                    street.length as f64,
+                );
+                let nc = cost_bits.saturating_add(((step_cost + elev_cost) * 1000.0) as u64);
                 let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
                 if nc < *entry {
                     *entry = nc;
                     arrival.insert(street.destination, nt);
+                    elev_buf.insert(street.destination, new_buf);
                     pq.push(Reverse((nc, street.destination, nt, node.0 as u64)));
                 }
             }
@@ -323,20 +332,25 @@ impl Graph {
         destination: NodeID,
         max_seconds: u32,
         bike: &BikeCost,
-    ) -> Option<(Vec<NodeID>, u32, usize, usize)> {
+    ) -> Option<(Vec<NodeID>, u32, usize, usize, usize)> {
         if origin == destination {
-            return Some((vec![origin], 0, 0, 0));
+            return Some((vec![origin], 0, 0, 0, 0));
         }
         let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
         let mut arrival: HashMap<NodeID, u32> = HashMap::new();
         let mut length: HashMap<NodeID, usize> = HashMap::new();
         let mut cycleroute_length: HashMap<NodeID, usize> = HashMap::new();
+        // Total ascent (D+) in meters: running sum of positive edge elevation deltas.
+        let mut ascent: HashMap<NodeID, usize> = HashMap::new();
         let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
+        // Signed elevation hysteresis buffer (meters) of the min-cost path per node.
+        let mut elev_buf: HashMap<NodeID, f64> = HashMap::new();
         let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
         best_cost.insert(origin, 0);
         arrival.insert(origin, 0);
         length.insert(origin, 0);
         cycleroute_length.insert(origin, 0);
+        ascent.insert(origin, 0);
         pq.push(Reverse((0, origin, 0, u64::MAX)));
 
         while let Some(Reverse((cost_bits, node, time_secs, prev))) = pq.pop() {
@@ -367,11 +381,17 @@ impl Graph {
                 if nt > max_seconds {
                     continue;
                 }
-                let nc = cost_bits.saturating_add((step_cost * 1000.0) as u64);
+                let (elev_cost, new_buf) = bike.elevation_step(
+                    elev_buf.get(&node).copied().unwrap_or(0.0),
+                    street.elev_delta as f64,
+                    street.length as f64,
+                );
+                let nc = cost_bits.saturating_add(((step_cost + elev_cost) * 1000.0) as u64);
                 let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
                 if nc < *entry {
                     *entry = nc;
                     arrival.insert(street.destination, nt);
+                    elev_buf.insert(street.destination, new_buf);
                     let parent_cycleroute = cycleroute_length[&node];
                     cycleroute_length.insert(
                         street.destination,
@@ -382,6 +402,10 @@ impl Graph {
                         },
                     );
                     length.insert(street.destination, length[&node] + street.length);
+                    ascent.insert(
+                        street.destination,
+                        ascent[&node] + street.elev_delta.max(0) as usize,
+                    );
                     parent.insert(street.destination, node);
                     pq.push(Reverse((nc, street.destination, nt, node.0 as u64)));
                 }
@@ -402,6 +426,7 @@ impl Graph {
             arrival[&destination],
             length[&destination],
             cycleroute_length[&destination],
+            ascent[&destination],
         ))
     }
 
@@ -515,7 +540,7 @@ mod tests {
         g.build_raptor_index();
 
         let bc = BikeCost::new(BikeProfile::default());
-        let (_path, _secs, length, cycleroute_length) =
+        let (_path, _secs, length, cycleroute_length, _ascent) =
             g.bike_cost_path(o, c, u32::MAX, &bc).expect("c reachable from o");
 
         assert_eq!(length, 600, "total path length");
@@ -523,5 +548,42 @@ mod tests {
             cycleroute_length, 100,
             "only the 100 m A–B segment is a cycleroute"
         );
+    }
+
+    /// D+ (total ascent) sums only the positive elevation deltas along the chosen
+    /// path — a descent does not reduce it.
+    #[test]
+    fn bike_path_sums_positive_ascent() {
+        let mut g = Graph::new();
+        let o = g.add_node(osm("o", 50.000, 4.000));
+        let a = g.add_node(osm("a", 50.000, 4.0010));
+        let b = g.add_node(osm("b", 50.000, 4.0020));
+        let mut edge = |from: NodeID, to: NodeID, len: usize, elev: i16| {
+            g.add_edge(
+                from,
+                EdgeData::Street(StreetEdgeData {
+                    origin: from,
+                    destination: to,
+                    length: len,
+                    partial: false,
+                    foot: true,
+                    bike: true,
+                    car: false,
+                    attrs: cyc_attrs(false),
+                    elev_delta: elev,
+                }),
+            );
+        };
+        // Forced corridor O→A (+10 m climb) →B (−5 m descent); reverse edges negate.
+        edge(o, a, 100, 10);
+        edge(a, o, 100, -10);
+        edge(a, b, 100, -5);
+        edge(b, a, 100, 5);
+        g.build_raptor_index();
+
+        let bc = BikeCost::new(BikeProfile::default());
+        let (_p, _s, _len, _cyc, ascent) =
+            g.bike_cost_path(o, b, u32::MAX, &bc).expect("b reachable from o");
+        assert_eq!(ascent, 10, "D+ counts the +10 m climb only, not the −5 m descent");
     }
 }

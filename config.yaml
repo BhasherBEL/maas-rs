@@ -57,6 +57,7 @@ default_routing:
     uphillcutoff: 1.5
     downhillcost: 100
     downhillcutoff: 0.5
+    elevation_buffer_m: 5      # hysteresis band: only sustained net climbs/descents beyond this cost
     total_mass: 90
     max_speed: 45
     s_c_x: 0.225

@@ -77,6 +77,11 @@ pub struct BikeProfile {
     pub uphillcutoff: f64,
     pub downhillcost: f64,
     pub downhillcutoff: f64,
+    /// Hysteresis buffer (meters of elevation). Up/down within this band of an
+    /// uncharged accumulator is treated as noise and not charged, so rolling
+    /// terrain and DEM jitter don't inflate cost — only *sustained* net climbs
+    /// and descents beyond the band are. Mirrors BRouter's elevation buffering.
+    pub elevation_buffer_m: f64,
 
     pub total_mass: f64,
     pub max_speed: f64,
@@ -109,6 +114,7 @@ impl Default for BikeProfile {
             uphillcutoff: 1.5,
             downhillcost: 100.0,
             downhillcutoff: 0.5,
+            elevation_buffer_m: 5.0,
             total_mass: 90.0,
             max_speed: 45.0,
             s_c_x: 0.225,

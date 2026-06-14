@@ -37,6 +37,9 @@ pub enum PlanLeg {
 pub struct PlanWalkLeg {
     pub length: usize,
     pub cycleroute_length: Option<usize>,
+    /// Total ascent (D+) in meters along the leg, summed over the path's positive
+    /// elevation deltas. `None` when not computed (only the cost-routed bike leg sets it).
+    pub elevation_gain: Option<usize>,
     pub start: u32,
     pub end: u32,
     pub duration: u32,
