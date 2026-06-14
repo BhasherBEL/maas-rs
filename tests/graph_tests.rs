@@ -1225,7 +1225,7 @@ fn transit_modes_never_emit_zero_transit_plans() {
     let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
     let plans = g.raptor_range_tuned_rt_modes(
         osm_o, osm_d, 9 * 3600, 1800, 0, 0x7F, 10 * 60, &buckets, 300, &RealtimeIndex::new(), &am,
-        &BikeCost::new(BikeProfile::default()),
+        &BikeCost::new(BikeProfile::default(), 1.2),
     );
     // Direct modes (Walk/Bike/Car) are legitimately 0-transit; transit-labelled
     // modes must use transit.
@@ -3296,7 +3296,7 @@ fn direct_bike_plan_uses_kinematic_time() {
     assert_eq!(plans[0].mode, Mode::Bike);
     // Direct bike now reports the kinematic ETA of the cost-optimal route: two
     // flat 100 m road edges (the chain a→b→c), each solved by the power model.
-    let bc = BikeCost::new(BikeProfile::default());
+    let bc = BikeCost::new(BikeProfile::default(), 1.2);
     let edge100 = StreetEdgeData {
         origin: NodeID(0), destination: NodeID(1), length: 100,
         partial: false, foot: true, bike: true, car: true,
@@ -3353,7 +3353,7 @@ fn raptor_range_modes_matches_independent_oracle() {
 
     let pruned = g.raptor_range_tuned_rt_modes(
         origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
-        &BikeCost::new(BikeProfile::default()),
+        &BikeCost::new(BikeProfile::default(), 1.2),
     );
     let indep = g.raptor_range_independent_rt_modes(
         origin, dest, 8 * 3600, 180 * 60, 0, 0x7F, 10 * 60, &buckets, 900, &rt, &am,
@@ -3379,7 +3379,7 @@ fn raptor_explain_supports_bike_modes() {
     let res = g.raptor_explain_tuned_rt_modes(
         origin, dest, 8 * 3600 + 3300, 0, 0x7F, 10 * 60, &buckets, 900,
         &RealtimeIndex::new(), &am,
-        &BikeCost::new(BikeProfile::default()),
+        &BikeCost::new(BikeProfile::default(), 1.2),
     );
     assert!(!res.access.fell_back_to_walk_only);
     assert!(res.plans.iter().any(|p| transit_leg_count(p) == 2));
@@ -3435,7 +3435,7 @@ fn bike_prefers_cycleway() {
     edge(&mut g, d, stop, 8, snap); // foot connector to the platform
     g.build_raptor_index();
 
-    let bc = BikeCost::new(BikeProfile::default());
+    let bc = BikeCost::new(BikeProfile::default(), 1.2);
     let mk = |len: usize, attrs: BikeAttrs| StreetEdgeData {
         origin: NodeID(0),
         destination: NodeID(1),
@@ -3470,7 +3470,7 @@ fn bike_prefers_cycleway() {
     prof.avoid_unsafe = false;
     prof.stick_to_cycleroutes = false;
     prof.highway.primary = 1.0;
-    let bc2 = BikeCost::new(prof);
+    let bc2 = BikeCost::new(prof, 1.2);
     let stops2 = g.bike_nearby_stops(o, 600, &bc2);
     let (_, secs2) = stops2[0];
     assert!(

@@ -120,7 +120,7 @@ impl Graph {
 
     /// `BikeCost` built from the graph's configured default profile.
     pub(super) fn default_bike_cost(&self) -> BikeCost {
-        BikeCost::new(self.raptor.bike_profile)
+        BikeCost::new(self.raptor.bike_profile, self.raptor.walking_speed_mps)
     }
 
     pub fn set_driving_speed_mps(&mut self, mps: f64) {

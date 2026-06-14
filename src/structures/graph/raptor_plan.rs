@@ -79,11 +79,9 @@ impl Graph {
                 cycleroute_length: None,
                 elevation_gain: None,
                 street_mode: mode,
-                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                    length,
-                    time: secs,
-                    place: to_place,
-                })],
+                steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+                    length, secs, to_place,
+                ))],
                 geometry: self.street_path(origin, destination, profile),
             })],
             start: start_time,
@@ -109,16 +107,51 @@ impl Graph {
         max_secs: u32,
         bike: &crate::structures::BikeCost,
     ) -> Option<Plan> {
-        let (nodes, secs, length, cycleroute_length, elevation_gain) =
-            self.bike_cost_path(origin, destination, max_secs, bike)?;
-        let end = start_time + secs;
-        let geometry = nodes.iter().map(|&n| self.node_coord(n)).collect();
+        let p = self.bike_cost_path(origin, destination, max_secs, bike)?;
+        let end = start_time + p.secs;
+        let geometry: Vec<_> = p.nodes.iter().map(|&n| self.node_coord(n)).collect();
         let to_place = PlanPlace {
             node_id: destination,
             stop_position: None,
             arrival: Some(end),
             departure: None,
         };
+
+        // Group consecutive edges by ride/push into steps so the client can show
+        // (and time) dismount stretches distinctly. Each step covers the inclusive
+        // geometry range [start_idx, i].
+        let mut steps: Vec<PlanLegStep> = Vec::new();
+        let mut i = 0;
+        let mut cum_time = 0u32;
+        while i < p.edges.len() {
+            let push = p.edges[i].push;
+            let start_idx = i;
+            let (mut run_len, mut run_time) = (0usize, 0u32);
+            while i < p.edges.len() && p.edges[i].push == push {
+                run_len += p.edges[i].length;
+                run_time += p.edges[i].time;
+                i += 1;
+            }
+            cum_time += run_time;
+            steps.push(PlanLegStep::Walk(PlanWalkLegStep {
+                length: run_len,
+                time: run_time,
+                place: PlanPlace {
+                    node_id: p.nodes[i],
+                    stop_position: None,
+                    arrival: Some(start_time + cum_time),
+                    departure: None,
+                },
+                dismount: push,
+                geom_start: start_idx,
+                geom_end: i,
+            }));
+        }
+        if steps.is_empty() {
+            steps.push(PlanLegStep::Walk(PlanWalkLegStep::plain(
+                p.length, p.secs, to_place,
+            )));
+        }
 
         Some(Plan {
             legs: vec![PlanLeg::Walk(PlanWalkLeg {
@@ -131,16 +164,12 @@ impl Graph {
                 to: to_place,
                 start: start_time,
                 end,
-                duration: secs,
-                length,
-                cycleroute_length: Some(cycleroute_length),
-                elevation_gain: Some(elevation_gain),
+                duration: p.secs,
+                length: p.length,
+                cycleroute_length: Some(p.cycleroute_length),
+                elevation_gain: Some(p.ascent),
                 street_mode: Mode::Bike,
-                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                    length,
-                    time: secs,
-                    place: to_place,
-                })],
+                steps,
                 geometry,
             })],
             start: start_time,
@@ -463,11 +492,9 @@ impl Graph {
                                 cycleroute_length: None,
                 elevation_gain: None,
                                 street_mode: access_mode,
-                                steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                                    length,
-                                    time: first_walk,
-                                    place: to_place,
-                                })],
+                                steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+                                    length, first_walk, to_place,
+                                ))],
                                 geometry: self.street_path(origin, stop_node, access_profile),
                             }),
                         );
@@ -509,11 +536,9 @@ impl Graph {
                         street_mode: egress_mode,
                         cycleroute_length: None,
                 elevation_gain: None,
-                        steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                            length,
-                            time: best_walk,
-                            place: to_place,
-                        })],
+                        steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+                            length, best_walk, to_place,
+                        ))],
                         geometry: self.street_path(stop_node, destination, egress_profile),
                     }));
                 }
@@ -640,11 +665,11 @@ impl Graph {
                     let new_length = prev.length + next.length;
                     let new_end = next.end;
                     let to = next.to;
-                    let step = PlanLegStep::Walk(PlanWalkLegStep {
-                        length: new_length,
-                        time: new_duration,
-                        place: to,
-                    });
+                    let step = PlanLegStep::Walk(PlanWalkLegStep::plain(
+                        new_length,
+                        new_duration,
+                        to,
+                    ));
                     *prev = PlanWalkLeg {
                         from: prev.from,
                         to,
@@ -747,11 +772,9 @@ impl Graph {
                     cycleroute_length: None,
                 elevation_gain: None,
                     street_mode: Mode::Walk,
-                    steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
-                        length,
-                        time: duration,
-                        place: to_place,
-                    })],
+                    steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+                        length, duration, to_place,
+                    ))],
                     geometry: self.walk_path(from_node, to_node),
                 }));
                 origin_stop = from;

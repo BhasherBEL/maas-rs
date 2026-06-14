@@ -16,6 +16,30 @@ pub struct PlanWalkLegStep {
     pub length: usize,
     pub time: u32,
     pub place: PlanPlace,
+
+    /// True when this step must be walked with the bike pushed (a foot-only
+    /// "dismount" stretch on a bike journey). Always false on plain walk legs.
+    pub dismount: bool,
+    /// Inclusive `[geom_start, geom_end]` index range into the parent leg's
+    /// `geometry`, delimiting this step's coordinate run so the client can draw it
+    /// distinctly. Both `0` on a single-step leg (the client draws the whole
+    /// `geometry` and ignores the range).
+    pub geom_start: usize,
+    pub geom_end: usize,
+}
+
+impl PlanWalkLegStep {
+    /// A single-step walk leg covering its whole geometry (no dismount, no range).
+    pub fn plain(length: usize, time: u32, place: PlanPlace) -> Self {
+        PlanWalkLegStep {
+            length,
+            time,
+            place,
+            dismount: false,
+            geom_start: 0,
+            geom_end: 0,
+        }
+    }
 }
 
 #[derive(Debug, SimpleObject, Clone, Copy)]
