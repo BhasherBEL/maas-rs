@@ -468,6 +468,7 @@ header a.head-btn { text-decoration: none; }
   border-radius: 999px; padding: 1px 8px; white-space: nowrap;
 }
 .bike-stat-cr { color: #2e7d32; background: #2e7d3218; }
+.bike-stat-push { color: #e65100; background: #e6510018; border-color: #e6510033; }
 .access-alts { margin: 6px 0 2px; font-size: 12px; color: var(--fg-2); }
 .access-alts .alt { display: block; margin-top: 2px; }
 
@@ -792,6 +793,11 @@ const PLAN_FRAGMENT = `
       from { node { name lat lon } }
       to   { node { name lat lon } }
       geometry { lat lon }
+      steps {
+        ... on PlanWalkLegStep {
+          length time dismount geomStart geomEnd
+        }
+      }
     }
     ... on PlanTransitLeg {
       __typename start end duration
@@ -1346,6 +1352,12 @@ function mkBikeStats(leg) {
   const cycle = mkEl('span', 'bike-stat bike-stat-cr', '🛤️ ' + pct + '% cycle route');
   cycle.title = fmtDist(cr) + ' of ' + fmtDist(dist) + ' on signposted cycle routes';
   stats.appendChild(cycle);
+  const pushDist = (leg.steps || []).reduce((m, s) => m + (s.dismount ? (s.length || 0) : 0), 0);
+  if (pushDist > 0) {
+    const push = mkEl('span', 'bike-stat bike-stat-push', '🚶 ' + fmtDist(pushDist) + ' dismount');
+    push.title = 'Walk and push the bike on foot-only stretches';
+    stats.appendChild(push);
+  }
   return stats;
 }
 
@@ -2098,6 +2110,17 @@ function renderAllPlansOnMap() {
         color, weight: isTransit ? 5 : (isBike || isCar ? 4 : 3), opacity: 0.9,
         dashArray: isTransit ? null : (isBike || isCar ? '2,8' : '5,6'),
       }).addTo(map));
+      // Overlay dismount (push) stretches of a bike leg distinctly.
+      if (isBike) {
+        (leg.steps || []).forEach(s => {
+          if (!s.dismount || s.geomEnd <= s.geomStart) return;
+          const seg = pts.slice(s.geomStart, s.geomEnd + 1);
+          if (seg.length < 2) return;
+          state.legLayers.push(L.polyline(seg, {
+            color: '#e65100', weight: 6, opacity: 0.95, dashArray: '1,7', lineCap: 'round',
+          }).addTo(map).bindTooltip('🚶 Dismount — push your bike'));
+        });
+      }
       if (isTransit && leg.from?.node && leg.to?.node) {
         state.legLayers.push(
           L.marker([leg.from.node.lat, leg.from.node.lon], { icon: makeStopDot(color) })

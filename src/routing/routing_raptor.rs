@@ -117,7 +117,7 @@ pub fn route(
     let (buckets, slack) = resolve_tuning(graph, query)?;
     let am = resolve_modes(query)?;
 
-    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query), graph.raptor.walking_speed_mps);
     let plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
@@ -147,7 +147,7 @@ pub fn route_explain(
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
-    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query), graph.raptor.walking_speed_mps);
     let result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);

@@ -282,6 +282,7 @@ impl HighwayFactorsInput {
 #[derive(InputObject, Default)]
 struct BikeProfileInput {
     allow_steps: Option<bool>,
+    allow_dismount: Option<bool>,
     ignore_cycleroutes: Option<bool>,
     stick_to_cycleroutes: Option<bool>,
     avoid_unsafe: Option<bool>,
@@ -313,6 +314,7 @@ impl BikeProfileInput {
     /// Overlay the provided fields onto a base profile.
     fn merge_into(self, mut base: crate::structures::BikeProfile) -> crate::structures::BikeProfile {
         if let Some(v) = self.allow_steps { base.allow_steps = v; }
+        if let Some(v) = self.allow_dismount { base.allow_dismount = v; }
         if let Some(v) = self.ignore_cycleroutes { base.ignore_cycleroutes = v; }
         if let Some(v) = self.stick_to_cycleroutes { base.stick_to_cycleroutes = v; }
         if let Some(v) = self.avoid_unsafe { base.avoid_unsafe = v; }

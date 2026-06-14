@@ -49,6 +49,7 @@ default_routing:
   vehicle_access_secs: 1200
   bike_profile:
     allow_steps: true
+    allow_dismount: true   # false = forbid push (dismount) ways; routes detour around them
     ignore_cycleroutes: false
     stick_to_cycleroutes: true
     avoid_unsafe: true
@@ -57,7 +58,9 @@ default_routing:
     uphillcutoff: 1.5
     downhillcost: 100
     downhillcutoff: 0.5
-    elevation_buffer_m: 5      # hysteresis band: only sustained net climbs/descents beyond this cost
+    elevation_penalty_buffer: 5   # descent/ascent below this (m, net of cutoff) is free
+    elevation_max_buffer: 10      # excess above this is force-charged at down/uphillcost per m
+    elevation_buffer_reduce: 0    # slope-proportional buffer bleed (0 = drain only at the ceiling)
     total_mass: 90
     max_speed: 45
     s_c_x: 0.225

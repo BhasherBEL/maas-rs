@@ -49,6 +49,10 @@ impl Default for HighwayFactors {
 #[serde(default)]
 pub struct BikeProfile {
     pub allow_steps: bool,
+    /// When false, push (dismount) ways — foot-accessible but not bike-accessible —
+    /// are impassable, so routes detour entirely around them instead of assuming
+    /// the rider walks the bike.
+    pub allow_dismount: bool,
     pub ignore_cycleroutes: bool,
     pub stick_to_cycleroutes: bool,
     pub avoid_unsafe: bool,
@@ -77,11 +81,13 @@ pub struct BikeProfile {
     pub uphillcutoff: f64,
     pub downhillcost: f64,
     pub downhillcutoff: f64,
-    /// Hysteresis buffer (meters of elevation). Up/down within this band of an
-    /// uncharged accumulator is treated as noise and not charged, so rolling
-    /// terrain and DEM jitter don't inflate cost — only *sustained* net climbs
-    /// and descents beyond the band are. Mirrors BRouter's elevation buffering.
-    pub elevation_buffer_m: f64,
+    /// BRouter elevation hysteresis buffers (meters). Descent/ascent must exceed
+    /// `elevation_penalty_buffer` before any cost; above `elevation_max_buffer`
+    /// the excess is force-drained and charged; `elevation_buffer_reduce` is a
+    /// slope-proportional bleed (0 = drain only at the max ceiling).
+    pub elevation_penalty_buffer: f64,
+    pub elevation_max_buffer: f64,
+    pub elevation_buffer_reduce: f64,
 
     pub total_mass: f64,
     pub max_speed: f64,
@@ -94,6 +100,7 @@ impl Default for BikeProfile {
     fn default() -> Self {
         BikeProfile {
             allow_steps: true,
+            allow_dismount: true,
             ignore_cycleroutes: false,
             stick_to_cycleroutes: true,
             avoid_unsafe: true,
@@ -114,7 +121,9 @@ impl Default for BikeProfile {
             uphillcutoff: 1.5,
             downhillcost: 100.0,
             downhillcutoff: 0.5,
-            elevation_buffer_m: 5.0,
+            elevation_penalty_buffer: 5.0,
+            elevation_max_buffer: 10.0,
+            elevation_buffer_reduce: 0.0,
             total_mass: 90.0,
             max_speed: 45.0,
             s_c_x: 0.225,
