@@ -77,6 +77,7 @@ impl Graph {
                 duration: secs,
                 length,
                 cycleroute_length: None,
+                elevation_gain: None,
                 street_mode: mode,
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                     length,
@@ -108,7 +109,7 @@ impl Graph {
         max_secs: u32,
         bike: &crate::structures::BikeCost,
     ) -> Option<Plan> {
-        let (nodes, secs, length, cycleroute_length) =
+        let (nodes, secs, length, cycleroute_length, elevation_gain) =
             self.bike_cost_path(origin, destination, max_secs, bike)?;
         let end = start_time + secs;
         let geometry = nodes.iter().map(|&n| self.node_coord(n)).collect();
@@ -133,6 +134,7 @@ impl Graph {
                 duration: secs,
                 length,
                 cycleroute_length: Some(cycleroute_length),
+                elevation_gain: Some(elevation_gain),
                 street_mode: Mode::Bike,
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                     length,
@@ -459,6 +461,7 @@ impl Graph {
                                 duration: first_walk,
                                 length,
                                 cycleroute_length: None,
+                elevation_gain: None,
                                 street_mode: access_mode,
                                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                                     length,
@@ -505,6 +508,7 @@ impl Graph {
                         length,
                         street_mode: egress_mode,
                         cycleroute_length: None,
+                elevation_gain: None,
                         steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                             length,
                             time: best_walk,
@@ -649,6 +653,7 @@ impl Graph {
                         duration: new_duration,
                         length: new_length,
                         cycleroute_length: None,
+                elevation_gain: None,
                         street_mode: prev.street_mode,
                         steps: vec![step],
                         geometry: merged_geo,
@@ -740,6 +745,7 @@ impl Graph {
                     duration,
                     length,
                     cycleroute_length: None,
+                elevation_gain: None,
                     street_mode: Mode::Walk,
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep {
                         length,
@@ -1701,6 +1707,7 @@ mod tests {
         PlanLeg::Walk(PlanWalkLeg {
             length: 0,
             cycleroute_length: None,
+                elevation_gain: None,
             start,
             end,
             duration: end - start,

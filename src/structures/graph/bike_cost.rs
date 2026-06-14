@@ -153,20 +153,44 @@ impl BikeCost {
         }
     }
 
-    /// Elevation cost: penalize up/downhill beyond the cutoff gradients.
-    fn elevation_cost(&self, length: f64, delta: f64) -> f64 {
+    /// Stateful, BRouter-style elevation cost. `buf` is the signed elevation
+    /// accumulator carried along the path (meters); `delta`/`length` are this
+    /// edge's elevation change and length. Returns `(added_cost, new_buf)`.
+    ///
+    /// Gentle grades (|gradient| ≤ cutoff) are treated as flat and don't
+    /// accumulate. Otherwise the signed delta is added to `buf`; only the part
+    /// of `|buf|` beyond `elevation_buffer_m` is charged (uphill/downhill cost
+    /// per meter), then `buf` is clamped to ±buffer. This way an up-then-down
+    /// wiggle inside the band nets to zero — only *sustained* net climbs and
+    /// descents cost, unlike the old per-edge penalty.
+    pub fn elevation_step(&self, buf: f64, delta: f64, length: f64) -> (f64, f64) {
         let p = &self.profile;
         if !p.consider_elevation || length <= 0.0 {
-            return 0.0;
+            return (0.0, buf);
         }
         let grade_pct = (delta / length) * 100.0;
-        if delta >= 0.0 {
-            let over = (grade_pct - p.uphillcutoff).max(0.0);
-            over / 100.0 * length * p.uphillcost
+        let cutoff = if delta >= 0.0 {
+            p.uphillcutoff
         } else {
-            let over = (-grade_pct - p.downhillcutoff).max(0.0);
-            over / 100.0 * length * p.downhillcost
+            p.downhillcutoff
+        };
+        if grade_pct.abs() <= cutoff {
+            return (0.0, buf); // gentle slope ⇒ effectively flat
         }
+        let mut b = buf + delta;
+        let buffer = p.elevation_buffer_m;
+        let cost = if b > buffer {
+            let charged = (b - buffer) * p.uphillcost / 100.0;
+            b = buffer;
+            charged
+        } else if b < -buffer {
+            let charged = (-b - buffer) * p.downhillcost / 100.0;
+            b = -buffer;
+            charged
+        } else {
+            0.0
+        };
+        (cost, b)
     }
 
     /// Routing cost of an edge given the incoming direction (unit vector) for
@@ -182,7 +206,10 @@ impl BikeCost {
             return None;
         }
         let length = e.length as f64;
-        let mut cost = length * cf + self.elevation_cost(length, e.elev_delta as f64);
+        // Elevation is NOT charged here — it is path-dependent (see `elevation_step`,
+        // which the bike search threads through a hysteresis buffer). Charging it
+        // per-edge would over-count every dip on rolling terrain.
+        let mut cost = length * cf;
         if let Some(inc) = incoming {
             let dot = (inc.0 * this_dir.0 + inc.1 * this_dir.1).clamp(-1.0, 1.0);
             // turncost × (1 - cos θ) / 2  →  0 straight, turncost for 90°+.
@@ -302,35 +329,53 @@ mod tests {
     }
 
     #[test]
-    fn uphill_costs_more_than_flat() {
+    fn edge_cost_excludes_elevation() {
+        // Elevation is no longer charged per-edge; flat and steep edges of the
+        // same class/length now cost the same from `edge_cost` alone.
         let bc = BikeCost::new(BikeProfile::default());
         let flat = bc
-            .edge_cost(
-                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 0),
-                None,
-                (1.0, 0.0),
-            )
+            .edge_cost(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 0), None, (1.0, 0.0))
             .unwrap();
-        let up = bc
-            .edge_cost(
-                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10),
-                None,
-                (1.0, 0.0),
-            )
+        let steep = bc
+            .edge_cost(&edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10), None, (1.0, 0.0))
             .unwrap();
-        // default uphillcost is 0, so equal; bump it to see the effect.
-        assert!(up >= flat);
+        assert_eq!(flat, steep);
+    }
+
+    #[test]
+    fn elevation_buffer_charges_sustained_not_oscillation() {
+        // defaults: downhillcost 100, downhillcutoff 0.5, elevation_buffer_m 5.
+        let bc = BikeCost::new(BikeProfile::default());
+
+        // Gentle slope (|grade| ≤ cutoff) is treated as flat: no cost, buffer kept.
+        assert_eq!(bc.elevation_step(0.0, -0.4, 100.0), (0.0, 0.0));
+
+        // Up-then-down wiggles within the 5 m band net to zero charge.
+        let (mut buf, mut total) = (0.0_f64, 0.0_f64);
+        for _ in 0..10 {
+            let (c1, nb) = bc.elevation_step(buf, 2.0, 100.0);
+            buf = nb;
+            total += c1;
+            let (c2, nb) = bc.elevation_step(buf, -2.0, 100.0);
+            buf = nb;
+            total += c2;
+        }
+        assert_eq!(total, 0.0, "oscillation within the buffer must not be charged");
+
+        // A sustained 60 m descent (30 × −2 m) charges (60 − 5) × 100/100 = 55.
+        let (mut buf, mut total) = (0.0_f64, 0.0_f64);
+        for _ in 0..30 {
+            let (c, nb) = bc.elevation_step(buf, -2.0, 100.0);
+            buf = nb;
+            total += c;
+        }
+        assert!((total - 55.0).abs() < 1e-6, "sustained descent cost {total}");
+
+        // consider_elevation off ⇒ never charges.
         let mut prof = BikeProfile::default();
-        prof.uphillcost = 60.0;
-        let bc2 = BikeCost::new(prof);
-        let up2 = bc2
-            .edge_cost(
-                &edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), 100, 10),
-                None,
-                (1.0, 0.0),
-            )
-            .unwrap();
-        assert!(up2 > flat);
+        prof.consider_elevation = false;
+        let off = BikeCost::new(prof);
+        assert_eq!(off.elevation_step(0.0, -50.0, 100.0), (0.0, 0.0));
     }
 
     #[test]
