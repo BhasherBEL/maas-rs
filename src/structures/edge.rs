@@ -24,6 +24,16 @@ pub struct StreetEdgeData {
     pub attrs: crate::structures::BikeAttrs,
     /// Elevation change origin→destination in meters (signed). 0 when no DEM.
     pub elev_delta: i16,
+    /// Per-edge bike cruise-speed multiplier baked from OSM `surface=*`, as
+    /// `round(factor·100)` (100 = asphalt baseline 1.0, 60 = gravel 0.60). A
+    /// SPEED factor only — distinct from the Surface comfort Pareto axis. `0`
+    /// means "unset" (old cache / non-bike edge) and is read as the unknown
+    /// default (90). Baked at ingest, so re-tuning the table needs a rebuild.
+    pub surface_speed: u8,
+    /// Variance-generating features (signals, elevators, uncontrolled crossings)
+    /// classified at ingest from the segment's endpoint nodes. Consumed only
+    /// post-hoc and by the deadline variance-proxy axis — never in the search.
+    pub var_gen: crate::structures::cost::VarGen,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -106,7 +106,10 @@ impl Dem {
 
     fn read_transform(decoder: &mut Decoder<std::fs::File>) -> Result<Transform, String> {
         let f64s = |d: &mut Decoder<std::fs::File>, tag: Tag| -> Option<Vec<f64>> {
-            d.find_tag(tag).ok().flatten().and_then(|v| v.into_f64_vec().ok())
+            d.find_tag(tag)
+                .ok()
+                .flatten()
+                .and_then(|v| v.into_f64_vec().ok())
         };
         if let Some(m) = f64s(decoder, Tag::ModelTransformationTag) {
             if m.len() == 16 {

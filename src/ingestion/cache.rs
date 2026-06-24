@@ -52,8 +52,7 @@ fn download(url: &str, headers: &HashMap<String, String>, dest: &str) -> Result<
     let tmp = format!("{dest}.tmp");
     let mut reader = resp.into_reader();
     let mut file = fs::File::create(&tmp).map_err(|e| format!("failed to create '{tmp}': {e}"))?;
-    std::io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("failed to write '{tmp}': {e}"))?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("failed to write '{tmp}': {e}"))?;
     fs::rename(&tmp, dest).map_err(|e| format!("failed to publish '{dest}': {e}"))?;
     Ok(())
 }
@@ -133,7 +132,12 @@ pub fn save_last_checked(cache_dir: &str, when: DateTime<Local>) -> Result<(), S
 pub fn load_input_labels(cache_dir: &str) -> Vec<String> {
     let path = format!("{cache_dir}/input_labels");
     fs::read_to_string(&path)
-        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 

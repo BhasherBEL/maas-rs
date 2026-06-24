@@ -72,8 +72,8 @@ impl Graph {
             let mut in_queue: Vec<bool> = vec![false; n_patterns];
 
             for &stop in &marked {
-                let pats =
-                    self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
+                let pats = self.raptor.transit_idx_stop_patterns[stop]
+                    .of(&self.raptor.transit_stop_patterns);
                 for &(pat_id, _pos) in pats {
                     let p = pat_id.0 as usize;
                     if !in_queue[p] {
@@ -88,16 +88,16 @@ impl Graph {
 
             // Backward scan for each queued pattern
             for &pat in &queue {
-                let pat_stops =
-                    self.raptor.transit_idx_pattern_stops[pat].of(&self.raptor.transit_pattern_stops);
+                let pat_stops = self.raptor.transit_idx_pattern_stops[pat]
+                    .of(&self.raptor.transit_pattern_stops);
                 let n_trips = self.raptor.transit_patterns[pat].num_trips as usize;
                 if n_trips == 0 {
                     continue;
                 }
                 let all_times = self.raptor.transit_idx_pattern_stop_times[pat]
                     .of(&self.raptor.transit_pattern_stop_times);
-                let trip_ids =
-                    self.raptor.transit_idx_pattern_trips[pat].of(&self.raptor.transit_pattern_trips);
+                let trip_ids = self.raptor.transit_idx_pattern_trips[pat]
+                    .of(&self.raptor.transit_pattern_trips);
 
                 let mut t_star: Option<usize> = None;
 
@@ -126,15 +126,16 @@ impl Graph {
                             lambda[round - 1][stop],
                             date,
                             weekday,
-                        ) {
-                            let update = match t_star {
-                                None => true,
-                                Some(ct) => col[t].departure > col[ct].departure,
-                            };
-                            if update {
-                                t_star = Some(t);
-                            }
+                        )
+                    {
+                        let update = match t_star {
+                            None => true,
+                            Some(ct) => col[t].departure > col[ct].departure,
+                        };
+                        if update {
+                            t_star = Some(t);
                         }
+                    }
                 }
             }
 

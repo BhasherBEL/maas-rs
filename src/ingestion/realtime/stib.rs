@@ -147,7 +147,11 @@ impl StibFeed {
         // Prefer the match with the smaller absolute delay.
         let chosen = match (same_day, prev_day) {
             (Some(a), Some(b)) => {
-                if a.2.abs() <= b.2.abs() { Some(a) } else { Some(b) }
+                if a.2.abs() <= b.2.abs() {
+                    Some(a)
+                } else {
+                    Some(b)
+                }
             }
             (a, b) => a.or(b),
         }?;
@@ -172,7 +176,10 @@ impl StibFeed {
 
         let mut all: Vec<(usize, ScheduledArrival)> = Vec::new();
         for &stop in stops {
-            for sa in self.graph.stib_scheduled_arrivals(stop, line, date, weekday) {
+            for sa in self
+                .graph
+                .stib_scheduled_arrivals(stop, line, date, weekday)
+            {
                 all.push((stop, sa));
             }
         }

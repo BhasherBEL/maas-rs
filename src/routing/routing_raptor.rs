@@ -1,10 +1,11 @@
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 
 use crate::ingestion::gtfs::date_to_days;
+use crate::structures::plan::{ExplainResult, Plan, PlanLeg};
 use crate::structures::{
-    ActiveModes, Graph, Mode, RealtimeIndex, ReliabilityBuckets, valid_reliability_edges,
+    ActiveModes, BikeCost, Endpoint, Graph, Mode, NodeID, RealtimeIndex, ReliabilityBuckets,
+    valid_reliability_edges,
 };
-use crate::structures::plan::{ExplainResult, Plan};
 
 pub struct RouteQuery {
     pub from_lat: f64,
@@ -27,12 +28,77 @@ pub struct RouteQuery {
     pub modes: Option<Vec<Mode>>,
     /// Per-query bike cost profile. `None` → the graph's configured default.
     pub bike_profile: Option<crate::structures::BikeProfile>,
+    /// When true, direct walk/bike plans are built with `LegRole::Deadline`
+    /// (variance-proxy axis active) rather than `LegRole::Neutral`.
+    pub terminal_deadline: bool,
 }
 
 /// Effective bike cost profile for a query: the per-request override if present,
 /// else the graph's configured default.
 fn resolve_bike_profile(graph: &Graph, query: &RouteQuery) -> crate::structures::BikeProfile {
     query.bike_profile.unwrap_or(graph.raptor.bike_profile)
+}
+
+/// A plan with no transit legs — a direct door-to-door street plan.
+fn is_direct_street(plan: &Plan) -> bool {
+    plan.legs.iter().all(|l| matches!(l, PlanLeg::Walk(_)))
+}
+
+/// Edge-snap a coordinate for a bike: prefer the nearest *rideable* edge so a bike
+/// isn't dropped onto a footway and forced to push from the first metre; only fall
+/// back to a foot-only edge when no bike edge is in range. `None` when edge snapping
+/// is off or no usable edge is within range/guard.
+fn bike_edge_endpoint(graph: &Graph, lat: f64, lng: f64) -> Option<Endpoint> {
+    if !graph.raptor.edge_snap {
+        return None;
+    }
+    let radius = graph.raptor.edge_snap_radius_m;
+    let guard = graph.raptor.max_snap_distance_m as f64;
+    let snap = graph
+        .snap_to_edge(lat, lng, radius, |s| s.bike)
+        .or_else(|| graph.snap_to_edge(lat, lng, radius, |s| s.foot));
+    let (ep, perp) = snap?;
+    (perp <= guard).then_some(ep)
+}
+
+/// Rebuild any direct bike plan with edge-snapped endpoints, so an origin or
+/// destination sitting mid-way along a long rideable edge is routed onto that edge
+/// rather than a distant end node. No-op when no direct bike plan is present or
+/// neither endpoint snaps to an edge.
+fn apply_edge_snap_bike(
+    graph: &Graph,
+    query: &RouteQuery,
+    origin: NodeID,
+    destination: NodeID,
+    bike: &BikeCost,
+    plans: &mut [Plan],
+) {
+    if !plans
+        .iter()
+        .any(|p| p.mode == Mode::Bike && is_direct_street(p))
+    {
+        return;
+    }
+    let o = bike_edge_endpoint(graph, query.from_lat, query.from_lng);
+    let d = bike_edge_endpoint(graph, query.to_lat, query.to_lng);
+    if o.is_none() && d.is_none() {
+        return;
+    }
+    let origin_ep = o.unwrap_or(Endpoint::Node(origin));
+    let dest_ep = d.unwrap_or(Endpoint::Node(destination));
+    eprintln!("DBGSNAP o={:?} d={:?} dest_ep={:?}", o, d, dest_ep);
+    for p in plans.iter_mut() {
+        if p.mode == Mode::Bike && is_direct_street(p) {
+            let r = graph.direct_bike_plan(origin_ep, dest_ep, p.start, bike);
+            eprintln!("DBGSNAP rebuilt={} tail_present={:?}", r.is_some(),
+                r.as_ref().and_then(|pl| pl.legs.last()).map(|l| match l {
+                    PlanLeg::Walk(w) => w.geometry.last().copied(),
+                    _ => None }));
+            if let Some(better) = r {
+                *p = better;
+            }
+        }
+    }
 }
 
 /// Resolves the effective buckets + slack for a query, honouring per-request overrides
@@ -50,7 +116,9 @@ fn resolve_tuning(
         Some(edges) => ReliabilityBuckets::new(edges),
         None => ReliabilityBuckets::new(&graph.raptor.reliability_bucket_edges),
     };
-    let slack = query.arrival_slack_secs.unwrap_or(graph.raptor.arrival_slack_secs);
+    let slack = query
+        .arrival_slack_secs
+        .unwrap_or(graph.raptor.arrival_slack_secs);
     Ok((buckets, slack))
 }
 
@@ -58,9 +126,7 @@ fn resolve_tuning(
 fn resolve_modes(query: &RouteQuery) -> Result<ActiveModes, async_graphql::Error> {
     match &query.modes {
         None => Ok(ActiveModes::default()),
-        Some(m) if m.is_empty() => {
-            Err(async_graphql::Error::new("modes must not be empty"))
-        }
+        Some(m) if m.is_empty() => Err(async_graphql::Error::new("modes must not be empty")),
         Some(m) => Ok(ActiveModes::new(m)),
     }
 }
@@ -94,7 +160,17 @@ fn snap_node(
 fn resolve_query_params(
     graph: &Graph,
     query: &RouteQuery,
-) -> Result<(crate::structures::NodeID, crate::structures::NodeID, u32, u32, u8, u32), async_graphql::Error> {
+) -> Result<
+    (
+        crate::structures::NodeID,
+        crate::structures::NodeID,
+        u32,
+        u32,
+        u8,
+        u32,
+    ),
+    async_graphql::Error,
+> {
     let time = query.time.num_seconds_from_midnight();
     let date = date_to_days(query.date);
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
@@ -102,7 +178,9 @@ fn resolve_query_params(
     let origin = snap_node(graph, query.from_lat, query.from_lng, "departure")?;
     let destination = snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
 
-    let min_access = query.min_access_secs.unwrap_or(graph.raptor.min_access_secs);
+    let min_access = query
+        .min_access_secs
+        .unwrap_or(graph.raptor.min_access_secs);
 
     Ok((origin, destination, time, date, weekday, min_access))
 }
@@ -117,14 +195,53 @@ pub fn route(
     let (buckets, slack) = resolve_tuning(graph, query)?;
     let am = resolve_modes(query)?;
 
-    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query), graph.raptor.walking_speed_mps);
-    let plans = match query.window_minutes {
+    let bike = crate::structures::BikeCost::new(
+        resolve_bike_profile(graph, query),
+        graph.raptor.walking_speed_mps,
+    );
+    let mut plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_tuned_rt_overnight_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am, &bike)
+            graph.raptor_range_tuned_rt_overnight_modes(
+                origin,
+                destination,
+                time,
+                window,
+                date,
+                weekday,
+                min_access,
+                &buckets,
+                slack,
+                rt,
+                &am,
+                &bike,
+                query.terminal_deadline,
+            )
         }
-        _ => graph.raptor_tuned_rt_overnight_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am, &bike),
+        _ => graph.raptor_tuned_rt_overnight_modes(
+            origin,
+            destination,
+            time,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            slack,
+            rt,
+            &am,
+            &bike,
+            query.terminal_deadline,
+        ),
     };
+
+    apply_edge_snap_bike(graph, query, origin, destination, &bike, &mut plans);
+    graph.enrich_street_legs(
+        &mut plans,
+        origin,
+        destination,
+        &bike,
+        query.terminal_deadline,
+    );
 
     if plans.is_empty() {
         return Err(async_graphql::Error::new("No plan found"));
@@ -147,14 +264,50 @@ pub fn route_explain(
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
-    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query), graph.raptor.walking_speed_mps);
-    let result = match query.window_minutes {
+    let bike = crate::structures::BikeCost::new(
+        resolve_bike_profile(graph, query),
+        graph.raptor.walking_speed_mps,
+    );
+    let mut result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
-            graph.raptor_range_explain_tuned_rt_modes(origin, destination, time, window, date, weekday, min_access, &buckets, slack, rt, &am, &bike)
+            graph.raptor_range_explain_tuned_rt_modes(
+                origin,
+                destination,
+                time,
+                window,
+                date,
+                weekday,
+                min_access,
+                &buckets,
+                slack,
+                rt,
+                &am,
+                &bike,
+            )
         }
-        _ => graph.raptor_explain_tuned_rt_modes(origin, destination, time, date, weekday, min_access, &buckets, slack, rt, &am, &bike),
+        _ => graph.raptor_explain_tuned_rt_modes(
+            origin,
+            destination,
+            time,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            slack,
+            rt,
+            &am,
+            &bike,
+        ),
     };
+
+    graph.enrich_street_legs(
+        &mut result.plans,
+        origin,
+        destination,
+        &bike,
+        query.terminal_deadline,
+    );
 
     Ok(result)
 }
@@ -168,7 +321,10 @@ mod tests {
         let mut g = Graph::new();
         g.add_node(NodeData::OsmNode(OsmNodeData {
             eid: "n1".to_string(),
-            lat_lng: LatLng { latitude: lat, longitude: lon },
+            lat_lng: LatLng {
+                latitude: lat,
+                longitude: lon,
+            },
         }));
         g.build_raptor_index();
         g
@@ -188,6 +344,7 @@ mod tests {
             reliability_bucket_edges: None,
             modes: None,
             bike_profile: None,
+            terminal_deadline: false,
         }
     }
 
@@ -234,5 +391,245 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    #[test]
+    fn direct_walk_plan_carries_multiobj_alternatives() {
+        use crate::structures::cost::VarGen;
+        use crate::structures::plan::PlanLeg;
+        use crate::structures::{
+            BikeAttrs, EdgeData, HighwayClass, LatLng, Mode, NodeData, OsmNodeData, StreetEdgeData,
+            Surface,
+        };
+        let mut g = Graph::new();
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng {
+                    latitude: lat,
+                    longitude: lon,
+                },
+            })
+        };
+        let a = g.add_node(mk("a", 50.000, 4.000));
+        let b = g.add_node(mk("b", 50.000, 4.0001));
+        let c = g.add_node(mk("c", 50.00001, 4.00005));
+        g.build_raptor_index();
+        g.raptor.set_bike_select_dplus(true);
+        g.set_distance_budget(f64::INFINITY);
+        g.set_multiobj_street(true);
+        let e = |o, d, len, s| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Residential;
+            at.surface = s;
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                partial: false,
+                length: len,
+                foot: true,
+                bike: true,
+                car: false,
+                attrs: at,
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        g.add_edge(a, e(a, b, 100, Surface::Unpaved));
+        g.add_edge(a, e(a, c, 90, Surface::Paved));
+        g.add_edge(c, e(c, b, 90, Surface::Paved));
+        let q = RouteQuery {
+            from_lat: 50.000,
+            from_lng: 4.000,
+            to_lat: 50.000,
+            to_lng: 4.0001,
+            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
+            time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+            window_minutes: None,
+            min_access_secs: None,
+            arrival_slack_secs: None,
+            reliability_bucket_edges: None,
+            modes: Some(vec![Mode::Walk]),
+            bike_profile: None,
+            terminal_deadline: false,
+        };
+        let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
+        let walk = plans
+            .iter()
+            .find(|p| p.mode == Mode::Walk)
+            .expect("a walk plan");
+        let PlanLeg::Walk(leg) = &walk.legs[0] else {
+            panic!()
+        };
+        assert!(
+            leg.alternatives.len() >= 2,
+            "direct walk plan carries multiobj alternatives"
+        );
+    }
+
+    // Phase B (done): bike street legs are enriched like walk legs — the multi-objective
+    // post-pass now runs for bike, so a direct bike plan surfaces route alternatives.
+    #[test]
+    fn direct_bike_plan_has_alternatives() {
+        use crate::structures::cost::VarGen;
+        use crate::structures::plan::PlanLeg;
+        use crate::structures::{
+            BikeAttrs, EdgeData, HighwayClass, LatLng, Mode, NodeData, OsmNodeData, StreetEdgeData,
+            Surface,
+        };
+        let mut g = Graph::new();
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng {
+                    latitude: lat,
+                    longitude: lon,
+                },
+            })
+        };
+        let a = g.add_node(mk("a", 50.000, 4.000));
+        let b = g.add_node(mk("b", 50.000, 4.0001));
+        let c = g.add_node(mk("c", 50.00001, 4.00005));
+        g.build_raptor_index();
+        g.raptor.set_bike_select_dplus(true);
+        g.set_distance_budget(f64::INFINITY);
+        g.set_multiobj_street(true);
+        let e = |o, d, len, elev: i16| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Residential;
+            at.surface = Surface::Paved;
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                partial: false,
+                length: len,
+                foot: true,
+                bike: true,
+                car: false,
+                attrs: at,
+                elev_delta: elev,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        // Climb trade-off (D+ is a bike front axis; Surface is display-only): the
+        // short direct edge climbs, the long flat detour avoids the climb. Both
+        // survive the 3-axis front as a faster-hillier vs flatter-slower pair.
+        g.add_edge(a, e(a, b, 100, 8));
+        g.add_edge(a, e(a, c, 400, 0));
+        g.add_edge(c, e(c, b, 400, 0));
+        let q = RouteQuery {
+            from_lat: 50.000,
+            from_lng: 4.000,
+            to_lat: 50.000,
+            to_lng: 4.0001,
+            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
+            time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+            window_minutes: None,
+            min_access_secs: None,
+            arrival_slack_secs: None,
+            reliability_bucket_edges: None,
+            modes: Some(vec![Mode::Bike]),
+            bike_profile: None,
+            terminal_deadline: false,
+        };
+        let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
+        let bike = plans
+            .iter()
+            .find(|p| p.mode == Mode::Bike)
+            .expect("a bike plan");
+        let PlanLeg::Walk(leg) = &bike.legs[0] else {
+            panic!("expected a walk leg in a bike plan")
+        };
+        assert!(
+            leg.alternatives.len() >= 2,
+            "bike legs are enriched with route alternatives (Phase B)"
+        );
+        assert_eq!(leg.street_mode, Mode::Bike, "stays a bike leg");
+    }
+
+    fn street(
+        g: &mut Graph,
+        o: NodeID,
+        d: NodeID,
+        len: usize,
+        foot: bool,
+        bike: bool,
+    ) {
+        use crate::structures::cost::VarGen;
+        use crate::structures::{BikeAttrs, EdgeData, StreetEdgeData};
+        g.add_edge(
+            o,
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                partial: false,
+                length: len,
+                foot,
+                bike,
+                car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            }),
+        );
+    }
+
+    fn osm(g: &mut Graph, id: &str, lat: f64, lon: f64) -> NodeID {
+        g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: id.into(),
+            lat_lng: LatLng {
+                latitude: lat,
+                longitude: lon,
+            },
+        }))
+    }
+
+    #[test]
+    fn bike_edge_endpoint_prefers_bike_edge_over_nearer_footway() {
+        // A foot-only edge sits closest to the query; a bike edge is a touch
+        // farther. Bike snapping must land on the bike edge, never the footway.
+        let mut g = Graph::new();
+        let fa = osm(&mut g, "fa", 50.0001, 4.000);
+        let fb = osm(&mut g, "fb", 50.0001, 4.006);
+        let ba = osm(&mut g, "ba", 49.9997, 4.000);
+        let bb = osm(&mut g, "bb", 49.9997, 4.006);
+        street(&mut g, fa, fb, 430, true, false);
+        street(&mut g, fb, fa, 430, true, false);
+        street(&mut g, ba, bb, 430, false, true);
+        street(&mut g, bb, ba, 430, false, true);
+        g.build_edge_index();
+
+        let ep = bike_edge_endpoint(&g, 50.0000, 4.003).expect("snaps to an edge");
+        let Endpoint::OnEdge { a, b, .. } = ep else {
+            panic!("expected OnEdge");
+        };
+        assert!(
+            (a == ba && b == bb) || (a == bb && b == ba),
+            "bike snap landed on the footway instead of the bike edge: {a:?},{b:?}"
+        );
+    }
+
+    #[test]
+    fn bike_edge_endpoint_falls_back_to_foot_when_no_bike_edge() {
+        // Only a foot-only edge is in range: a bike with no rideable edge nearby
+        // still snaps onto the footway (it will push from there).
+        let mut g = Graph::new();
+        let fa = osm(&mut g, "fa", 50.0001, 4.000);
+        let fb = osm(&mut g, "fb", 50.0001, 4.006);
+        street(&mut g, fa, fb, 430, true, false);
+        street(&mut g, fb, fa, 430, true, false);
+        g.build_edge_index();
+
+        let ep = bike_edge_endpoint(&g, 50.0000, 4.003).expect("falls back to footway");
+        let Endpoint::OnEdge { a, b, .. } = ep else {
+            panic!("expected OnEdge");
+        };
+        assert!(
+            (a == fa && b == fb) || (a == fb && b == fa),
+            "expected the footway as fallback: {a:?},{b:?}"
+        );
     }
 }

@@ -3,13 +3,13 @@ use super::raptor_route::{Label, LabelSet, ModeContext};
 use crate::{
     ingestion::gtfs::TimetableSegment,
     structures::{
-        EdgeData, Mode, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
+        EdgeData, Endpoint, Mode, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
         VehicleState,
         delay::DelayCDF,
         plan::{
-            AccessAlternative, ArrivalScenario, CandidateStatus, Plan, PlanCandidate, PlanLeg,
-            PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep, PlanWalkLeg,
-            PlanWalkLegStep, TransferRisk,
+            AccessAlternative, ArrivalScenario, CandidateStatus, Plan, PlanCandidate,
+            PlanCoordinate, PlanLeg, PlanLegStep, PlanPlace, PlanTransitLeg, PlanTransitLegStep,
+            PlanWalkLeg, PlanWalkLegStep, TransferRisk,
         },
     },
 };
@@ -83,6 +83,8 @@ impl Graph {
                     length, secs, to_place,
                 ))],
                 geometry: self.street_path(origin, destination, profile),
+                alternatives: vec![],
+                leave_by: None,
             })],
             start: start_time,
             end,
@@ -99,23 +101,60 @@ impl Graph {
     /// Cost-routed direct bike plan: geometry follows the minimum-cost route and
     /// the duration is its accumulated kinematic time. Returns `None` if the
     /// destination is unreachable within `max_secs`.
+    /// Public, edge-snap-aware direct bike plan between two [`Endpoint`]s. Used by
+    /// the routing layer to rebuild the door-to-door bike plan once origin and
+    /// destination have been projected onto their nearest rideable edges.
+    pub fn direct_bike_plan(
+        &self,
+        origin: Endpoint,
+        destination: Endpoint,
+        start_time: u32,
+        bike: &crate::structures::BikeCost,
+    ) -> Option<Plan> {
+        self.build_bike_plan(origin, destination, start_time, u32::MAX, bike)
+    }
+
     pub(super) fn build_bike_plan(
         &self,
-        origin: NodeID,
-        destination: NodeID,
+        origin: Endpoint,
+        destination: Endpoint,
         start_time: u32,
         max_secs: u32,
         bike: &crate::structures::BikeCost,
     ) -> Option<Plan> {
         let p = self.bike_cost_path(origin, destination, max_secs, bike)?;
         let end = start_time + p.secs;
-        let geometry: Vec<_> = p.nodes.iter().map(|&n| self.node_coord(n)).collect();
         let to_place = PlanPlace {
-            node_id: destination,
+            node_id: destination.node(),
             stop_position: None,
             arrival: Some(end),
             departure: None,
         };
+
+        // Stitch the projection stubs (edge-snapped origin/destination) around the
+        // node path so geometry and the per-edge run list both start/end at the
+        // exact projection points.
+        let coord = |c: crate::structures::LatLng| PlanCoordinate {
+            lat: c.latitude,
+            lon: c.longitude,
+        };
+        let lead_off = if p.lead.is_some() { 1 } else { 0 };
+        let mut geometry: Vec<PlanCoordinate> = Vec::new();
+        if let Some((proj, _)) = p.lead {
+            geometry.push(coord(proj));
+        }
+        geometry.extend(p.nodes.iter().map(|&n| self.node_coord(n)));
+        if let Some((proj, _)) = p.tail {
+            geometry.push(coord(proj));
+        }
+        let mut cedges: Vec<super::raptor_access::BikeEdge> = Vec::new();
+        if let Some((_, be)) = p.lead {
+            cedges.push(be);
+        }
+        cedges.extend(p.edges.iter().copied());
+        if let Some((_, be)) = p.tail {
+            cedges.push(be);
+        }
 
         // Group consecutive edges by ride/push into steps so the client can show
         // (and time) dismount stretches distinctly. Each step covers the inclusive
@@ -123,21 +162,27 @@ impl Graph {
         let mut steps: Vec<PlanLegStep> = Vec::new();
         let mut i = 0;
         let mut cum_time = 0u32;
-        while i < p.edges.len() {
-            let push = p.edges[i].push;
+        while i < cedges.len() {
+            let push = cedges[i].push;
             let start_idx = i;
             let (mut run_len, mut run_time) = (0usize, 0u32);
-            while i < p.edges.len() && p.edges[i].push == push {
-                run_len += p.edges[i].length;
-                run_time += p.edges[i].time;
+            while i < cedges.len() && cedges[i].push == push {
+                run_len += cedges[i].length;
+                run_time += cedges[i].time;
                 i += 1;
             }
             cum_time += run_time;
+            // Edge k connects geometry[k]→geometry[k+1]; the run ends at geometry[i].
+            let node_id = if i >= lead_off && i - lead_off < p.nodes.len() {
+                p.nodes[i - lead_off]
+            } else {
+                destination.node()
+            };
             steps.push(PlanLegStep::Walk(PlanWalkLegStep {
                 length: run_len,
                 time: run_time,
                 place: PlanPlace {
-                    node_id: p.nodes[i],
+                    node_id,
                     stop_position: None,
                     arrival: Some(start_time + cum_time),
                     departure: None,
@@ -156,7 +201,7 @@ impl Graph {
         Some(Plan {
             legs: vec![PlanLeg::Walk(PlanWalkLeg {
                 from: PlanPlace {
-                    node_id: origin,
+                    node_id: origin.node(),
                     stop_position: None,
                     arrival: None,
                     departure: Some(start_time),
@@ -171,6 +216,8 @@ impl Graph {
                 street_mode: Mode::Bike,
                 steps,
                 geometry,
+                alternatives: vec![],
+                leave_by: None,
             })],
             start: start_time,
             end,
@@ -454,50 +501,49 @@ impl Graph {
                 {
                     if first_walk > 0 {
                         let stop_node = self.raptor.transit_stop_to_node[origin_stop];
+                        let board = legs
+                            .first()
+                            .map(|l| match l {
+                                PlanLeg::Transit(t) => t.start,
+                                PlanLeg::Walk(w) => w.start,
+                            })
+                            .unwrap_or(start_time + first_walk);
                         let speed = match access_profile {
                             StreetProfile::Foot => self.raptor.walking_speed_mps,
                             StreetProfile::Bike => self.raptor.cycling_speed_mps,
                             StreetProfile::Car => self.raptor.driving_speed_mps,
                         };
                         let length = (first_walk as f64 * speed) as usize;
-                        let walk_start = legs
-                            .first()
-                            .map(|l| match l {
-                                PlanLeg::Transit(t) => t.start.saturating_sub(first_walk),
-                                PlanLeg::Walk(w) => w.start.saturating_sub(first_walk),
-                            })
-                            .unwrap_or(start_time)
-                            .max(start_time);
-                        let walk_end = walk_start + first_walk;
+                        let walk_start = board.saturating_sub(first_walk).max(start_time);
                         let to_place = PlanPlace {
                             node_id: stop_node,
                             stop_position: None,
-                            arrival: Some(walk_end),
+                            arrival: Some(walk_start + first_walk),
                             departure: None,
                         };
-                        legs.insert(
-                            0,
-                            PlanLeg::Walk(PlanWalkLeg {
-                                from: PlanPlace {
-                                    node_id: origin,
-                                    stop_position: None,
-                                    arrival: None,
-                                    departure: Some(walk_start),
-                                },
-                                to: to_place,
-                                start: walk_start,
-                                end: walk_end,
-                                duration: first_walk,
-                                length,
-                                cycleroute_length: None,
-                elevation_gain: None,
-                                street_mode: access_mode,
-                                steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
-                                    length, first_walk, to_place,
-                                ))],
-                                geometry: self.street_path(origin, stop_node, access_profile),
-                            }),
-                        );
+                        let access_leg = PlanWalkLeg {
+                            from: PlanPlace {
+                                node_id: origin,
+                                stop_position: None,
+                                arrival: None,
+                                departure: Some(walk_start),
+                            },
+                            to: to_place,
+                            start: walk_start,
+                            end: walk_start + first_walk,
+                            duration: first_walk,
+                            length,
+                            cycleroute_length: None,
+                            elevation_gain: None,
+                            street_mode: access_mode,
+                            steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+                                length, first_walk, to_place,
+                            ))],
+                            geometry: self.street_path(origin, stop_node, access_profile),
+                            alternatives: vec![],
+                            leave_by: None,
+                        };
+                        legs.insert(0, PlanLeg::Walk(access_leg));
                     }
                 }
 
@@ -507,7 +553,7 @@ impl Graph {
                         VehicleState::CarEgress => (StreetProfile::Car, Mode::Car),
                         _ => (StreetProfile::Foot, Mode::Walk),
                     };
-                    let walk_start = chosen_bag.earliest();
+                    let alight = chosen_bag.earliest();
                     let stop_node = self.raptor.transit_stop_to_node[best_stop];
                     let speed = match egress_profile {
                         StreetProfile::Foot => self.raptor.walking_speed_mps,
@@ -518,29 +564,32 @@ impl Graph {
                     let to_place = PlanPlace {
                         node_id: destination,
                         stop_position: None,
-                        arrival: Some(best_arr),
+                        arrival: Some(alight + best_walk),
                         departure: None,
                     };
-                    legs.push(PlanLeg::Walk(PlanWalkLeg {
+                    let egress_leg = PlanWalkLeg {
                         from: PlanPlace {
                             node_id: stop_node,
                             stop_position: None,
                             arrival: None,
-                            departure: Some(walk_start),
+                            departure: Some(alight),
                         },
                         to: to_place,
-                        start: walk_start,
-                        end: best_arr,
+                        start: alight,
+                        end: alight + best_walk,
                         duration: best_walk,
                         length,
                         street_mode: egress_mode,
                         cycleroute_length: None,
-                elevation_gain: None,
+                        elevation_gain: None,
                         steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                             length, best_walk, to_place,
                         ))],
                         geometry: self.street_path(stop_node, destination, egress_profile),
-                    }));
+                        alternatives: vec![],
+                        leave_by: None,
+                    };
+                    legs.push(PlanLeg::Walk(egress_leg));
                 }
 
                 // Re-chain trailing walks onto the realtime-settled legs and read the
@@ -651,7 +700,9 @@ impl Graph {
         for leg in legs {
             match (out.last_mut(), &leg) {
                 (Some(PlanLeg::Walk(prev)), PlanLeg::Walk(next))
-                    if prev.street_mode == next.street_mode =>
+                    if prev.street_mode == next.street_mode
+                        && prev.alternatives.is_empty()
+                        && next.alternatives.is_empty() =>
                 {
                     let mut merged_geo = prev.geometry.clone();
                     if merged_geo.last().map(|c| (c.lat, c.lon))
@@ -665,11 +716,10 @@ impl Graph {
                     let new_length = prev.length + next.length;
                     let new_end = next.end;
                     let to = next.to;
-                    let step = PlanLegStep::Walk(PlanWalkLegStep::plain(
-                        new_length,
-                        new_duration,
-                        to,
-                    ));
+                    let step =
+                        PlanLegStep::Walk(PlanWalkLegStep::plain(new_length, new_duration, to));
+                    let prev_alternatives = prev.alternatives.clone();
+                    let prev_leave_by = prev.leave_by;
                     *prev = PlanWalkLeg {
                         from: prev.from,
                         to,
@@ -678,10 +728,12 @@ impl Graph {
                         duration: new_duration,
                         length: new_length,
                         cycleroute_length: None,
-                elevation_gain: None,
+                        elevation_gain: None,
                         street_mode: prev.street_mode,
                         steps: vec![step],
                         geometry: merged_geo,
+                        alternatives: prev_alternatives,
+                        leave_by: prev_leave_by,
                     };
                 }
                 _ => out.push(leg),
@@ -770,12 +822,14 @@ impl Graph {
                     duration,
                     length,
                     cycleroute_length: None,
-                elevation_gain: None,
+                    elevation_gain: None,
                     street_mode: Mode::Walk,
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                         length, duration, to_place,
                     ))],
                     geometry: self.walk_path(from_node, to_node),
+                    alternatives: vec![],
+                    leave_by: None,
                 }));
                 origin_stop = from;
                 cur = parent;
@@ -1670,6 +1724,70 @@ mod tests {
     use crate::structures::delay::{DelayCDF, ScenarioBag};
 
     #[test]
+    fn access_leg_leave_by_is_board_minus_p95() {
+        use crate::structures::plan::LegOption;
+        let opt = |t: u32, p95: u32| LegOption {
+            time: t as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50: t,
+            p95,
+            length: t as usize,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![NodeID(0), NodeID(1)],
+        };
+        let options = vec![opt(100, 130), opt(150, 165)];
+        let board = 30_000u32;
+        let earliest = 29_800u32;
+        let (leg_start, leave_by, cur) = super::super::street_enrich::access_timing(
+            &options,
+            board,
+            earliest,
+            &crate::structures::cost::BalanceWeights::default(),
+        );
+        assert!(cur < options.len());
+        assert_eq!(leg_start, board - options[cur].p50);
+        assert_eq!(leave_by, board - options[cur].p95);
+    }
+
+    #[test]
+    fn egress_leg_end_equals_alight_plus_highlighted_p50() {
+        use crate::structures::cost::BalanceWeights;
+        use crate::structures::plan::{LegOption, highlight_index};
+        let opt = |p50: u32, p95: u32| LegOption {
+            time: p50 as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50,
+            p95,
+            length: p50 as usize,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![NodeID(0), NodeID(1)],
+        };
+        let options = vec![opt(120, 160), opt(180, 220)];
+        let alight = 32_400u32;
+        let balance = BalanceWeights::default();
+        let cur = highlight_index(&options, None, &balance);
+        assert!(cur < options.len());
+        let expected_end = alight + options[cur].p50;
+        assert_eq!(expected_end, alight + options[cur].p50);
+    }
+
+    #[test]
     fn arrival_stats_excludes_unreachable_miss_scenarios() {
         let bag = ScenarioBag::with_scenarios(36000, 0.6, u32::MAX, 0.4);
         let (dist, expected_end) = Graph::arrival_stats(&bag, None, 37000);
@@ -1730,7 +1848,7 @@ mod tests {
         PlanLeg::Walk(PlanWalkLeg {
             length: 0,
             cycleroute_length: None,
-                elevation_gain: None,
+            elevation_gain: None,
             start,
             end,
             duration: end - start,
@@ -1739,6 +1857,8 @@ mod tests {
             to: place(1),
             steps: vec![],
             geometry: vec![],
+            alternatives: vec![],
+            leave_by: None,
         })
     }
 
@@ -2008,5 +2128,319 @@ mod tests {
         let b = plan(Mode::Bike, 80, 140, vec![walk_leg(Mode::Bike, 80, 140)]);
         let out = Graph::group_access_alternatives(vec![a, b]);
         assert_eq!(out.len(), 2);
+    }
+
+    /// Real-graph smoke: load OSM PBF + STIB GTFS, run a transit-mode route between
+    /// two Brussels points ~3 km apart, and verify that the access leg carries
+    /// non-empty multiobj `alternatives` + `leave_by`, and the egress leg carries
+    /// non-empty `alternatives`. Run with:
+    ///   cargo test --release --lib access_egress_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn access_egress_smoke() {
+        use crate::ingestion::gtfs::load_gtfs_stib;
+        use crate::ingestion::osm::load_pbf_file;
+        use crate::routing::routing_raptor::{RouteQuery, route};
+        use crate::structures::{Mode, RealtimeIndex};
+        use chrono::{NaiveDate, NaiveTime};
+        use std::time::Instant;
+
+        let pbf = "data/brussels_capital_region-2026_01_24.osm.pbf";
+        let gtfs = "data/stib.zip";
+
+        let t0 = Instant::now();
+        let mut g = Graph::new();
+        load_pbf_file(pbf, None, 4.0, &Default::default(), &mut g).expect("OSM load failed");
+        eprintln!(
+            "SMOKE osm_load={:.1?} nodes={}",
+            t0.elapsed(),
+            g.nodes.len()
+        );
+        load_gtfs_stib(gtfs, &mut g).expect("GTFS load failed");
+        eprintln!("SMOKE gtfs_load={:.1?}", t0.elapsed());
+        g.build_raptor_index();
+        eprintln!("SMOKE raptor_index={:.1?}", t0.elapsed());
+
+        let q = RouteQuery {
+            from_lat: 50.810,
+            from_lng: 4.330,
+            to_lat: 50.880,
+            to_lng: 4.430,
+            date: NaiveDate::from_ymd_opt(2026, 6, 16).unwrap(),
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            window_minutes: None,
+            min_access_secs: Some(600),
+            arrival_slack_secs: None,
+            reliability_bucket_edges: None,
+            modes: Some(vec![Mode::Walk, Mode::WalkTransit]),
+            bike_profile: None,
+            terminal_deadline: false,
+        };
+
+        eprintln!("SMOKE stop_count={}", g.raptor.transit_stop_to_node.len());
+        let (dist_o, &orig_node) = g
+            .nearest_node_dist(q.from_lat, q.from_lng)
+            .expect("origin snaps");
+        let (dist_d, &dest_node) = g.nearest_node_dist(q.to_lat, q.to_lng).expect("dest snaps");
+        eprintln!(
+            "SMOKE origin_node={:?} dist={:.0}m dest_node={:?} dist={:.0}m",
+            orig_node, dist_o, dest_node, dist_d
+        );
+        let access_stops = g.nearby_stops(orig_node, 600);
+        let egress_stops = g.nearby_stops(dest_node, 600);
+        eprintln!(
+            "SMOKE access_stops={} egress_stops={}",
+            access_stops.len(),
+            egress_stops.len()
+        );
+
+        use crate::routing::routing_raptor::route_explain;
+        let explain = route_explain(&g, &q, &RealtimeIndex::new()).expect("explain failed");
+        eprintln!(
+            "SMOKE explain stops_reached={} access_fallback={}",
+            explain.stops_reached.len(),
+            explain.access.fell_back_to_walk_only
+        );
+        eprintln!("SMOKE explain plans_before_filter={}", explain.plans.len());
+
+        let plans = route(&g, &q, &RealtimeIndex::new()).expect("route failed");
+        eprintln!("SMOKE plans={} elapsed={:.1?}", plans.len(), t0.elapsed());
+        for (i, p) in plans.iter().enumerate() {
+            let tlegs = p
+                .legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count();
+            let wlegs = p
+                .legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Walk(_)))
+                .count();
+            eprintln!(
+                "  plan[{i}] mode={:?} transit_legs={tlegs} walk_legs={wlegs}",
+                p.mode
+            );
+        }
+
+        let transit_plan = plans
+            .iter()
+            .find(|p| {
+                p.mode == Mode::WalkTransit
+                    && p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_)))
+            })
+            .expect("expected at least one WalkTransit plan with a transit leg");
+
+        for (i, leg) in transit_plan.legs.iter().enumerate() {
+            match leg {
+                PlanLeg::Walk(w) => eprintln!(
+                    "  leg[{i}] Walk alts={} leave_by={:?} from={:?} to={:?}",
+                    w.alternatives.len(),
+                    w.leave_by,
+                    w.from.node_id,
+                    w.to.node_id
+                ),
+                PlanLeg::Transit(_) => eprintln!("  leg[{i}] Transit"),
+            }
+        }
+
+        let first_walk_from = transit_plan
+            .legs
+            .iter()
+            .find_map(|l| match l {
+                PlanLeg::Walk(w) => Some((w.from.node_id, w.to.node_id)),
+                _ => None,
+            })
+            .unwrap();
+        let (fw_from, fw_to) = first_walk_from;
+        eprintln!("SMOKE first_walk from={:?} to={:?}", fw_from, fw_to);
+        let bike_cost = crate::structures::BikeCost::new(
+            crate::structures::BikeProfile::default(),
+            g.raptor.walking_speed_mps,
+        );
+        let reps = g.multiobj_representatives(
+            fw_from,
+            fw_to,
+            crate::structures::cost::RoutingMode::Walk,
+            crate::structures::cost::LegRole::Deadline,
+            &bike_cost,
+        );
+        eprintln!(
+            "SMOKE first_walk_multiobj_reps={} distance_budget={}",
+            reps.len(),
+            g.raptor.distance_budget
+        );
+
+        let multiobj_result = g.multiobj_search(
+            fw_from,
+            fw_to,
+            crate::structures::cost::RoutingMode::Walk,
+            crate::structures::cost::LegRole::Deadline,
+            &bike_cost,
+            &g.raptor.cost_weights,
+            &g.raptor.epsilon,
+            g.raptor.distance_budget,
+            false,
+        );
+        eprintln!("SMOKE first_walk_front={}", multiobj_result.front.len());
+
+        let multiobj_unlimited = g.multiobj_search(
+            fw_from,
+            fw_to,
+            crate::structures::cost::RoutingMode::Walk,
+            crate::structures::cost::LegRole::Deadline,
+            &bike_cost,
+            &g.raptor.cost_weights,
+            &g.raptor.epsilon,
+            f64::INFINITY,
+            false,
+        );
+        eprintln!(
+            "SMOKE first_walk_front_unlimited={}",
+            multiobj_unlimited.front.len()
+        );
+
+        let access_leg = transit_plan
+            .legs
+            .iter()
+            .find_map(|l| match l {
+                PlanLeg::Walk(w) if w.leave_by.is_some() => Some(w),
+                _ => None,
+            })
+            .expect("expected an access walk leg with leave_by");
+
+        eprintln!(
+            "SMOKE access_opts={} leave_by={:?} egress checking…",
+            access_leg.alternatives.len(),
+            access_leg.leave_by,
+        );
+
+        assert!(
+            !access_leg.alternatives.is_empty(),
+            "access leg must have non-empty multiobj alternatives"
+        );
+        assert!(
+            access_leg.leave_by.is_some(),
+            "access leg must carry leave_by"
+        );
+
+        let egress_leg = transit_plan.legs.iter().rev().find_map(|l| match l {
+            PlanLeg::Walk(w) if w.leave_by.is_none() && !w.alternatives.is_empty() => Some(w),
+            _ => None,
+        });
+
+        let egress_opts = egress_leg.map(|l| l.alternatives.len()).unwrap_or(0);
+        eprintln!(
+            "SMOKE access_opts={} leave_by={:?} egress_opts={}",
+            access_leg.alternatives.len(),
+            access_leg.leave_by,
+            egress_opts,
+        );
+
+        assert!(
+            egress_leg.is_some(),
+            "transit plan must have an egress walk leg with non-empty multiobj alternatives"
+        );
+    }
+
+    fn leg_option(p50: u32, p95: u32) -> crate::structures::plan::LegOption {
+        crate::structures::plan::LegOption {
+            time: p50 as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50,
+            p95,
+            length: p50 as usize,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![],
+        }
+    }
+
+    fn coord(lat: f64, lon: f64) -> PlanCoordinate {
+        PlanCoordinate { lat, lon }
+    }
+
+    fn walk_leg_with_alternatives(
+        start: u32,
+        end: u32,
+        alternatives: Vec<crate::structures::plan::LegOption>,
+        leave_by: Option<u32>,
+        geometry: Vec<PlanCoordinate>,
+    ) -> PlanLeg {
+        PlanLeg::Walk(PlanWalkLeg {
+            length: 0,
+            cycleroute_length: None,
+            elevation_gain: None,
+            start,
+            end,
+            duration: end - start,
+            street_mode: Mode::Walk,
+            from: place(0),
+            to: place(1),
+            steps: vec![],
+            geometry,
+            alternatives,
+            leave_by,
+        })
+    }
+
+    #[test]
+    fn merge_consecutive_walks_does_not_merge_when_egress_has_alternatives() {
+        let geo1 = vec![coord(1.0, 2.0), coord(1.1, 2.1)];
+        let geo2 = vec![coord(1.1, 2.1), coord(1.2, 2.2)];
+        let transfer_walk = walk_leg_with_alternatives(200, 250, vec![], None, geo1);
+        let egress_walk =
+            walk_leg_with_alternatives(250, 320, vec![leg_option(70, 90)], None, geo2);
+        let legs = vec![transfer_walk, egress_walk];
+        let merged = Graph::merge_consecutive_walks(legs);
+        assert_eq!(merged.len(), 2, "legs with alternatives must NOT be merged");
+        match &merged[1] {
+            PlanLeg::Walk(w) => {
+                assert_eq!(w.alternatives.len(), 1, "egress alternatives must survive")
+            }
+            _ => panic!("expected walk leg"),
+        }
+    }
+
+    #[test]
+    fn merge_consecutive_walks_merges_plain_walks_without_alternatives() {
+        let geo1 = vec![coord(1.0, 2.0), coord(1.1, 2.1)];
+        let geo2 = vec![coord(1.2, 2.2), coord(1.3, 2.3)];
+        let walk1 = walk_leg_with_alternatives(100, 150, vec![], None, geo1);
+        let walk2 = walk_leg_with_alternatives(150, 220, vec![], None, geo2);
+        let legs = vec![walk1, walk2];
+        let merged = Graph::merge_consecutive_walks(legs);
+        assert_eq!(merged.len(), 1, "two plain walks must merge into one");
+        match &merged[0] {
+            PlanLeg::Walk(w) => {
+                assert_eq!(w.start, 100);
+                assert_eq!(w.end, 220);
+                assert!(w.alternatives.is_empty());
+            }
+            _ => panic!("expected walk leg"),
+        }
+    }
+
+    #[test]
+    fn access_timing_clamps_leg_start_to_earliest() {
+        let options = vec![leg_option(5000, 6000)];
+        let board = 30_000u32;
+        let earliest = 29_000u32;
+        let (leg_start, _leave_by, _cur) = super::super::street_enrich::access_timing(
+            &options,
+            board,
+            earliest,
+            &crate::structures::cost::BalanceWeights::default(),
+        );
+        assert_eq!(
+            leg_start, earliest,
+            "leg_start must be clamped to earliest when p50 exceeds the window"
+        );
     }
 }

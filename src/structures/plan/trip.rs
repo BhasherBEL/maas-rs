@@ -1,4 +1,3 @@
-
 use async_graphql::{ComplexObject, Context, Result, SimpleObject};
 
 use crate::{
@@ -18,9 +17,14 @@ pub struct PlanTrip {
 #[ComplexObject]
 impl PlanTrip {
     pub async fn route(&self, ctx: &Context<'_>) -> Result<Option<PlanRoute>> {
-        let graph = ctx.data::<crate::services::scheduler::SharedGraph>()?.load_full();
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
 
-        Ok(PlanRoute::from_route_id(graph.as_ref(), Some(self.route_id)))
+        Ok(PlanRoute::from_route_id(
+            graph.as_ref(),
+            Some(self.route_id),
+        ))
     }
 }
 

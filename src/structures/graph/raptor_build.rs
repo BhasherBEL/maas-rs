@@ -14,6 +14,7 @@ impl Graph {
         self.build_stop_transfers();
         self.build_reverse_transfers();
         self.raptor.build_runtime_indices();
+        self.build_edge_index();
     }
 
     fn build_compact_stop_index(&mut self) {
@@ -30,7 +31,8 @@ impl Graph {
                 self.raptor.transit_stop_ids.push(stop.id.clone());
                 let loc = node.loc();
                 let _ = self
-                    .raptor.transit_stops_tree
+                    .raptor
+                    .transit_stops_tree
                     .add([loc.latitude, loc.longitude], compact);
             }
         }
@@ -73,8 +75,8 @@ impl Graph {
         let mut reverse_map: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n_stops];
 
         for source in 0..n_stops {
-            let transfers =
-                self.raptor.transit_idx_stop_transfers[source].of(&self.raptor.transit_stop_transfers);
+            let transfers = self.raptor.transit_idx_stop_transfers[source]
+                .of(&self.raptor.transit_stop_transfers);
             for &(target_node, walk) in transfers {
                 let target = self.raptor.transit_node_to_stop[target_node.0];
                 if target != u32::MAX {
@@ -88,7 +90,9 @@ impl Graph {
 
         for pairs in &reverse_map {
             let start = self.raptor.transit_stop_reverse_transfers.len();
-            self.raptor.transit_stop_reverse_transfers.extend_from_slice(pairs);
+            self.raptor
+                .transit_stop_reverse_transfers
+                .extend_from_slice(pairs);
             self.raptor.transit_idx_stop_reverse_transfers.push(Lookup {
                 start,
                 len: pairs.len(),
@@ -111,7 +115,8 @@ impl Graph {
             let origin_osm = match self.nearest_node(loc.latitude, loc.longitude) {
                 Some(n) => n,
                 None => {
-                    self.raptor.transit_idx_stop_transfers
+                    self.raptor
+                        .transit_idx_stop_transfers
                         .push(Lookup { start, len: 0 });
                     continue;
                 }
@@ -120,7 +125,8 @@ impl Graph {
             let walk_times = self.walk_dijkstra(origin_osm, max_walk_secs);
 
             let nearby = self
-                .raptor.transit_stops_tree
+                .raptor
+                .transit_stops_tree
                 .within(
                     &[loc.latitude, loc.longitude],
                     meters_to_degrees(MAX_TRANSFER_DISTANCE_M),
@@ -134,7 +140,9 @@ impl Graph {
                 }
                 let neighbor_node = self.raptor.transit_stop_to_node[compact_neighbor];
                 if let Some(&walk_secs) = walk_times.get(&neighbor_node) {
-                    self.raptor.transit_stop_transfers.push((neighbor_node, walk_secs));
+                    self.raptor
+                        .transit_stop_transfers
+                        .push((neighbor_node, walk_secs));
                 }
             }
 

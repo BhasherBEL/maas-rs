@@ -76,8 +76,14 @@ mod tests {
 
     #[test]
     fn dist_method_matches_distance_fn() {
-        let a = LatLng { latitude: 50.85, longitude: 4.35 };
-        let b = LatLng { latitude: 52.37, longitude: 4.90 };
+        let a = LatLng {
+            latitude: 50.85,
+            longitude: 4.35,
+        };
+        let b = LatLng {
+            latitude: 52.37,
+            longitude: 4.90,
+        };
         let d1 = LatLng::distance(&[50.85, 4.35], &[52.37, 4.90]);
         let d2 = a.dist(b);
         assert!((d1 - d2).abs() < EPSILON);
@@ -85,7 +91,10 @@ mod tests {
 
     #[test]
     fn dist_same_point_is_zero() {
-        let loc = LatLng { latitude: 50.0, longitude: 4.0 };
+        let loc = LatLng {
+            latitude: 50.0,
+            longitude: 4.0,
+        };
         assert!(loc.dist(loc) < EPSILON);
     }
 
@@ -107,7 +116,10 @@ mod tests {
         let original = 500.0_f64;
         let sq = meters_to_degrees(original);
         let back = degrees_to_meters(sq, 0.0);
-        assert!((back - original).abs() < 1.0, "Roundtrip failed: {back} != {original}");
+        assert!(
+            (back - original).abs() < 1.0,
+            "Roundtrip failed: {back} != {original}"
+        );
     }
 
     #[test]
@@ -116,12 +128,18 @@ mod tests {
         let m_clamped = degrees_to_meters(1.0, 80.0);
         let m_at_min = degrees_to_meters(1.0, 60.0); // cos(60°) = 0.5, exactly at boundary
         // At lat=80° clamped to 0.5, result should equal lat=60°
-        assert!((m_clamped - m_at_min).abs() < 1.0, "{m_clamped} != {m_at_min}");
+        assert!(
+            (m_clamped - m_at_min).abs() < 1.0,
+            "{m_clamped} != {m_at_min}"
+        );
     }
 
     #[test]
     fn latlng_display_format() {
-        let loc = LatLng { latitude: 50.85, longitude: 4.35 };
+        let loc = LatLng {
+            latitude: 50.85,
+            longitude: 4.35,
+        };
         assert_eq!(format!("{loc}"), "50.85, 4.35");
     }
 }

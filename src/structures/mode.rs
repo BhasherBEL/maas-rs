@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 /// A user-selectable travel mode. Each `Plan` is labeled with the mode that
 /// produced it; the burden ordering is the only cross-mode comparison axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Enum, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Enum, Serialize, Deserialize,
+)]
 pub enum Mode {
     Walk,
     Bike,
@@ -108,7 +110,11 @@ impl ActiveModes {
             }
         }
 
-        ActiveModes { modes: deduped, state_idx, n_states }
+        ActiveModes {
+            modes: deduped,
+            state_idx,
+            n_states,
+        }
     }
 
     pub fn n_states(&self) -> usize {

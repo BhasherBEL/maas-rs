@@ -54,22 +54,26 @@ impl RateLimiter {
     fn acquire(&self) {
         let mut st = self.state.lock().unwrap();
         if st.throttled
-            && let Some(last) = st.last_request {
-                let elapsed = last.elapsed();
-                if elapsed < self.cfg.throttled_min_interval {
-                    let wait = self.cfg.throttled_min_interval - elapsed;
-                    drop(st);
-                    std::thread::sleep(wait);
-                    st = self.state.lock().unwrap();
-                }
+            && let Some(last) = st.last_request
+        {
+            let elapsed = last.elapsed();
+            if elapsed < self.cfg.throttled_min_interval {
+                let wait = self.cfg.throttled_min_interval - elapsed;
+                drop(st);
+                std::thread::sleep(wait);
+                st = self.state.lock().unwrap();
             }
+        }
         st.last_request = Some(Instant::now());
     }
 
     fn on_429(&self) {
         let mut st = self.state.lock().unwrap();
         st.consecutive_429 += 1;
-        tracing::warn!(consecutive = st.consecutive_429, "realtime: received HTTP 429");
+        tracing::warn!(
+            consecutive = st.consecutive_429,
+            "realtime: received HTTP 429"
+        );
         if !st.throttled && st.consecutive_429 >= self.cfg.consecutive_429_threshold {
             st.throttled = true;
             tracing::error!("realtime: repeated 429s; throttling all feeds");

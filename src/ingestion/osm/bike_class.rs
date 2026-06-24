@@ -3,11 +3,18 @@
 
 use osmpbf::{Relation, Way};
 
-use crate::structures::{BikeAttrs, HighwayClass, Surface};
+use crate::structures::{BikeAttrs, HighwayClass, Surface, SurfaceSpeedFactors};
 
 /// Looks up a tag value on a way.
 fn tag<'a>(w: &'a Way, key: &str) -> Option<&'a str> {
     w.tags().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// Per-edge bike speed factor (quantized to `u8`) for a way, from its raw OSM
+/// `surface=*` tag and the configured factor table. Non-directional, so both
+/// emitted directed edges share it.
+pub fn surface_speed(w: &Way, factors: &SurfaceSpeedFactors) -> u8 {
+    factors.quantize(tag(w, "surface"))
 }
 
 /// Pure predicate: do these relation tags describe a signposted cycle route?

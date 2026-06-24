@@ -7,7 +7,9 @@ use maas_rs::{
     logging,
     services::{
         build::{build_gtfs_phase, build_osm_phase, gtfs_input_labels},
-        persistence::{load_graph, load_osm_graph, save_graph, save_graph_with_rollback, save_osm_graph},
+        persistence::{
+            load_graph, load_osm_graph, save_graph, save_graph_with_rollback, save_osm_graph,
+        },
     },
     structures::Config,
     web::app,
@@ -71,11 +73,10 @@ async fn main() {
             }
         };
 
-        if save_mode
-            && let Err(e) = save_osm_graph(&osm_graph, &config.build.osm_output) {
-                tracing::error!("{e}");
-                return;
-            }
+        if save_mode && let Err(e) = save_osm_graph(&osm_graph, &config.build.osm_output) {
+            tracing::error!("{e}");
+            return;
+        }
 
         match build_gtfs_phase(osm_graph, &config.build, &cache_dir, false) {
             Some(g) => g,

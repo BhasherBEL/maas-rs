@@ -13,7 +13,10 @@ impl Graph {
         if self.raptor.railway_nodes.is_empty() {
             None
         } else {
-            Some((self.raptor.railway_nodes.clone(), self.raptor.railway_adj.clone()))
+            Some((
+                self.raptor.railway_nodes.clone(),
+                self.raptor.railway_adj.clone(),
+            ))
         }
     }
 }

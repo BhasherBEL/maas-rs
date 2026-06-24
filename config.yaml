@@ -28,6 +28,35 @@ build:
   output: graph.bin
   osm_output: osm.bin
   elevation: path:data/belgium-DTM-20m.tif
+  elevation_smoothing_epsilon: 4.0
+
+  # OSM surface=* -> bike cruise-speed factor (relative to asphalt = 1.0), baked
+  # per-edge at ingest. A SPEED factor only, separate from the Surface comfort
+  # axis. Unlisted or untagged surfaces use the unknown default (0.90). Re-tuning
+  # requires a graph rebuild (the factor is baked, like elevation smoothing).
+  surface_speed_factors:
+    asphalt: 1.00
+    concrete: 0.95
+    paved: 0.90
+    "concrete:plates": 0.85
+    metal: 0.85
+    wood: 0.85
+    paving_stones: 0.80
+    compacted: 0.80
+    fine_gravel: 0.80
+    grass_paver: 0.70
+    unpaved: 0.70
+    sett: 0.65
+    gravel: 0.60
+    pebblestone: 0.60
+    ground: 0.60
+    dirt: 0.60
+    earth: 0.60
+    cobblestone: 0.50
+    unhewn_cobblestone: 0.50
+    grass: 0.45
+    sand: 0.25
+    mud: 0.20
 
   delay_models:
     - mode: subway
@@ -42,6 +71,17 @@ build:
 log_level: info
 
 default_routing:
+  multiobj_street: true
+  # Max scalar leg length (m) to enrich with bike/car route alternatives. Alternatives
+  # come from a few fast corridor-bounded scalar searches, so this is a high safety net
+  # against pathological cross-country legs, not a perf cliff. Walk is never gated.
+  multiobj_street_max_len_m: 50000
+  # Secondary Time weight in a single-axis bike/car alternative ("champion") so a
+  # near-degenerate objective (e.g. flattest) still prefers the shorter equal route.
+  champion_time_tiebreak: 0.1
+  # ADGW limited-sharing threshold: drop a bike/car alternative sharing more than this
+  # fraction of its length with a higher-ranked one (0.6 = GraphHopper default).
+  alt_max_share_factor: 0.6
   max_window_minutes: 1440
   max_snap_distance_m: 10000
   cycling_speed_mps: 4.2
@@ -53,6 +93,7 @@ default_routing:
     ignore_cycleroutes: false
     stick_to_cycleroutes: true
     avoid_unsafe: true
+    respect_oneway: true   # forbid riding against a one-way (non-exempt contraflow); false = soft penalty only
     consider_elevation: true
     uphillcost: 0
     uphillcutoff: 1.5
@@ -62,10 +103,22 @@ default_routing:
     elevation_max_buffer: 10      # excess above this is force-charged at down/uphillcost per m
     elevation_buffer_reduce: 0    # slope-proportional buffer bleed (0 = drain only at the ceiling)
     total_mass: 90
-    max_speed: 45
-    s_c_x: 0.225
-    c_r: 0.01
-    biker_power: 100
+    max_speed: 36
+    s_c_x: 0.55
+    c_r: 0.006
+    biker_power: 70
+    # Speed-change physics: a cyclist loses time whenever forced off cruise speed —
+    # slowing for a tight corner, or stopping to dismount. The lost time is the time to
+    # brake to a target speed and re-accelerate back to cruise (re-accel from the power
+    # model; braking at brake_decel). The corner radius comes from geometry,
+    # r = min(L_prev, L_this)/θ, so the same angle is free over long edges (a sweep) but
+    # costly over short ones (a tight corner); v_corner = sqrt(lateral_accel·r), capped
+    # at cruise. A dismount run is one stop (decel→0) + one restart (accel→cruise).
+    brake_decel: 2.5          # braking deceleration (m/s²) for a corner slow-down or a stop
+    accel_rate: 1.0           # forward acceleration (m/s²) getting back to speed after a stop/corner
+    lateral_accel: 2.5        # comfortable cornering lateral accel (m/s²)
+    push_speed_mps: 0.9       # pushing a dismounted bike (m/s) — slower than free walking (1.2)
+    steps_push_speed_mps: 0.25 # hauling a bike up/down stairs (m/s) — slower still
   # Stochastic access/egress times. Walk/bike/drive times are log-normal: the
   # routed time is the median; access legs are planned at access_percentile to
   # buffer the connection, egress at the mean for an honest arrival estimate.
@@ -74,9 +127,76 @@ default_routing:
     sigma_alpha: 3.8          # spread scale; sigma = alpha / sqrt(seconds)
     sigma_floor: 0.12         # min spread (long trips never become over-confident)
     sigma_cap: 0.5            # max spread (very short trips)
+  # RCSP distance budget multiplier δ: explore paths up to (1+δ)×shortest distance.
+  # Tightened to 0.15: with the geometric length corridor this bounds the explored
+  # ellipse, keeping a 10 km bike Pareto search near ~2.8 s while still admitting the
+  # most-cycleway detour. Applies to all multi-objective street legs (bike + the
+  # short walk/drive access/egress legs).
+  distance_budget: 0.15
+  # Bike grid-bucketing cell size = k·D (D = origin→dest straight-line distance), on
+  # the CyclewayDeficit and Dplus diversity axes. Bounds the per-node Pareto frontier
+  # so the search stays fast on long legs while the cycleway/climb trade-off span is
+  # preserved cell-by-cell (a fixed grid keeps the axis extremes a coarse ε would
+  # absorb). 0 disables bucketing on that axis.
+  # Tightened 0.11 → 0.025: the elevation D+ axis is now correctly denoised (so the
+  # Dplus diversity dimension is near-flat in flat terrain) AND the signal/turn time
+  # penalty shifts the Time front, so the cycleway cell must be fine to keep distinct
+  # fast↔most-cycleway alternatives (else the front collapses). 0.025 ≈ 4 bike alts on
+  # a city leg (~2 s); 0.02 ≈ 5 (~2.8 s). Costs per-node frontier on long legs (gated).
+  bike_bucket_cyc_k: 0.025
+  bike_bucket_dpl_k: 0.013
+  # On-the-fly degree-2 contraction in the bike search. Cost-exact only without lossy
+  # pruning; it interacts with bucketing and can drop the cycleway extreme at tight
+  # budgets, so it is off. (~3.6× fewer labels but only ~30% wall-clock, as the
+  # per-edge cost dominates.) Kept for future work.
+  multiobj_contract: false
+  # Whether D+ (ascent) is a bike SELECTION axis. false (default): D+ is displayed but
+  # does not pick routes — the gradient power model already prices climbing into Time, so
+  # a separate min-D+ axis only manufactured absurd extremes (a ~1.5 km walk to shave a
+  # few m of ascent) and tripled search cost. A/B: push 1114→44 m, search 3–4× faster,
+  # diversity comparable. Set true to restore D+ as a third selection axis (e.g. hilly
+  # regions where flat-vs-climb is a genuine trade-off beyond time).
+  bike_select_dplus: false
+  # Per-axis ε-dominance: ε_i = a_i + b_i×value; unspecified axes keep defaults.
+  # epsilon:
+  #   time_a: 2.0            # absolute time slack (seconds)
+  #   time_b: 0.01           # relative time slack (fraction of value)
+  #   dplus_a: 3.0           # ascent slack (meters) — merge routes within ~3 m D+
+  #   surface_a: 10.0        # absolute surface slack (cost·m)
+  #   surface_b: 0.06        # relative surface slack (≈ routes within ~6% roughness)
+  # Time-variance model feeding the always-on Variance axis (and the post-hoc
+  # [p50,p95] bracket): signalized/uncontrolled crossings, elevators, bike turns,
+  # and (opt-in) stressful-road-class exposure.
+  # variance_model:
+  #   signal_sigma_major: 25.0
+  #   signal_sigma_secondary: 18.0
+  #   signal_sigma_minor: 12.0
+  #   elevator_sigma: 20.0
+  #   uncontrolled_sigma: 3.0
+  #   turn_sigma: 10.0          # σ seconds for a full reversal turn (bike only)
+  #   stress_var_per_m: 0.0     # seconds²/m on a stressful road class. OFF by default: as a
+  #                             # continuous, Time-decorrelated term it explodes the walk
+  #                             # Pareto front. Crossings/turns are the discrete primary signal.
+  #   # Expected (mean) delay folded into the Time/ETA objective by lights (the sigmas
+  #   # above only feed the spread). A signal's mean uniform-arrival delay
+  #   # ≈ red²/(2·cycle); ~30 s red on a ~90 s cycle ⇒ ~15 s major; secondary/minor
+  #   # roads have shorter reds/cycles ⇒ smaller means. The bike turn/corner mean is no
+  #   # longer here — it is the physical corner slow-down in bike_profile (brake_decel,
+  #   # lateral_accel), charged per-vertex from the edge geometry.
+  #   signal_delay_major: 15.0      # mean seconds lost at a signal on a major road
+  #   signal_delay_secondary: 10.0  # mean seconds lost at a signal on a secondary road
+  #   signal_delay_minor: 7.0       # mean seconds lost at a signal on a minor road
+  #   push_sigma: 8.0               # σ seconds of dismount-time uncertainty, once per push run (bike only)
+  # Surface roughness and comfort-stress multipliers for the multi-objective cost vector.
+  # Unspecified fields keep their compiled-in defaults.
+  # cost_weights:
+  #   surface_paved: 1.0       # multiplier on edge length for paved surfaces
+  #   surface_unknown: 1.3     # multiplier for unknown surface quality
+  #   surface_unpaved: 2.5     # multiplier for unpaved / gravel / dirt
+  #   comfort_stress_factor: 1.0  # multiplier on stressful-road length for Comfort axis
 
 server:
-  host: 192.168.0.211
+  host: 0.0.0.0
   port: 8000
 
 auto_update:

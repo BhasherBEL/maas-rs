@@ -3,7 +3,7 @@ use std::fmt;
 use chrono::Local;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{
-    fmt::{format, FmtContext, FormatEvent, FormatFields},
+    fmt::{FmtContext, FormatEvent, FormatFields, format},
     registry::LookupSpan,
 };
 
@@ -106,7 +106,13 @@ mod tests {
 
     #[test]
     fn test_level_style_label_padding() {
-        for level in [Level::TRACE, Level::DEBUG, Level::INFO, Level::WARN, Level::ERROR] {
+        for level in [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ] {
             let (_, label) = level_style(level);
             assert_eq!(label.len(), 5, "label for {level} must be 5 chars");
         }

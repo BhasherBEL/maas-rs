@@ -8,6 +8,7 @@ use crate::{
     structures::{
         BikeAttrs, EdgeData, Graph, LatLng, NodeData, NodeID, StreetEdgeData, TransitEdgeData,
         TransitStopData,
+        cost::VarGen,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -189,6 +190,8 @@ where
                 car: false,
                 attrs: BikeAttrs::road_default(),
                 elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
             }),
         );
         g.add_edge(
@@ -203,6 +206,8 @@ where
                 car: false,
                 attrs: BikeAttrs::road_default(),
                 elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
             }),
         );
     }
@@ -452,9 +457,10 @@ where
         }
         pattern_trip_data[pattern_id].push((global_trip_id, trip_stop_times));
         if pattern_shape_data[pattern_id].is_none()
-            && let Some(ref shape_id) = trip.shape_id {
-                pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));
-            }
+            && let Some(ref shape_id) = trip.shape_id
+        {
+            pattern_shape_data[pattern_id] = Some((shape_id.clone(), trip_shape_dists));
+        }
     }
 
     for pattern_id in 0..pattern_sequences.len() {
@@ -505,9 +511,10 @@ where
         let stop_coords: Vec<LatLng> = sequence
             .iter()
             .map(|&node_id| {
-                g.get_node(node_id)
-                    .map(|n| n.loc())
-                    .unwrap_or(LatLng { latitude: 0.0, longitude: 0.0 })
+                g.get_node(node_id).map(|n| n.loc()).unwrap_or(LatLng {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                })
             })
             .collect();
         let (shape_pts, stop_idx) =
@@ -572,8 +579,7 @@ fn compute_pattern_shape(
     pattern_shape_data: &[Option<(String, Vec<Option<f32>>)>],
     gtfs_shapes: &HashMap<String, Vec<gtfs_structures::Shape>>,
 ) -> (Vec<LatLng>, Vec<u32>) {
-    let Some((shape_id, stop_dists)) =
-        pattern_shape_data.get(pattern_id).and_then(|x| x.as_ref())
+    let Some((shape_id, stop_dists)) = pattern_shape_data.get(pattern_id).and_then(|x| x.as_ref())
     else {
         return (vec![], vec![]);
     };
@@ -590,8 +596,8 @@ fn compute_pattern_shape(
 
     let n_stops = stop_coords.len();
 
-    let has_dist = stop_dists.iter().any(|d| d.is_some())
-        && sorted.iter().all(|s| s.dist_traveled.is_some());
+    let has_dist =
+        stop_dists.iter().any(|d| d.is_some()) && sorted.iter().all(|s| s.dist_traveled.is_some());
 
     let stop_shape_indices: Vec<usize> = if has_dist {
         // Case A: use shape_dist_traveled
@@ -640,7 +646,10 @@ fn compute_pattern_shape(
 
     let all_pts: Vec<LatLng> = sorted[from_idx..=to_idx]
         .iter()
-        .map(|s| LatLng { latitude: s.latitude, longitude: s.longitude })
+        .map(|s| LatLng {
+            latitude: s.latitude,
+            longitude: s.longitude,
+        })
         .collect();
 
     let stop_idx: Vec<u32> = stop_shape_indices
@@ -698,7 +707,10 @@ mod tests {
     }
 
     fn dummy_coord(lat: f64, lon: f64) -> LatLng {
-        LatLng { latitude: lat, longitude: lon }
+        LatLng {
+            latitude: lat,
+            longitude: lon,
+        }
     }
 
     #[test]
@@ -737,13 +749,11 @@ mod tests {
         gtfs_shapes.insert("s1".to_string(), shape_pts);
 
         let stop_coords = vec![
-            dummy_coord(0.0, 0.0),       // near shape_pt[0] at (0.0, 0.0)
-            dummy_coord(0.04, 0.0),      // near shape_pt[4] at (0.04, 0.0)
+            dummy_coord(0.0, 0.0),  // near shape_pt[0] at (0.0, 0.0)
+            dummy_coord(0.04, 0.0), // near shape_pt[4] at (0.04, 0.0)
         ];
-        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![Some((
-            "s1".to_string(),
-            vec![None, None],
-        ))];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> =
+            vec![Some(("s1".to_string(), vec![None, None]))];
 
         let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
         assert_eq!(pts.len(), 5);
@@ -784,10 +794,8 @@ mod tests {
 
         let stop_coords = vec![dummy_coord(0.0, 0.0), dummy_coord(0.0, 0.0)];
         // stop 0 has dist 5.0 → index 5; stop 1 has dist 1.0 → index 1
-        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = vec![Some((
-            "s1".to_string(),
-            vec![Some(5.0), Some(1.0)],
-        ))];
+        let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> =
+            vec![Some(("s1".to_string(), vec![Some(5.0), Some(1.0)]))];
 
         let (pts, idx) = compute_pattern_shape(0, &stop_coords, &pattern_shape_data, &gtfs_shapes);
         assert!(pts.is_empty());
@@ -909,7 +917,7 @@ mod tests {
             removed_dates: vec![150],
         };
         assert!(!sp.is_active(150, MON)); // explicitly removed
-        assert!(sp.is_active(151, MON));  // adjacent date still active
+        assert!(sp.is_active(151, MON)); // adjacent date still active
     }
 
     #[test]

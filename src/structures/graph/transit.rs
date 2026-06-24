@@ -90,9 +90,9 @@ impl Graph {
         let mut stop_mode: Vec<Option<RouteType>> =
             vec![None; self.raptor.transit_stop_to_node.len()];
         for (pattern_idx, lookup) in self.raptor.transit_idx_pattern_stops.iter().enumerate() {
-            let route_type =
-                self.raptor.transit_routes[self.raptor.transit_patterns[pattern_idx].route.0 as usize]
-                    .route_type;
+            let route_type = self.raptor.transit_routes
+                [self.raptor.transit_patterns[pattern_idx].route.0 as usize]
+                .route_type;
             for &node_id in lookup.of(&self.raptor.transit_pattern_stops) {
                 let compact = self.raptor.transit_node_to_stop[node_id.0];
                 if compact != u32::MAX {
@@ -101,7 +101,8 @@ impl Graph {
             }
         }
 
-        self.raptor.transit_stop_to_node
+        self.raptor
+            .transit_stop_to_node
             .iter()
             .enumerate()
             .filter_map(|(stop_idx, &node_id)| match &self.nodes[node_id.0] {
@@ -110,10 +111,7 @@ impl Graph {
                     stop.name.clone(),
                     stop.lat_lng.latitude,
                     stop.lat_lng.longitude,
-                    display_route_type(
-                        stop_mode[stop_idx].unwrap_or(RouteType::Bus),
-                    )
-                    .to_string(),
+                    display_route_type(stop_mode[stop_idx].unwrap_or(RouteType::Bus)).to_string(),
                 )),
                 _ => None,
             })
@@ -125,15 +123,39 @@ impl Graph {
     /// Each route: (route_idx, short_name, long_name, mode_string, color_hex, text_color_hex)
     pub fn gtfs_agencies_with_routes(
         &self,
-    ) -> Vec<(usize, String, String, Vec<(usize, String, String, String, Option<String>, Option<String>)>)> {
-        let mut agency_routes: Vec<Vec<(usize, String, String, String, Option<String>, Option<String>)>> =
-            vec![vec![]; self.raptor.transit_agencies.len()];
+    ) -> Vec<(
+        usize,
+        String,
+        String,
+        Vec<(
+            usize,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )>,
+    )> {
+        let mut agency_routes: Vec<
+            Vec<(
+                usize,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            )>,
+        > = vec![vec![]; self.raptor.transit_agencies.len()];
 
         for (route_idx, route) in self.raptor.transit_routes.iter().enumerate() {
             let agency_idx = route.agency_id.0 as usize;
             if agency_idx < agency_routes.len() {
-                let color = route.route_color.map(|(r, g, b)| crate::structures::plan::rgb_to_hex(r, g, b));
-                let text_color = route.route_text_color.map(|(r, g, b)| crate::structures::plan::rgb_to_hex(r, g, b));
+                let color = route
+                    .route_color
+                    .map(|(r, g, b)| crate::structures::plan::rgb_to_hex(r, g, b));
+                let text_color = route
+                    .route_text_color
+                    .map(|(r, g, b)| crate::structures::plan::rgb_to_hex(r, g, b));
                 agency_routes[agency_idx].push((
                     route_idx,
                     route.route_short_name.clone(),
@@ -145,7 +167,8 @@ impl Graph {
             }
         }
 
-        self.raptor.transit_agencies
+        self.raptor
+            .transit_agencies
             .iter()
             .enumerate()
             .map(|(i, agency)| {
@@ -259,8 +282,7 @@ impl Graph {
         // Build the set of trip_ids already covered by the same-route timetable.
         let exclude_slice = &self.raptor.transit_departures
             [exclude_timetable.start..exclude_timetable.start + exclude_timetable.len];
-        let excluded_trips: HashSet<TripId> =
-            exclude_slice.iter().map(|s| s.trip_id).collect();
+        let excluded_trips: HashSet<TripId> = exclude_slice.iter().map(|s| s.trip_id).collect();
 
         let mut seen_trips: HashSet<TripId> = HashSet::new();
         let mut candidates: Vec<(TripId, u32, u32)> = Vec::new();
@@ -294,8 +316,7 @@ impl Graph {
             // Stop-time columns: layout is [stop_pos * n_trips + trip_idx].
             let boarding_col =
                 &all_times[boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
-            let alighting_col =
-                &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
+            let alighting_col = &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
 
             if after {
                 let start = boarding_col.partition_point(|st| st.departure < reference_time);
@@ -304,9 +325,9 @@ impl Graph {
                     if excluded_trips.contains(&trip_id) || seen_trips.contains(&trip_id) {
                         continue;
                     }
-                    let service_id =
-                        self.raptor.transit_trips[trip_id.0 as usize].service_id;
-                    if self.raptor.transit_services[service_id.0 as usize].is_active(date, weekday) {
+                    let service_id = self.raptor.transit_trips[trip_id.0 as usize].service_id;
+                    if self.raptor.transit_services[service_id.0 as usize].is_active(date, weekday)
+                    {
                         seen_trips.insert(trip_id);
                         candidates.push((
                             trip_id,
@@ -322,9 +343,9 @@ impl Graph {
                     if excluded_trips.contains(&trip_id) || seen_trips.contains(&trip_id) {
                         continue;
                     }
-                    let service_id =
-                        self.raptor.transit_trips[trip_id.0 as usize].service_id;
-                    if self.raptor.transit_services[service_id.0 as usize].is_active(date, weekday) {
+                    let service_id = self.raptor.transit_trips[trip_id.0 as usize].service_id;
+                    if self.raptor.transit_services[service_id.0 as usize].is_active(date, weekday)
+                    {
                         seen_trips.insert(trip_id);
                         candidates.push((
                             trip_id,
@@ -479,10 +500,9 @@ impl Graph {
             let trip_ids = self.raptor.transit_idx_pattern_trips[pattern_id.0 as usize]
                 .of(&self.raptor.transit_pattern_trips);
 
-            let boarding_col = &all_times
-                [boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
-            let alighting_col =
-                &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
+            let boarding_col =
+                &all_times[boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
+            let alighting_col = &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
 
             let start_t = boarding_col.partition_point(|st| st.departure < min_boarding);
 
@@ -491,14 +511,16 @@ impl Graph {
             let boarding_stop_node = pat_stops[boarding_pos as usize];
             let next_stop_node = pat_stops[boarding_pos as usize + 1];
             let route_id: RouteId = self.raptor.transit_patterns[pattern_id.0 as usize].route;
-            let ts = match self.edges[boarding_stop_node.0].iter().find_map(|e| match e {
-                EdgeData::Transit(te)
-                    if te.destination == next_stop_node && te.route_id == route_id =>
-                {
-                    Some(te.timetable_segment)
-                }
-                _ => None,
-            }) {
+            let ts = match self.edges[boarding_stop_node.0]
+                .iter()
+                .find_map(|e| match e {
+                    EdgeData::Transit(te)
+                        if te.destination == next_stop_node && te.route_id == route_id =>
+                    {
+                        Some(te.timetable_segment)
+                    }
+                    _ => None,
+                }) {
                 Some(ts) => ts,
                 None => continue,
             };
@@ -517,14 +539,13 @@ impl Graph {
                 }
 
                 let dep = boarding_col[t].departure;
-                let dep_abs_idx =
-                    match self.raptor.transit_departures[ts.start..ts.start + ts.len]
-                        .iter()
-                        .position(|seg| seg.trip_id == trip_id)
-                    {
-                        Some(i) => ts.start + i,
-                        None => continue,
-                    };
+                let dep_abs_idx = match self.raptor.transit_departures[ts.start..ts.start + ts.len]
+                    .iter()
+                    .position(|seg| seg.trip_id == trip_id)
+                {
+                    Some(i) => ts.start + i,
+                    None => continue,
+                };
 
                 if best.is_none_or(|(_, best_dep, _)| dep > best_dep) {
                     best = Some((dep_abs_idx, dep, arr));
@@ -548,7 +569,11 @@ impl Graph {
     pub fn get_pattern_shape(&self, p: usize) -> Option<(&[LatLng], &[u32])> {
         let pts = self.raptor.transit_pattern_shapes.get(p)?;
         let idx = self.raptor.transit_pattern_shape_stop_idx.get(p)?;
-        if pts.is_empty() { None } else { Some((pts, idx)) }
+        if pts.is_empty() {
+            None
+        } else {
+            Some((pts, idx))
+        }
     }
 
     /// Number of transit patterns currently in the graph.
@@ -577,7 +602,15 @@ mod outbound_reliability_tests {
 
     /// A bus-mode CDF: ~62% on time (delay ≤ 0), rising with slack.
     fn bus_cdf() -> DelayCDF {
-        DelayCDF { bins: vec![(-120, 0.10), (0, 0.62), (120, 0.80), (300, 0.95), (600, 1.00)] }
+        DelayCDF {
+            bins: vec![
+                (-120, 0.10),
+                (0, 0.62),
+                (120, 0.80),
+                (300, 0.95),
+                (600, 1.00),
+            ],
+        }
     }
 
     fn graph_with_bus_model() -> Graph {
@@ -603,12 +636,8 @@ mod outbound_reliability_tests {
         let g = graph_with_bus_model();
         // Original slack 60s, but the alternative arrives 600s later than planned
         // ⇒ effective margin −540s ⇒ essentially impossible to make the next leg.
-        let rel = g.outbound_reliability(
-            Some(RouteType::Bus),
-            Some(RouteType::Bus),
-            Some(60),
-            -600,
-        );
+        let rel =
+            g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), -600);
         assert!(rel < 0.05, "expected near-zero, got {rel}");
     }
 
@@ -620,7 +649,10 @@ mod outbound_reliability_tests {
         let base = g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 0);
         let earlier =
             g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 300);
-        assert!(earlier > base, "earlier ({earlier}) should beat base ({base})");
+        assert!(
+            earlier > base,
+            "earlier ({earlier}) should beat base ({base})"
+        );
     }
 
     #[test]

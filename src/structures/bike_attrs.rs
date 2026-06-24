@@ -63,7 +63,10 @@ impl BikeAttrs {
     }
 
     pub fn is_residential_or_living(&self) -> bool {
-        matches!(self.highway, HighwayClass::Residential | HighwayClass::LivingStreet)
+        matches!(
+            self.highway,
+            HighwayClass::Residential | HighwayClass::LivingStreet
+        )
     }
 
     /// A neutral default used by non-OSM-built test graphs (treated as a plain road).

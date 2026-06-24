@@ -70,13 +70,14 @@ header .head-btn.active { background: var(--accent-2); border-color: var(--accen
 header a.head-btn { text-decoration: none; }
 
 /* ── Layout ──────────────────────────────────────────────────── */
-.main { display: flex; flex: 1; overflow: hidden; }
+.main { display: flex; flex: 1; overflow: hidden; position: relative; }
 
 #sidebar {
-  width: 440px; flex-shrink: 0;
+  width: 520px; flex-shrink: 0;
   display: flex; flex-direction: column;
   border-right: 1px solid var(--border); background: var(--panel);
-  overflow: hidden;
+  overflow-y: auto;
+  transition: width 0.22s ease;
   /* ── Design system palette override (warm neutral) ── */
   --ds-bg:        oklch(0.978 0.004 95);
   --ds-surface:   #ffffff;
@@ -97,11 +98,19 @@ header a.head-btn { text-decoration: none; }
   --ds-rel-high-soft: oklch(0.95 0.04 152);
   --ds-rel-mid-soft:  oklch(0.955 0.05 88);
   --ds-rel-low-soft:  oklch(0.955 0.045 33);
+  --ds-stone:      oklch(0.55 0.018 75);
+  --ds-stone-soft: oklch(0.915 0.012 80);
   --ds-radius:    11px;
   --ds-radius-sm: 7px;
   --ds-shadow-sm: 0 1px 2px oklch(0.4 0.02 70 / 0.06), 0 1px 1px oklch(0.4 0.02 70 / 0.04);
   --ds-shadow-md: 0 2px 6px oklch(0.4 0.02 70 / 0.08), 0 8px 24px oklch(0.4 0.02 70 / 0.06);
 }
+
+#sidebar.collapsed { width: 0; border-right: none; overflow: hidden; }
+
+#sidebar-fold { display: inline-flex; align-items: center; justify-content: center; }
+#sidebar-fold svg { transition: transform 0.22s ease; }
+#sidebar-fold.collapsed svg { transform: rotate(180deg); }
 
 #map { flex: 1; min-width: 0; }
 @media (prefers-color-scheme: dark) {
@@ -249,7 +258,7 @@ header a.head-btn { text-decoration: none; }
 
 /* ── Plans panel ─────────────────────────────────────────────── */
 #plans-panel {
-  flex: 1; overflow-y: auto;
+  flex: 1; overflow-y: visible;
   background: var(--ds-bg);
   font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -267,6 +276,82 @@ header a.head-btn { text-decoration: none; }
 
 .status-msg { color: var(--fg-3); font-size: 13px; padding: 24px 14px; text-align: center; }
 .status-msg.error { color: var(--danger); }
+
+/* ── Per-leg route picker (Pareto alternatives) — reuses --ds-* tokens only ── */
+#plans-panel.rp-active .plans-list-head { display: none; }
+.rp { display: flex; flex-direction: column; }
+.rp-back { display: flex; align-items: center; gap: 6px; padding: 11px 2px; cursor: pointer;
+  color: var(--ds-ink-3); font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  border-bottom: 1px solid var(--ds-line-soft); }
+.rp-back b { color: var(--ds-ink); }
+.rp-head { padding: 13px 2px 8px; }
+.rp-head-row { display: flex; align-items: center; gap: 9px; margin-top: 7px; }
+.rp-icon { width: 30px; height: 30px; border-radius: 9px; background: var(--ds-accent-soft);
+  color: var(--ds-accent); display: flex; align-items: center; justify-content: center; flex: none; }
+.rp-title { font-size: 16px; font-weight: 700; letter-spacing: -.01em; color: var(--ds-ink); }
+.rp-count { margin-left: auto; font-size: 11px; font-weight: 700; color: var(--ds-ink-3);
+  background: var(--ds-surface-2); border: 1px solid var(--ds-line); border-radius: 999px; padding: 4px 10px; }
+.rp-grid { background: var(--ds-surface-2); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius); padding: 10px; margin-top: 4px; }
+.rp-ghead, .rp-row { display: grid;
+  grid-template-columns: minmax(108px, 1.5fr) repeat(var(--rp-cols, 3), 1fr);
+  column-gap: 7px; align-items: stretch; }
+.rp-ghead { padding-bottom: 8px; }
+.rp-gh { font-size: 9.5px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--ds-ink-3); display: flex; align-items: center; justify-content: center; gap: 3px;
+  cursor: pointer; user-select: none; border-radius: var(--ds-radius-sm); padding: 5px 2px;
+  transition: background .12s, color .12s; }
+.rp-gh.rp-name { justify-content: flex-start; padding-left: 6px; }
+.rp-gh:not(.rp-name):hover { background: var(--ds-surface); color: var(--ds-ink-2); }
+.rp-gh.on { color: var(--ds-accent); }
+.rp-gh .rp-mode { color: var(--ds-accent); }
+.rp-row { margin-bottom: 7px; cursor: pointer; }
+.rp-cellname { background: var(--ds-surface); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius); padding: 8px 11px; display: flex; flex-direction: column;
+  justify-content: center; gap: 4px; min-width: 0; transition: border-color .12s, box-shadow .12s; }
+.rp-row:hover .rp-cellname { border-color: var(--ds-accent); }
+.rp-row.sel .rp-cellname { border-color: var(--ds-accent); box-shadow: inset 0 0 0 1px var(--ds-accent); }
+.rp-nm { font-size: 13px; font-weight: 700; letter-spacing: -.01em; color: var(--ds-ink);
+  line-height: 1.18; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere; }
+.rp-row.sel .rp-nm::after { content: '✓'; color: var(--ds-accent); font-size: 11px; margin-left: 6px; }
+.rp-sub { font-size: 10px; color: var(--ds-ink-3); font-weight: 600; font-variant-numeric: tabular-nums; }
+.rp-tags { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 1px; }
+.rp-tag { font-size: 8.5px; font-weight: 800; letter-spacing: .02em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 999px; background: var(--ds-rel-high-soft); color: var(--ds-rel-high);
+  white-space: nowrap; }
+.rp-tag.all { background: var(--ds-accent-soft); color: var(--ds-accent); }
+.rp-cell { border-radius: var(--ds-radius); min-height: 50px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 1px; font-variant-numeric: tabular-nums;
+  font-size: 13.5px; font-weight: 700; }
+.rp-cell.best { box-shadow: inset 0 0 0 1.5px var(--ds-accent); }
+.rp-cell .rp-lead { font-size: 7.5px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; opacity: .9; color: var(--ds-accent); }
+.rp-rdots { display: inline-flex; gap: 3px; align-items: center; }
+.rp-rdot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .22; }
+.rp-rdot.on { opacity: 1; }
+.rp-vsub { font-size: 9px; font-weight: 700; opacity: .65; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.rp-more { display: flex; align-items: center; gap: 9px; padding: 5px 4px 6px; cursor: pointer; }
+.rp-more .rp-ln { flex: 1; height: 1px; background: var(--ds-line); }
+.rp-more .rp-tx { font-size: 10.5px; font-weight: 700; color: var(--ds-ink-3); white-space: nowrap; }
+.rp-band { font-size: 9px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ds-ink-4); padding: 4px 4px 7px; }
+.rp-legend { display: flex; align-items: center; gap: 13px; padding: 9px 2px 4px; font-size: 10px; color: var(--ds-ink-3); }
+.rp-legend .rp-k { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; }
+.rp-legend .rp-sw { width: 11px; height: 11px; border-radius: 3px; }
+.rp-foot { position: sticky; bottom: 0; background: var(--ds-bg); border-top: 1px solid var(--ds-line);
+  padding: 12px 2px; margin-top: 6px; display: flex; align-items: center; gap: 12px; }
+.rp-foot .rp-pk { flex: 1; min-width: 0; }
+.rp-foot .rp-pk .rp-k { font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; color: var(--ds-ink-4); }
+.rp-foot .rp-pk .rp-v { font-size: 13px; font-weight: 700; color: var(--ds-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rp-choose { border: 0; background: var(--ds-accent); color: #fff; font-weight: 700; font-size: 13.5px;
+  padding: 11px 18px; border-radius: 10px; white-space: nowrap; box-shadow: var(--ds-shadow-sm); transition: background .12s; }
+.rp-choose:hover { background: var(--ds-accent-deep); }
+.rp-choose.done { background: var(--ds-rel-high); box-shadow: none; }
+/* Entry-point affordances for a leg that has route alternatives.
+   (Ribbon walk segments reuse `.rib .s.clickable` from the itinerary styles.) */
+.leg-row-pick { cursor: pointer; border-radius: var(--ds-radius-sm); transition: background .12s; }
+.leg-row-pick:hover { background: var(--ds-surface-2); }
+.leg-routes-link { font-size: 11px; font-weight: 700; color: var(--ds-accent); white-space: nowrap; }
 
 /* ── Trip card ───────────────────────────────────────────────── */
 .card {
@@ -366,17 +451,22 @@ header a.head-btn { text-decoration: none; }
   background: none; border: none; cursor: pointer; padding: 9px 12px;
   font-size: 13px; font-weight: 700; color: var(--fg);
 }
-.mh-icons { font-size: 12px; opacity: 0.45; letter-spacing: 1px; }
-.mh-count { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--fg-2); }
-.mh-count b { color: var(--accent, #1a73e8); font-weight: 700; }
-.mh-chev { font-size: 12px; color: var(--fg-2); transition: transform .15s; }
+.mh-title { white-space: nowrap; }
+.mh-fams { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.mh-fam { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--fg-3);
+  transition: background .12s, border-color .12s, color .12s; }
+.mh-fam.on { background: var(--accent-2); border-color: var(--accent); color: var(--accent); }
+.mh-fam .fam-ic { font-size: 13px; line-height: 1; }
+.mh-fam b { font-family: var(--mono); font-size: 11px; font-weight: 700; }
+.mh-chev { font-size: 12px; color: var(--fg-2); transition: transform .15s; margin-left: 2px; }
 #modes-card.collapsed .mh-chev { transform: rotate(-180deg); }
 #modes-body { padding: 0 12px 12px; border-top: 1px solid var(--border); }
 #modes-card.collapsed #modes-body { display: none; }
 .modes-subhead { display: flex; align-items: center; margin: 10px 0 8px; }
-.msh-label { font-size: 10px; font-weight: 700; letter-spacing: .07em;
+.msh-label { margin-left: auto; font-size: 10px; font-weight: 700; letter-spacing: .07em;
   text-transform: uppercase; color: var(--fg-2); }
-.msh-actions { margin-left: auto; display: flex; gap: 6px; }
+.msh-actions { display: flex; gap: 6px; }
 .msh-actions button {
   font-size: 11px; font-weight: 600; color: var(--fg-2); cursor: pointer;
   background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px;
@@ -569,6 +659,154 @@ header a.head-btn { text-decoration: none; }
 .cf-k { font-weight: 700; color: var(--ds-ink-2); }
 .cf-mono { font-family: 'IBM Plex Mono', monospace; color: var(--ds-ink); font-weight: 600; }
 
+/* ════════════════════════════════════════════════════════════════
+   Plan detail — boxed-spine rework. Tokens alias the global --ds-*
+   palette so this block stays a verbatim port of the design handoff.
+   Classes: rc- (result card), rib (folded ribbon), it- (itinerary),
+   wsplit (walk+buffer), opx (operator wordmark).
+   ════════════════════════════════════════════════════════════════ */
+.pd-root {
+  --bg: var(--ds-bg); --surface: var(--ds-surface); --surface-2: var(--ds-surface-2); --surface-3: var(--ds-surface-3);
+  --line: var(--ds-line); --line-soft: var(--ds-line-soft);
+  --ink: var(--ds-ink); --ink-2: var(--ds-ink-2); --ink-3: var(--ds-ink-3); --ink-4: var(--ds-ink-4);
+  --accent: var(--ds-accent); --accent-deep: var(--ds-accent-deep); --accent-soft: var(--ds-accent-soft);
+  --rel-high: var(--ds-rel-high); --rel-mid: var(--ds-rel-mid); --rel-low: var(--ds-rel-low);
+  --rel-high-soft: var(--ds-rel-high-soft); --rel-mid-soft: var(--ds-rel-mid-soft); --rel-low-soft: var(--ds-rel-low-soft);
+  --radius: var(--ds-radius); --radius-sm: var(--ds-radius-sm);
+  --shadow-sm: var(--ds-shadow-sm); --shadow-md: var(--ds-shadow-md);
+  --sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+.pd-root .mono{ font-family: var(--mono); font-feature-settings:"tnum" 1; letter-spacing:-.01em; }
+
+/* ---- result card (collapsed / expanded) ---- */
+.rc { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+.rc.best { border-color: var(--accent); box-shadow: var(--shadow-sm); }
+.rc-head { display: flex; align-items: center; gap: 11px; padding: 13px 16px 11px; cursor: pointer; }
+.rc-times { display: flex; align-items: baseline; gap: 8px; }
+.rc-times .big { font-family: var(--mono); font-size: 22px; font-weight: 600; color: var(--ink); letter-spacing: -.01em; }
+.rc-times .ar { color: var(--ink-4); font-size: 14px; }
+.rc-tag { font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--accent-deep); }
+.rc-rel { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 13px; font-weight: 700; white-space: nowrap; }
+.rc-rel .bead { width: 8px; height: 8px; border-radius: 50%; }
+.rc-rel[data-rel="high"] { color: oklch(0.44 0.13 152); } .rc-rel[data-rel="high"] .bead { background: var(--rel-high); }
+.rc-rel[data-rel="mid"]  { color: oklch(0.5 0.12 64); }   .rc-rel[data-rel="mid"]  .bead { background: var(--rel-mid); }
+.rc-rel[data-rel="low"]  { color: oklch(0.5 0.17 33); }   .rc-rel[data-rel="low"]  .bead { background: var(--rel-low); }
+
+/* folded plan: where + when the first transit leaves */
+.rc-first { display: flex; align-items: center; gap: 8px; padding: 0 16px 11px; }
+.rc-first .ic { color: var(--fc); flex: none; }
+.rc-fbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 21px; height: 20px; padding: 0 6px; border-radius: 5px; font-family: var(--mono); font-size: 11.5px; font-weight: 700; line-height: 1; flex: none; }
+.rc-ftxt { font-size: 12px; color: var(--ink-2); }
+.rc-ftxt b { color: var(--ink); font-weight: 700; }
+.rc-ftime { margin-left: auto; font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--ink); }
+.rc-ftime .pre { font-family: var(--sans); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-4); margin-right: 4px; }
+
+.rc-ribbon { padding: 0 16px 13px; }
+.rc-expand { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px; border-top: 1px solid var(--line-soft); font-size: 11px; font-weight: 700; color: var(--accent-deep); cursor: pointer; letter-spacing: .02em; }
+.rc-expand .chev { font-size: 9px; transition: transform .15s; }
+.rc-expand.open .chev { transform: rotate(180deg); }
+
+/* ---- proportional ribbon (header summary) ---- */
+.rib { display: flex; align-items: stretch; gap: 3px; height: 38px; }
+.rib .s { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border-radius: 6px; min-width: 14px; overflow: hidden; line-height: 1.05; }
+.rib .s.transit { color: #fff; }
+.rib .s.transit .ln { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+.rib .s.transit .mn { font-family: var(--mono); font-size: 9.5px; font-weight: 600; opacity: .85; }
+.rib .s.walk { background: repeating-linear-gradient(135deg, var(--surface-3) 0 5px, var(--surface-2) 5px 10px); border: 1px solid var(--line); color: var(--ink-3); }
+.rib .s.walk .mn { font-family: var(--mono); font-size: 9.5px; font-weight: 600; }
+.rib .s.xf { background: var(--surface); border: 1.5px solid var(--line); position: relative; }
+.rib .s.xf .pc { font-family: var(--mono); font-size: 12px; font-weight: 700; }
+.rib .s.xf .wt { font-family: var(--mono); font-size: 8.5px; font-weight: 600; color: var(--ink-4); }
+.rib .s.xf[data-rel="high"] { border-color: color-mix(in oklab, var(--rel-high) 55%, var(--line)); }
+.rib .s.xf[data-rel="high"] .pc { color: oklch(0.44 0.13 152); }
+.rib .s.xf[data-rel="mid"]  { border-color: color-mix(in oklab, var(--rel-mid) 60%, var(--line)); }
+.rib .s.xf[data-rel="mid"] .pc { color: oklch(0.5 0.12 64); }
+.rib .s.xf::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; }
+.rib .s.xf[data-rel="high"]::after { background: var(--rel-high); }
+.rib .s.xf[data-rel="mid"]::after { background: var(--rel-mid); }
+.rib .s.clickable { cursor: pointer; transition: filter .12s, box-shadow .12s; }
+.rib .s.clickable:hover { filter: brightness(1.04); box-shadow: 0 0 0 2px var(--accent-soft); }
+.rib .s.hi { box-shadow: 0 0 0 2px var(--accent); }
+
+/* ---- the itinerary: white background, boxed-ride spine ---- */
+.it { border-top: 1px solid var(--line-soft); padding: 14px 16px 16px; background: var(--surface); }
+.it-live { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding: 8px 11px; border-radius: 9px; font-size: 11.5px; font-weight: 600; }
+.it-live.ontime { background: var(--rel-high-soft); color: oklch(0.42 0.13 152); }
+.it-live.late   { background: var(--rel-low-soft);  color: oklch(0.5 0.17 33); }
+.it-live .pulse { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.it-live.ontime .pulse { background: var(--rel-high); }
+.it-live.late .pulse { background: var(--rel-low); }
+.it-live b { font-weight: 700; white-space: nowrap; }
+
+.it-row { display: grid; grid-template-columns: 50px 22px 1fr; column-gap: 11px; }
+.it-t { padding-top: 10px; text-align: right; font-family: var(--mono); letter-spacing: -.02em; line-height: 1.15; }
+.it-t .s { font-size: 12.5px; font-weight: 700; color: var(--ink); }
+.it-t.ontime .s { color: oklch(0.46 0.13 152); }
+.it-t.late .s { color: var(--ink-4); font-weight: 500; text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.it-t.late .r { display: block; font-size: 12.5px; font-weight: 700; color: oklch(0.53 0.18 30); margin-top: 1px; }
+.it-t.dim .s { color: var(--ink-4); font-weight: 500; font-size: 11.5px; }
+
+.it-rail { position: relative; display: flex; justify-content: center; align-self: stretch; }
+.it-rail .ln { position: absolute; top: 0; bottom: 0; width: 4px; border-radius: 2px; background: var(--lc, var(--line)); }
+.it-rail .ln.half-down { top: 50%; }
+.it-rail .ln.half-up { bottom: 50%; }
+.it-rail .ln.dash { background: none; border-left: 3px dotted var(--ink-4); width: 0; }
+.it-rail .ln.dash.acc { border-color: var(--accent); }
+.it-rail .nd { position: relative; z-index: 2; margin-top: 12px; box-sizing: border-box; flex: none; border-radius: 50%; background: var(--surface); }
+.it-rail .nd.board { width: 15px; height: 15px; background: var(--lc); }
+.it-rail .nd.alight { width: 15px; height: 15px; border: 4px solid var(--lc); }
+.it-rail .nd.mid { width: 8px; height: 8px; margin-top: 6px; border: 2.5px solid var(--lc); }
+.it-rail .nd.origin { width: 14px; height: 14px; border: 3px solid var(--ink); }
+.it-rail .nd.arrive { width: 19px; height: 19px; margin-top: 10px; background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.it-rail .nd.arrive::after { content: ""; position: absolute; inset: 6px; border-radius: 50%; background: var(--surface); }
+
+.it-c { padding: 8px 0 6px; min-width: 0; }
+.it-place { font-size: 14px; font-weight: 700; color: var(--ink); letter-spacing: -.01em; }
+.it-place.arrive { font-size: 15.5px; }
+.it-role { font-size: 9px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-4); margin-left: 7px; }
+.it-role.arrive { color: var(--accent); }
+.it-mid { padding: 4px 0; }
+.it-midstop { font-size: 12.5px; color: var(--ink-3); font-weight: 500; padding: 3px 0; }
+
+.it-walk { display: flex; align-items: center; gap: 8px; padding: 9px 0; color: var(--ink-3); }
+.it-walk svg { flex: none; }
+.it-walk .m { font-size: 12.5px; font-weight: 650; color: var(--ink-2); }
+
+.it-veh { border: 1px solid var(--bd); background: var(--bg2); border-radius: 10px; padding: 9px 11px; margin-top: 6px; }
+.it-vehline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.it-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 23px; height: 22px; padding: 0 7px; border-radius: 6px; font-family: var(--mono); font-size: 12.5px; font-weight: 700; line-height: 1; flex: none; }
+.it-dir { font-size: 13px; font-weight: 600; color: var(--ink); display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.it-dir .ar { color: var(--ink-4); font-weight: 700; }
+.it-stops { margin-top: 8px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 11.5px; font-weight: 600; color: var(--ink-2); cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px 3px 11px; transition: .12s; }
+.it-stops:hover { border-color: oklch(0.86 0.01 70); }
+.it-stops .chev { font-size: 9px; color: var(--ink-4); transition: transform .15s; }
+.it-stops.open .chev { transform: rotate(180deg); }
+.it-stops .dur { color: var(--ink-4); }
+
+.it-xfer { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 3px 0; padding: 9px 11px; background: var(--surface); border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow-sm); }
+.it-xfer .ic { width: 20px; height: 20px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-deep); display: flex; align-items: center; justify-content: center; flex: none; }
+.it-xfer .t { font-size: 12px; font-weight: 700; color: var(--ink); }
+.it-xfer .w { font-size: 11.5px; color: var(--ink-3); font-weight: 600; }
+.it-xfer .w b { color: var(--ink); }
+
+.it-rel { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 12px; font-weight: 700; padding: 2px 8px 2px 7px; border-radius: 999px; white-space: nowrap; }
+.it-rel .bead { width: 7px; height: 7px; border-radius: 50%; }
+.it-rel[data-rel="high"] { background: var(--rel-high-soft); color: oklch(0.42 0.13 152); } .it-rel[data-rel="high"] .bead { background: var(--rel-high); }
+.it-rel[data-rel="mid"]  { background: var(--rel-mid-soft);  color: oklch(0.48 0.12 64); }  .it-rel[data-rel="mid"]  .bead { background: var(--rel-mid); }
+.it-rel[data-rel="low"]  { background: var(--rel-low-soft);  color: oklch(0.5 0.17 33); }    .it-rel[data-rel="low"]  .bead { background: var(--rel-low); }
+
+.opx { font-family: var(--mono); font-size: 9.5px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-4); }
+.mode-ic { flex: none; display: block; }
+
+.wsplit { margin-top: 7px; max-width: 250px; }
+.wsbar { display: flex; height: 9px; border-radius: 5px; overflow: hidden; gap: 2px; }
+.wsbar .walkp { background: var(--ink-3); border-radius: 5px 2px 2px 5px; }
+.wsbar .bufp { border-radius: 2px 5px 5px 2px; background: repeating-linear-gradient(135deg, var(--accent-soft) 0 4px, color-mix(in oklab, var(--accent) 28%, var(--accent-soft)) 4px 8px); }
+.wscap { margin-top: 6px; font-size: 11px; color: var(--ink-3); line-height: 1.4; }
+.wscap b { color: var(--ink); font-weight: 700; }
+.wscap .mg { color: var(--accent-deep); font-weight: 700; }
+
 /* ── Modal ───────────────────────────────────────────────────── */
 .modal-backdrop {
   display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
@@ -614,6 +852,8 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 
   .main { position: relative; }
   #sidebar { width: 100%; overflow-y: auto; }
+  #sidebar.collapsed { width: 100%; border-right: 1px solid var(--border); }
+  #sidebar-fold { display: none; }
   #map { position: absolute; inset: 0; z-index: 400; display: none; }
   .main.show-map #sidebar { display: none; }
   .main.show-map #map { display: block; }
@@ -635,6 +875,9 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
     <button data-view="list" class="active">List</button>
     <button data-view="map">Map</button>
   </div>
+  <button id="sidebar-fold" class="head-btn" title="Collapse sidebar" aria-label="Collapse sidebar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="width:13px;height:13px;display:block;"><polyline points="15 18 9 12 15 6"></polyline></svg>
+  </button>
   <button id="reverse-btn" class="head-btn" title="Swap origin and destination (R)">⇅ Reverse</button>
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
   <a href="/debug" class="head-btn" target="_blank">Debug ↗</a>
@@ -678,20 +921,19 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
         </div>
         <button class="now-btn" id="now-btn" title="Set to now (N)">Now</button>
       </div>
-      <div id="modes-card">
-        <button type="button" id="modes-head" aria-expanded="true">
-          <span class="mh-title">🚶 Travel modes</span>
-          <span class="mh-icons" aria-hidden="true">🚶 🚲 🚗</span>
-          <span class="mh-count"><b id="modes-count">2</b> of 9</span>
+      <div id="modes-card" class="collapsed">
+        <button type="button" id="modes-head" aria-expanded="false">
+          <span class="mh-title">Travel modes</span>
+          <span class="mh-fams" id="modes-fams" aria-hidden="true"></span>
           <span class="mh-chev" aria-hidden="true">▾</span>
         </button>
         <div id="modes-body">
           <div class="modes-subhead">
-            <span class="msh-label">Mix any combination</span>
             <span class="msh-actions">
               <button type="button" id="modes-all">All</button>
               <button type="button" id="modes-none">None</button>
             </span>
+            <span class="msh-label">Mix any combination</span>
           </div>
           <div id="modes-grid" role="group" aria-label="Travel modes"></div>
           <p class="modes-caption">Every valid pairing is a cell — striped cells aren’t possible (you can’t take a car onto the train).</p>
@@ -754,12 +996,12 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
         <span class="eyebrow">Results</span>
         <span class="eyebrow" id="plans-count"></span>
         <div id="group-toggle" role="group" aria-label="Group results by">
-          <button type="button" data-group="departure" class="active" title="Group plans by their first transit vehicle">Leaving at</button>
-          <button type="button" data-group="none" title="Flat list, no grouping">Ungrouped</button>
-          <button type="button" data-group="arrival" title="Group plans by their last transit vehicle">Arrival at</button>
+          <button type="button" data-group="departure" class="active" title="Group plans by their first transit vehicle">Leave by</button>
+          <button type="button" data-group="arrival" title="Group plans by their last transit vehicle">Arrive by</button>
+          <button type="button" data-group="none" title="Flat list, no grouping">Anytime</button>
         </div>
       </div>
-      <div id="plans-list">
+      <div id="plans-list" class="pd-root">
         <p class="status-msg">Set origin and destination above, or right-click the map.</p>
       </div>
     </div>
@@ -793,6 +1035,7 @@ const PLAN_FRAGMENT = `
       from { node { name lat lon } }
       to   { node { name lat lon } }
       geometry { lat lon }
+      alternatives { p50 p95 length elevationGain cyclerouteLength surface unpavedLength dismountLength dismountRuns { start end } geometry { lat lon } }
       steps {
         ... on PlanWalkLegStep {
           length time dismount geomStart geomEnd
@@ -883,9 +1126,11 @@ const state = {
   displayOrder: [],             // plan indices in current render order (for kbd nav)
   selectedIdx: -1,
   selectedLegIdxMap: new Map(), // planIdx -> leg index within that plan
+  openStops: new Set(),         // `${planIdx}:${legIdx}` of itinerary legs with in-between stops expanded
   legLayers: [],
   queryVars: null,              // routing inputs of the current result (for lazy alternatives)
   altCache: new Map(),          // `${planIdx}:${legIdx}` -> { prev:[], next:[], prevCount, nextCount, loading }
+  picker: null,                 // active per-leg route picker, or null (see openPicker)
 };
 
 // ── Stop search inputs ────────────────────────────────────────
@@ -957,6 +1202,13 @@ function loadFromUrl() {
     const wanted = new Set(p.get('modes').split(','));
     document.querySelectorAll('#modes-grid .mode-cell[data-mode]').forEach(b =>
       b.classList.toggle('active', wanted.has(b.dataset.mode)));
+    updateModeCount();
+  }
+  // Deep-link to open the travel-mode matrix on load. `?matrix=open` is a separate
+  // param from `?modes=` (the selected-mode CSV) so the two never collide.
+  if (p.get('matrix') === 'open') {
+    el('modes-card').classList.remove('collapsed');
+    el('modes-head').setAttribute('aria-expanded', 'true');
   }
   if (p.has('group')) setGrouping(p.get('group'), false);
   if (p.get('advanced') === '1') {
@@ -1022,8 +1274,25 @@ function selectedModes() {
   return [...document.querySelectorAll('#modes-grid .mode-cell.active')].map(b => b.dataset.mode);
 }
 
+// Collapsed-card summary: one glanceable family chip per vehicle row (walk/bike/
+// car) showing its icon and how many of its modes are selected.
+const MODE_FAMS = [
+  { glyph: '🚶', row: 'WALK', label: 'Walk' },
+  { glyph: '🚲', row: 'BIKE', label: 'Bike' },
+  { glyph: '🚗', row: 'CAR',  label: 'Car' },
+];
 function updateModeCount() {
-  el('modes-count').textContent = selectedModes().length;
+  const fams = el('modes-fams');
+  if (!fams) return;
+  fams.replaceChildren();
+  MODE_FAMS.forEach(({ glyph, row, label }) => {
+    const on = [...document.querySelectorAll('#modes-grid .mode-cell.active[data-row="' + row + '"]')].length;
+    const chip = mkEl('span', 'mh-fam' + (on ? ' on' : ''));
+    chip.title = label + (on ? ' · ' + on + ' selected' : ' · off');
+    chip.appendChild(mkEl('span', 'fam-ic', glyph));
+    if (on) chip.appendChild(mkEl('b', null, String(on)));
+    fams.appendChild(chip);
+  });
 }
 
 // Apply `target` (on/off) to a set of cells, then enforce the never-zero rule by
@@ -1112,6 +1381,14 @@ function reverseEndpoints() {
   if (fLat != null) setDestMarker(fLat, fLng);   else if (destMarker)   { map.removeLayer(destMarker);   destMarker   = null; }
   doSyncUrl();
 }
+el('sidebar-fold').addEventListener('click', () => {
+  const collapsed = el('sidebar').classList.toggle('collapsed');
+  el('sidebar-fold').classList.toggle('collapsed', collapsed);
+  el('sidebar-fold').title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+  el('sidebar-fold').setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+  setTimeout(() => map.invalidateSize(), 240);
+});
+
 el('reverse-btn').addEventListener('click', reverseEndpoints);
 el('swap-stops').addEventListener('click', reverseEndpoints);
 
@@ -1175,6 +1452,7 @@ async function runQuery() {
     state.plans = data.raptor || [];
     state.queryVars = vars;          // reused by lazy per-leg alternative fetches
     state.altCache.clear();
+    state.picker = null;
     state.selectedLegIdxMap.clear();
     if (state.selectedIdx >= state.plans.length) {
       state.selectedIdx = -1;
@@ -1368,6 +1646,59 @@ function mkClockIcon(s) {
   ], s || 12);
 }
 
+// ── Boxed-spine icons ─────────────────────────────────────────
+// Mode glyph as a small stroked SVG, tinted to the line colour.
+function mkModeIc(mode, size, color) {
+  const m = (mode || '').toUpperCase();
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', 'mode-ic');
+  svg.setAttribute('width', size); svg.setAttribute('height', size);
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', color || 'currentColor'); svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+  const add = (tag, attrs) => { const e = document.createElementNS(ns, tag); Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v)); svg.appendChild(e); };
+  if (m === 'TRAM' || m === 'TRAMWAY') {
+    add('path', { d: 'M12 2.5l-3 1.5h6z' }); add('rect', { x: 5, y: 4, width: 14, height: 13, rx: 3.2 });
+    add('path', { d: 'M5 11h14' }); add('path', { d: 'M8 17l-2 4.5M16 17l2 4.5' });
+  } else if (m === 'RAIL' || m === 'METRO' || m === 'SUBWAY') {
+    add('rect', { x: 5, y: 3, width: 14, height: 14, rx: 3 }); add('path', { d: 'M5 11h14' });
+    add('path', { d: 'M8 21l2-4M16 21l-2-4' }); add('circle', { cx: 8.5, cy: 14, r: 1 }); add('circle', { cx: 15.5, cy: 14, r: 1 });
+  } else { // Bus (default)
+    add('rect', { x: 4, y: 4, width: 16, height: 13, rx: 3 }); add('path', { d: 'M4 11h16' });
+    add('circle', { cx: 8.5, cy: 20, r: 1.4 }); add('circle', { cx: 15.5, cy: 20, r: 1.4 });
+  }
+  return svg;
+}
+function mkSwapIcon(s) {
+  return mkSvgIcon([['path', { d: 'M4 8h13l-3-3M20 16H7l3 3' }]], s || 12);
+}
+function mkChev() { return mkEl('span', 'chev', '▾'); }
+
+// Realtime-aware time descriptor → {s, real?, rt}. rt: 'ontime' | 'late' | 'plain' | 'dim'.
+function rtTime(schedSecs, actualSecs, realtime) {
+  if (schedSecs == null && actualSecs == null) return null;
+  if (!realtime) return { s: fmtTime(actualSecs ?? schedSecs), rt: 'plain' };
+  if (schedSecs != null && actualSecs != null && actualSecs - schedSecs >= 60)
+    return { s: fmtTime(schedSecs), real: fmtTime(actualSecs), rt: 'late' };
+  return { s: fmtTime(actualSecs ?? schedSecs), rt: 'ontime' };
+}
+// Render an .it-t time cell from an rtTime() descriptor.
+function mkTimeCell(t) {
+  const w = mkEl('div', 'it-t');
+  if (!t) return w;
+  if (t.rt === 'late') {
+    w.classList.add('late');
+    w.appendChild(mkEl('span', 's', t.s));
+    w.appendChild(mkEl('span', 'r', t.real));
+    return w;
+  }
+  if (t.rt === 'ontime') w.classList.add('ontime');
+  else if (t.rt === 'dim') w.classList.add('dim');
+  w.appendChild(mkEl('span', 's', t.s));
+  return w;
+}
+
 function planTag(plans, plan) {
   const dur  = p => p.end - p.start;
   const rel  = p => planReliability(p);
@@ -1418,80 +1749,131 @@ function buildPlanSegs(plan) {
   return out;
 }
 
-// ── Ribbon renderer ───────────────────────────────────────────
+// ── Ribbon renderer (folded summary, proportional flex) ───────
 function renderRibbon(plan, openLeg, onLeg) {
-  const segs     = buildPlanSegs(plan);
-  const totalMin = (plan.end - plan.start) / 60;
+  const segs = buildPlanSegs(plan);
+  const rib  = mkEl('div', 'rib');
 
-  function basisOf(s) {
-    if (s.type === 'transfer') return Math.max((s.totalMins / totalMin) * 100, 13) + '%';
-    return Math.max((s.mins / totalMin) * 100, s.type === 'walk' ? 6 : 7) + '%';
-  }
-
-  const track = mkEl('div', 'rb-track');
   segs.forEach(s => {
     if (s.type === 'walk') {
       const isBike = s.leg.streetMode === 'BIKE';
       const isCar  = s.leg.streetMode === 'CAR';
-      const seg = mkEl('div', 'rb-seg rb-walk');
-      if (isBike) seg.style.background = '#2e7d32';
-      else if (isCar) seg.style.background = '#1565c0';
-      seg.style.flexBasis = basisOf(s);
-      if (isBike) seg.appendChild(mkEl('span', 'rb-min light', '🚲' + (s.mins >= 4 ? s.mins + '′' : '')));
-      else if (isCar) seg.appendChild(mkEl('span', 'rb-min light', '🚗' + (s.mins >= 4 ? s.mins + '′' : '')));
-      else if (s.mins >= 4) seg.appendChild(mkEl('span', 'rb-min', s.mins + '′'));
-      track.appendChild(seg);
+      const hasAlts = s.leg.alternatives?.length >= 2;
+      const d = mkEl('div', 's walk' + (onLeg && hasAlts ? ' clickable' : ''));
+      d.style.flex = s.mins + ' 1 0';
+      d.style.minWidth = (s.mins >= 10 ? 34 : 22) + 'px';
+      if (isBike)     { d.style.background = '#2e7d32'; d.style.borderColor = '#2e7d32'; }
+      else if (isCar) { d.style.background = '#1565c0'; d.style.borderColor = '#1565c0'; }
+      const glyph = isBike ? '🚲' : isCar ? '🚗' : '';
+      if (glyph) {
+        const mn = mkEl('span', 'mn', glyph + (s.mins >= 4 ? s.mins + '′' : ''));
+        mn.style.color = '#fff';
+        d.appendChild(mn);
+      } else if (s.mins >= 8) {
+        d.appendChild(mkEl('span', 'mn', s.mins + '′'));
+      }
+      if (onLeg && hasAlts) {
+        d.title = s.leg.alternatives.length + ' route options — click to compare';
+        d.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
+      }
+      rib.appendChild(d);
       return;
     }
     if (s.type === 'transfer') {
       const r = s.leg.transferRisk?.reliability;
-      const rc = r != null ? relClass(r) : tightClass(s.marginSecs);
-      const div = mkEl('div', 'rb-transfer rel-' + rc + (s.leg.transferRisk ? ' clickable' : '') +
-        (openLeg === s.leg ? ' hi' : ''));
-      div.style.flexBasis = basisOf(s);
-      div.title = `${s.walkDist} m walk (${s.walkMins}′) · ${s.totalMins}′ to make the connection`;
-      if (onLeg) div.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
-      if (s.walkMins >= 3) {
-        const xw = mkEl('span', 'rb-xw');
-        xw.appendChild(mkWalkIcon(12));
-        xw.appendChild(document.createTextNode(s.walkDist + ' m '));
-        xw.appendChild(mkEl('em', null, '(' + s.walkMins + '′)'));
-        div.appendChild(xw);
-      }
-      const xt = mkEl('span', 'rb-xt');
-      if (r != null) {
-        xt.appendChild(mkEl('b', 'rb-rel', relPct(r)));
-        if (s.totalMins >= 9) xt.appendChild(mkEl('span', 'rb-waitm', s.totalMins + '′ wait'));
-      } else {
-        xt.appendChild(mkClockIcon(12));
-        xt.appendChild(document.createTextNode(s.totalMins + '′'));
-      }
-      div.appendChild(xt);
-      track.appendChild(div);
+      const d = mkEl('div', 's xf' + (s.leg.transferRisk ? ' clickable' : '') + (openLeg === s.leg ? ' hi' : ''));
+      if (r != null) d.dataset.rel = relClass(r);
+      d.style.flex = '8 1 0';
+      d.style.minWidth = '56px';
+      d.title = `${s.walkDist} m walk (${s.walkMins}′) · ${s.totalMins}′ to make the connection`;
+      if (onLeg) d.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
+      d.appendChild(mkEl('span', 'pc', r != null ? relPct(r) : s.totalMins + '′'));
+      if (s.totalMins >= 4) d.appendChild(mkEl('span', 'wt', s.totalMins + '′ wait'));
+      rib.appendChild(d);
       return;
     }
-    if (s.type === 'transit') {
-      const route = s.leg.trip?.route;
-      const { bg, fg } = routeColors(route);
-      const seg = mkEl('div', 'rb-seg rb-transit clickable' + (openLeg === s.leg ? ' hi' : ''));
-      seg.style.flexBasis = basisOf(s);
-      seg.style.background = bg;
-      if (onLeg) seg.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
-      seg.appendChild(mkEl('span', 'rb-line', route?.shortName || route?.mode || '?'));
-      if (s.mins >= 10) seg.appendChild(mkEl('span', 'rb-min light', s.mins + '′'));
-      track.appendChild(seg);
-    }
+    // transit
+    const route = s.leg.trip?.route;
+    const { bg, fg } = routeColors(route);
+    const d = mkEl('div', 's transit clickable' + (openLeg === s.leg ? ' hi' : ''));
+    d.style.flex = s.mins + ' 1 0';
+    d.style.minWidth = '30px';
+    d.style.background = bg;
+    d.style.color = fg;
+    if (onLeg) d.addEventListener('click', e => { e.stopPropagation(); onLeg(e, s.leg); });
+    d.appendChild(mkEl('span', 'ln', route?.shortName || route?.mode || '?'));
+    if (s.mins >= 12) d.appendChild(mkEl('span', 'mn', s.mins + '′'));
+    rib.appendChild(d);
   });
 
-  const rb = mkEl('div', 'rb');
-  rb.appendChild(track);
-  return rb;
+  return rib;
 }
 
-// ── Leg list (expanded timeline) ──────────────────────────────
-function renderLegList(plan) {
-  const legs   = plan.legs;
-  const legsEl = mkEl('div', 'legs');
+// ── Itinerary (boxed-spine timeline) ──────────────────────────
+// The median-walk + safety-buffer split shown under the first foot leg.
+function mkWalkSplit(leaveT, walkMed, buffer) {
+  const w   = mkEl('div', 'wsplit');
+  const bar = mkEl('div', 'wsbar');
+  const wp  = mkEl('span', 'walkp'); wp.style.flex = String(Math.max(walkMed, 1));
+  bar.appendChild(wp);
+  if (buffer > 0) {
+    const bp = mkEl('span', 'bufp'); bp.style.flex = String(buffer);
+    bar.appendChild(bp);
+  }
+  w.appendChild(bar);
+  const cap = mkEl('div', 'wscap');
+  cap.appendChild(mkEl('b', null, 'Leave ' + leaveT));
+  cap.appendChild(document.createTextNode(' · ' + walkMed + ' min walk'));
+  if (buffer > 0) {
+    cap.appendChild(document.createTextNode(' '));
+    cap.appendChild(mkEl('span', 'mg', '+ ' + buffer + ' min buffer'));
+  }
+  w.appendChild(cap);
+  return w;
+}
+
+// First boarded transit leg → folded "where + when the first ride leaves".
+function firstTransitOf(plan) {
+  const leg = plan.legs.find(l => l.__typename === 'PlanTransitLeg');
+  if (!leg) return null;
+  const route = leg.trip?.route;
+  return { route, line: route?.shortName || route?.mode || '?', stop: leg.from?.node?.name || '—', time: leg.start };
+}
+
+function buildItinerary(plan, idx, onLeg) {
+  const it   = mkEl('div', 'it');
+  const legs = plan.legs;
+
+  // Live banner — only when some transit leg carries realtime.
+  const rtTransit = legs.filter(l => l.__typename === 'PlanTransitLeg' && l.realtime);
+  if (rtTransit.length) {
+    const lastRt   = rtTransit[rtTransit.length - 1];
+    const lateSecs = Math.max(0, (lastRt.end ?? 0) - (lastRt.scheduledEnd ?? lastRt.end ?? 0));
+    if (lateSecs >= 60) {
+      const b = mkEl('div', 'it-live late');
+      b.appendChild(mkEl('span', 'pulse'));
+      b.appendChild(document.createTextNode('Running '));
+      b.appendChild(mkEl('b', null, Math.round(lateSecs / 60) + ' min late'));
+      b.appendChild(document.createTextNode(' · now arriving '));
+      b.appendChild(mkEl('b', null, fmtTime(plan.end)));
+      it.appendChild(b);
+    } else {
+      const b = mkEl('div', 'it-live ontime');
+      b.appendChild(mkEl('span', 'pulse'));
+      b.appendChild(document.createTextNode('Live · on schedule'));
+      it.appendChild(b);
+    }
+  }
+
+  // Lateness carried to the final arrival (from the last transit leg).
+  const lastTransit  = [...legs].reverse().find(l => l.__typename === 'PlanTransitLeg');
+  const arrLateSecs  = lastTransit && lastTransit.realtime
+    ? Math.max(0, (lastTransit.end ?? 0) - (lastTransit.scheduledEnd ?? lastTransit.end ?? 0)) : 0;
+
+  const originName = (typeof fromSearch !== 'undefined' && fromSearch.getName && fromSearch.getName())
+    || legs[0]?.from?.node?.name || 'Start';
+  const destName = (typeof toSearch !== 'undefined' && toSearch.getName && toSearch.getName())
+    || legs[legs.length - 1]?.to?.node?.name || 'Destination';
 
   legs.forEach((leg, i) => {
     const isLast    = i === legs.length - 1;
@@ -1500,118 +1882,194 @@ function renderLegList(plan) {
 
     if (isWalk) {
       const prev = legs[i - 1], next = legs[i + 1];
+      // a walk between two transit legs is the transfer of the next transit leg
       if (prev?.__typename === 'PlanTransitLeg' && next?.__typename === 'PlanTransitLeg') return;
-      const row  = mkEl('div', 'leg-row');
-      row.appendChild(mkEl('div', 'leg-time-col', fmtTime(leg.start)));
-      const rail = mkEl('div', 'leg-rail');
-      const dot  = mkEl('span', 'leg-dot'); dot.style.background = 'var(--ds-ink-4)';
-      rail.appendChild(dot);
-      if (!isLast) rail.appendChild(mkEl('span', 'leg-line-v'));
-      row.appendChild(rail);
-      const body = mkEl('div', 'leg-body');
-      const main = mkEl('div', 'leg-main');
-      const desc = mkEl('div', 'leg-desc');
-      const mins = Math.round((leg.end - leg.start) / 60);
-      if (leg.streetMode === 'BIKE') {
-        desc.appendChild(mkEl('span', 'leg-walk-lbl leg-bike-lbl', '🚲 Bike ' + mins + '′'));
-      } else if (leg.streetMode === 'CAR') {
-        desc.appendChild(mkEl('span', 'leg-walk-lbl leg-bike-lbl', '🚗 Drive ' + mins + '′'));
-      } else {
-        desc.appendChild(mkEl('span', 'leg-walk-lbl', 'Walk ' + mins + '′'));
+
+      const isFirst = i === 0;
+      const isBike  = leg.streetMode === 'BIKE';
+      const isCar   = leg.streetMode === 'CAR';
+      const mins    = Math.round((leg.end - leg.start) / 60);
+
+      if (isFirst) {
+        const o = mkEl('div', 'it-row');
+        o.appendChild(mkTimeCell({ s: fmtTime(leg.start), rt: 'dim' }));
+        const rail = mkEl('div', 'it-rail');
+        rail.appendChild(mkEl('span', 'ln half-down dash'));
+        rail.appendChild(mkEl('span', 'nd origin'));
+        o.appendChild(rail);
+        const c = mkEl('div', 'it-c');
+        c.appendChild(mkEl('span', 'it-place', originName));
+        c.appendChild(mkEl('span', 'it-role', 'Start'));
+        o.appendChild(c);
+        it.appendChild(o);
       }
-      if (leg.to?.node?.name) desc.appendChild(mkEl('span', 'leg-to', 'to ' + leg.to.node.name));
-      main.appendChild(desc);
-      body.appendChild(main);
-      if (leg.streetMode === 'BIKE') body.appendChild(mkBikeStats(leg));
-      row.appendChild(body);
-      legsEl.appendChild(row);
+
+      const w = mkEl('div', 'it-row');
+      w.appendChild(mkEl('div', 'it-t'));
+      const wrail = mkEl('div', 'it-rail');
+      wrail.appendChild(mkEl('span', 'ln dash'));
+      w.appendChild(wrail);
+      const wc    = mkEl('div', 'it-c');
+      const label = mkEl('span', 'it-walk');
+      label.appendChild(isBike || isCar ? mkModeIc(isBike ? 'BUS' : 'RAIL', 14) : mkWalkIcon(14));
+      label.appendChild(mkEl('span', 'm', (isBike ? 'Bike ' : isCar ? 'Drive ' : 'Walk ') + mins + ' min'));
+      wc.appendChild(label);
+      if (isFirst && !isBike && !isCar && next?.__typename === 'PlanTransitLeg') {
+        const total  = Math.max(mins, Math.round((next.start - leg.start) / 60));
+        const buffer = Math.max(0, total - mins);
+        wc.appendChild(mkWalkSplit(fmtTime(leg.start), mins, buffer));
+      }
+      if (isBike) wc.appendChild(mkBikeStats(leg));
+      w.appendChild(wc);
+      it.appendChild(w);
+
+      if (isLast) {
+        const a   = mkEl('div', 'it-row');
+        const arr = lastTransit
+          ? rtTime(plan.end - arrLateSecs, plan.end, !!lastTransit.realtime)
+          : { s: fmtTime(plan.end), rt: 'plain' };
+        a.appendChild(mkTimeCell(arr));
+        const arail = mkEl('div', 'it-rail');
+        arail.appendChild(mkEl('span', 'ln half-up dash'));
+        arail.appendChild(mkEl('span', 'nd arrive'));
+        a.appendChild(arail);
+        const ac = mkEl('div', 'it-c');
+        ac.appendChild(mkEl('span', 'it-place arrive', destName));
+        ac.appendChild(mkEl('span', 'it-role arrive', 'Arrive'));
+        a.appendChild(ac);
+        it.appendChild(a);
+      }
+      if (leg.alternatives?.length >= 2) {
+        wc.appendChild(mkEl('span', 'leg-routes-link', leg.alternatives.length + ' routes ›'));
+        w.classList.add('leg-row-pick');
+        w.title = 'Compare ' + leg.alternatives.length + ' route options';
+        w.addEventListener('click', e => { e.stopPropagation(); openPicker(idx, i); });
+      }
       return;
     }
 
     if (isTransit) {
-      const pw     = legs[i - 1];
-      const before = legs[i - 2];
-      const hasXfer = pw?.__typename === 'PlanWalkLeg' && before?.__typename === 'PlanTransitLeg';
-
-      if (hasXfer) {
-        const walkMins   = Math.round((pw.end - pw.start) / 60);
-        const gapSecs    = Math.max(0, leg.start - pw.end);
-        const totalMins  = walkMins + Math.round(gapSecs / 60);
-        const walkDist   = Math.round((pw.end - pw.start) * 1.2 / 10) * 10;
-        const marginSecs = leg.transferRisk?.marginSecs ?? gapSecs;
-        const tc         = tightClass(marginSecs);
-
-        const xRow = mkEl('div', 'leg-row xfer');
-        xRow.appendChild(mkEl('div', 'leg-time-col', fmtTime(pw.end)));
-        const xRail = mkEl('div', 'leg-rail');
-        xRail.appendChild(mkEl('span', 'leg-dot xfer-dot'));
-        xRail.appendChild(mkEl('span', 'leg-line-v'));
-        xRow.appendChild(xRail);
-
-        const xBody = mkEl('div', 'leg-body');
-        const card  = mkEl('div', 'xfer-card');
-
-        const dw = mkEl('span', 'xfer-d-walk');
-        dw.appendChild(mkWalkIcon(15));
-        if (walkMins >= 3) {
-          dw.appendChild(document.createTextNode(walkDist + ' m '));
-          dw.appendChild(mkEl('em', null, '(' + walkMins + '′)'));
-          dw.appendChild(document.createTextNode(' to ' + (pw.to?.node?.name || '—')));
-        } else {
-          dw.appendChild(document.createTextNode('Change at ' + (pw.to?.node?.name || '—')));
+      // preceding transfer (walk between two transit legs)
+      const pw = legs[i - 1], before = legs[i - 2];
+      if (pw?.__typename === 'PlanWalkLeg' && before?.__typename === 'PlanTransitLeg') {
+        const walkMin   = Math.round((pw.end - pw.start) / 60);
+        const gapSecs   = Math.max(0, leg.start - pw.end);
+        const windowMin = walkMin + Math.round(gapSecs / 60);
+        const catchP    = leg.transferRisk?.reliability;
+        const x = mkEl('div', 'it-row');
+        x.appendChild(mkEl('div', 'it-t'));
+        const xr = mkEl('div', 'it-rail');
+        xr.appendChild(mkEl('span', 'ln dash acc'));
+        x.appendChild(xr);
+        const xc = mkEl('div', 'it-c'); xc.style.padding = '5px 0';
+        const card = mkEl('div', 'it-xfer');
+        const ic   = mkEl('span', 'ic'); ic.appendChild(mkSwapIcon(12)); card.appendChild(ic);
+        card.appendChild(mkEl('span', 't', 'Change at ' + (pw.to?.node?.name || '—')));
+        const wspan = mkEl('span', 'w');
+        wspan.appendChild(document.createTextNode(walkMin + '′ walk · '));
+        wspan.appendChild(mkEl('b', null, windowMin + ' min'));
+        wspan.appendChild(document.createTextNode(' to connect'));
+        card.appendChild(wspan);
+        if (catchP != null) {
+          const rel = mkEl('span', 'it-rel'); rel.dataset.rel = relClass(catchP);
+          rel.appendChild(mkEl('span', 'bead'));
+          rel.appendChild(document.createTextNode(relPct(catchP)));
+          card.appendChild(rel);
         }
-        card.appendChild(dw);
-
-        const tot = mkEl('span', 'xfer-d-tot key t-' + tc);
-        tot.appendChild(mkClockIcon(15));
-        tot.appendChild(document.createTextNode(totalMins + '′ to make it'));
-        card.appendChild(tot);
-
-        if (leg.transferRisk?.reliability != null) {
-          const r   = leg.transferRisk.reliability;
-          const prb = mkEl('span', 'xfer-prob');
-          prb.dataset.rel = relClass(r);
-          prb.title = 'Probability of making this connection';
-          prb.appendChild(mkDonut(r));
-          prb.appendChild(document.createTextNode(relPct(r)));
-          card.appendChild(prb);
-        }
-
-        xBody.appendChild(card);
-        xRow.appendChild(xBody);
-        legsEl.appendChild(xRow);
+        xc.appendChild(card);
+        x.appendChild(xc);
+        it.appendChild(x);
       }
 
-      const route = leg.trip?.route;
+      const route   = leg.trip?.route;
       const { bg, fg } = routeColors(route);
-      const row  = mkEl('div', 'leg-row' + (leg.realtime ? ' rt-leg' : ''));
-      row.appendChild(mkLegTime(leg.start, leg.scheduledStart, leg.realtime));
-      const rail = mkEl('div', 'leg-rail');
-      const dot  = mkEl('span', 'leg-dot' + (leg.realtime ? ' rt-dot' : '')); dot.style.background = bg;
-      rail.appendChild(dot);
-      if (!isLast) rail.appendChild(mkEl('span', 'leg-line-v'));
-      row.appendChild(rail);
+      const line    = route?.shortName || route?.mode || '?';
+      const board   = leg.from?.node?.name || '—';
+      const alight  = leg.to?.node?.name || '—';
+      const rideMin = Math.round((leg.end - leg.start) / 60);
 
-      const body = mkEl('div', 'leg-body');
-      const main = mkEl('div', 'leg-main');
-      const desc = mkEl('div', 'leg-desc');
-      desc.appendChild(mkBadge(route?.shortName || route?.mode || '?', bg, fg));
-      const headsign = leg.trip?.headsign || '';
-      const kind     = route?.mode ? route.mode.charAt(0) + route.mode.slice(1).toLowerCase() : '';
-      const toText   = headsign ? (kind ? kind + ' → ' : '') + headsign : leg.to?.node?.name || '';
-      if (toText) desc.appendChild(mkEl('span', 'leg-to', toText));
-      main.appendChild(desc);
+      // board row + boxed vehicle descriptor
+      const b = mkEl('div', 'it-row');
+      b.appendChild(mkTimeCell(rtTime(leg.scheduledStart, leg.start, leg.realtime)));
+      const brail = mkEl('div', 'it-rail');
+      const bln = mkEl('span', 'ln'); bln.style.setProperty('--lc', bg); brail.appendChild(bln);
+      const bnd = mkEl('span', 'nd board'); bnd.style.setProperty('--lc', bg); brail.appendChild(bnd);
+      b.appendChild(brail);
+      const bc = mkEl('div', 'it-c');
+      bc.appendChild(mkEl('span', 'it-place', board));
+      bc.appendChild(mkEl('span', 'it-role', 'Board'));
 
-      const meta = mkEl('div', 'leg-meta');
-      meta.appendChild(mkEl('span', 'leg-dur', Math.round((leg.end - leg.start) / 60) + '′'));
-      main.appendChild(meta);
-      body.appendChild(main);
-      row.appendChild(body);
-      legsEl.appendChild(row);
+      const veh = mkEl('div', 'it-veh');
+      veh.style.setProperty('--bd', `color-mix(in oklab, ${bg} 26%, var(--line))`);
+      veh.style.setProperty('--bg2', `color-mix(in oklab, ${bg} 8%, var(--surface))`);
+      const vline = mkEl('div', 'it-vehline');
+      vline.appendChild(mkModeIc(route?.mode, 17, bg));
+      const badge = mkEl('span', 'it-badge', line); badge.style.background = bg; badge.style.color = fg;
+      vline.appendChild(badge);
+      const headsign = leg.trip?.headsign;
+      if (headsign) {
+        const dir = mkEl('span', 'it-dir');
+        dir.appendChild(mkEl('span', 'ar', '→'));
+        dir.appendChild(document.createTextNode(' ' + headsign));
+        vline.appendChild(dir);
+      }
+      const agency = route?.agency?.name;
+      if (agency) { const op = mkEl('span', 'opx', agency); op.style.marginLeft = '2px'; vline.appendChild(op); }
+      if (onLeg) {
+        vline.style.cursor = 'pointer';
+        vline.addEventListener('click', e => { e.stopPropagation(); onLeg(e, leg); });
+      }
+      veh.appendChild(vline);
+
+      // expandable in-between stops — keep name AND arrival time per stop
+      const between = (leg.steps || [])
+        .map(st => ({ name: st.place?.node?.name, t: st.place?.arrival ?? st.place?.departure }))
+        .filter(s => s.name && s.name !== board && s.name !== alight);
+      const key    = idx + ':' + i;
+      const isOpen = state.openStops.has(key);
+      const pill   = mkEl('span', 'it-stops' + (isOpen ? ' open' : ''));
+      pill.appendChild(document.createTextNode((between.length + 1) + ' stops'));
+      pill.appendChild(mkEl('span', 'dur', '· ' + rideMin + ' min'));
+      pill.appendChild(mkChev());
+      pill.addEventListener('click', e => {
+        e.stopPropagation();
+        if (state.openStops.has(key)) state.openStops.delete(key); else state.openStops.add(key);
+        renderList();
+      });
+      veh.appendChild(pill);
+      bc.appendChild(veh);
+      b.appendChild(bc);
+      it.appendChild(b);
+
+      if (isOpen) between.forEach(name => {
+        const m = mkEl('div', 'it-row');
+        m.appendChild(mkEl('div', 'it-t'));
+        const mr = mkEl('div', 'it-rail');
+        const mln = mkEl('span', 'ln'); mln.style.setProperty('--lc', bg); mr.appendChild(mln);
+        const mnd = mkEl('span', 'nd mid'); mnd.style.setProperty('--lc', bg); mr.appendChild(mnd);
+        m.appendChild(mr);
+        const mc = mkEl('div', 'it-c it-mid');
+        mc.appendChild(mkEl('span', 'it-midstop', name));
+        m.appendChild(mc);
+        it.appendChild(m);
+      });
+
+      // alight row
+      const a = mkEl('div', 'it-row');
+      a.appendChild(mkTimeCell(rtTime(leg.scheduledEnd, leg.end, leg.realtime)));
+      const arail = mkEl('div', 'it-rail');
+      const aln = mkEl('span', 'ln'); aln.style.setProperty('--lc', bg); arail.appendChild(aln);
+      const and2 = mkEl('span', 'nd alight'); and2.style.setProperty('--lc', bg); arail.appendChild(and2);
+      a.appendChild(arail);
+      const ac = mkEl('div', 'it-c');
+      ac.appendChild(mkEl('span', 'it-place', alight));
+      ac.appendChild(mkEl('span', 'it-role', 'Get off'));
+      a.appendChild(ac);
+      it.appendChild(a);
     }
   });
 
-  return legsEl;
+  return it;
 }
 
 // ── Connection card (always renders for any transit leg) ──────
@@ -1733,7 +2191,11 @@ function buildLegHandler(plan, idx, isOpen, openLegIdx) {
   return (e, clickedLeg) => {
     e.stopPropagation();
     if (clickedLeg.__typename === 'PlanWalkLeg') {
-      if (!isOpen) openCard(idx);
+      if (clickedLeg.alternatives?.length >= 2) {
+        openPicker(idx, plan.legs.indexOf(clickedLeg));
+      } else if (!isOpen) {
+        openCard(idx);
+      }
       return;
     }
     const clickedIdx = plan.legs.indexOf(clickedLeg);
@@ -1752,18 +2214,6 @@ function buildLegHandler(plan, idx, isOpen, openLegIdx) {
 function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
   const detail = mkEl('div', 'card-detail');
   detail.addEventListener('click', e => e.stopPropagation());
-  const xferLegs = plan.legs.filter(l => l.transferRisk);
-  if (xferLegs.length > 0) {
-    const pRel = mkEl('div', 'plan-rel');
-    pRel.appendChild(mkEl('span', 'pr-k', 'Plan reliability'));
-    pRel.appendChild(mkRelChip(rel));
-    const note = mkEl('span', 'pr-note');
-    note.textContent = xferLegs.length > 1
-      ? 'Chance of making every connection — ' + xferLegs.map(l => relPct(l.transferRisk.reliability)).join(' × ')
-      : "Chance of making this plan's single connection";
-    pRel.appendChild(note);
-    detail.appendChild(pRel);
-  }
   if (plan.accessAlternatives?.length) {
     const altsEl = mkEl('div', 'access-alts');
     plan.accessAlternatives.forEach(a => {
@@ -1775,7 +2225,8 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
     });
     detail.appendChild(altsEl);
   }
-  detail.appendChild(renderLegList(plan));
+  const onLeg = buildLegHandler(plan, idx, true, openLegIdx);
+  detail.appendChild(buildItinerary(plan, idx, onLeg));
   if (openLeg) {
     const connEl = renderConnection(openLeg, idx, openLegIdx);
     if (connEl) detail.appendChild(connEl);
@@ -1784,60 +2235,64 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
 }
 
 function renderTripCard(plan, idx, isOpen) {
-  const card = mkEl('div', 'card' + (isOpen ? ' open' : ''));
+  const card = mkEl('div', 'rc' + (isOpen ? ' best' : ''));
   card.id = 'plan-card-' + idx;
-
-  const top   = mkEl('div', 'card-top');
-  const times = mkEl('div', 'card-times');
-  times.appendChild(mkEl('span', 't-dep', fmtTime(plan.start)));
-  times.appendChild(mkEl('span', 't-arrow', '→'));
-  times.appendChild(mkEl('span', 't-arr', fmtTime(plan.end)));
-  top.appendChild(times);
-
-  const meta    = mkEl('div', 'card-meta');
-  const totMins = Math.round((plan.end - plan.start) / 60);
-  const h = Math.floor(totMins / 60), m = totMins % 60;
-  meta.appendChild(mkEl('span', 'm-dur', h > 0 ? h + 'h' + String(m).padStart(2, '0') : m + '′'));
   const rel = planReliability(plan);
-  if (rel < 1) meta.appendChild(mkRelChip(rel));
-  if (BIKE_MODES.has(plan.mode)) meta.appendChild(mkEl('span', 'plan-mode-badge', MODE_LABEL[plan.mode] || plan.mode));
-  top.appendChild(meta);
-  card.appendChild(top);
 
-  const tagEl = mkEl('div', 'card-tag');
-  const tag   = planTag(state.plans, plan);
-  if (tag) {
-    if (idx === 0) tagEl.appendChild(mkEl('span', 'lead', '●'));
-    tagEl.appendChild(document.createTextNode(tag));
+  // header — departure → arrival, tag, reliability chip
+  const head  = mkEl('div', 'rc-head');
+  const times = mkEl('div', 'rc-times');
+  times.appendChild(mkEl('span', 'big', fmtTime(plan.start)));
+  times.appendChild(mkEl('span', 'ar', '→'));
+  times.appendChild(mkEl('span', 'big', fmtTime(plan.end)));
+  head.appendChild(times);
+  const tag = planTag(state.plans, plan);
+  if (tag) head.appendChild(mkEl('span', 'rc-tag', tag));
+  else if (BIKE_MODES.has(plan.mode)) head.appendChild(mkEl('span', 'rc-tag', MODE_LABEL[plan.mode] || plan.mode));
+  if (rel < 1) {
+    const relEl = mkEl('span', 'rc-rel'); relEl.dataset.rel = relClass(rel);
+    relEl.appendChild(mkEl('span', 'bead'));
+    relEl.appendChild(document.createTextNode(relPct(rel)));
+    head.appendChild(relEl);
   }
-  card.appendChild(tagEl);
+  head.addEventListener('click', () => { if (isOpen) closeCard(); else openCard(idx); });
+  card.appendChild(head);
 
+  // folded: when + where the first transit departs (omitted for street-only plans)
+  const ft = firstTransitOf(plan);
+  if (ft) {
+    const { bg, fg } = routeColors(ft.route);
+    const row = mkEl('div', 'rc-first'); row.style.setProperty('--fc', bg);
+    const ic  = mkEl('span', 'ic'); ic.appendChild(mkModeIc(ft.route?.mode, 16, bg)); row.appendChild(ic);
+    const badge = mkEl('span', 'rc-fbadge', ft.line); badge.style.background = bg; badge.style.color = fg;
+    row.appendChild(badge);
+    const txt = mkEl('span', 'rc-ftxt');
+    txt.appendChild(document.createTextNode('from '));
+    txt.appendChild(mkEl('b', null, ft.stop));
+    row.appendChild(txt);
+    const time = mkEl('span', 'rc-ftime');
+    time.appendChild(mkEl('span', 'pre', 'dep'));
+    time.appendChild(document.createTextNode(fmtTime(ft.time)));
+    row.appendChild(time);
+    card.appendChild(row);
+  }
+
+  // ribbon
   const openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
-  const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
-  const onLeg = buildLegHandler(plan, idx, isOpen, openLegIdx);
-  card.appendChild(renderRibbon(plan, openLeg, onLeg));
-
-  const foot = mkEl('div', 'card-foot');
-  const xfer = planTransferCount(plan);
-  foot.appendChild(document.createTextNode(xfer + ' transfer' + (xfer !== 1 ? 's' : '')));
-  const walkMin = Math.round(planWalkSeconds(plan) / 60);
-  const bikeMin = Math.round(planRideSeconds(plan, 'BIKE') / 60);
-  const carMin  = Math.round(planRideSeconds(plan, 'CAR') / 60);
-  const streetParts = [];
-  if (walkMin > 0 || (bikeMin === 0 && carMin === 0)) streetParts.push(walkMin + '′ walk');
-  if (bikeMin > 0) streetParts.push(bikeMin + '′ bike');
-  if (carMin > 0)  streetParts.push(carMin + '′ car');
-  streetParts.forEach(part => { foot.appendChild(mkEl('span', 'sep', '·')); foot.appendChild(document.createTextNode(part)); });
-  foot.appendChild(mkEl('span', 'expand', isOpen ? (openLeg ? 'Hide detail ▴' : 'Tap a transit leg ▾') : 'Tap a transit leg ▾'));
-  card.appendChild(foot);
+  const openLeg    = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
+  const onLeg      = buildLegHandler(plan, idx, isOpen, openLegIdx);
+  const ribWrap    = mkEl('div', 'rc-ribbon');
+  ribWrap.appendChild(renderRibbon(plan, openLeg, onLeg));
+  card.appendChild(ribWrap);
 
   if (isOpen) card.appendChild(buildPlanDetail(plan, idx, openLegIdx, openLeg, rel));
 
-  card.addEventListener('click', e => {
-    if (e.target.closest('button')) return;
-    if (isOpen) { closeCard(); return; }
-    openCard(idx);
-  });
+  const exp = mkEl('div', 'rc-expand' + (isOpen ? ' open' : ''));
+  exp.appendChild(document.createTextNode(isOpen ? 'Hide itinerary ' : 'Show itinerary '));
+  exp.appendChild(mkChev());
+  exp.addEventListener('click', () => { if (isOpen) closeCard(); else openCard(idx); });
+  card.appendChild(exp);
+
   return card;
 }
 
@@ -1965,6 +2420,8 @@ function renderGroupCard(group, mode, isFirst) {
 
 // ── Render list ───────────────────────────────────────────────
 function renderList() {
+  if (state.picker) { renderPicker(); return; }
+  el('plans-panel').classList.remove('rp-active');
   const listEl = el('plans-list');
   listEl.replaceChildren();
   el('plans-count').textContent = state.plans.length
@@ -2110,11 +2567,16 @@ function renderAllPlansOnMap() {
         color, weight: isTransit ? 5 : (isBike || isCar ? 4 : 3), opacity: 0.9,
         dashArray: isTransit ? null : (isBike || isCar ? '2,8' : '5,6'),
       }).addTo(map));
-      // Overlay dismount (push) stretches of a bike leg distinctly.
+      // Overlay dismount (push) stretches of a bike leg distinctly. A selected
+      // alternative carries its push ranges in `_dismountRuns` (the default route's
+      // are in `steps`), so the orange follows whichever route is on the map.
       if (isBike) {
-        (leg.steps || []).forEach(s => {
-          if (!s.dismount || s.geomEnd <= s.geomStart) return;
-          const seg = pts.slice(s.geomStart, s.geomEnd + 1);
+        const runs = leg._dismountRuns
+          ? leg._dismountRuns.map(r => [r.start, r.end])
+          : (leg.steps || []).filter(s => s.dismount && s.geomEnd > s.geomStart)
+              .map(s => [s.geomStart, s.geomEnd]);
+        runs.forEach(([a, b]) => {
+          const seg = pts.slice(a, b + 1);
           if (seg.length < 2) return;
           state.legLayers.push(L.polyline(seg, {
             color: '#e65100', weight: 6, opacity: 0.95, dashArray: '1,7', lineCap: 'round',
@@ -2137,6 +2599,272 @@ function renderAllPlansOnMap() {
 
 function renderPlanOnMap(_idx) {
   renderAllPlansOnMap();
+}
+
+// ── Per-leg route picker ──────────────────────────────────────
+// A panel-takeover that lets a user compare a walk/bike leg's Pareto
+// alternatives across objectives, preview on the map, and commit one back into
+// the plan. Bike legs are scalar today (no alternatives) so this fires for walk;
+// the column set is mode-parametrized for when bike enrichment lands. All values
+// are real figures derived from the leg's LegOption[] — never a server label.
+// `cost` is the raw objective (fine-grained, used only for the sort dropdown).
+// `disp` is the displayed value as an integer (lower = better) — the exact
+// granularity the user reads. Tile colour and the "best" label compare `disp`,
+// so two routes that READ identical share a colour and both earn "best".
+const _pct = (a, b) => (a || 0) / (b || 1);
+const RP_OBJ = {
+  time:     { head: 'Time',     cost: o => o.p50,                 disp: o => Math.round(o.p50 / 60),
+              val: o => Math.round(o.p50 / 60) + ' min', tag: 'Fastest' },
+  dplus:    { head: 'Climb',    cost: o => o.elevationGain || 0,  disp: o => Math.round(o.elevationGain || 0),
+              val: o => '+' + (o.elevationGain || 0) + ' m', tag: 'Flattest',
+              grade: o => 1 - Math.min(1, ((o.elevationGain || 0) / ((o.length || 1) / 1000)) / 18) },
+  surface:  { head: 'Surface',  cost: o => _pct(o.unpavedLength, o.length),
+              disp: o => Math.round(_pct(o.unpavedLength, o.length) * 100),
+              val: o => { const p = Math.round(_pct(o.unpavedLength, o.length) * 100); return p === 0 ? 'paved' : p + '% unpaved'; },
+              tag: 'Smoothest', grade: o => 1 - Math.min(1, _pct(o.unpavedLength, o.length) / 0.40) },
+  dismount: { head: 'Dismount', cost: o => o.dismountLength || 0,
+              disp: o => Math.round(o.dismountLength || 0),
+              val: o => { const m = Math.round(o.dismountLength || 0); return m === 0 ? 'none' : m + ' m'; },
+              tag: 'Least push', grade: o => 1 - Math.min(1, (o.dismountLength || 0) / 600) },
+  cycleway: { head: 'Bike %',   cost: o => 1 - _pct(o.cyclerouteLength, o.length),
+              disp: o => -Math.round(_pct(o.cyclerouteLength, o.length) * 100),
+              val: o => Math.round(_pct(o.cyclerouteLength, o.length) * 100) + '%', tag: 'Most bike lanes',
+              grade: o => Math.min(1, _pct(o.cyclerouteLength, o.length) / 0.75) },
+  // Reliability = the p50→p95 spread (seconds), shown as a ± band in minutes.
+  variance: { head: 'Reliable', cost: o => o.p95 - o.p50,         disp: o => Math.round((o.p95 - o.p50) / 60),
+              val: o => { const m = Math.round((o.p95 - o.p50) / 60); return '±' + (o.p95 > o.p50 && m === 0 ? '<1' : m) + ' min'; },
+              tag: 'Steadiest', grade: o => 1 - Math.min(1, ((o.p95 - o.p50) / 60) / 8) },
+};
+const RP_WALK_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="4" r="2"/><path d="M11 21l1-7 3 2 1 4M12 14l-2-4 2-3 3 2 2 1"/></svg>';
+const RP_BIKE_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="17" r="3.3"/><circle cx="18.5" cy="17" r="3.3"/><path d="M5.5 17l4-8h5l-3 8M9 9l1.5-3H8"/><path d="M14.5 9l4 8"/></svg>';
+
+function rpObjectives(streetMode) {
+  return streetMode === 'BIKE'
+    ? ['time', 'cycleway', 'dplus', 'surface', 'dismount', 'variance']
+    : ['time', 'surface', 'dplus', 'variance'];
+}
+function rpVar(name) { return getComputedStyle(el('sidebar')).getPropertyValue(name).trim(); }
+
+function rpRamp(t, lo, mid, hi) {
+  t = Math.max(0, Math.min(1, t));
+  return t < 0.5
+    ? `color-mix(in oklab, ${mid} ${Math.round(t * 200)}%, ${lo})`
+    : `color-mix(in oklab, ${hi} ${Math.round((t - 0.5) * 200)}%, ${mid})`;
+}
+const rpGradeBg = t => rpRamp(t, 'var(--ds-rel-low-soft)', 'var(--ds-rel-mid-soft)', 'var(--ds-rel-high-soft)');
+const rpGradeFg = t => rpRamp(t, 'var(--ds-rel-low)', 'var(--ds-rel-mid)', 'var(--ds-rel-high)');
+
+// Normalize the option set on each objective → per-cell 0–1 goodness + best/worst
+// flags. Ranges/colours/best use `disp` (the displayed integer), so equal displayed
+// values colour alike and share the "best" label.
+function rpNormalize(opts, keys) {
+  const ranges = {};
+  keys.forEach(k => { const cs = opts.map(o => RP_OBJ[k].disp(o)); ranges[k] = { min: Math.min(...cs), max: Math.max(...cs) }; });
+  return opts.map((o, i) => {
+    const cells = {};
+    keys.forEach(k => {
+      const c = RP_OBJ[k].disp(o), r = ranges[k], span = r.max - r.min;
+      const rel = span < 1e-9 ? 1 : 1 - (c - r.min) / span;
+      cells[k] = {
+        cost: c, value: RP_OBJ[k].val(o),
+        good: rel,
+        grade: RP_OBJ[k].grade ? Math.max(0, Math.min(1, RP_OBJ[k].grade(o))) : rel,
+        best:  span > 1e-9 && Math.abs(c - r.min) < 1e-9,
+        worst: span > 1e-9 && Math.abs(c - r.max) < 1e-9,
+      };
+    });
+    return { o, cells, i };
+  });
+}
+
+// Curate: each objective's corner (min-cost) + the maximin all-rounder (best worst
+// axis). These are the genuinely DIFFERENT routes; the rest fold under the expander.
+function rpCurate(norm, keys) {
+  const tagOf = {};
+  const cornerOf = k => { let bi = 0; norm.forEach((n, i) => { if (n.cells[k].cost < norm[bi].cells[k].cost) bi = i; }); return bi; };
+  let balanced = 0, bestMin = -Infinity;
+  norm.forEach((n, i) => { const mn = Math.min(...keys.map(k => n.cells[k].good)); if (mn > bestMin) { bestMin = mn; balanced = i; } });
+  (tagOf[balanced] = tagOf[balanced] || []).push('All-round');
+  const distinct = [];
+  keys.forEach(k => { const bi = cornerOf(k); if (!distinct.includes(bi)) distinct.push(bi); });
+  if (!distinct.includes(balanced)) distinct.push(balanced);
+  const rest = norm.map((_, i) => i).filter(i => !distinct.includes(i));
+  return { distinct, rest, tagOf, allRound: balanced };
+}
+
+function openPicker(planIdx, legIdx) {
+  const leg = state.plans[planIdx]?.legs[legIdx];
+  if (!leg || leg.__typename !== 'PlanWalkLeg' || !(leg.alternatives?.length >= 2)) return;
+  const objs = rpObjectives(leg.streetMode).filter(k => {
+    const first = RP_OBJ[k].val(leg.alternatives[0]);
+    return leg.alternatives.some(o => RP_OBJ[k].val(o) !== first);
+  });
+  const norm = rpNormalize(leg.alternatives, objs);
+  const curate = rpCurate(norm, objs);
+  const prior = typeof leg._selAlt === 'number' && leg._selAlt < norm.length ? leg._selAlt : null;
+  state.picker = {
+    planIdx, legIdx, objs, norm, curate,
+    sel: prior ?? curate.allRound, hover: null, sortKey: null, expanded: false, committed: prior,
+    origLegStart: leg.start, origLegEnd: leg.end, origLegDur: leg.end - leg.start,
+    origPlanEnd: state.plans[planIdx].end,
+  };
+  renderList();
+  renderPickerMap(true);
+}
+
+function closePicker() {
+  state.picker = null;
+  renderList();
+  renderAllPlansOnMap();
+}
+
+// Write the chosen alternative back into the leg (client-side; geometry is already
+// in hand, no refetch). Idempotent: timings recompute from the captured originals.
+function commitPicker() {
+  const p = state.picker; if (!p) return;
+  const plan = state.plans[p.planIdx], leg = plan.legs[p.legIdx], o = p.norm[p.sel].o;
+  leg.geometry = o.geometry;
+  leg.duration = o.p50;
+  leg.length = o.length;
+  leg.cyclerouteLength = o.cyclerouteLength;
+  leg.elevationGain = o.elevationGain;
+  if (p.legIdx === plan.legs.length - 1) {
+    // Direct / egress leg: anchored at its start; arrival and the plan's end
+    // shift by the change in walk duration.
+    leg.start = p.origLegStart;
+    leg.end = p.origLegStart + o.p50;
+    plan.end = p.origPlanEnd + (o.p50 - p.origLegDur);
+  } else {
+    // Access leg: anchored at the (fixed) boarding time; the leave time moves
+    // instead. If it is the first leg, that leave time is the plan's start.
+    leg.end = p.origLegEnd;
+    leg.start = p.origLegEnd - o.p50;
+    if (p.legIdx === 0) plan.start = leg.start;
+  }
+  p.committed = p.sel;
+  leg._selAlt = p.sel;
+  leg._dismountRuns = o.dismountRuns || [];
+  renderPicker();
+}
+
+function rpGridHTML() {
+  const p = state.picker;
+  const cellHTML = (n, k) => { const c = n.cells[k];
+    return `<div class="rp-cell${c.best ? ' best' : ''}" style="background:${rpGradeBg(c.grade)};color:${rpGradeFg(c.grade)}"><span>${c.value}</span>${c.best ? '<span class="rp-lead">best</span>' : ''}</div>`; };
+  const tagsHTML = i => { const t = p.curate.tagOf[i];
+    return t && t.length ? `<div class="rp-tags">${t.map(x => `<span class="rp-tag${x === 'All-round' ? ' all' : ''}">${x}</span>`).join('')}</div>` : ''; };
+  const rowHTML = n => `<div class="rp-row${n.i === p.sel ? ' sel' : ''}" data-i="${n.i}">`
+    + `<div class="rp-cellname"><div class="rp-nm">Route ${n.i + 1}</div>`
+    + `<div class="rp-sub">${Math.round(n.o.p50 / 60)}–${Math.round(n.o.p95 / 60)} min · ${fmtDist(n.o.length)}</div>${tagsHTML(n.i)}</div>`
+    + p.objs.map(k => cellHTML(n, k)).join('') + '</div>';
+  let h = `<div class="rp-ghead"><div class="rp-gh rp-name" data-sort="__none">`
+    + (p.sortKey ? 'Route' : '<span class="rp-mode">✦ Most different</span>') + '</div>'
+    + p.objs.map(k => `<div class="rp-gh${p.sortKey === k ? ' on' : ''}" data-sort="${k}">${p.sortKey === k ? '▲ ' : ''}${RP_OBJ[k].head}</div>`).join('') + '</div>';
+  if (p.sortKey) {
+    h += p.norm.slice().sort((a, b) => RP_OBJ[p.sortKey].cost(a.o) - RP_OBJ[p.sortKey].cost(b.o)).map(rowHTML).join('');
+  } else {
+    h += p.curate.distinct.map(i => rowHTML(p.norm[i])).join('');
+    if (p.curate.rest.length) {
+      h += `<div class="rp-more" data-more><span class="rp-ln"></span><span class="rp-tx">`
+        + (p.expanded ? 'Hide in-between routes ▴' : p.curate.rest.length + ' more routes in between ▾')
+        + `</span><span class="rp-ln"></span></div>`;
+      if (p.expanded) h += `<div class="rp-band">In between — trades between the corners</div>`
+        + p.curate.rest.slice().sort((a, b) => p.norm[a].o.p50 - p.norm[b].o.p50).map(i => rowHTML(p.norm[i])).join('');
+    }
+  }
+  return h;
+}
+
+function renderPicker() {
+  const p = state.picker;
+  const plan = state.plans[p.planIdx], leg = plan.legs[p.legIdx];
+  el('plans-panel').classList.add('rp-active');
+  const host = el('plans-list');
+  host.replaceChildren();
+  const rp = mkEl('div', 'rp');
+
+  const back = mkEl('div', 'rp-back');
+  back.append(document.createTextNode('‹ '), mkEl('span', null, 'Back to results · '),
+    mkEl('b', null, fmtTime(plan.start) + ' → ' + fmtTime(plan.end)));
+  back.addEventListener('click', closePicker);
+  rp.appendChild(back);
+
+  const head = mkEl('div', 'rp-head');
+  head.appendChild(mkEl('div', 'eyebrow', 'Editing one leg'));
+  const hrow = mkEl('div', 'rp-head-row');
+  const icon = mkEl('span', 'rp-icon'); icon.innerHTML = leg.streetMode === 'BIKE' ? RP_BIKE_SVG : RP_WALK_SVG;
+  const verb = leg.streetMode === 'BIKE' ? 'Cycle' : 'Walk';
+  hrow.append(icon, mkEl('span', 'rp-title', verb + ' to ' + (leg.to?.node?.name || 'destination')),
+    mkEl('span', 'rp-count', leg.alternatives.length + ' routes'));
+  head.appendChild(hrow);
+  rp.appendChild(head);
+
+  const grid = mkEl('div', 'rp-grid');
+  grid.style.setProperty('--rp-cols', p.objs.length);
+  grid.innerHTML = rpGridHTML();
+  rp.appendChild(grid);
+
+  const legend = mkEl('div', 'rp-legend');
+  legend.innerHTML = '<span class="rp-k"><span class="rp-sw" style="background:' + rpGradeBg(1) + '"></span>Good</span>'
+    + '<span class="rp-k"><span class="rp-sw" style="background:' + rpGradeBg(0.5) + '"></span>OK</span>'
+    + '<span class="rp-k"><span class="rp-sw" style="background:' + rpGradeBg(0) + '"></span>Poor</span>'
+    + '<span class="rp-k"><span class="rp-sw" style="box-shadow:inset 0 0 0 1.5px var(--ds-accent)"></span>Best in set</span>';
+  rp.appendChild(legend);
+
+  const committed = p.committed === p.sel;
+  const foot = mkEl('div', 'rp-foot');
+  const pk = mkEl('div', 'rp-pk');
+  pk.appendChild(mkEl('div', 'rp-k', committed ? 'Added to your plan' : 'Selected'));
+  pk.appendChild(mkEl('div', 'rp-v', 'Route ' + (p.sel + 1) + ' · ' + Math.round(p.norm[p.sel].o.p50 / 60) + ' min'));
+  foot.appendChild(pk);
+  const choose = mkEl('button', 'rp-choose' + (committed ? ' done' : ''), committed ? '✓ In your plan' : 'Choose this route');
+  choose.addEventListener('click', commitPicker);
+  foot.appendChild(choose);
+  rp.appendChild(foot);
+
+  host.appendChild(rp);
+
+  grid.querySelectorAll('[data-sort]').forEach(node => node.addEventListener('click', () => {
+    const k = node.dataset.sort;
+    p.sortKey = k === '__none' ? null : (p.sortKey === k ? null : k);
+    renderPicker();
+  }));
+  const more = grid.querySelector('[data-more]');
+  if (more) more.addEventListener('click', () => { p.expanded = !p.expanded; renderPicker(); });
+  grid.querySelectorAll('.rp-row').forEach(row => {
+    const i = +row.dataset.i;
+    row.addEventListener('mouseenter', () => { p.hover = i; renderPickerMap(); });
+    row.addEventListener('mouseleave', () => { p.hover = null; renderPickerMap(); });
+    row.addEventListener('click', () => { p.sel = i; renderPicker(); renderPickerMap(); });
+  });
+}
+
+// Map for the active picker: three polyline styles (faint alternatives, dashed
+// hover ghost, solid selected) + fit to the leg's alternatives.
+// `fit` re-frames the map to all alternatives — done only when the picker first
+// opens, not on every hover/select re-render.
+function renderPickerMap(fit) {
+  clearLegLayers();
+  const p = state.picker; if (!p) return;
+  const accent = rpVar('--ds-accent'), other = rpVar('--ds-ink-3');
+  const pts = g => g.map(c => [c.lat, c.lon]);
+  const clickable = (poly, i) => {
+    poly.on('click', () => { p.sel = i; renderPicker(); renderPickerMap(); });
+    state.legLayers.push(poly);
+    return poly;
+  };
+  p.norm.forEach((n, i) => {
+    if (i === p.sel || i === p.hover) return;
+    clickable(L.polyline(pts(n.o.geometry), { color: other, weight: 4, opacity: .8, lineCap: 'round', lineJoin: 'round' }).addTo(map), i);
+  });
+  if (p.hover != null && p.hover !== p.sel) {
+    clickable(L.polyline(pts(p.norm[p.hover].o.geometry), { color: accent, weight: 5, opacity: .7, dashArray: '3 8', lineCap: 'round' }).addTo(map), p.hover);
+  }
+  clickable(L.polyline(pts(p.norm[p.sel].o.geometry), { color: accent, weight: 6, opacity: 1, lineCap: 'round' }).addTo(map), p.sel);
+  if (fit) {
+    const all = p.norm.flatMap(n => pts(n.o.geometry));
+    if (all.length) map.fitBounds(L.latLngBounds(all).pad(0.35));
+  }
 }
 
 // ── Keyboard ──────────────────────────────────────────────────

@@ -89,7 +89,8 @@ impl Graph {
         weekday: u8,
     ) -> Vec<ScheduledArrival> {
         let mut out = Vec::new();
-        let pats = self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
+        let pats =
+            self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
         for &(pat_id, pos) in pats {
             let p = pat_id.0 as usize;
             let route = self.raptor.transit_patterns[p].route;
@@ -100,8 +101,8 @@ impl Graph {
             if n_trips == 0 {
                 continue;
             }
-            let times =
-                self.raptor.transit_idx_pattern_stop_times[p].of(&self.raptor.transit_pattern_stop_times);
+            let times = self.raptor.transit_idx_pattern_stop_times[p]
+                .of(&self.raptor.transit_pattern_stop_times);
             let trip_ids =
                 self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
             let col = &times[pos as usize * n_trips..(pos as usize + 1) * n_trips];
@@ -126,8 +127,14 @@ mod tests {
     fn best_match_picks_closest_within_tolerance() {
         let params = MatchParams::default();
         let cands = [
-            ScheduledArrival { trip: TripId(1), scheduled_secs: 30_000 },
-            ScheduledArrival { trip: TripId(2), scheduled_secs: 30_300 }, // +5 min
+            ScheduledArrival {
+                trip: TripId(1),
+                scheduled_secs: 30_000,
+            },
+            ScheduledArrival {
+                trip: TripId(2),
+                scheduled_secs: 30_300,
+            }, // +5 min
         ];
         // Predicted 30_120: delay vs trip1 = +120 (late, ok); vs trip2 = -180 (too early).
         let (trip, delay) = best_match(&cands, 30_120, &params).unwrap();
@@ -138,15 +145,24 @@ mod tests {
     #[test]
     fn best_match_rejects_too_early() {
         let params = MatchParams::default();
-        let cands = [ScheduledArrival { trip: TripId(1), scheduled_secs: 30_000 }];
+        let cands = [ScheduledArrival {
+            trip: TripId(1),
+            scheduled_secs: 30_000,
+        }];
         // Predicted 200s before schedule — beyond the 90s early tolerance.
         assert!(best_match(&cands, 29_800, &params).is_none());
     }
 
     #[test]
     fn best_match_rejects_beyond_max_late() {
-        let params = MatchParams { early_tolerance_secs: 90, max_late_secs: 600 };
-        let cands = [ScheduledArrival { trip: TripId(1), scheduled_secs: 30_000 }];
+        let params = MatchParams {
+            early_tolerance_secs: 90,
+            max_late_secs: 600,
+        };
+        let cands = [ScheduledArrival {
+            trip: TripId(1),
+            scheduled_secs: 30_000,
+        }];
         assert!(best_match(&cands, 31_000, &params).is_none()); // +1000s > 600s
     }
 

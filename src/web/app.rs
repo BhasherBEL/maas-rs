@@ -6,7 +6,9 @@ use async_graphql::{
 };
 use async_graphql_poem::GraphQL;
 use chrono::{Local, NaiveDate, NaiveTime};
-use poem::{IntoResponse, Response, Result, Route, Server, get, handler, listener::TcpListener, web::Html};
+use poem::{
+    IntoResponse, Response, Result, Route, Server, get, handler, listener::TcpListener, web::Html,
+};
 
 use crate::{
     routing::routing_raptor,
@@ -151,15 +153,30 @@ fn map_candidate(c: crate::structures::plan::PlanCandidate) -> PlanCandidateGql 
         dom_higher_reliability,
     ) = match &c.status {
         CandidateStatus::Kept => (CandidateStatusGql::Kept, None, None, None, None, None),
-        CandidateStatus::NotImproving => {
-            (CandidateStatusGql::NotImproving, None, None, None, None, None)
-        }
-        CandidateStatus::ReconstructionEmpty => {
-            (CandidateStatusGql::ReconstructionEmpty, None, None, None, None, None)
-        }
-        CandidateStatus::ExtremeRisk => {
-            (CandidateStatusGql::ExtremeRisk, None, None, None, None, None)
-        }
+        CandidateStatus::NotImproving => (
+            CandidateStatusGql::NotImproving,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        CandidateStatus::ReconstructionEmpty => (
+            CandidateStatusGql::ReconstructionEmpty,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        CandidateStatus::ExtremeRisk => (
+            CandidateStatusGql::ExtremeRisk,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
         CandidateStatus::ParetoDominated {
             dominator_index,
             departure_worse,
@@ -253,25 +270,64 @@ struct HighwayFactorsInput {
 }
 
 impl HighwayFactorsInput {
-    fn merge_into(self, mut b: crate::structures::HighwayFactors) -> crate::structures::HighwayFactors {
-        if let Some(v) = self.trunk { b.trunk = v; }
-        if let Some(v) = self.trunk_bike { b.trunk_bike = v; }
-        if let Some(v) = self.primary { b.primary = v; }
-        if let Some(v) = self.primary_bike { b.primary_bike = v; }
-        if let Some(v) = self.secondary { b.secondary = v; }
-        if let Some(v) = self.secondary_bike { b.secondary_bike = v; }
-        if let Some(v) = self.tertiary { b.tertiary = v; }
-        if let Some(v) = self.tertiary_bike { b.tertiary_bike = v; }
-        if let Some(v) = self.unclassified { b.unclassified = v; }
-        if let Some(v) = self.unclassified_bike { b.unclassified_bike = v; }
-        if let Some(v) = self.residential_paved { b.residential_paved = v; }
-        if let Some(v) = self.residential_unpaved { b.residential_unpaved = v; }
-        if let Some(v) = self.service_paved { b.service_paved = v; }
-        if let Some(v) = self.service_unpaved { b.service_unpaved = v; }
-        if let Some(v) = self.cycleway { b.cycleway = v; }
-        if let Some(v) = self.pedestrian { b.pedestrian = v; }
-        if let Some(v) = self.bridleway { b.bridleway = v; }
-        if let Some(v) = self.other { b.other = v; }
+    fn merge_into(
+        self,
+        mut b: crate::structures::HighwayFactors,
+    ) -> crate::structures::HighwayFactors {
+        if let Some(v) = self.trunk {
+            b.trunk = v;
+        }
+        if let Some(v) = self.trunk_bike {
+            b.trunk_bike = v;
+        }
+        if let Some(v) = self.primary {
+            b.primary = v;
+        }
+        if let Some(v) = self.primary_bike {
+            b.primary_bike = v;
+        }
+        if let Some(v) = self.secondary {
+            b.secondary = v;
+        }
+        if let Some(v) = self.secondary_bike {
+            b.secondary_bike = v;
+        }
+        if let Some(v) = self.tertiary {
+            b.tertiary = v;
+        }
+        if let Some(v) = self.tertiary_bike {
+            b.tertiary_bike = v;
+        }
+        if let Some(v) = self.unclassified {
+            b.unclassified = v;
+        }
+        if let Some(v) = self.unclassified_bike {
+            b.unclassified_bike = v;
+        }
+        if let Some(v) = self.residential_paved {
+            b.residential_paved = v;
+        }
+        if let Some(v) = self.residential_unpaved {
+            b.residential_unpaved = v;
+        }
+        if let Some(v) = self.service_paved {
+            b.service_paved = v;
+        }
+        if let Some(v) = self.service_unpaved {
+            b.service_unpaved = v;
+        }
+        if let Some(v) = self.cycleway {
+            b.cycleway = v;
+        }
+        if let Some(v) = self.pedestrian {
+            b.pedestrian = v;
+        }
+        if let Some(v) = self.bridleway {
+            b.bridleway = v;
+        }
+        if let Some(v) = self.other {
+            b.other = v;
+        }
         b
     }
 }
@@ -312,34 +368,91 @@ struct BikeProfileInput {
 
 impl BikeProfileInput {
     /// Overlay the provided fields onto a base profile.
-    fn merge_into(self, mut base: crate::structures::BikeProfile) -> crate::structures::BikeProfile {
-        if let Some(v) = self.allow_steps { base.allow_steps = v; }
-        if let Some(v) = self.allow_dismount { base.allow_dismount = v; }
-        if let Some(v) = self.ignore_cycleroutes { base.ignore_cycleroutes = v; }
-        if let Some(v) = self.stick_to_cycleroutes { base.stick_to_cycleroutes = v; }
-        if let Some(v) = self.avoid_unsafe { base.avoid_unsafe = v; }
-        if let Some(h) = self.highway { base.highway = h.merge_into(base.highway); }
-        if let Some(v) = self.steps_cost { base.steps_cost = v; }
-        if let Some(v) = self.unsafe_penalty { base.unsafe_penalty = v; }
-        if let Some(v) = self.oneway_roundabout { base.oneway_roundabout = v; }
-        if let Some(v) = self.oneway_primary { base.oneway_primary = v; }
-        if let Some(v) = self.oneway_secondary { base.oneway_secondary = v; }
-        if let Some(v) = self.oneway_tertiary { base.oneway_tertiary = v; }
-        if let Some(v) = self.oneway_other { base.oneway_other = v; }
-        if let Some(v) = self.access_foot_only { base.access_foot_only = v; }
-        if let Some(v) = self.access_cycleroute { base.access_cycleroute = v; }
-        if let Some(v) = self.access_forbidden { base.access_forbidden = v; }
-        if let Some(v) = self.turncost { base.turncost = v; }
-        if let Some(v) = self.consider_elevation { base.consider_elevation = v; }
-        if let Some(v) = self.uphillcost { base.uphillcost = v; }
-        if let Some(v) = self.uphillcutoff { base.uphillcutoff = v; }
-        if let Some(v) = self.downhillcost { base.downhillcost = v; }
-        if let Some(v) = self.downhillcutoff { base.downhillcutoff = v; }
-        if let Some(v) = self.total_mass { base.total_mass = v; }
-        if let Some(v) = self.max_speed { base.max_speed = v; }
-        if let Some(v) = self.s_c_x { base.s_c_x = v; }
-        if let Some(v) = self.c_r { base.c_r = v; }
-        if let Some(v) = self.biker_power { base.biker_power = v; }
+    fn merge_into(
+        self,
+        mut base: crate::structures::BikeProfile,
+    ) -> crate::structures::BikeProfile {
+        if let Some(v) = self.allow_steps {
+            base.allow_steps = v;
+        }
+        if let Some(v) = self.allow_dismount {
+            base.allow_dismount = v;
+        }
+        if let Some(v) = self.ignore_cycleroutes {
+            base.ignore_cycleroutes = v;
+        }
+        if let Some(v) = self.stick_to_cycleroutes {
+            base.stick_to_cycleroutes = v;
+        }
+        if let Some(v) = self.avoid_unsafe {
+            base.avoid_unsafe = v;
+        }
+        if let Some(h) = self.highway {
+            base.highway = h.merge_into(base.highway);
+        }
+        if let Some(v) = self.steps_cost {
+            base.steps_cost = v;
+        }
+        if let Some(v) = self.unsafe_penalty {
+            base.unsafe_penalty = v;
+        }
+        if let Some(v) = self.oneway_roundabout {
+            base.oneway_roundabout = v;
+        }
+        if let Some(v) = self.oneway_primary {
+            base.oneway_primary = v;
+        }
+        if let Some(v) = self.oneway_secondary {
+            base.oneway_secondary = v;
+        }
+        if let Some(v) = self.oneway_tertiary {
+            base.oneway_tertiary = v;
+        }
+        if let Some(v) = self.oneway_other {
+            base.oneway_other = v;
+        }
+        if let Some(v) = self.access_foot_only {
+            base.access_foot_only = v;
+        }
+        if let Some(v) = self.access_cycleroute {
+            base.access_cycleroute = v;
+        }
+        if let Some(v) = self.access_forbidden {
+            base.access_forbidden = v;
+        }
+        if let Some(v) = self.turncost {
+            base.turncost = v;
+        }
+        if let Some(v) = self.consider_elevation {
+            base.consider_elevation = v;
+        }
+        if let Some(v) = self.uphillcost {
+            base.uphillcost = v;
+        }
+        if let Some(v) = self.uphillcutoff {
+            base.uphillcutoff = v;
+        }
+        if let Some(v) = self.downhillcost {
+            base.downhillcost = v;
+        }
+        if let Some(v) = self.downhillcutoff {
+            base.downhillcutoff = v;
+        }
+        if let Some(v) = self.total_mass {
+            base.total_mass = v;
+        }
+        if let Some(v) = self.max_speed {
+            base.max_speed = v;
+        }
+        if let Some(v) = self.s_c_x {
+            base.s_c_x = v;
+        }
+        if let Some(v) = self.c_r {
+            base.c_r = v;
+        }
+        if let Some(v) = self.biker_power {
+            base.biker_power = v;
+        }
         base
     }
 }
@@ -377,6 +490,8 @@ impl QueryRoot {
         modes: Option<Vec<Mode>>,
         // Bike cost profile override; sparse fields overlay the graph default.
         bike_profile: Option<BikeProfileInput>,
+        // When true, direct walk/bike plans are built with the Deadline leg role.
+        terminal_deadline: Option<bool>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -395,6 +510,7 @@ impl QueryRoot {
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
             bike_profile: bike_profile.map(|i| i.merge_into(graph.raptor.bike_profile)),
+            terminal_deadline: terminal_deadline.unwrap_or(false),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -418,6 +534,7 @@ impl QueryRoot {
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
         bike_profile: Option<BikeProfileInput>,
+        terminal_deadline: Option<bool>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -436,6 +553,7 @@ impl QueryRoot {
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
             bike_profile: bike_profile.map(|i| i.merge_into(graph.raptor.bike_profile)),
+            terminal_deadline: terminal_deadline.unwrap_or(false),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -452,19 +570,27 @@ impl QueryRoot {
                 access_attempts: result.access.access_attempts as i32,
                 fell_back_to_walk_only: result.access.fell_back_to_walk_only,
             },
-            stops_reached: result.stops_reached.into_iter().map(|s| StopReachGql {
-                stop_idx: s.stop_idx as i32,
-                round: s.round as i32,
-                arrival_secs: s.arrival_secs as i32,
-                lat: s.lat,
-                lon: s.lon,
-                name: s.name,
-                path: s.path.into_iter().map(|l| StopPathLegGql {
-                    is_transit: l.is_transit,
-                    route_label: l.route_label,
-                    geometry: l.geometry,
-                }).collect(),
-            }).collect(),
+            stops_reached: result
+                .stops_reached
+                .into_iter()
+                .map(|s| StopReachGql {
+                    stop_idx: s.stop_idx as i32,
+                    round: s.round as i32,
+                    arrival_secs: s.arrival_secs as i32,
+                    lat: s.lat,
+                    lon: s.lon,
+                    name: s.name,
+                    path: s
+                        .path
+                        .into_iter()
+                        .map(|l| StopPathLegGql {
+                            is_transit: l.is_transit,
+                            route_label: l.route_label,
+                            geometry: l.geometry,
+                        })
+                        .collect(),
+                })
+                .collect(),
             origin: result.origin,
             destination: result.destination,
         })
@@ -512,6 +638,7 @@ impl QueryRoot {
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
             bike_profile: None,
+            terminal_deadline: false,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -574,14 +701,16 @@ impl QueryRoot {
                 url,
                 routes: routes
                     .into_iter()
-                    .map(|(route_idx, short_name, long_name, mode, color, text_color)| GtfsRoute {
-                        id: format!("maas:route:{}", route_idx),
-                        short_name,
-                        long_name,
-                        mode,
-                        color,
-                        text_color,
-                    })
+                    .map(
+                        |(route_idx, short_name, long_name, mode, color, text_color)| GtfsRoute {
+                            id: format!("maas:route:{}", route_idx),
+                            short_name,
+                            long_name,
+                            mode,
+                            color,
+                            text_color,
+                        },
+                    )
                     .collect(),
             })
             .collect())
@@ -590,7 +719,7 @@ impl QueryRoot {
 
 const DEBUG_HTML: &str = include_str!("static/debug.html");
 const INDEX_HTML: &str = include_str!("static/index.html");
-const MAAS_JS: &str    = include_str!("static/maas.js");
+const MAAS_JS: &str = include_str!("static/maas.js");
 
 struct Js(&'static str);
 impl IntoResponse for Js {
@@ -612,7 +741,9 @@ pub async fn index_page() -> Html<&'static str> {
 }
 
 #[handler]
-pub async fn maas_js_handler() -> Js { Js(MAAS_JS) }
+pub async fn maas_js_handler() -> Js {
+    Js(MAAS_JS)
+}
 
 #[handler]
 async fn graphiql() -> Html<String> {
@@ -670,11 +801,8 @@ mod tests {
 
     #[test]
     fn parse_date_time_short_time_format() {
-        let (_, t) = parse_date_time(
-            &Some("2025-01-01".to_string()),
-            &Some("14:05".to_string()),
-        )
-        .unwrap();
+        let (_, t) =
+            parse_date_time(&Some("2025-01-01".to_string()), &Some("14:05".to_string())).unwrap();
         assert_eq!(t, NaiveTime::from_hms_opt(14, 5, 0).unwrap());
     }
 

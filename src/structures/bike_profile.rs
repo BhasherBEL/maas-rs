@@ -33,14 +33,24 @@ pub struct HighwayFactors {
 impl Default for HighwayFactors {
     fn default() -> Self {
         HighwayFactors {
-            trunk: 10.0, trunk_bike: 1.5,
-            primary: 3.0, primary_bike: 1.2,
-            secondary: 1.6, secondary_bike: 1.1,
-            tertiary: 1.4, tertiary_bike: 1.0,
-            unclassified: 1.3, unclassified_bike: 1.0,
-            residential_paved: 1.1, residential_unpaved: 1.5,
-            service_paved: 1.3, service_unpaved: 1.6,
-            cycleway: 1.0, pedestrian: 3.0, bridleway: 5.0, other: 2.0,
+            trunk: 10.0,
+            trunk_bike: 1.5,
+            primary: 3.0,
+            primary_bike: 1.2,
+            secondary: 1.6,
+            secondary_bike: 1.1,
+            tertiary: 1.4,
+            tertiary_bike: 1.0,
+            unclassified: 1.3,
+            unclassified_bike: 1.0,
+            residential_paved: 1.1,
+            residential_unpaved: 1.5,
+            service_paved: 1.3,
+            service_unpaved: 1.6,
+            cycleway: 1.0,
+            pedestrian: 3.0,
+            bridleway: 5.0,
+            other: 2.0,
         }
     }
 }
@@ -56,6 +66,10 @@ pub struct BikeProfile {
     pub ignore_cycleroutes: bool,
     pub stick_to_cycleroutes: bool,
     pub avoid_unsafe: bool,
+    /// When true, riding against a one-way (a `wrong_way` edge that ingest did not
+    /// clear via a cyclist contraflow exemption) is impassable, so the search routes
+    /// the legal direction instead of merely paying the `oneway_*` penalty.
+    pub respect_oneway: bool,
 
     pub highway: HighwayFactors,
 
@@ -94,6 +108,21 @@ pub struct BikeProfile {
     pub s_c_x: f64,
     pub c_r: f64,
     pub biker_power: f64,
+
+    /// Braking deceleration (m/s²) used to time a slow-down for a corner or a stop.
+    pub brake_decel: f64,
+    /// Comfortable forward acceleration (m/s²) when getting back up to speed after a
+    /// stop or a corner. A rider surges well above cruise power to accelerate, so this
+    /// is a constant rate, not energy/cruise-power.
+    pub accel_rate: f64,
+    /// Comfortable lateral (centripetal) acceleration (m/s²) a cyclist accepts in a
+    /// bend; the cornering speed is `sqrt(lateral_accel · radius)`.
+    pub lateral_accel: f64,
+    /// Speed (m/s) of pushing a dismounted bike on a non-stairs way (slower than free
+    /// walking — a loaded bike is awkward to maneuver).
+    pub push_speed_mps: f64,
+    /// Speed (m/s) of hauling a dismounted bike up/down stairs (slower still).
+    pub steps_push_speed_mps: f64,
 }
 
 impl Default for BikeProfile {
@@ -104,6 +133,7 @@ impl Default for BikeProfile {
             ignore_cycleroutes: false,
             stick_to_cycleroutes: true,
             avoid_unsafe: true,
+            respect_oneway: true,
             highway: HighwayFactors::default(),
             steps_cost: 40.0,
             unsafe_penalty: 2.0,
@@ -125,10 +155,15 @@ impl Default for BikeProfile {
             elevation_max_buffer: 10.0,
             elevation_buffer_reduce: 0.0,
             total_mass: 90.0,
-            max_speed: 45.0,
-            s_c_x: 0.225,
-            c_r: 0.01,
-            biker_power: 100.0,
+            max_speed: 36.0,
+            s_c_x: 0.55,
+            c_r: 0.006,
+            biker_power: 70.0,
+            brake_decel: 2.5,
+            accel_rate: 1.0,
+            lateral_accel: 2.5,
+            push_speed_mps: 0.9,
+            steps_push_speed_mps: 0.25,
         }
     }
 }
@@ -140,13 +175,55 @@ impl BikeProfile {
         use HighwayClass::*;
         let f = &self.highway;
         match h {
-            Trunk | TrunkLink => if isbike { f.trunk_bike } else { f.trunk },
-            Primary | PrimaryLink => if isbike { f.primary_bike } else { f.primary },
-            Secondary | SecondaryLink => if isbike { f.secondary_bike } else { f.secondary },
-            Tertiary | TertiaryLink => if isbike { f.tertiary_bike } else { f.tertiary },
-            Unclassified => if isbike { f.unclassified_bike } else { f.unclassified },
-            Residential | LivingStreet => if unpaved { f.residential_unpaved } else { f.residential_paved },
-            Service => if unpaved { f.service_unpaved } else { f.service_paved },
+            Trunk | TrunkLink => {
+                if isbike {
+                    f.trunk_bike
+                } else {
+                    f.trunk
+                }
+            }
+            Primary | PrimaryLink => {
+                if isbike {
+                    f.primary_bike
+                } else {
+                    f.primary
+                }
+            }
+            Secondary | SecondaryLink => {
+                if isbike {
+                    f.secondary_bike
+                } else {
+                    f.secondary
+                }
+            }
+            Tertiary | TertiaryLink => {
+                if isbike {
+                    f.tertiary_bike
+                } else {
+                    f.tertiary
+                }
+            }
+            Unclassified => {
+                if isbike {
+                    f.unclassified_bike
+                } else {
+                    f.unclassified
+                }
+            }
+            Residential | LivingStreet => {
+                if unpaved {
+                    f.residential_unpaved
+                } else {
+                    f.residential_paved
+                }
+            }
+            Service => {
+                if unpaved {
+                    f.service_unpaved
+                } else {
+                    f.service_paved
+                }
+            }
             Cycleway => f.cycleway,
             Pedestrian => f.pedestrian,
             Bridleway => f.bridleway,
@@ -160,12 +237,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_trekking_values() {
+    fn defaults_match_commuter_values() {
         let p = BikeProfile::default();
         assert_eq!(p.highway.cycleway, 1.0);
         assert_eq!(p.highway.trunk, 10.0);
         assert_eq!(p.downhillcost, 100.0);
-        assert_eq!(p.biker_power, 100.0);
+        assert_eq!(p.biker_power, 70.0);
         assert!(p.avoid_unsafe && p.stick_to_cycleroutes);
     }
 
