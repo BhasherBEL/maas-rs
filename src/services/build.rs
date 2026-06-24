@@ -12,15 +12,20 @@ use crate::{
 
 /// Run only phase-0 (OSM) ingestors, then call prepare on all non-OSM ingestors.
 /// The returned graph is suitable for serialization to osm.bin.
-pub fn build_osm_phase(config: &BuildConfig, cache_dir: &str, force_download: bool) -> Option<Graph> {
+pub fn build_osm_phase(
+    config: &BuildConfig,
+    cache_dir: &str,
+    force_download: bool,
+) -> Option<Graph> {
     let mut g = Graph::new();
     run_phase(config, &mut g, 0, cache_dir, force_download)?;
     for input in &config.inputs {
         if input.phase() != 0
-            && let Err(e) = prepare_ingestor(input, &mut g) {
-                tracing::warn!("prepare step for '{}' failed: {e}", input.label());
-                // Non-fatal: GTFS phase will fall back to re-parsing
-            }
+            && let Err(e) = prepare_ingestor(input, &mut g)
+        {
+            tracing::warn!("prepare step for '{}' failed: {e}", input.label());
+            // Non-fatal: GTFS phase will fall back to re-parsing
+        }
     }
     Some(g)
 }
@@ -39,7 +44,8 @@ pub fn build_gtfs_phase(
 fn prepare_ingestor(input: &Ingestor, g: &mut Graph) -> Result<(), String> {
     match input {
         Ingestor::GtfsSncb(c) => {
-            let osm_path = c.osm_url
+            let osm_path = c
+                .osm_url
                 .strip_prefix("path:")
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| c.osm_url.clone());
@@ -56,13 +62,17 @@ fn run_phase(
     cache_dir: &str,
     force_download: bool,
 ) -> Option<()> {
-    let ordered: Vec<&Ingestor> = config.inputs.iter()
+    let ordered: Vec<&Ingestor> = config
+        .inputs
+        .iter()
         .filter(|i| i.phase() == phase)
         .collect();
 
     // Load the elevation DEM once for this phase, only if it ingests OSM streets.
     let dem = if ordered.iter().any(|i| matches!(i, Ingestor::OsmPbf(_))) {
-        config.elevation.as_deref()
+        config
+            .elevation
+            .as_deref()
             .map(|u| u.strip_prefix("path:").unwrap_or(u))
             .and_then(|p| match Dem::load(p) {
                 Ok(d) => Some(d),
@@ -88,11 +98,21 @@ fn run_phase(
         };
 
         let result = match input {
-            Ingestor::OsmPbf(_) => osm::load_pbf_file(&path, dem.as_ref(), g).map_err(|e| e.to_string()),
+            Ingestor::OsmPbf(_) => {
+                osm::load_pbf_file(
+                    &path,
+                    dem.as_ref(),
+                    config.elevation_smoothing_epsilon,
+                    &config.surface_speed_factors,
+                    g,
+                )
+                .map_err(|e| e.to_string())
+            }
             Ingestor::GtfsGeneric(_) => load_gtfs(&path, g).map_err(|e| e.to_string()),
             Ingestor::GtfsStib(_) => load_gtfs_stib(&path, g).map_err(|e| e.to_string()),
             Ingestor::GtfsSncb(c) => {
-                let osm_path = c.osm_url
+                let osm_path = c
+                    .osm_url
                     .strip_prefix("path:")
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| c.osm_url.clone());
@@ -122,7 +142,16 @@ fn finalize(mut g: Graph, config: &BuildConfig) -> Option<Graph> {
     let models = config
         .delay_models
         .iter()
-        .filter_map(|m| m.route_type().map(|rt| (rt, DelayCDF { bins: m.bins.clone() })))
+        .filter_map(|m| {
+            m.route_type().map(|rt| {
+                (
+                    rt,
+                    DelayCDF {
+                        bins: m.bins.clone(),
+                    },
+                )
+            })
+        })
         .collect::<HashMap<_, _>>();
     g.set_transit_delay_models(models);
 
@@ -179,6 +208,51 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(m) = routing.max_snap_distance_m {
         g.set_max_snap_distance_m(m);
     }
+    if let Some(db) = routing.distance_budget {
+        g.set_distance_budget(db);
+    }
+    if let Some(ep) = &routing.epsilon {
+        g.set_epsilon(ep.to_epsilon());
+    }
+    if let Some(k) = routing.bike_bucket_cyc_k {
+        g.set_bike_bucket_cyc_k(k);
+    }
+    if let Some(k) = routing.bike_bucket_dpl_k {
+        g.set_bike_bucket_dpl_k(k);
+    }
+    if let Some(on) = routing.multiobj_contract {
+        g.set_multiobj_contract(on);
+    }
+    if let Some(on) = routing.bike_select_dplus {
+        g.raptor.set_bike_select_dplus(on);
+    }
+    if let Some(vm) = routing.variance_model {
+        g.set_variance_model(vm);
+    }
+    if let Some(cw) = routing.cost_weights {
+        g.set_cost_weights(cw);
+    }
+    if let Some(k) = routing.representatives_k {
+        g.set_representatives_k(k);
+    }
+    if let Some(on) = routing.multiobj_street {
+        g.set_multiobj_street(on);
+    }
+    if let Some(m) = routing.multiobj_street_max_len_m {
+        g.set_multiobj_street_max_len_m(m);
+    }
+    if let Some(t) = routing.champion_time_tiebreak {
+        g.set_champion_time_tiebreak(t);
+    }
+    if let Some(f) = routing.alt_max_share_factor {
+        g.set_alt_max_share_factor(f);
+    }
+    if let Some(cv) = routing.systematic_cv {
+        g.set_systematic_cv(cv);
+    }
+    if let Some(b) = routing.balance {
+        g.set_balance(b);
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +265,8 @@ mod tests {
             output: "out.bin".into(),
             osm_output: "osm.bin".into(),
             elevation: None,
+            elevation_smoothing_epsilon: 4.0,
+            surface_speed_factors: Default::default(),
             delay_models: vec![],
         }
     }

@@ -8,9 +8,14 @@ use crate::structures::Graph;
 const MAGIC: &[u8; 4] = b"MAAS";
 /// Bump when any OSM-side `Graph` field (nodes/edges/kdtree/id_mapper) changes layout.
 /// v3: bike-route membership now propagated from OSM relations onto edges' `cycleroute`.
-pub const OSM_SCHEMA_VERSION: u32 = 3;
-/// Bump when any `Graph`/`RaptorIndex` field changes layout.
-pub const GRAPH_SCHEMA_VERSION: u32 = 3;
+/// v4: `StreetEdgeData` gained a `var_gen` variance-generator field.
+/// v5: `elev_delta` is now DEM-denoised per-way at ingestion (RDP smoothing), so
+///     stale caches carry raw (noisy) ascent and must be rebuilt.
+/// v6: `StreetEdgeData` gained a baked `surface_speed` bike speed factor.
+pub const OSM_SCHEMA_VERSION: u32 = 6;
+/// Bump when any `Graph`/`RaptorIndex` field changes layout (or, like v5, the baked
+/// `elev_delta` edge values change meaning).
+pub const GRAPH_SCHEMA_VERSION: u32 = 6;
 
 const HEADER_LEN: usize = 8;
 
@@ -26,7 +31,9 @@ fn with_header(version: u32, payload: &[u8]) -> Vec<u8> {
 /// is an error so the caller can rebuild instead of deserializing stale bytes.
 fn split_header<'a>(bytes: &'a [u8], expected: u32, path: &str) -> Result<&'a [u8], String> {
     if bytes.len() < HEADER_LEN || &bytes[..4] != MAGIC {
-        return Err(format!("'{path}' is not a maas-rs cache file (missing header)"));
+        return Err(format!(
+            "'{path}' is not a maas-rs cache file (missing header)"
+        ));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     if version != expected {
@@ -56,6 +63,8 @@ pub fn load_graph(path: &str) -> Result<Graph, String> {
     })?;
     // Rebuild #[serde(skip)] runtime indices (e.g. trip_id → TripId).
     graph.raptor.build_runtime_indices();
+    // Rebuild the #[serde(skip)] spatial edge index for edge-aware snapping.
+    graph.build_edge_index();
     tracing::info!("graph restored from {path}");
     Ok(graph)
 }
@@ -121,6 +130,60 @@ mod tests {
         assert!(std::path::Path::new(&prev_s).exists());
 
         assert!(load_graph(path_s).is_ok());
+    }
+
+    #[test]
+    fn load_graph_rebuilds_edge_index_for_snapping() {
+        use crate::structures::{
+            BikeAttrs, EdgeData, Endpoint, LatLng, NodeData, OsmNodeData, StreetEdgeData,
+            cost::VarGen,
+        };
+        let dir = std::env::temp_dir().join("maas_persist_edgeidx_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graph.bin");
+        let path_s = path.to_str().unwrap();
+
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng {
+                    latitude: lat,
+                    longitude: lon,
+                },
+            })
+        };
+        let mut g = Graph::new();
+        let a = g.add_node(mk("a", 50.000, 4.000));
+        let b = g.add_node(mk("b", 50.000, 4.0085));
+        let edge = |o, d| {
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                partial: false,
+                length: 607,
+                foot: false,
+                bike: true,
+                car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        g.add_edge(a, edge(a, b));
+        g.add_edge(b, edge(b, a));
+        // Deliberately do NOT build the edge index before saving: it is #[serde(skip)]
+        // and must be rebuilt on load.
+        save_graph(&g, path_s).unwrap();
+
+        let loaded = load_graph(path_s).unwrap();
+        let (ep, _) = loaded
+            .snap_to_edge(50.000, 4.00425, 300.0, |s| s.bike)
+            .expect("loaded graph snaps onto the bike edge");
+        assert!(
+            matches!(ep, Endpoint::OnEdge { .. }),
+            "edge index rebuilt on load"
+        );
     }
 
     #[test]

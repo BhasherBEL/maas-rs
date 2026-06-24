@@ -186,7 +186,11 @@ mod tests {
         let now = Local::now();
 
         // Checked 90 minutes ago: at least one top-of-hour tick has passed.
-        assert!(feeds_stale(&sched, now - chrono::Duration::minutes(90), now));
+        assert!(feeds_stale(
+            &sched,
+            now - chrono::Duration::minutes(90),
+            now
+        ));
 
         // Checked just now: no tick since (next fire is in the future).
         assert!(!feeds_stale(&sched, now, now));

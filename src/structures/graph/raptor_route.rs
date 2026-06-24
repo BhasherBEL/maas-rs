@@ -7,12 +7,15 @@ use crate::{
     structures::{
         ALL_STATES, ActiveModes, NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
         VehicleState,
-        plan::{AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate, PlanLeg, PlanLegStep, StopPathLeg, StopReach},
+        plan::{
+            AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate,
+            PlanLeg, PlanLegStep, StopPathLeg, StopReach,
+        },
         raptor::Trace,
     },
 };
 
-use super::{BikeCost, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
+use super::{BikeCost, Endpoint, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
 
 /// Per-query mode resolution: the active vehicle states plus per-state
 /// access/egress stop lists (walk/ride seconds, relative to the endpoint).
@@ -207,7 +210,10 @@ impl LabelSet {
     /// This is the time axis of the Pareto front — risk lives in the reliability axis,
     /// so we compare on scheduled arrival, not probability-weighted expected arrival.
     pub fn earliest(&self) -> u32 {
-        self.iter().map(|l| l.bag.earliest()).min().unwrap_or(u32::MAX)
+        self.iter()
+            .map(|l| l.bag.earliest())
+            .min()
+            .unwrap_or(u32::MAX)
     }
 
     /// The label with the earliest scheduled arrival (fastest), if any.
@@ -298,7 +304,11 @@ impl LabelSet {
                 Some(g) => {
                     let (gr, ge) = (self.labels[g].reliability, self.labels[g].bag.earliest());
                     let (ir, ie) = (self.labels[i].reliability, self.labels[i].bag.earliest());
-                    if ir < gr || (ir == gr && ie > ge) { i } else { g }
+                    if ir < gr || (ir == gr && ie > ge) {
+                        i
+                    } else {
+                        g
+                    }
                 }
             });
         }
@@ -346,6 +356,7 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         am: &ActiveModes,
         bike: &BikeCost,
+        terminal_deadline: bool,
         mut try_routing: F,
     ) -> Vec<Plan>
     where
@@ -353,20 +364,28 @@ impl Graph {
     {
         // No transit mode selected: the direct street plans are the whole answer.
         if !am.wants_transit() {
-            let walk_secs = self
-                .walk_dijkstra(origin, u32::MAX)
-                .get(&destination)
-                .copied()
-                .unwrap_or(u32::MAX);
-            let mut plans = self.direct_fallback_plans(am, origin, destination, start_time, walk_secs, bike);
-            if !am.wants_direct_walk() {
-                plans.retain(|p| p.mode != crate::structures::Mode::Walk);
-            }
+            let walk_secs = if am.wants_direct_walk() {
+                self.walk_dijkstra(origin, u32::MAX)
+                    .get(&destination)
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            } else {
+                u32::MAX
+            };
+            let plans = self.direct_fallback_plans(
+                am,
+                origin,
+                destination,
+                start_time,
+                walk_secs,
+                bike,
+                terminal_deadline,
+            );
             return Self::finalize_plans(plans, buckets);
         }
 
-        let straight_line_secs =
-            (self.nodes_distance(origin, destination) as f64 / self.raptor.walking_speed_mps) as u32;
+        let straight_line_secs = (self.nodes_distance(origin, destination) as f64
+            / self.raptor.walking_speed_mps) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
@@ -380,7 +399,14 @@ impl Graph {
                 let mut results = try_routing(&mc, access_secs);
                 if !results.is_empty() {
                     self.append_bounded_direct_plans(
-                        am, origin, destination, start_time, slack, bike, &mut results,
+                        am,
+                        origin,
+                        destination,
+                        start_time,
+                        slack,
+                        bike,
+                        terminal_deadline,
+                        &mut results,
                     );
                     return Self::finalize_plans(results, buckets);
                 }
@@ -398,11 +424,19 @@ impl Graph {
             }
 
             if let Some(actual) = walk_only_secs
-                && access_secs >= actual {
-                    let plans =
-                        self.direct_fallback_plans(am, origin, destination, start_time, actual, bike);
-                    return Self::finalize_plans(plans, buckets);
-                }
+                && access_secs >= actual
+            {
+                let plans = self.direct_fallback_plans(
+                    am,
+                    origin,
+                    destination,
+                    start_time,
+                    actual,
+                    bike,
+                    terminal_deadline,
+                );
+                return Self::finalize_plans(plans, buckets);
+            }
         }
     }
 
@@ -410,13 +444,19 @@ impl Graph {
     /// connection). Stop ids are unchanged; only the seconds are transformed.
     pub(crate) fn access_times(&self, stops: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
         let m = &self.raptor.street_time;
-        stops.into_iter().map(|(s, t)| (s, m.access_secs(t))).collect()
+        stops
+            .into_iter()
+            .map(|(s, t)| (s, m.access_secs(t)))
+            .collect()
     }
 
     /// Adjust egress-leg seconds to the distribution mean (honest arrival).
     pub(crate) fn egress_times(&self, stops: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
         let m = &self.raptor.street_time;
-        stops.into_iter().map(|(s, t)| (s, m.egress_secs(t))).collect()
+        stops
+            .into_iter()
+            .map(|(s, t)| (s, m.egress_secs(t)))
+            .collect()
     }
 
     /// Per-profile access/egress stop discovery for the active states. Each list
@@ -466,7 +506,11 @@ impl Graph {
             vec![]
         };
         let car_egress = if has(CarEgress) {
-            self.egress_times(self.nearby_stops_profile(destination, vehicle_secs, StreetProfile::Car))
+            self.egress_times(self.nearby_stops_profile(
+                destination,
+                vehicle_secs,
+                StreetProfile::Car,
+            ))
         } else {
             vec![]
         };
@@ -493,7 +537,13 @@ impl Graph {
         }
 
         ModeContext::build(
-            am, &foot_access, &bike_access, &car_access, &foot_egress, &bike_egress, &car_egress,
+            am,
+            &foot_access,
+            &bike_access,
+            &car_access,
+            &foot_egress,
+            &bike_egress,
+            &car_egress,
         )
     }
 
@@ -511,6 +561,7 @@ impl Graph {
         start_time: u32,
         slack: u32,
         bike: &BikeCost,
+        _terminal_deadline: bool,
         results: &mut Vec<Plan>,
     ) {
         let best_end = match results.iter().map(|p| p.end).min() {
@@ -520,9 +571,15 @@ impl Graph {
         let bound = best_end.saturating_sub(start_time).saturating_add(slack);
 
         if (am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some())
-            && let Some(plan) = self.build_bike_plan(origin, destination, start_time, bound, bike)
+            && let Some(scalar) = self.build_bike_plan(
+                Endpoint::Node(origin),
+                Endpoint::Node(destination),
+                start_time,
+                bound,
+                bike,
+            )
         {
-            results.push(plan);
+            results.push(scalar);
         }
         if am.wants_direct_car() {
             if let Some(&secs) = self
@@ -530,7 +587,11 @@ impl Graph {
                 .get(&destination)
             {
                 results.push(self.build_street_plan(
-                    origin, destination, start_time, secs, StreetProfile::Car,
+                    origin,
+                    destination,
+                    start_time,
+                    secs,
+                    StreetProfile::Car,
                 ));
             }
         }
@@ -554,15 +615,22 @@ impl Graph {
         start_time: u32,
         walk_secs: u32,
         bike: &BikeCost,
+        _terminal_deadline: bool,
     ) -> Vec<Plan> {
         let mut plans = Vec::new();
         if walk_secs < u32::MAX {
             plans.push(self.build_walk_plan(origin, destination, start_time, walk_secs));
         }
-        if (am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some())
-            && let Some(plan) = self.build_bike_plan(origin, destination, start_time, u32::MAX, bike)
-        {
-            plans.push(plan);
+        if am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some() {
+            if let Some(scalar) = self.build_bike_plan(
+                Endpoint::Node(origin),
+                Endpoint::Node(destination),
+                start_time,
+                u32::MAX,
+                bike,
+            ) {
+                plans.push(scalar);
+            }
         }
         if am.wants_direct_car() {
             if let Some(&car_secs) = self
@@ -591,8 +659,15 @@ impl Graph {
         weekday: u8,
         min_access_secs: u32,
     ) -> Vec<Plan> {
-        self.raptor_modes(origin, destination, start_time, date, weekday, min_access_secs,
-            &ActiveModes::default())
+        self.raptor_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            &ActiveModes::default(),
+        )
     }
 
     /// `raptor` over an explicit mode selection.
@@ -608,8 +683,20 @@ impl Graph {
         am: &ActiveModes,
     ) -> Vec<Plan> {
         let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
-        self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday, min_access_secs,
-            &buckets, self.raptor.arrival_slack_secs, &RealtimeIndex::new(), am, &self.default_bike_cost())
+        self.raptor_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            &buckets,
+            self.raptor.arrival_slack_secs,
+            &RealtimeIndex::new(),
+            am,
+            &self.default_bike_cost(),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -624,8 +711,17 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> Vec<Plan> {
-        self.raptor_tuned_rt(origin, destination, start_time, date, weekday, min_access_secs,
-            buckets, slack, &RealtimeIndex::new())
+        self.raptor_tuned_rt(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            &RealtimeIndex::new(),
+        )
     }
 
     /// `raptor_tuned` with a realtime delay index applied to trip times.
@@ -642,8 +738,20 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,11 +768,33 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        terminal_deadline: bool,
     ) -> Vec<Plan> {
-        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am, bike,
+        self.with_access_search(
+            origin,
+            destination,
+            start_time,
+            min_access_secs,
+            slack,
+            buckets,
+            am,
+            bike,
+            terminal_deadline,
             |mc, access_secs| {
-                self.raptor_inner(mc, start_time, access_secs, date, weekday, origin, destination, buckets, slack, rt)
-            })
+                self.raptor_inner(
+                    mc,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                    buckets,
+                    slack,
+                    rt,
+                )
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -682,8 +812,17 @@ impl Graph {
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
         self.raptor_inner_with_debug(
-            mc, start_time, access_secs, date, weekday, origin, destination,
-            buckets, slack, rt, false,
+            mc,
+            start_time,
+            access_secs,
+            date,
+            weekday,
+            origin,
+            destination,
+            buckets,
+            slack,
+            rt,
+            false,
         )
         .0
     }
@@ -722,9 +861,22 @@ impl Graph {
         let mut arena: Vec<Label> = Vec::new();
 
         self.run_departure_into(
-            mc, start_time, access_secs, date, weekday, buckets, slack, rt,
-            0, false,
-            &mut best, &mut labels, &mut marked, &mut is_marked, &mut queue, &mut queue_pos,
+            mc,
+            start_time,
+            access_secs,
+            date,
+            weekday,
+            buckets,
+            slack,
+            rt,
+            0,
+            false,
+            &mut best,
+            &mut labels,
+            &mut marked,
+            &mut is_marked,
+            &mut queue,
+            &mut queue_pos,
             &mut arena,
         );
 
@@ -733,8 +885,8 @@ impl Graph {
             (0..n_stops)
                 .filter_map(|stop_idx| {
                     for k in 0..=MAX_ROUNDS {
-                        let reached = (0..n_states)
-                            .any(|s| labels[k][stop_idx * n_states + s].is_reached());
+                        let reached =
+                            (0..n_states).any(|s| labels[k][stop_idx * n_states + s].is_reached());
                         if reached {
                             let node_id = self.raptor.transit_stop_to_node[stop_idx];
                             let loc = self.nodes[node_id.0].loc();
@@ -767,7 +919,11 @@ impl Graph {
 
         // The candidate sink clones every kept plan; only `raptor_explain*` needs it.
         let mut candidates: Vec<PlanCandidate> = Vec::new();
-        let debug_sink = if want_debug { Some(&mut candidates) } else { None };
+        let debug_sink = if want_debug {
+            Some(&mut candidates)
+        } else {
+            None
+        };
         let plans = self.extract_with_debug(
             mc,
             start_time,
@@ -834,33 +990,37 @@ impl Graph {
 
         for (sidx, _vs) in mc.am.states() {
             for &(stop, walk) in &mc.access[sidx] {
-                let lab = Label::arena_push(arena, Label {
-                    bag: ScenarioBag::single(start_time + walk),
-                    route_type: None,
-                    reliability: 1.0,
-                    trace: Trace::NONE,
-                    created_by: stamp,
-                    at_stop: stop as u32,
-                    round: 0,
-                    parent: u32::MAX,
-                    arena_id: u32::MAX,
-                    state: sidx as u8,
-                });
+                let lab = Label::arena_push(
+                    arena,
+                    Label {
+                        bag: ScenarioBag::single(start_time + walk),
+                        route_type: None,
+                        reliability: 1.0,
+                        trace: Trace::NONE,
+                        created_by: stamp,
+                        at_stop: stop as u32,
+                        round: 0,
+                        parent: u32::MAX,
+                        arena_id: u32::MAX,
+                        state: sidx as u8,
+                    },
+                );
                 let cell = stop * n_states + sidx;
                 labels[0][cell].insert(lab, buckets);
                 best[cell].insert(lab, buckets);
                 Self::mark(cell, marked, is_marked);
                 // Free drop at the access stop (park & ride).
                 if let Some((in_hand, dropped)) = drop_to
-                    && sidx as u8 == in_hand {
-                        let mut d = lab;
-                        d.state = dropped;
-                        let d = Label::arena_push(arena, d);
-                        let dcell = stop * n_states + dropped as usize;
-                        labels[0][dcell].insert(d, buckets);
-                        best[dcell].insert(d, buckets);
-                        Self::mark(dcell, marked, is_marked);
-                    }
+                    && sidx as u8 == in_hand
+                {
+                    let mut d = lab;
+                    d.state = dropped;
+                    let d = Label::arena_push(arena, d);
+                    let dcell = stop * n_states + dropped as usize;
+                    labels[0][dcell].insert(d, buckets);
+                    best[dcell].insert(d, buckets);
+                    Self::mark(dcell, marked, is_marked);
+                }
             }
         }
 
@@ -919,13 +1079,13 @@ impl Graph {
                     let mut cands: Vec<Label> = Vec::new();
                     for &pat in queue.iter() {
                         self.scan_route_collect(
-                            pat, qp[pat], date, weekday, cutoff,
-                            prev_slice, best, buckets, rt, stamp, &mut cands, mc,
+                            pat, qp[pat], date, weekday, cutoff, prev_slice, best, buckets, rt,
+                            stamp, &mut cands, mc,
                         );
                     }
                     self.apply_scan_candidates(
-                        &cands, curr_slice, best, buckets, marked, is_marked, arena,
-                        n_states, drop_to,
+                        &cands, curr_slice, best, buckets, marked, is_marked, arena, n_states,
+                        drop_to,
                     );
                 } else {
                     // Phase A: read-only scans in parallel over contiguous queue
@@ -944,8 +1104,8 @@ impl Graph {
                                     let mut cands: Vec<Label> = Vec::new();
                                     for &pat in chunk {
                                         self.scan_route_collect(
-                                            pat, qp[pat], date, weekday, cutoff,
-                                            prev_slice, best_ro, buckets, rt, stamp, &mut cands, mc,
+                                            pat, qp[pat], date, weekday, cutoff, prev_slice,
+                                            best_ro, buckets, rt, stamp, &mut cands, mc,
                                         );
                                     }
                                     cands
@@ -956,8 +1116,8 @@ impl Graph {
                     });
                     for cands in &collected {
                         self.apply_scan_candidates(
-                            cands, curr_slice, best, buckets, marked, is_marked, arena,
-                            n_states, drop_to,
+                            cands, curr_slice, best, buckets, marked, is_marked, arena, n_states,
+                            drop_to,
                         );
                     }
                 }
@@ -1018,20 +1178,29 @@ impl Graph {
                 let p = trace.pattern as usize;
                 let bp = trace.boarded_at as usize;
                 let ap = trace.alighted_at as usize;
-                let pat_stops = self.raptor.transit_idx_pattern_stops[p]
-                    .of(&self.raptor.transit_pattern_stops);
+                let pat_stops =
+                    self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
 
                 let geometry: Vec<PlanCoordinate> = (bp..=ap)
                     .map(|i| {
                         let loc = self.nodes[pat_stops[i].0].loc();
-                        PlanCoordinate { lat: loc.latitude, lon: loc.longitude }
+                        PlanCoordinate {
+                            lat: loc.latitude,
+                            lon: loc.longitude,
+                        }
                     })
                     .collect();
 
                 let route_id = self.raptor.transit_patterns[p].route;
-                let route_label = self.raptor.transit_routes[route_id.0 as usize].route_short_name.clone();
+                let route_label = self.raptor.transit_routes[route_id.0 as usize]
+                    .route_short_name
+                    .clone();
 
-                legs.push(StopPathLeg { is_transit: true, route_label, geometry });
+                legs.push(StopPathLeg {
+                    is_transit: true,
+                    route_label,
+                    geometry,
+                });
 
                 let boarding_stop = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
                 stop = boarding_stop;
@@ -1044,8 +1213,14 @@ impl Graph {
                     is_transit: false,
                     route_label: String::new(),
                     geometry: vec![
-                        PlanCoordinate { lat: from_loc.latitude, lon: from_loc.longitude },
-                        PlanCoordinate { lat: to_loc.latitude, lon: to_loc.longitude },
+                        PlanCoordinate {
+                            lat: from_loc.latitude,
+                            lon: from_loc.longitude,
+                        },
+                        PlanCoordinate {
+                            lat: to_loc.latitude,
+                            lon: to_loc.longitude,
+                        },
                     ],
                 });
                 stop = from;
@@ -1057,8 +1232,14 @@ impl Graph {
                     is_transit: false,
                     route_label: String::new(),
                     geometry: vec![
-                        PlanCoordinate { lat: from_loc.latitude, lon: from_loc.longitude },
-                        PlanCoordinate { lat: to_loc.latitude, lon: to_loc.longitude },
+                        PlanCoordinate {
+                            lat: from_loc.latitude,
+                            lon: from_loc.longitude,
+                        },
+                        PlanCoordinate {
+                            lat: to_loc.latitude,
+                            lon: to_loc.longitude,
+                        },
                     ],
                 });
                 break;
@@ -1086,8 +1267,8 @@ impl Graph {
     where
         F: FnMut(&ModeContext, u32) -> Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>,
     {
-        let straight_line_secs =
-            (self.nodes_distance(origin, destination) as f64 / self.raptor.walking_speed_mps) as u32;
+        let straight_line_secs = (self.nodes_distance(origin, destination) as f64
+            / self.raptor.walking_speed_mps) as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
@@ -1098,18 +1279,21 @@ impl Graph {
         loop {
             let mc = self.build_mode_context(am, origin, destination, access_secs, bike);
 
-            if mc.any_access() && mc.any_egress()
-                && let Some((plans, candidates, stops)) = try_routing(&mc, access_secs) {
-                    let access = AccessInfo {
-                        walk_radius_secs: access_secs,
-                        walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
-                        origin_stops_found: mc.merged_access().len() as u32,
-                        destination_stops_found: mc.egress.iter().map(|e| e.len()).max().unwrap_or(0) as u32,
-                        access_attempts: attempts,
-                        fell_back_to_walk_only: false,
-                    };
-                    return (plans, candidates, access, stops);
-                }
+            if mc.any_access()
+                && mc.any_egress()
+                && let Some((plans, candidates, stops)) = try_routing(&mc, access_secs)
+            {
+                let access = AccessInfo {
+                    walk_radius_secs: access_secs,
+                    walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
+                    origin_stops_found: mc.merged_access().len() as u32,
+                    destination_stops_found: mc.egress.iter().map(|e| e.len()).max().unwrap_or(0)
+                        as u32,
+                    access_attempts: attempts,
+                    fell_back_to_walk_only: false,
+                };
+                return (plans, candidates, access, stops);
+            }
 
             access_secs = access_secs.saturating_mul(2);
             attempts += 1;
@@ -1124,27 +1308,36 @@ impl Graph {
             }
 
             if let Some(actual) = walk_only_secs
-                && access_secs >= actual {
-                    let plans = self.direct_fallback_plans(am, origin, destination, start_time, actual, bike);
-                    let candidates = plans
-                        .iter()
-                        .map(|plan| PlanCandidate {
-                            round: 0,
-                            origin_departure: start_time,
-                            plan: Some(plan.clone()),
-                            status: CandidateStatus::Kept,
-                        })
-                        .collect();
-                    let access = AccessInfo {
-                        walk_radius_secs: access_secs,
-                        walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
-                        origin_stops_found: 0,
-                        destination_stops_found: 0,
-                        access_attempts: attempts,
-                        fell_back_to_walk_only: true,
-                    };
-                    return (plans, candidates, access, vec![]);
-                }
+                && access_secs >= actual
+            {
+                let plans = self.direct_fallback_plans(
+                    am,
+                    origin,
+                    destination,
+                    start_time,
+                    actual,
+                    bike,
+                    false,
+                );
+                let candidates = plans
+                    .iter()
+                    .map(|plan| PlanCandidate {
+                        round: 0,
+                        origin_departure: start_time,
+                        plan: Some(plan.clone()),
+                        status: CandidateStatus::Kept,
+                    })
+                    .collect();
+                let access = AccessInfo {
+                    walk_radius_secs: access_secs,
+                    walk_radius_meters: (access_secs as f64 * self.raptor.walking_speed_mps) as u32,
+                    origin_stops_found: 0,
+                    destination_stops_found: 0,
+                    access_attempts: attempts,
+                    fell_back_to_walk_only: true,
+                };
+                return (plans, candidates, access, vec![]);
+            }
         }
     }
 
@@ -1158,8 +1351,16 @@ impl Graph {
         min_access_secs: u32,
     ) -> ExplainResult {
         let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
-        self.raptor_explain_tuned(origin, destination, start_time, date, weekday, min_access_secs,
-            &buckets, self.raptor.arrival_slack_secs)
+        self.raptor_explain_tuned(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            &buckets,
+            self.raptor.arrival_slack_secs,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1174,8 +1375,17 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> ExplainResult {
-        self.raptor_explain_tuned_rt(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, &RealtimeIndex::new())
+        self.raptor_explain_tuned_rt(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            &RealtimeIndex::new(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1191,8 +1401,19 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> ExplainResult {
-        self.raptor_explain_tuned_rt_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_explain_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1219,10 +1440,23 @@ impl Graph {
             bike,
             |mc, access_secs| {
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
-                    mc, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt, true,
+                    mc,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                    buckets,
+                    slack,
+                    rt,
+                    true,
                 );
-                if plans.is_empty() { None } else { Some((plans, cands, stops)) }
+                if plans.is_empty() {
+                    None
+                } else {
+                    Some((plans, cands, stops))
+                }
             },
         );
         ExplainResult {
@@ -1248,8 +1482,18 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> ExplainResult {
-        self.raptor_range_explain_tuned_rt(origin, destination, start_time, window_secs, date,
-            weekday, min_access_secs, buckets, slack, &RealtimeIndex::new())
+        self.raptor_range_explain_tuned_rt(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            &RealtimeIndex::new(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1266,8 +1510,20 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> ExplainResult {
-        self.raptor_range_explain_tuned_rt_modes(origin, destination, start_time, window_secs,
-            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_range_explain_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1295,8 +1551,17 @@ impl Graph {
             bike,
             |mc, access_secs| {
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
-                    mc, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt, true,
+                    mc,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                    buckets,
+                    slack,
+                    rt,
+                    true,
                 );
                 if probe.is_empty() {
                     return None;
@@ -1318,8 +1583,17 @@ impl Graph {
 
                 for t in departure_times {
                     let (plans_t, mut cands_t, _stops_t) = self.raptor_inner_with_debug(
-                        mc, t, access_secs, date, weekday, origin, destination,
-                        buckets, slack, rt, true,
+                        mc,
+                        t,
+                        access_secs,
+                        date,
+                        weekday,
+                        origin,
+                        destination,
+                        buckets,
+                        slack,
+                        rt,
+                        true,
                     );
                     all_plans.extend(plans_t);
                     all_candidates.append(&mut cands_t);
@@ -1331,12 +1605,20 @@ impl Graph {
                     .iter()
                     .enumerate()
                     .filter_map(|(ci, c)| {
-                        if matches!(c.status, CandidateStatus::Kept) { Some(ci) } else { None }
+                        if matches!(c.status, CandidateStatus::Kept) {
+                            Some(ci)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
 
-                let final_plans =
-                    Self::pareto_filter_with_debug(all_plans, &plan_to_sink_idx, &mut all_candidates, buckets);
+                let final_plans = Self::pareto_filter_with_debug(
+                    all_plans,
+                    &plan_to_sink_idx,
+                    &mut all_candidates,
+                    buckets,
+                );
 
                 Some((final_plans, all_candidates, probe_stops))
             },
@@ -1360,7 +1642,8 @@ impl Graph {
     ) {
         for &cell in marked {
             let stop = cell / n_states;
-            let pats = self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
+            let pats =
+                self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
             for &(pat_id, pos) in pats {
                 let p = pat_id.0 as usize;
                 if queue_pos[p] == u32::MAX {
@@ -1393,7 +1676,8 @@ impl Graph {
         out: &mut Vec<Label>,
         mc: &ModeContext,
     ) {
-        let pat_stops = self.raptor.transit_idx_pattern_stops[pattern].of(&self.raptor.transit_pattern_stops);
+        let pat_stops =
+            self.raptor.transit_idx_pattern_stops[pattern].of(&self.raptor.transit_pattern_stops);
         let n_trips = self.raptor.transit_patterns[pattern].num_trips as usize;
         if n_trips == 0 {
             return;
@@ -1405,9 +1689,10 @@ impl Graph {
         let route_id = self.raptor.transit_patterns[pattern].route;
         let pat_rt = self.raptor.transit_routes[route_id.0 as usize].route_type;
 
-        let all_times =
-            self.raptor.transit_idx_pattern_stop_times[pattern].of(&self.raptor.transit_pattern_stop_times);
-        let trip_ids = self.raptor.transit_idx_pattern_trips[pattern].of(&self.raptor.transit_pattern_trips);
+        let all_times = self.raptor.transit_idx_pattern_stop_times[pattern]
+            .of(&self.raptor.transit_pattern_stop_times);
+        let trip_ids =
+            self.raptor.transit_idx_pattern_trips[pattern].of(&self.raptor.transit_pattern_trips);
 
         // Labels currently riding this route. Pareto set over (trip index ↓, bucket ↑):
         // a smaller trip index arrives earlier at every downstream stop.
@@ -1428,8 +1713,12 @@ impl Graph {
                 let bag = if r.hit_prob < 1.0 {
                     let miss_arr = self.next_trip_arrival(trip_ids, r.t + 1, col, date, weekday);
                     match miss_arr {
-                        Some(ma) => ScenarioBag::with_scenarios(arr, r.hit_prob, ma, 1.0 - r.hit_prob),
-                        None => ScenarioBag::with_scenarios(arr, r.hit_prob, u32::MAX, 1.0 - r.hit_prob),
+                        Some(ma) => {
+                            ScenarioBag::with_scenarios(arr, r.hit_prob, ma, 1.0 - r.hit_prob)
+                        }
+                        None => {
+                            ScenarioBag::with_scenarios(arr, r.hit_prob, u32::MAX, 1.0 - r.hit_prob)
+                        }
                     }
                 } else {
                     ScenarioBag::single(arr)
@@ -1495,7 +1784,8 @@ impl Graph {
                             continue;
                         }
                         // Realtime: effective departure = scheduled + live delay.
-                        let trip_dep = apply_delay(col[t].departure, rt.delay(trip_ids[t], stop as u32));
+                        let trip_dep =
+                            apply_delay(col[t].departure, rt.delay(trip_ids[t], stop as u32));
 
                         // Cumulative reliability — same per-transfer formula as
                         // reconstruction (earliest-based), so buckets agree.
@@ -1525,7 +1815,8 @@ impl Graph {
                                 let buf = trip_dep as i32 - s.time as i32;
                                 let p_make = match pl.route_type {
                                     Some(rt) => self
-                                        .raptor.transit_delay_models
+                                        .raptor
+                                        .transit_delay_models
                                         .get(&rt)
                                         .map(|cdf| cdf.prob_on_time(buf))
                                         .unwrap_or(1.0),
@@ -1613,18 +1904,19 @@ impl Graph {
             }
         }
         if let Some((in_hand, dropped)) = drop_to
-            && cand.state == in_hand {
-                let mut d = cand;
-                d.state = dropped;
-                let dcell = d.at_stop as usize * n_states + dropped as usize;
-                if !best[dcell].dominates(d, buckets) {
-                    let pushed = Label::arena_push(arena, d);
-                    best[dcell].insert(pushed, buckets);
-                    if curr[dcell].insert(pushed, buckets) {
-                        Self::mark(dcell, marked, is_marked);
-                    }
+            && cand.state == in_hand
+        {
+            let mut d = cand;
+            d.state = dropped;
+            let dcell = d.at_stop as usize * n_states + dropped as usize;
+            if !best[dcell].dominates(d, buckets) {
+                let pushed = Label::arena_push(arena, d);
+                best[dcell].insert(pushed, buckets);
+                if curr[dcell].insert(pushed, buckets) {
+                    Self::mark(dcell, marked, is_marked);
                 }
             }
+        }
     }
 
     /// Number of parallel chunks for a round's route-scan queue. 1 = stay
@@ -1638,7 +1930,9 @@ impl Graph {
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n >= 1)
                 .unwrap_or_else(|| {
-                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
                 })
         });
         if queue_len < 32 || threads == 1 {
@@ -1739,7 +2033,8 @@ impl Graph {
                 continue;
             }
 
-            let transfers = self.raptor.transit_idx_stop_transfers[stop].of(&self.raptor.transit_stop_transfers);
+            let transfers = self.raptor.transit_idx_stop_transfers[stop]
+                .of(&self.raptor.transit_stop_transfers);
             for &(target_node, walk) in transfers {
                 let target = self.raptor.transit_node_to_stop[target_node.0] as usize;
 
@@ -1851,7 +2146,8 @@ impl Graph {
             let earliest_at_stop = earliest_origin_departure.saturating_add(walk_secs);
             let latest_at_stop = latest_origin_departure.saturating_add(walk_secs);
 
-            let pats = self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
+            let pats =
+                self.raptor.transit_idx_stop_patterns[stop].of(&self.raptor.transit_stop_patterns);
             for &(pat_id, stop_pos) in pats {
                 let p = pat_id.0 as usize;
                 let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
@@ -1859,12 +2155,13 @@ impl Graph {
                     continue;
                 }
 
-                let stop_times =
-                    self.raptor.transit_idx_pattern_stop_times[p].of(&self.raptor.transit_pattern_stop_times);
+                let stop_times = self.raptor.transit_idx_pattern_stop_times[p]
+                    .of(&self.raptor.transit_pattern_stop_times);
                 let trip_ids =
                     self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
 
-                let col = &stop_times[stop_pos as usize * n_trips..(stop_pos as usize + 1) * n_trips];
+                let col =
+                    &stop_times[stop_pos as usize * n_trips..(stop_pos as usize + 1) * n_trips];
 
                 let lo = col.partition_point(|st| st.departure < earliest_at_stop);
                 let hi = col.partition_point(|st| st.departure <= latest_at_stop);
@@ -1905,8 +2202,17 @@ impl Graph {
         min_access_secs: u32,
     ) -> Vec<Plan> {
         let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
-        self.raptor_range_tuned(origin, destination, start_time, window_secs, date, weekday,
-            min_access_secs, &buckets, self.raptor.arrival_slack_secs)
+        self.raptor_range_tuned(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            &buckets,
+            self.raptor.arrival_slack_secs,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1922,8 +2228,18 @@ impl Graph {
         buckets: &ReliabilityBuckets,
         slack: u32,
     ) -> Vec<Plan> {
-        self.raptor_range_tuned_rt(origin, destination, start_time, window_secs, date, weekday,
-            min_access_secs, buckets, slack, &RealtimeIndex::new())
+        self.raptor_range_tuned_rt(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            &RealtimeIndex::new(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1940,8 +2256,21 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        self.raptor_range_tuned_rt_modes(origin, destination, start_time, window_secs, date,
-            weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_range_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1959,6 +2288,7 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        terminal_deadline: bool,
     ) -> Vec<Plan> {
         // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
         // interesting departures, which are processed **latest → earliest** so a
@@ -1969,11 +2299,28 @@ impl Graph {
         // Each pass reconstructs its own plans (filtered by `created_by`) before the
         // next pass mutates the grid. Output is the 4-D Pareto set
         // (departure ↑, arrival ↓, transfers ↓, reliability ↑); walk is an attribute.
-        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets, am, bike,
+        self.with_access_search(
+            origin,
+            destination,
+            start_time,
+            min_access_secs,
+            slack,
+            buckets,
+            am,
+            bike,
+            terminal_deadline,
             |mc, access_secs| {
                 let probe = self.raptor_inner(
-                    mc, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt,
+                    mc,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                    buckets,
+                    slack,
+                    rt,
                 );
                 if probe.is_empty() {
                     return vec![];
@@ -2007,19 +2354,43 @@ impl Graph {
                 for (i, t) in times.into_iter().enumerate() {
                     let stamp = i as u32;
                     self.run_departure_into(
-                        mc, t, access_secs, date, weekday, buckets, slack, rt,
-                        stamp, true,
-                        &mut best, &mut labels, &mut marked, &mut is_marked, &mut queue, &mut queue_pos,
+                        mc,
+                        t,
+                        access_secs,
+                        date,
+                        weekday,
+                        buckets,
+                        slack,
+                        rt,
+                        stamp,
+                        true,
+                        &mut best,
+                        &mut labels,
+                        &mut marked,
+                        &mut is_marked,
+                        &mut queue,
+                        &mut queue_pos,
                         &mut arena,
                     );
                     let plans = self.extract_with_debug(
-                        mc, t, date, weekday, &labels, buckets, origin, destination, rt,
-                        None, stamp, &arena,
+                        mc,
+                        t,
+                        date,
+                        weekday,
+                        &labels,
+                        buckets,
+                        origin,
+                        destination,
+                        rt,
+                        None,
+                        stamp,
+                        &arena,
                     );
                     all_plans.extend(plans);
                 }
                 Self::finalize_plans(all_plans, buckets)
-            })
+            },
+        )
     }
 
     /// Reference range driver: each interesting departure runs as an independent
@@ -2039,8 +2410,19 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        self.raptor_range_independent_rt_modes(origin, destination, start_time, window_secs,
-            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default())
+        self.raptor_range_independent_rt_modes(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2058,12 +2440,28 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
     ) -> Vec<Plan> {
-        self.with_access_search(origin, destination, start_time, min_access_secs, slack, buckets,
-            am, &self.default_bike_cost(),
+        self.with_access_search(
+            origin,
+            destination,
+            start_time,
+            min_access_secs,
+            slack,
+            buckets,
+            am,
+            &self.default_bike_cost(),
+            false,
             |mc, access_secs| {
                 let probe = self.raptor_inner(
-                    mc, start_time, access_secs, date, weekday, origin, destination,
-                    buckets, slack, rt,
+                    mc,
+                    start_time,
+                    access_secs,
+                    date,
+                    weekday,
+                    origin,
+                    destination,
+                    buckets,
+                    slack,
+                    rt,
                 );
                 if probe.is_empty() {
                     return vec![];
@@ -2083,13 +2481,22 @@ impl Graph {
                 let mut all_plans = Vec::new();
                 for t in departure_times {
                     let plans = self.raptor_inner(
-                        mc, t, access_secs, date, weekday, origin, destination,
-                        buckets, slack, rt,
+                        mc,
+                        t,
+                        access_secs,
+                        date,
+                        weekday,
+                        origin,
+                        destination,
+                        buckets,
+                        slack,
+                        rt,
                     );
                     all_plans.extend(plans);
                 }
                 Self::finalize_plans(all_plans, buckets)
-            })
+            },
+        )
     }
 
     /// Public reference range query (default buckets / no realtime), mirroring
@@ -2105,8 +2512,18 @@ impl Graph {
         min_access_secs: u32,
     ) -> Vec<Plan> {
         let buckets = ReliabilityBuckets::new(&self.raptor.reliability_bucket_edges);
-        self.raptor_range_independent_rt(origin, destination, start_time, window_secs, date, weekday,
-            min_access_secs, &buckets, self.raptor.arrival_slack_secs, &RealtimeIndex::new())
+        self.raptor_range_independent_rt(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            &buckets,
+            self.raptor.arrival_slack_secs,
+            &RealtimeIndex::new(),
+        )
     }
     /// Trips departing between midnight and this threshold may actually be
     /// overnight extensions of the previous service day (GTFS times > 86400).
@@ -2134,8 +2551,14 @@ impl Graph {
                     w.end = w.end.saturating_sub(shift);
                     for step in &mut w.steps {
                         *step = match *step {
-                            PlanLegStep::Walk(mut ws) => { ws.time = ws.time.saturating_sub(shift); PlanLegStep::Walk(ws) }
-                            PlanLegStep::Transit(mut ts) => { ts.time = ts.time.saturating_sub(shift); PlanLegStep::Transit(ts) }
+                            PlanLegStep::Walk(mut ws) => {
+                                ws.time = ws.time.saturating_sub(shift);
+                                PlanLegStep::Walk(ws)
+                            }
+                            PlanLegStep::Transit(mut ts) => {
+                                ts.time = ts.time.saturating_sub(shift);
+                                PlanLegStep::Transit(ts)
+                            }
                         };
                     }
                 }
@@ -2151,8 +2574,14 @@ impl Graph {
                     t.preceding_arrival = t.preceding_arrival.map(|a| a.saturating_sub(shift));
                     for step in &mut t.steps {
                         *step = match *step {
-                            PlanLegStep::Walk(mut ws) => { ws.time = ws.time.saturating_sub(shift); PlanLegStep::Walk(ws) }
-                            PlanLegStep::Transit(mut ts) => { ts.time = ts.time.saturating_sub(shift); PlanLegStep::Transit(ts) }
+                            PlanLegStep::Walk(mut ws) => {
+                                ws.time = ws.time.saturating_sub(shift);
+                                PlanLegStep::Walk(ws)
+                            }
+                            PlanLegStep::Transit(mut ts) => {
+                                ts.time = ts.time.saturating_sub(shift);
+                                PlanLegStep::Transit(ts)
+                            }
                         };
                     }
                     t.time_shift = shift;
@@ -2177,8 +2606,20 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        self.raptor_tuned_rt_overnight_modes(origin, destination, start_time, date, weekday,
-            min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_tuned_rt_overnight_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2195,17 +2636,42 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        terminal_deadline: bool,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_tuned_rt_modes(origin, destination, start_time, date, weekday, min_access_secs, buckets, slack, rt, am, bike);
+        let mut plans = self.raptor_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            am,
+            bike,
+            terminal_deadline,
+        );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
             let overnight = self.raptor_tuned_rt_modes(
-                origin, destination,
+                origin,
+                destination,
                 start_time + 86400,
-                date - 1, Self::prev_weekday(weekday),
-                min_access_secs, buckets, slack, rt, am, bike,
+                date - 1,
+                Self::prev_weekday(weekday),
+                min_access_secs,
+                buckets,
+                slack,
+                rt,
+                am,
+                bike,
+                terminal_deadline,
             );
-            let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
+            let normalized: Vec<Plan> = overnight
+                .into_iter()
+                .map(|p| Self::shift_plan(p, 86400))
+                .collect();
             if !normalized.is_empty() {
                 plans.extend(normalized);
                 plans = Self::finalize_plans(plans, buckets);
@@ -2231,8 +2697,21 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        self.raptor_range_tuned_rt_overnight_modes(origin, destination, start_time, window_secs,
-            date, weekday, min_access_secs, buckets, slack, rt, &ActiveModes::default(), &self.default_bike_cost())
+        self.raptor_range_tuned_rt_overnight_modes(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            &ActiveModes::default(),
+            &self.default_bike_cost(),
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2250,18 +2729,44 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        terminal_deadline: bool,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_range_tuned_rt_modes(origin, destination, start_time, window_secs, date, weekday, min_access_secs, buckets, slack, rt, am, bike);
+        let mut plans = self.raptor_range_tuned_rt_modes(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            am,
+            bike,
+            terminal_deadline,
+        );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
             let overnight = self.raptor_range_tuned_rt_modes(
-                origin, destination,
+                origin,
+                destination,
                 start_time + 86400,
                 window_secs,
-                date - 1, Self::prev_weekday(weekday),
-                min_access_secs, buckets, slack, rt, am, bike,
+                date - 1,
+                Self::prev_weekday(weekday),
+                min_access_secs,
+                buckets,
+                slack,
+                rt,
+                am,
+                bike,
+                terminal_deadline,
             );
-            let normalized: Vec<Plan> = overnight.into_iter().map(|p| Self::shift_plan(p, 86400)).collect();
+            let normalized: Vec<Plan> = overnight
+                .into_iter()
+                .map(|p| Self::shift_plan(p, 86400))
+                .collect();
             if !normalized.is_empty() {
                 plans.extend(normalized);
                 plans = Self::finalize_plans(plans, buckets);
@@ -2417,7 +2922,10 @@ mod label_tests {
         let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
         assert!(s.insert(lbl_stamped(100, 0.81, 1), &b));
-        assert!(!s.insert(lbl_stamped(100, 0.94, 1), &b), "same-stamp same-bucket same-arrival must stay pruned");
+        assert!(
+            !s.insert(lbl_stamped(100, 0.94, 1), &b),
+            "same-stamp same-bucket same-arrival must stay pruned"
+        );
     }
 
     /// When a cell is full, old-stamp ghosts (pruning-only, already extracted)
@@ -2440,8 +2948,14 @@ mod label_tests {
         // displace a ghost, because ghosts can never appear in output again.
         let stamp = MAX_LABELS as u32;
         let cand = lbl_stamped(100 + MAX_LABELS as u32 + 5, 0.9999, stamp);
-        assert!(s.insert(cand, &b), "current-stamp label lost to ghosts in a full cell");
-        assert!(s.iter().any(|l| l.created_by == stamp), "current-stamp label must be present");
+        assert!(
+            s.insert(cand, &b),
+            "current-stamp label lost to ghosts in a full cell"
+        );
+        assert!(
+            s.iter().any(|l| l.created_by == stamp),
+            "current-stamp label must be present"
+        );
     }
 }
 
@@ -2455,9 +2969,18 @@ mod street_time_tests {
         g.set_street_time(StreetTimeModel::default());
         let acc = g.access_times(vec![(0, 120), (1, 600)]);
         let egr = g.egress_times(vec![(0, 120), (1, 600)]);
-        assert!(acc[0].1 > 120 && acc[1].1 > 600, "access is buffered above median");
-        assert!(egr[0].1 > 120 && egr[1].1 > 600, "egress mean is strictly above the median");
-        assert!(egr[0].1 < acc[0].1, "egress mean is below the p85 access buffer");
+        assert!(
+            acc[0].1 > 120 && acc[1].1 > 600,
+            "access is buffered above median"
+        );
+        assert!(
+            egr[0].1 > 120 && egr[1].1 > 600,
+            "egress mean is strictly above the median"
+        );
+        assert!(
+            egr[0].1 < acc[0].1,
+            "egress mean is below the p85 access buffer"
+        );
         assert_eq!(acc[0].0, 0);
         assert_eq!(acc[1].0, 1);
     }

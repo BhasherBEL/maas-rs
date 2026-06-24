@@ -1,5 +1,6 @@
 mod bike_class;
 pub mod elevation;
+mod elevation_smooth;
 mod lambert;
 mod pbf;
 

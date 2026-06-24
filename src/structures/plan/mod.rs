@@ -1,5 +1,6 @@
 mod agency;
 mod leg;
+mod leg_option;
 mod leg_step;
 mod node;
 mod place;
@@ -9,6 +10,7 @@ mod trip;
 
 pub use agency::*;
 pub use leg::*;
+pub use leg_option::{DismountRun, LegOption, highlight_index, initial_cursor};
 pub use leg_step::*;
 pub use node::*;
 pub use place::*;

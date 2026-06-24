@@ -1,12 +1,13 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
 };
 
 use kdtree::distance::squared_euclidean;
 
 use crate::structures::{
-    BikeCost, EdgeData, NodeID, StreetEdgeData, degrees_to_meters, plan::PlanCoordinate,
+    BikeCost, EdgeData, Endpoint, LatLng, NodeID, StreetEdgeData, degrees_to_meters,
+    plan::PlanCoordinate,
 };
 
 use super::Graph;
@@ -40,6 +41,12 @@ pub(super) struct BikePath {
     pub cycleroute_length: usize,
     pub ascent: usize,
     pub edges: Vec<BikeEdge>,
+    /// Partial stub from an edge-projected origin to `nodes[0]` (coordinate + edge),
+    /// when the origin was snapped to the interior of an edge. `None` for a node origin.
+    pub lead: Option<(LatLng, BikeEdge)>,
+    /// Partial stub from `nodes[last]` to an edge-projected destination. `None` for
+    /// a node destination.
+    pub tail: Option<(LatLng, BikeEdge)>,
 }
 
 impl Graph {
@@ -270,7 +277,7 @@ impl Graph {
 
     /// Unit direction vector from `from` to `to` in lat/lon space (adequate for
     /// turn-angle dot products at Belgian latitudes; not great-circle exact).
-    fn dir_between(&self, from: NodeID, to: NodeID) -> (f64, f64) {
+    pub(super) fn dir_between(&self, from: NodeID, to: NodeID) -> (f64, f64) {
         let a = self.nodes[from.0].loc();
         let b = self.nodes[to.0].loc();
         let (dx, dy) = (b.longitude - a.longitude, b.latitude - a.latitude);
@@ -326,12 +333,8 @@ impl Graph {
                     continue;
                 }
                 let (ehbd, ehbu) = elev_buf.get(&node).copied().unwrap_or((0.0, 0.0));
-                let (elev_cost, new_ehbd, new_ehbu) = bike.elevation_step(
-                    ehbd,
-                    ehbu,
-                    street.elev_delta as f64,
-                    street.length as f64,
-                );
+                let (elev_cost, new_ehbd, new_ehbu) =
+                    bike.elevation_step(ehbd, ehbu, street.elev_delta as f64, street.length as f64);
                 let nc = cost_bits.saturating_add(((step_cost + elev_cost) * 1000.0) as u64);
                 let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
                 if nc < *entry {
@@ -345,56 +348,169 @@ impl Graph {
         arrival
     }
 
-    /// Cost-routed bike path `origin → destination`: returns the node sequence on
-    /// the minimum-cost route, its accumulated kinematic time (seconds) and total
-    /// length (meters), or `None` if the destination is unreachable within the
-    /// time budget. Mirrors `bike_cost_dijkstra` but tracks parents for backtrack.
+    /// The directed street edge `from → to`, if one exists.
+    fn street_edge_between(&self, from: NodeID, to: NodeID) -> Option<&StreetEdgeData> {
+        self.edges.get(from.0)?.iter().find_map(|e| match e {
+            EdgeData::Street(s) if s.destination == to => Some(s),
+            _ => None,
+        })
+    }
+
+    /// A synthetic partial-length copy of `e` (a stub of `len` meters along it),
+    /// elevation prorated. Used to charge the bit of an edge between a projected
+    /// endpoint and the edge's node.
+    fn partial_edge(e: &StreetEdgeData, len: usize) -> StreetEdgeData {
+        let frac = if e.length == 0 {
+            0.0
+        } else {
+            len as f64 / e.length as f64
+        };
+        StreetEdgeData {
+            origin: e.origin,
+            destination: e.destination,
+            length: len,
+            partial: true,
+            foot: e.foot,
+            bike: e.bike,
+            car: e.car,
+            attrs: e.attrs,
+            elev_delta: (e.elev_delta as f64 * frac).round() as i16,
+            surface_speed: 100,
+            var_gen: e.var_gen,
+        }
+    }
+
+    /// Cost-routed bike path between two [`Endpoint`]s. A `Node` endpoint is the
+    /// usual graph node; an `OnEdge` endpoint is a point projected onto an edge's
+    /// interior — handled by seeding the search from *both* edge ends with the
+    /// partial-stub cost (origin) and by adding the partial stub when the search
+    /// reaches either end (destination). No graph mutation. Returns the node path,
+    /// totals (stubs included) and per-edge metadata, or `None` if unreachable.
     pub(super) fn bike_cost_path(
         &self,
-        origin: NodeID,
-        destination: NodeID,
+        origin: Endpoint,
+        destination: Endpoint,
         max_seconds: u32,
         bike: &BikeCost,
     ) -> Option<BikePath> {
-        if origin == destination {
-            return Some(BikePath {
-                nodes: vec![origin],
-                secs: 0,
-                length: 0,
-                cycleroute_length: 0,
-                ascent: 0,
-                edges: vec![],
-            });
-        }
         let mut best_cost: HashMap<NodeID, u64> = HashMap::new();
         let mut arrival: HashMap<NodeID, u32> = HashMap::new();
         let mut length: HashMap<NodeID, usize> = HashMap::new();
         let mut cycleroute_length: HashMap<NodeID, usize> = HashMap::new();
-        // Total ascent (D+) in meters: running sum of positive edge elevation deltas.
         let mut ascent: HashMap<NodeID, usize> = HashMap::new();
         let mut parent: HashMap<NodeID, NodeID> = HashMap::new();
-        // Per-node metadata of the edge used to reach it on the best path, so the
-        // backtrack can label each segment ride vs push (dismount).
         let mut step_meta: HashMap<NodeID, BikeEdge> = HashMap::new();
-        // Signed elevation hysteresis buffer (meters) of the min-cost path per node.
         let mut elev_buf: HashMap<NodeID, (f64, f64)> = HashMap::new();
         let mut pq: BinaryHeap<Reverse<(u64, NodeID, u32, u64)>> = BinaryHeap::new();
-        best_cost.insert(origin, 0);
-        arrival.insert(origin, 0);
-        length.insert(origin, 0);
-        cycleroute_length.insert(origin, 0);
-        ascent.insert(origin, 0);
-        pq.push(Reverse((0, origin, 0, u64::MAX)));
 
+        // ── Seed the search ────────────────────────────────────────────────────
+        // For a node origin: one zero-cost seed. For an edge origin: seed both ends
+        // with the cost/time of the stub from the projection to that end.
+        let mut seed_nodes: HashSet<NodeID> = HashSet::new();
+        let mut lead_stub: HashMap<NodeID, BikeEdge> = HashMap::new();
+        let origin_proj = match origin {
+            Endpoint::Node(n) => {
+                best_cost.insert(n, 0);
+                arrival.insert(n, 0);
+                length.insert(n, 0);
+                cycleroute_length.insert(n, 0);
+                ascent.insert(n, 0);
+                elev_buf.insert(n, (0.0, 0.0));
+                seed_nodes.insert(n);
+                pq.push(Reverse((0, n, 0, u64::MAX)));
+                None
+            }
+            Endpoint::OnEdge {
+                a,
+                b,
+                dist_a,
+                dist_b,
+                proj,
+            } => {
+                // To reach end `e` from the projection, ride the stub `other→e`.
+                for (e, other, d) in [(a, b, dist_a), (b, a, dist_b)] {
+                    let Some(edge) = self.street_edge_between(other, e) else {
+                        continue;
+                    };
+                    let stub = Self::partial_edge(edge, d);
+                    let Some(c) = bike.edge_cost(&stub, None, (1.0, 0.0)) else {
+                        continue;
+                    };
+                    let (ec, ehbd, ehbu) =
+                        bike.elevation_step(0.0, 0.0, stub.elev_delta as f64, stub.length as f64);
+                    let bits = ((c + ec) * 1000.0) as u64;
+                    let t = bike.edge_time(&stub);
+                    if t > max_seconds {
+                        continue;
+                    }
+                    if bits < *best_cost.get(&e).unwrap_or(&u64::MAX) {
+                        best_cost.insert(e, bits);
+                        arrival.insert(e, t);
+                        length.insert(e, d);
+                        cycleroute_length.insert(e, if stub.attrs.cycleroute { d } else { 0 });
+                        ascent.insert(e, stub.elev_delta.max(0) as usize);
+                        elev_buf.insert(e, (ehbd, ehbu));
+                        lead_stub.insert(
+                            e,
+                            BikeEdge {
+                                push: !stub.attrs.bikeaccess && stub.attrs.footaccess,
+                                length: d,
+                                time: t,
+                            },
+                        );
+                        pq.push(Reverse((bits, e, t, u64::MAX)));
+                    }
+                    seed_nodes.insert(e);
+                }
+                Some(proj)
+            }
+        };
+        if pq.is_empty() {
+            return None;
+        }
+
+        // ── Targets ────────────────────────────────────────────────────────────
+        // For a node destination: settle that node. For an edge destination: settle
+        // both ends, each with a tail stub `end→projection` added on arrival.
+        let dest_proj = match destination {
+            Endpoint::OnEdge { proj, .. } => Some(proj),
+            Endpoint::Node(_) => None,
+        };
+        // target end -> Option<(directed edge end→other, stub length)>
+        let mut target_stub: HashMap<NodeID, Option<(NodeID, usize)>> = HashMap::new();
+        match destination {
+            Endpoint::Node(n) => {
+                target_stub.insert(n, None);
+            }
+            Endpoint::OnEdge {
+                a,
+                b,
+                dist_a,
+                dist_b,
+                ..
+            } => {
+                for (e, other, d) in [(a, b, dist_a), (b, a, dist_b)] {
+                    if self.street_edge_between(e, other).is_some() {
+                        target_stub.insert(e, Some((other, d)));
+                    }
+                }
+            }
+        }
+        if target_stub.is_empty() {
+            return None;
+        }
+        let mut remaining: HashSet<NodeID> = target_stub.keys().copied().collect();
+
+        // ── Dijkstra ───────────────────────────────────────────────────────────
         while let Some(Reverse((cost_bits, node, time_secs, prev))) = pq.pop() {
             if cost_bits > *best_cost.get(&node).unwrap_or(&u64::MAX) {
                 continue;
             }
-            if node == destination {
+            if remaining.remove(&node) && remaining.is_empty() {
                 break;
             }
-            // Stop expansion at intermediate transit stops (except origin/destination).
-            if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
+            // Stop expansion at intermediate transit stops (except seeds).
+            if !seed_nodes.contains(&node) && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
                 continue;
             }
             let incoming =
@@ -415,12 +531,8 @@ impl Graph {
                     continue;
                 }
                 let (ehbd, ehbu) = elev_buf.get(&node).copied().unwrap_or((0.0, 0.0));
-                let (elev_cost, new_ehbd, new_ehbu) = bike.elevation_step(
-                    ehbd,
-                    ehbu,
-                    street.elev_delta as f64,
-                    street.length as f64,
-                );
+                let (elev_cost, new_ehbd, new_ehbu) =
+                    bike.elevation_step(ehbd, ehbu, street.elev_delta as f64, street.length as f64);
                 let nc = cost_bits.saturating_add(((step_cost + elev_cost) * 1000.0) as u64);
                 let entry = best_cost.entry(street.destination).or_insert(u64::MAX);
                 if nc < *entry {
@@ -455,53 +567,70 @@ impl Graph {
             }
         }
 
-        best_cost.get(&destination)?;
-        let mut path = vec![destination];
-        let mut cur = destination;
-        while cur != origin {
+        // ── Pick the best settled target (path cost + tail stub) ────────────────
+        // tail data per reachable target: (total_bits, BikeEdge, time, len, cyc, asc)
+        let tail_of = |end: NodeID,
+                       stub: &Option<(NodeID, usize)>|
+         -> Option<(u64, Option<BikeEdge>, u32, usize, usize, usize)> {
+            let base = *best_cost.get(&end)?;
+            match stub {
+                None => Some((base, None, 0, 0, 0, 0)),
+                Some((other, d)) => {
+                    let e = self.street_edge_between(end, *other)?;
+                    let s = Self::partial_edge(e, *d);
+                    let c = bike.edge_cost(&s, None, (1.0, 0.0))?;
+                    let (ehbd, ehbu) = elev_buf.get(&end).copied().unwrap_or((0.0, 0.0));
+                    let (ec, _, _) =
+                        bike.elevation_step(ehbd, ehbu, s.elev_delta as f64, s.length as f64);
+                    let t = bike.edge_time(&s);
+                    let be = BikeEdge {
+                        push: !s.attrs.bikeaccess && s.attrs.footaccess,
+                        length: *d,
+                        time: t,
+                    };
+                    let cyc = if s.attrs.cycleroute { *d } else { 0 };
+                    Some((
+                        base.saturating_add(((c + ec) * 1000.0) as u64),
+                        Some(be),
+                        t,
+                        *d,
+                        cyc,
+                        s.elev_delta.max(0) as usize,
+                    ))
+                }
+            }
+        };
+        let (end, _total, tail_be, tail_t, tail_len, tail_cyc, tail_asc) = target_stub
+            .iter()
+            .filter_map(|(&e, stub)| {
+                tail_of(e, stub).map(|(tot, be, t, l, cy, asc)| (e, tot, be, t, l, cy, asc))
+            })
+            .min_by_key(|x| x.1)?;
+
+        // ── Reconstruct ─────────────────────────────────────────────────────────
+        let mut path = vec![end];
+        let mut cur = end;
+        while !seed_nodes.contains(&cur) {
             let p = *parent.get(&cur)?;
             path.push(p);
             cur = p;
         }
         path.reverse();
-        // Per-edge metadata aligned with `path.windows(2)`: the edge used to reach
-        // each non-origin node, in forward order.
         let edges: Vec<BikeEdge> = path[1..].iter().map(|n| step_meta[n]).collect();
-        // Env-gated diagnostic: dump the chosen path's per-edge cost drivers so a
-        // route can be compared segment-by-segment against an external engine.
-        if std::env::var("MAAS_BIKE_DEBUG").is_ok() {
-            let mut cum = 0usize;
-            for w in path.windows(2) {
-                let (a, b) = (w[0], w[1]);
-                let edge = self
-                    .edges
-                    .get(a.0)
-                    .and_then(|es| {
-                        es.iter().find(
-                            |e| matches!(e, EdgeData::Street(st) if st.destination == b),
-                        )
-                    });
-                if let Some(EdgeData::Street(s)) = edge {
-                    let loc = self.nodes[b.0].loc();
-                    let cf = bike
-                        .edge_cost(s, None, (1.0, 0.0))
-                        .map(|c| c / (s.length.max(1) as f64));
-                    eprintln!(
-                        "BIKEDBG cum={cum} {:.5},{:.5} len={} hw={:?} cyc={} surf={:?} bike={} elev={} cf={:?}",
-                        loc.latitude, loc.longitude, s.length, s.attrs.highway,
-                        s.attrs.cycleroute, s.attrs.surface, s.attrs.isbike, s.elev_delta, cf
-                    );
-                    cum += s.length;
-                }
-            }
-        }
+        let lead = origin_proj.and_then(|p| lead_stub.get(&path[0]).map(|be| (p, *be)));
+        let tail = match (dest_proj, tail_be) {
+            (Some(p), Some(be)) => Some((p, be)),
+            _ => None,
+        };
         Some(BikePath {
             nodes: path,
-            secs: arrival[&destination],
-            length: length[&destination],
-            cycleroute_length: cycleroute_length[&destination],
-            ascent: ascent[&destination],
+            secs: arrival[&end] + tail_t,
+            length: length[&end] + tail_len,
+            cycleroute_length: cycleroute_length[&end] + tail_cyc,
+            ascent: ascent[&end] + tail_asc,
             edges,
+            lead,
+            tail,
         })
     }
 
@@ -556,14 +685,17 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use crate::structures::{
-        BikeAttrs, BikeCost, BikeProfile, EdgeData, Graph, HighwayClass, LatLng, NodeData,
-        NodeID, OsmNodeData, StreetEdgeData, Surface,
+        BikeAttrs, BikeCost, BikeProfile, EdgeData, Endpoint, Graph, HighwayClass, LatLng,
+        NodeData, NodeID, OsmNodeData, StreetEdgeData, Surface,
     };
 
     fn osm(id: &str, lat: f64, lon: f64) -> NodeData {
         NodeData::OsmNode(OsmNodeData {
             eid: id.to_string(),
-            lat_lng: LatLng { latitude: lat, longitude: lon },
+            lat_lng: LatLng {
+                latitude: lat,
+                longitude: lon,
+            },
         })
     }
 
@@ -607,6 +739,8 @@ mod tests {
                         car: false,
                         attrs,
                         elev_delta: 0,
+                        surface_speed: 100,
+                        var_gen: crate::structures::cost::VarGen::NONE,
                     }),
                 );
             }
@@ -619,7 +753,7 @@ mod tests {
         let walk = 1.2;
         let bc = BikeCost::new(BikeProfile::default(), walk);
         let plan = g
-            .build_bike_plan(a, d, 0, u32::MAX, &bc)
+            .build_bike_plan(Endpoint::Node(a), Endpoint::Node(d), 0, u32::MAX, &bc)
             .expect("d reachable from a");
         let leg = match &plan.legs[0] {
             PlanLeg::Walk(w) => w,
@@ -640,8 +774,75 @@ mod tests {
         assert_eq!(runs[1].1, 60, "push run length");
         assert_eq!(
             runs[1].2,
-            (60.0_f64 / walk).round() as u32,
-            "push run timed at walk speed"
+            (60.0_f64 / BikeProfile::default().push_speed_mps).round() as u32,
+            "push run timed at the (slow) push speed, not free walking"
+        );
+    }
+
+    /// A destination projected onto the interior of a long rideable cycleway must
+    /// be ridden to (no dismount), with the partial stub stitched onto the plan so
+    /// the geometry ends at the projection point.
+    #[test]
+    fn build_bike_plan_edge_destination_rides_to_projection() {
+        use crate::structures::plan::{PlanLeg, PlanLegStep};
+        let mut g = Graph::new();
+        let s = g.add_node(osm("s", 50.000, 4.0000));
+        let a = g.add_node(osm("a", 50.000, 4.0010));
+        let b = g.add_node(osm("b", 50.000, 4.0030));
+        let mut edge = |from: NodeID, to: NodeID, len: usize| {
+            for (o2, d2) in [(from, to), (to, from)] {
+                g.add_edge(
+                    o2,
+                    EdgeData::Street(StreetEdgeData {
+                        origin: o2,
+                        destination: d2,
+                        length: len,
+                        partial: false,
+                        foot: true,
+                        bike: true,
+                        car: false,
+                        attrs: cyc_attrs(true), // rideable cycleway
+                        elev_delta: 0,
+                        surface_speed: 100,
+                        var_gen: crate::structures::cost::VarGen::NONE,
+                    }),
+                );
+            }
+        };
+        edge(s, a, 100);
+        edge(a, b, 200); // long cycleway; destination sits 120 m along it from a
+        g.build_raptor_index();
+
+        let bc = BikeCost::new(BikeProfile::default(), 1.2);
+        let proj = LatLng {
+            latitude: 50.000,
+            longitude: 4.0010 + 0.6 * (4.0030 - 4.0010),
+        };
+        let dest = Endpoint::OnEdge {
+            a,
+            b,
+            dist_a: 120,
+            dist_b: 80,
+            proj,
+        };
+        let plan = g
+            .build_bike_plan(Endpoint::Node(s), dest, 0, u32::MAX, &bc)
+            .expect("projection reachable");
+        let leg = match &plan.legs[0] {
+            PlanLeg::Walk(w) => w,
+            _ => panic!("expected a walk leg"),
+        };
+        assert_eq!(leg.length, 220, "s->a (100) + a->proj (120)");
+        assert!(
+            leg.steps
+                .iter()
+                .all(|st| matches!(st, PlanLegStep::Walk(w) if !w.dismount)),
+            "no dismount riding the cycleway"
+        );
+        let last = leg.geometry.last().unwrap();
+        assert!(
+            (last.lat - proj.latitude).abs() < 1e-9 && (last.lon - proj.longitude).abs() < 1e-9,
+            "geometry ends at the projection point"
         );
     }
 
@@ -674,6 +875,8 @@ mod tests {
                         car: false,
                         attrs: cyc_attrs(cycleroute),
                         elev_delta: 0,
+                        surface_speed: 100,
+                        var_gen: crate::structures::cost::VarGen::NONE,
                     }),
                 );
             }
@@ -684,7 +887,9 @@ mod tests {
         g.build_raptor_index();
 
         let bc = BikeCost::new(BikeProfile::default(), 1.2);
-        let p = g.bike_cost_path(o, c, u32::MAX, &bc).expect("c reachable from o");
+        let p = g
+            .bike_cost_path(Endpoint::Node(o), Endpoint::Node(c), u32::MAX, &bc)
+            .expect("c reachable from o");
 
         assert_eq!(p.length, 600, "total path length");
         assert_eq!(
@@ -714,6 +919,8 @@ mod tests {
                     car: false,
                     attrs: cyc_attrs(false),
                     elev_delta: elev,
+                    surface_speed: 100,
+                    var_gen: crate::structures::cost::VarGen::NONE,
                 }),
             );
         };
@@ -725,7 +932,12 @@ mod tests {
         g.build_raptor_index();
 
         let bc = BikeCost::new(BikeProfile::default(), 1.2);
-        let p = g.bike_cost_path(o, b, u32::MAX, &bc).expect("b reachable from o");
-        assert_eq!(p.ascent, 10, "D+ counts the +10 m climb only, not the −5 m descent");
+        let p = g
+            .bike_cost_path(Endpoint::Node(o), Endpoint::Node(b), u32::MAX, &bc)
+            .expect("b reachable from o");
+        assert_eq!(
+            p.ascent, 10,
+            "D+ counts the +10 m climb only, not the −5 m descent"
+        );
     }
 }

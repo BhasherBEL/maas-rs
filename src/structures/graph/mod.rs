@@ -5,25 +5,71 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::{AgencyId, AgencyInfo, RouteId, RouteInfo, TripId, TripInfo},
-    structures::{EdgeData, LatLng, NodeData, NodeID},
+    structures::{EdgeData, LatLng, NodeData, NodeID, StreetEdgeData},
 };
 
 use raptor_index::RaptorIndex;
 
 mod bike_cost;
+mod edge_index;
+mod multiobj;
+mod multiobj_plan;
+mod path_distribution;
+mod railway;
 mod raptor_access;
 mod raptor_backward;
 mod raptor_build;
 mod raptor_index;
 mod raptor_plan;
 mod raptor_route;
-mod railway;
 mod realtime_match;
+mod representatives;
+mod street_enrich;
 mod transit;
 
-pub use bike_cost::BikeCost;
+pub use bike_cost::{BikeCost, PrevCtx};
 pub use raptor_access::StreetProfile;
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
+
+/// A routing terminal: either an exact graph node, or a point projected onto the
+/// interior of an edge between nodes `a` and `b` (used by edge-aware snapping so a
+/// pin sitting mid-way along a long edge isn't forced onto a distant end node).
+/// `dist_a`/`dist_b` are the meters from the projection to each endpoint, summing
+/// to the edge length.
+#[derive(Debug, Clone, Copy)]
+pub enum Endpoint {
+    Node(NodeID),
+    OnEdge {
+        a: NodeID,
+        b: NodeID,
+        dist_a: usize,
+        dist_b: usize,
+        proj: LatLng,
+    },
+}
+
+impl Endpoint {
+    /// The endpoint's representative node — the nearer edge end, or the node
+    /// itself. Used as a fallback where edge-awareness isn't wired in.
+    pub fn node(&self) -> NodeID {
+        match *self {
+            Endpoint::Node(n) => n,
+            Endpoint::OnEdge {
+                a,
+                b,
+                dist_a,
+                dist_b,
+                ..
+            } => {
+                if dist_a <= dist_b {
+                    a
+                } else {
+                    b
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GraphError {
@@ -37,6 +83,8 @@ pub struct Graph {
     nodes_tree: KdTree<f64, NodeID, [f64; 2]>,
     id_mapper: HashMap<String, NodeID>,
     pub raptor: RaptorIndex,
+    #[serde(skip, default)]
+    edge_index: edge_index::EdgeIndex,
 }
 
 #[derive(Serialize)]
@@ -73,6 +121,7 @@ impl Graph {
             nodes_tree: KdTree::new(2),
             id_mapper: HashMap::new(),
             raptor: RaptorIndex::new(),
+            edge_index: edge_index::EdgeIndex::default(),
         }
     }
 
@@ -87,14 +136,15 @@ impl Graph {
     }
 
     pub fn from_osm_postcard(bytes: &[u8]) -> Result<Graph, String> {
-        let o: OsmOwned =
-            postcard::from_bytes(bytes).map_err(|e| format!("Failed to deserialize OSM graph: {e}"))?;
+        let o: OsmOwned = postcard::from_bytes(bytes)
+            .map_err(|e| format!("Failed to deserialize OSM graph: {e}"))?;
         Ok(Graph {
             nodes: o.nodes,
             edges: o.edges,
             nodes_tree: o.nodes_tree,
             id_mapper: o.id_mapper,
             raptor: RaptorIndex::new(),
+            edge_index: edge_index::EdgeIndex::default(),
         })
     }
 
@@ -116,6 +166,62 @@ impl Graph {
 
     pub fn set_street_time(&mut self, m: crate::structures::StreetTimeModel) {
         self.raptor.street_time = m;
+    }
+
+    pub fn set_distance_budget(&mut self, v: f64) {
+        self.raptor.distance_budget = v;
+    }
+
+    pub fn set_epsilon(&mut self, e: crate::structures::cost::Epsilon) {
+        self.raptor.epsilon = e;
+    }
+
+    pub fn set_bike_bucket_cyc_k(&mut self, k: f64) {
+        self.raptor.bike_bucket_cyc_k = k;
+    }
+
+    pub fn set_bike_bucket_dpl_k(&mut self, k: f64) {
+        self.raptor.bike_bucket_dpl_k = k;
+    }
+
+    pub fn set_multiobj_contract(&mut self, on: bool) {
+        self.raptor.multiobj_contract = on;
+    }
+
+    pub fn set_variance_model(&mut self, m: crate::structures::cost::VarianceModel) {
+        self.raptor.variance_model = m;
+    }
+
+    pub fn set_cost_weights(&mut self, w: crate::structures::cost::CostWeights) {
+        self.raptor.cost_weights = w;
+    }
+
+    pub fn set_representatives_k(&mut self, k: usize) {
+        self.raptor.representatives_k = k;
+    }
+
+    pub fn set_multiobj_street(&mut self, on: bool) {
+        self.raptor.multiobj_street = on;
+    }
+
+    pub fn set_multiobj_street_max_len_m(&mut self, m: usize) {
+        self.raptor.multiobj_street_max_len_m = m;
+    }
+
+    pub fn set_champion_time_tiebreak(&mut self, t: f64) {
+        self.raptor.champion_time_tiebreak = t;
+    }
+
+    pub fn set_alt_max_share_factor(&mut self, f: f64) {
+        self.raptor.alt_max_share_factor = f;
+    }
+
+    pub fn set_systematic_cv(&mut self, cv: f64) {
+        self.raptor.systematic_cv = cv;
+    }
+
+    pub fn set_balance(&mut self, b: crate::structures::cost::BalanceWeights) {
+        self.raptor.balance = b;
     }
 
     /// `BikeCost` built from the graph's configured default profile.
@@ -157,7 +263,9 @@ impl Graph {
         let id = NodeID(self.nodes.len());
 
         if let NodeData::OsmNode(ref osm_node) = node {
-            let _ = self.nodes_tree.add([osm_node.lat_lng.latitude, osm_node.lat_lng.longitude], id);
+            let _ = self
+                .nodes_tree
+                .add([osm_node.lat_lng.latitude, osm_node.lat_lng.longitude], id);
             self.id_mapper.insert(osm_node.eid.clone(), id);
         }
 
@@ -226,6 +334,86 @@ impl Graph {
                 None
             }
         }
+    }
+
+    /// Project a query coordinate onto the segment `pa→pb`, returning
+    /// `(perpendicular_distance_meters, t)` where `t∈[0,1]` is the fraction from
+    /// `pa` to the closest point. Equirectangular meters centred on the query.
+    fn project_point(lat: f64, lon: f64, pa: LatLng, pb: LatLng) -> (f64, f64) {
+        let m_lat = 111_320.0_f64;
+        let m_lon = 111_320.0_f64 * lat.to_radians().cos();
+        let to = |la: f64, lo: f64| ((lo - lon) * m_lon, (la - lat) * m_lat);
+        let (ax, ay) = to(pa.latitude, pa.longitude);
+        let (bx, by) = to(pb.latitude, pb.longitude);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 == 0.0 {
+            0.0
+        } else {
+            (-(ax * dx + ay * dy) / len2).clamp(0.0, 1.0)
+        };
+        let (px, py) = (ax + t * dx, ay + t * dy);
+        ((px * px + py * py).sqrt(), t)
+    }
+
+    /// Rebuild the spatial edge index over every street segment. Cheap, bulk-loaded,
+    /// and never serialized — call after a build or after deserialization so
+    /// edge-aware snapping works without a graph rebuild. No-op shape when there are
+    /// no OSM nodes (empty graph).
+    pub fn build_edge_index(&mut self) {
+        let ref_lat = self
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                NodeData::OsmNode(o) => Some(o.lat_lng.latitude),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let edges = self.edges.iter().flatten().filter_map(|e| {
+            let EdgeData::Street(s) = e else { return None };
+            let pa = self.nodes[s.origin.0].loc();
+            let pb = self.nodes[s.destination.0].loc();
+            Some((
+                *s,
+                (pa.latitude, pa.longitude),
+                (pb.latitude, pb.longitude),
+            ))
+        });
+        self.edge_index = edge_index::EdgeIndex::build(edges, ref_lat);
+    }
+
+    /// Snap a coordinate to the nearest *edge* (by perpendicular body distance)
+    /// whose street data satisfies `usable`, within `radius_m`, using the spatial
+    /// edge index (so a point mid-way along a long edge with distant endpoints is
+    /// still found). Returns the projected [`Endpoint`] and its perpendicular
+    /// distance in meters, or `None` if no usable edge is in range (caller falls
+    /// back to `nearest_node`).
+    pub fn snap_to_edge(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+        usable: impl Fn(&StreetEdgeData) -> bool,
+    ) -> Option<(Endpoint, f64)> {
+        let (s, _) = self.edge_index.nearest_usable(lat, lon, radius_m, usable)?;
+        let pa = self.nodes[s.origin.0].loc();
+        let pb = self.nodes[s.destination.0].loc();
+        let (perp, t) = Self::project_point(lat, lon, pa, pb);
+        let da = ((t * s.length as f64).round() as usize).min(s.length);
+        let proj = LatLng {
+            latitude: pa.latitude + t * (pb.latitude - pa.latitude),
+            longitude: pa.longitude + t * (pb.longitude - pa.longitude),
+        };
+        Some((
+            Endpoint::OnEdge {
+                a: s.origin,
+                b: s.destination,
+                dist_a: da,
+                dist_b: s.length - da,
+                proj,
+            },
+            perp,
+        ))
     }
 
     pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {

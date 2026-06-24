@@ -13,12 +13,10 @@ impl DelayCDF {
     /// Returns P(delay ≤ budget_secs) using a step-CDF lookup.
     /// `budget_secs` is the transfer margin (negative if you arrive after schedule).
     pub fn prob_on_time(&self, budget_secs: i32) -> f32 {
-        let pos = self.bins.partition_point(|&(delay, _)| delay <= budget_secs);
-        if pos == 0 {
-            0.0
-        } else {
-            self.bins[pos - 1].1
-        }
+        let pos = self
+            .bins
+            .partition_point(|&(delay, _)| delay <= budget_secs);
+        if pos == 0 { 0.0 } else { self.bins[pos - 1].1 }
     }
 
     /// Probability mass per bin, derived from the cumulative bins as
@@ -80,7 +78,9 @@ pub fn valid_reliability_edges(edges: &[f32]) -> bool {
 
 impl ReliabilityBuckets {
     pub fn new(edges: &[f32]) -> Self {
-        ReliabilityBuckets { edges: edges.to_vec() }
+        ReliabilityBuckets {
+            edges: edges.to_vec(),
+        }
     }
 
     /// Bucket index in `0..=edges.len()+1`. `0` = least reliable band,
@@ -139,13 +139,25 @@ impl ScenarioBag {
         let mut bag = Self::EMPTY;
         let (first, second) = if hit <= miss {
             (
-                Scenario { time: hit, prob: hit_prob },
-                Scenario { time: miss, prob: miss_prob },
+                Scenario {
+                    time: hit,
+                    prob: hit_prob,
+                },
+                Scenario {
+                    time: miss,
+                    prob: miss_prob,
+                },
             )
         } else {
             (
-                Scenario { time: miss, prob: miss_prob },
-                Scenario { time: hit, prob: hit_prob },
+                Scenario {
+                    time: miss,
+                    prob: miss_prob,
+                },
+                Scenario {
+                    time: hit,
+                    prob: hit_prob,
+                },
             )
         };
         bag.data[0] = first;
@@ -178,11 +190,7 @@ impl ScenarioBag {
     /// Probability of the earliest (best-case) scenario.
     #[inline]
     pub fn hit_prob(&self) -> f32 {
-        if self.len > 0 {
-            self.data[0].prob
-        } else {
-            0.0
-        }
+        if self.len > 0 { self.data[0].prob } else { 0.0 }
     }
 
     /// Returns the scenarios as a slice.
@@ -267,8 +275,14 @@ mod tests {
         // Mirrors the subway model from config.yaml
         DelayCDF {
             bins: vec![
-                (-120, 0.01), (-60, 0.02), (0, 0.08), (60, 0.22),
-                (120, 0.50), (180, 0.80), (300, 0.96), (900, 1.00),
+                (-120, 0.01),
+                (-60, 0.02),
+                (0, 0.08),
+                (60, 0.22),
+                (120, 0.50),
+                (180, 0.80),
+                (300, 0.96),
+                (900, 1.00),
             ],
         }
     }
@@ -308,7 +322,9 @@ mod tests {
 
     #[test]
     fn cdf_single_bin() {
-        let cdf = DelayCDF { bins: vec![(120, 0.85)] };
+        let cdf = DelayCDF {
+            bins: vec![(120, 0.85)],
+        };
         assert_eq!(cdf.prob_on_time(119), 0.0);
         assert_eq!(cdf.prob_on_time(120), 0.85);
         assert_eq!(cdf.prob_on_time(121), 0.85);
@@ -338,7 +354,7 @@ mod tests {
     fn cdf_negative_budget_means_late_arrival() {
         // margin < 0: you arrive after scheduled departure → very low probability
         let cdf = make_cdf_with_early();
-        assert_eq!(cdf.prob_on_time(-1), 0.02);  // between -60 and 0 → -60 bin
+        assert_eq!(cdf.prob_on_time(-1), 0.02); // between -60 and 0 → -60 bin
         assert_eq!(cdf.prob_on_time(-59), 0.02); // -60 ≤ -59, so -60 bin still applies
         assert_eq!(cdf.prob_on_time(-61), 0.01); // -60 > -61, so only -120 bin applies
     }
@@ -358,8 +374,16 @@ mod tests {
         // Mirrors the bus model from config.yaml
         DelayCDF {
             bins: vec![
-                (-300, 0.03), (-120, 0.09), (-60, 0.16), (0, 0.45), (60, 0.58),
-                (120, 0.67), (180, 0.74), (300, 0.84), (600, 0.93), (900, 0.97),
+                (-300, 0.03),
+                (-120, 0.09),
+                (-60, 0.16),
+                (0, 0.45),
+                (60, 0.58),
+                (120, 0.67),
+                (180, 0.74),
+                (300, 0.84),
+                (600, 0.93),
+                (900, 0.97),
                 (1800, 1.00),
             ],
         }
@@ -389,8 +413,12 @@ mod tests {
     #[test]
     fn prob_on_time_vs_point_mass_at_zero_equals_feeder_only() {
         let feeder = make_cdf_with_early();
-        let on_time = DelayCDF { bins: vec![(0, 1.0)] };
-        assert!((feeder.prob_on_time_vs(Some(&on_time), 96) - feeder.prob_on_time(96)).abs() < 1e-6);
+        let on_time = DelayCDF {
+            bins: vec![(0, 1.0)],
+        };
+        assert!(
+            (feeder.prob_on_time_vs(Some(&on_time), 96) - feeder.prob_on_time(96)).abs() < 1e-6
+        );
     }
 
     #[test]
@@ -401,7 +429,10 @@ mod tests {
         let board = make_bus_cdf();
         let merged = feeder.prob_on_time_vs(Some(&board), 96);
         assert_eq!(feeder.prob_on_time(96), 0.22);
-        assert!(merged > 0.22, "merged {merged} should exceed feeder-only 0.22");
+        assert!(
+            merged > 0.22,
+            "merged {merged} should exceed feeder-only 0.22"
+        );
         assert!((merged - 0.516).abs() < 1e-3, "merged was {merged}");
     }
 
@@ -409,7 +440,9 @@ mod tests {
     fn prob_on_time_vs_early_boarding_vehicle_lowers_reliability() {
         // A boarding vehicle that almost always leaves 2 min early eats the margin.
         let feeder = make_cdf_with_early();
-        let early = DelayCDF { bins: vec![(-120, 0.9), (0, 1.0)] };
+        let early = DelayCDF {
+            bins: vec![(-120, 0.9), (0, 1.0)],
+        };
         let merged = feeder.prob_on_time_vs(Some(&early), 96);
         // 0.9·P(feeder≤-24) + 0.1·P(feeder≤96) = 0.9·0.02 + 0.1·0.22 = 0.04
         assert!((merged - 0.04).abs() < 1e-6, "merged was {merged}");
@@ -446,7 +479,11 @@ mod tests {
         assert!(bag.is_reached());
         assert_eq!(bag.earliest(), 500);
         assert_eq!(bag.hit_prob(), 0.7);
-        assert!((bag.expected() - 560.0).abs() < 1e-3, "expected 560.0, got {}", bag.expected());
+        assert!(
+            (bag.expected() - 560.0).abs() < 1e-3,
+            "expected 560.0, got {}",
+            bag.expected()
+        );
         assert_eq!(bag.scenarios().len(), 2);
     }
 

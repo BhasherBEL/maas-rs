@@ -5,7 +5,7 @@ use crate::{
     ingestion::gtfs::{TripId, TripSegment},
     structures::{
         Graph, Mode, NodeID,
-        plan::{PlanLegStep, PlanPlace, PlanTransitLegStep, PlanTrip},
+        plan::{LegOption, PlanLegStep, PlanPlace, PlanTransitLegStep, PlanTrip, PlanWalkLegStep},
     },
 };
 
@@ -34,6 +34,7 @@ pub enum PlanLeg {
 }
 
 #[derive(Debug, SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct PlanWalkLeg {
     pub length: usize,
     pub cycleroute_length: Option<usize>,
@@ -54,6 +55,54 @@ pub struct PlanWalkLeg {
 
     /// Ordered sequence of coordinates tracing the walking path.
     pub geometry: Vec<PlanCoordinate>,
+
+    pub alternatives: Vec<LegOption>,
+
+    /// "Leave by" time (seconds since midnight) for an access leg with a downstream
+    /// boarding deadline: depart by this to make the connection with 95% confidence
+    /// (`board − p95`). `None` for legs without a deadline (egress, direct).
+    pub leave_by: Option<u32>,
+}
+
+impl PlanWalkLeg {
+    fn reselect_checked(&self, option_index: i32) -> Result<PlanWalkLeg, &'static str> {
+        if option_index < 0 {
+            return Err("option_index out of range");
+        }
+        self.reselect_to(option_index as usize)
+            .ok_or("option_index out of range")
+    }
+
+    /// A view of this leg with option `i` highlighted: leg metrics/geometry/steps
+    /// mirror `alternatives[i]`, the option set is preserved. O(1), no re-search.
+    pub fn reselect_to(&self, i: usize) -> Option<PlanWalkLeg> {
+        let o = self.alternatives.get(i)?;
+        let mut leg = self.clone();
+        leg.length = o.length;
+        leg.duration = o.p50;
+        leg.elevation_gain = o.elevation_gain;
+        leg.cycleroute_length = o.cycleroute_length;
+        leg.geometry = o.geometry.clone();
+        if self.leave_by.is_some() {
+            leg.start = self.end.saturating_sub(o.p50);
+            leg.leave_by = Some(self.end.saturating_sub(o.p95));
+        } else {
+            leg.end = self.start + o.p50;
+        }
+        leg.steps = vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
+            o.length, o.p50, leg.to,
+        ))];
+        Some(leg)
+    }
+}
+
+#[ComplexObject]
+impl PlanWalkLeg {
+    /// Switch the highlighted alternative without re-running the engine.
+    async fn reselect(&self, option_index: i32) -> Result<PlanWalkLeg> {
+        self.reselect_checked(option_index)
+            .map_err(async_graphql::Error::new)
+    }
 }
 
 #[derive(Debug, SimpleObject, Clone)]
@@ -538,5 +587,155 @@ impl PlanTransitLeg {
             })
             .take(count)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structures::{Mode, NodeID};
+
+    fn sample_walk_leg() -> PlanWalkLeg {
+        let place = PlanPlace {
+            stop_position: None,
+            arrival: None,
+            departure: None,
+            node_id: NodeID(0),
+        };
+        PlanWalkLeg {
+            length: 50,
+            cycleroute_length: None,
+            elevation_gain: None,
+            start: 1000,
+            end: 1060,
+            duration: 60,
+            street_mode: Mode::Walk,
+            from: place,
+            to: place,
+            steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(50, 60, place))],
+            geometry: vec![],
+            alternatives: vec![],
+            leave_by: None,
+        }
+    }
+
+    #[test]
+    fn walk_leg_leave_by_defaults_none_and_roundtrips() {
+        let mut leg = sample_walk_leg();
+        assert_eq!(leg.leave_by, None, "non-access legs carry no leave-by");
+        leg.leave_by = Some(28_800);
+        assert_eq!(leg.leave_by, Some(28_800));
+    }
+
+    #[test]
+    fn reselect_checked_rejects_negative_and_out_of_range() {
+        use crate::structures::plan::LegOption;
+        let opt = |len: usize| LegOption {
+            time: len as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50: len as u32,
+            p95: len as u32,
+            length: len,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![],
+        };
+        let mut leg = sample_walk_leg();
+        leg.alternatives = vec![opt(100), opt(250)];
+        leg.length = 100;
+        assert!(leg.reselect_checked(-1).is_err(), "negative index rejected");
+        assert!(leg.reselect_checked(9).is_err(), "out-of-range rejected");
+        assert_eq!(
+            leg.reselect_checked(1).unwrap().length,
+            250,
+            "valid index mirrors option"
+        );
+    }
+
+    #[test]
+    fn reselect_swaps_highlight_from_precomputed_options_without_research() {
+        use crate::structures::plan::LegOption;
+        let opt = |len: usize| LegOption {
+            time: len as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50: len as u32,
+            p95: len as u32,
+            length: len,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![],
+        };
+        let mut leg = sample_walk_leg();
+        leg.alternatives = vec![opt(100), opt(250)];
+        leg.length = 100;
+        let swapped = leg.reselect_to(1).expect("valid index");
+        assert_eq!(swapped.length, 250, "leg now mirrors option 1");
+        assert_eq!(
+            swapped.end,
+            leg.start + 250,
+            "non-deadline: end = start + p50"
+        );
+        assert_eq!(swapped.alternatives.len(), 2, "option set unchanged");
+        assert!(leg.reselect_to(9).is_none(), "out-of-range rejected");
+    }
+
+    #[test]
+    fn reselect_access_leg_holds_board_end_fixed() {
+        use crate::structures::plan::LegOption;
+        let opt = |p50: u32, p95: u32| LegOption {
+            time: p50 as f64,
+            dplus: 0.0,
+            surface: 0.0,
+            variance: 0.0,
+            cycleway_deficit: 0.0,
+            p50,
+            p95,
+            length: p50 as usize,
+            unpaved_length: 0,
+            dismount_length: 0,
+            dismount_runs: vec![],
+            elevation_gain: None,
+            cycleroute_length: None,
+            geometry: vec![],
+            nodes: vec![],
+        };
+        let board = 30_000u32;
+        let p50_0 = 200u32;
+        let p95_0 = 260u32;
+        let p50_1 = 350u32;
+        let p95_1 = 420u32;
+        let mut leg = sample_walk_leg();
+        leg.end = board;
+        leg.start = board - p50_0;
+        leg.duration = p50_0;
+        leg.leave_by = Some(board - p95_0);
+        leg.alternatives = vec![opt(p50_0, p95_0), opt(p50_1, p95_1)];
+
+        let reselected = leg.reselect_to(1).expect("valid index");
+        assert_eq!(
+            reselected.end, board,
+            "boarding time (end) must be unchanged"
+        );
+        assert_eq!(reselected.start, board - p50_1, "start = board - p50");
+        assert_eq!(
+            reselected.leave_by,
+            Some(board - p95_1),
+            "leave_by = board - p95 of selected option"
+        );
+        assert_eq!(reselected.duration, p50_1);
     }
 }

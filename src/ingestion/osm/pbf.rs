@@ -1,15 +1,35 @@
-use std::{collections::HashSet, result};
+use std::{
+    collections::{HashMap, HashSet},
+    result,
+};
 
 use osmpbf::{Element, ElementReader, RelMemberType, Way};
 
-use crate::ingestion::osm::{Dem, bike_class};
+use crate::ingestion::osm::{Dem, bike_class, elevation_smooth};
+use crate::structures::cost::VarGen;
 use crate::structures::{
-    BikeAttrs, EdgeData, Graph, NodeData, NodeID, OsmNodeData, StreetEdgeData,
+    BikeAttrs, EdgeData, Graph, NodeData, OsmNodeData, StreetEdgeData,
 };
+
+fn node_var_gen<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> VarGen {
+    let mut vg = VarGen::NONE;
+    for (k, v) in tags {
+        match (k, v) {
+            ("highway", "traffic_signals") => vg = vg.with(VarGen::SIGNALIZED),
+            ("crossing", "traffic_signals") => vg = vg.with(VarGen::SIGNALIZED),
+            ("highway", "elevator") => vg = vg.with(VarGen::ELEVATOR),
+            ("crossing", "uncontrolled" | "unmarked") => vg = vg.with(VarGen::UNCONTROLLED),
+            _ => {}
+        }
+    }
+    vg
+}
 
 pub fn load_pbf_file(
     pbf_path: &str,
     dem: Option<&Dem>,
+    smoothing_epsilon: f64,
+    surface_speed_factors: &crate::structures::SurfaceSpeedFactors,
     g: &mut Graph,
 ) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
@@ -34,23 +54,21 @@ pub fn load_pbf_file(
     })?;
 
     let reader = ElementReader::from_path(pbf_path)?;
-    let mut add_osm_node = |id: i64, lat: f64, lon: f64| {
-        let eid = format!("map#osm#{}", id);
-        let node = OsmNodeData {
-            eid,
-            lat_lng: crate::structures::LatLng {
-                latitude: lat,
-                longitude: lon,
-            },
-        };
-        g.add_node(NodeData::OsmNode(node));
-    };
+    let mut node_vargen: HashMap<i64, VarGen> = HashMap::new();
     reader.for_each(|element| match element {
         Element::DenseNode(n) if valid_node_ids.contains(&n.id()) => {
-            add_osm_node(n.id(), n.lat(), n.lon());
+            add_osm_node(g, n.id(), n.lat(), n.lon());
+            let vg = node_var_gen(n.tags());
+            if vg != VarGen::NONE {
+                node_vargen.insert(n.id(), vg);
+            }
         }
         Element::Node(n) if valid_node_ids.contains(&n.id()) => {
-            add_osm_node(n.id(), n.lat(), n.lon());
+            add_osm_node(g, n.id(), n.lat(), n.lon());
+            let vg = node_var_gen(n.tags());
+            if vg != VarGen::NONE {
+                node_vargen.insert(n.id(), vg);
+            }
         }
         _ => {}
     })?;
@@ -83,12 +101,33 @@ pub fn load_pbf_file(
             let in_cycle_route = cycle_route_ways.contains(&w.id());
             let attrs_fwd = bike_class::classify(&w, true, in_cycle_route);
             let attrs_rev = bike_class::classify(&w, false, in_cycle_route);
+            let surface_speed = bike_class::surface_speed(&w, surface_speed_factors);
+
+            let is_structure = way_is_bridge_or_tunnel(&w);
+            let seg_deltas = smoothed_segment_deltas(
+                g,
+                &node_ids,
+                dem,
+                smoothing_epsilon,
+                is_structure,
+            );
 
             for i in 0..node_ids.len().saturating_sub(1) {
                 n += 1;
                 if attrs_fwd.cycleroute {
                     n_cycleroute += 1;
                 }
+
+                let seg_vg = node_vargen
+                    .get(&node_ids[i])
+                    .copied()
+                    .unwrap_or(VarGen::NONE)
+                    .with(
+                        node_vargen
+                            .get(&node_ids[i + 1])
+                            .copied()
+                            .unwrap_or(VarGen::NONE),
+                    );
 
                 if !insert_from_osm_ids(
                     g,
@@ -101,7 +140,9 @@ pub fn load_pbf_file(
                     car,
                     attrs_fwd,
                     attrs_rev,
-                    dem,
+                    seg_vg,
+                    seg_deltas[i],
+                    surface_speed,
                 ) {
                     failed += 1;
                 }
@@ -120,6 +161,89 @@ pub fn load_pbf_file(
     );
 
     Ok(())
+}
+
+/// True when the way is tagged as a bridge or tunnel (any value except `no`).
+/// Such ways get end-to-end linear elevation interpolation, because a DTM reads
+/// the valley floor / canopy under them and fabricates huge false climbs.
+fn way_is_bridge_or_tunnel(w: &Way) -> bool {
+    w.tags().any(|(k, v)| {
+        (k == "bridge" || k == "tunnel") && v != "no"
+    })
+}
+
+/// Smoothed signed per-segment elevation delta (meters, `i16`) for each
+/// consecutive node pair along `node_ids`. Returns one entry per segment.
+///
+/// When the DEM is absent — or a node has no DEM sample — the affected deltas
+/// are `0`, preserving the no-elevation behavior. Otherwise the way's
+/// `(cumulative_distance, elevation)` profile is denoised once (RDP, vertical
+/// epsilon `smoothing_epsilon`; or straight linear interpolation for
+/// bridges/tunnels) and each segment's delta is the difference of the smoothed
+/// endpoint elevations, rounded to whole meters. Deltas telescope along the way,
+/// so they sum to `smoothed(last) − smoothed(first)`.
+fn smoothed_segment_deltas(
+    g: &Graph,
+    node_ids: &[i64],
+    dem: Option<&Dem>,
+    smoothing_epsilon: f64,
+    is_structure: bool,
+) -> Vec<i16> {
+    let n_seg = node_ids.len().saturating_sub(1);
+    let Some(dem) = dem else {
+        return vec![0; n_seg];
+    };
+
+    let mut profile: Vec<(f64, f64)> = Vec::with_capacity(node_ids.len());
+    let mut cum = 0.0;
+    let mut prev_loc: Option<crate::structures::LatLng> = None;
+    let mut all_sampled = true;
+    for id in node_ids {
+        let eid = format!("map#osm#{}", id);
+        let loc = g.get_id(eid.as_str()).and_then(|nid| g.get_node(*nid)).map(|nd| nd.loc());
+        let Some(loc) = loc else {
+            all_sampled = false;
+            break;
+        };
+        if let Some(prev) = prev_loc {
+            cum += prev.dist(loc);
+        }
+        prev_loc = Some(loc);
+        match dem.elevation(loc.latitude, loc.longitude) {
+            Some(z) => profile.push((cum, z as f64)),
+            None => {
+                all_sampled = false;
+                break;
+            }
+        }
+    }
+
+    if !all_sampled || profile.len() != node_ids.len() {
+        return vec![0; n_seg];
+    }
+
+    let smoothed = if is_structure {
+        elevation_smooth::linear_profile(&profile)
+    } else {
+        elevation_smooth::smooth_profile(&profile, smoothing_epsilon)
+    };
+
+    smoothed
+        .windows(2)
+        .map(|w| ((w[1] - w[0]).round() as i32).clamp(-30000, 30000) as i16)
+        .collect()
+}
+
+fn add_osm_node(g: &mut Graph, id: i64, lat: f64, lon: f64) {
+    let eid = format!("map#osm#{}", id);
+    let node = OsmNodeData {
+        eid,
+        lat_lng: crate::structures::LatLng {
+            latitude: lat,
+            longitude: lon,
+        },
+    };
+    g.add_node(NodeData::OsmNode(node));
 }
 
 fn validate_way(way: &Way) -> bool {
@@ -173,7 +297,9 @@ fn insert_from_osm_ids(
     car: bool,
     attrs_fwd: BikeAttrs,
     attrs_rev: BikeAttrs,
-    dem: Option<&Dem>,
+    var_gen: VarGen,
+    delta: i16,
+    surface_speed: u8,
 ) -> bool {
     let from_eid = format!("map#osm#{}", from);
     let to_eid = format!("map#osm#{}", to);
@@ -206,16 +332,6 @@ fn insert_from_osm_ids(
 
     let distance = from_node.loc().dist(to_node.loc()) as usize;
 
-    // Signed elevation change from→to (meters), from the DEM if available.
-    let elev = |id: NodeID| -> Option<f32> {
-        let loc = g.get_node(id)?.loc();
-        dem.and_then(|d| d.elevation(loc.latitude, loc.longitude))
-    };
-    let delta = match (elev(from_id), elev(to_id)) {
-        (Some(a), Some(b)) => ((b - a).round() as i32).clamp(-30000, 30000) as i16,
-        _ => 0,
-    };
-
     g.add_edge(
         from_id,
         EdgeData::Street(StreetEdgeData {
@@ -228,6 +344,8 @@ fn insert_from_osm_ids(
             car,
             attrs: attrs_fwd,
             elev_delta: delta,
+            surface_speed,
+            var_gen,
         }),
     );
     if bidirectional {
@@ -243,6 +361,8 @@ fn insert_from_osm_ids(
                 car,
                 attrs: attrs_rev,
                 elev_delta: -delta,
+                surface_speed,
+                var_gen,
             }),
         );
     }

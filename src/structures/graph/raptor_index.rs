@@ -104,6 +104,16 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_max_snap_distance_m")]
     pub max_snap_distance_m: u32,
 
+    // Edge-aware snapping: project a query coordinate onto the nearest *edge*
+    // (within `edge_snap_radius_m`) instead of the nearest node, so a point mid-way
+    // along a long straight edge isn't forced onto a distant end node. Runtime
+    // tuning — not serialized.
+    #[serde(skip, default = "RaptorIndex::default_edge_snap")]
+    pub edge_snap: bool,
+
+    #[serde(skip, default = "RaptorIndex::default_edge_snap_radius_m")]
+    pub edge_snap_radius_m: f64,
+
     // Default bike cost profile (BRouter trekking). Not serialized — applied from
     // config.yaml at startup; a per-request override merges over it.
     #[serde(skip, default)]
@@ -114,6 +124,93 @@ pub struct RaptorIndex {
     /// needs no schema bump; set from config at build time.
     #[serde(skip, default = "RaptorIndex::default_street_time")]
     pub street_time: crate::structures::StreetTimeModel,
+
+    /// RCSP distance budget multiplier δ: paths up to (1+δ)·shortest are explored.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_distance_budget")]
+    pub distance_budget: f64,
+
+    /// Per-axis ε-dominance thresholds for the multi-objective Pareto filter.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_epsilon")]
+    pub epsilon: crate::structures::cost::Epsilon,
+
+    /// Bike grid-bucketing cell-size coefficients per meter of origin→dest
+    /// straight-line distance, on the CyclewayDeficit and Dplus diversity axes.
+    /// Cell size = k·D; `0.0` disables bucketing on that axis (strict no-op).
+    /// Bounds the per-node Pareto frontier while preserving the cycleway/climb
+    /// span. Tuning params — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_bike_bucket_cyc_k")]
+    pub bike_bucket_cyc_k: f64,
+    #[serde(skip, default = "RaptorIndex::default_bike_bucket_dpl_k")]
+    pub bike_bucket_dpl_k: f64,
+
+    /// On-the-fly degree-2 contraction in the bike Pareto search: follow forced
+    /// single-successor chains to the next junction, creating one label there instead
+    /// of at every shape vertex (~81% of OSM nodes). Cost-exact only WITHOUT lossy
+    /// pruning; under bucketing the per-cell eviction happens at junctions only, which
+    /// changes the approximate front, so it defaults OFF (see config). Tuning param —
+    /// not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_multiobj_contract")]
+    pub multiobj_contract: bool,
+
+    /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false: with the
+    /// gradient-aware power model climbing is already priced in Time, so a separate
+    /// "minimize D+ at any cost" axis only manufactures absurd extremes (a long walk to
+    /// shave a few m of ascent) and triples search cost. D+ stays a displayed stat.
+    #[serde(skip, default = "RaptorIndex::default_bike_select_dplus")]
+    pub bike_select_dplus: bool,
+
+    /// Tunable σ model for signal/elevator/crossing variance generators.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_variance_model")]
+    pub variance_model: crate::structures::cost::VarianceModel,
+
+    /// Per-axis surface roughness and comfort-stress weights for the cost vector.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_cost_weights")]
+    pub cost_weights: crate::structures::cost::CostWeights,
+
+    /// Number of diverse representatives kept from the multi-objective front.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_representatives_k")]
+    pub representatives_k: usize,
+
+    /// Whether multi-objective street routing is enabled (opt-in; see config).
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_multiobj_street")]
+    pub multiobj_street: bool,
+
+    /// Max scalar leg length (metres) to enrich with multi-objective alternatives
+    /// for non-walk street modes (bike/car). Bike/car alternatives come from a few
+    /// fast scalar A* searches (`scalarized_leg_options`), bounded by the corridor, so
+    /// this is a high safety net against pathological cross-country legs rather than a
+    /// hard perf cliff. Walk legs are never gated. Tuning param — applied at startup.
+    #[serde(skip, default = "RaptorIndex::default_multiobj_street_max_len_m")]
+    pub multiobj_street_max_len_m: usize,
+
+    /// Secondary weight on Time in a single-axis "champion" scalarization (the
+    /// fastest champion is pure Time). Breaks ties toward shorter routes when an
+    /// objective (e.g. D+) is otherwise near-degenerate. Tuning param — applied at
+    /// startup, not serialized.
+    #[serde(skip, default = "RaptorIndex::default_champion_time_tiebreak")]
+    pub champion_time_tiebreak: f64,
+
+    /// ADGW limited-sharing threshold: an alternative bike/car leg is dropped if it
+    /// shares more than this fraction of its length with a higher-ranked one. Tuning
+    /// param — applied at startup, not serialized. 0.6 mirrors GraphHopper's default.
+    #[serde(skip, default = "RaptorIndex::default_alt_max_share_factor")]
+    pub alt_max_share_factor: f64,
+
+    /// Systematic coefficient of variation for post-hoc path-time variance.
+    /// Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_systematic_cv")]
+    pub systematic_cv: f64,
+
+    /// Per-axis balanced-default weights. Tuning param — not serialized, applied
+    /// from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_balance")]
+    pub balance: crate::structures::cost::BalanceWeights,
 }
 
 impl Default for RaptorIndex {
@@ -173,8 +270,25 @@ impl RaptorIndex {
             arrival_slack_secs: Self::default_arrival_slack_secs(),
             max_window_secs: Self::default_max_window_secs(),
             max_snap_distance_m: Self::default_max_snap_distance_m(),
+            edge_snap: Self::default_edge_snap(),
+            edge_snap_radius_m: Self::default_edge_snap_radius_m(),
             bike_profile: crate::structures::BikeProfile::default(),
             street_time: Self::default_street_time(),
+            distance_budget: Self::default_distance_budget(),
+            epsilon: Self::default_epsilon(),
+            bike_bucket_cyc_k: Self::default_bike_bucket_cyc_k(),
+            bike_bucket_dpl_k: Self::default_bike_bucket_dpl_k(),
+            multiobj_contract: Self::default_multiobj_contract(),
+            bike_select_dplus: Self::default_bike_select_dplus(),
+            variance_model: Self::default_variance_model(),
+            cost_weights: Self::default_cost_weights(),
+            representatives_k: Self::default_representatives_k(),
+            multiobj_street: Self::default_multiobj_street(),
+            multiobj_street_max_len_m: Self::default_multiobj_street_max_len_m(),
+            champion_time_tiebreak: Self::default_champion_time_tiebreak(),
+            alt_max_share_factor: Self::default_alt_max_share_factor(),
+            systematic_cv: Self::default_systematic_cv(),
+            balance: Self::default_balance(),
         }
     }
 
@@ -214,8 +328,87 @@ impl RaptorIndex {
         10_000
     }
 
+    pub fn default_edge_snap() -> bool {
+        true
+    }
+
+    pub fn default_edge_snap_radius_m() -> f64 {
+        300.0
+    }
+
     pub fn default_street_time() -> crate::structures::StreetTimeModel {
         crate::structures::StreetTimeModel::default()
+    }
+
+    pub fn default_distance_budget() -> f64 {
+        0.5
+    }
+
+    pub fn default_epsilon() -> crate::structures::cost::Epsilon {
+        crate::structures::EpsilonConfig::default().to_epsilon()
+    }
+
+    pub fn default_bike_bucket_cyc_k() -> f64 {
+        0.11
+    }
+
+    pub fn default_bike_bucket_dpl_k() -> f64 {
+        0.013
+    }
+
+    pub fn default_multiobj_contract() -> bool {
+        // Off by default: cost-exact only without lossy pruning; it interacts with
+        // bucketing (per-cell eviction at junctions-only) and can drop the cycleway
+        // extreme at tight budgets. Available behind config for future work.
+        false
+    }
+
+    pub fn default_bike_select_dplus() -> bool {
+        // Off: A/B showed demoting D+ removes the long-walk-for-flatness extreme
+        // (push 1114→44 m) and makes the search 3–4× faster, with comparable diversity.
+        false
+    }
+
+    pub fn set_bike_select_dplus(&mut self, v: bool) {
+        self.bike_select_dplus = v;
+    }
+
+    pub fn default_variance_model() -> crate::structures::cost::VarianceModel {
+        crate::structures::cost::VarianceModel::default()
+    }
+
+    pub fn default_cost_weights() -> crate::structures::cost::CostWeights {
+        crate::structures::cost::CostWeights::default()
+    }
+
+    pub fn default_representatives_k() -> usize {
+        6
+    }
+
+    pub fn default_multiobj_street() -> bool {
+        false
+    }
+
+    pub fn default_multiobj_street_max_len_m() -> usize {
+        // 25 km comfortably covers urban bike legs and the ~5 km vehicle access radius;
+        // the scalar search is corridor-bounded so this is a guard, not a perf cliff.
+        25_000
+    }
+
+    pub fn default_champion_time_tiebreak() -> f64 {
+        0.1
+    }
+
+    pub fn default_alt_max_share_factor() -> f64 {
+        0.6
+    }
+
+    pub fn default_systematic_cv() -> f64 {
+        0.05
+    }
+
+    pub fn default_balance() -> crate::structures::cost::BalanceWeights {
+        crate::structures::cost::BalanceWeights::default()
     }
 
     /// Rebuild non-serialized runtime indices from serialized data. Must be
@@ -244,7 +437,9 @@ impl RaptorIndex {
 
     /// Original GTFS `trip_id` string for an internal `TripId`, if known.
     pub fn trip_id_str(&self, trip: TripId) -> Option<&str> {
-        self.transit_trip_ids.get(trip.0 as usize).map(|s| s.as_str())
+        self.transit_trip_ids
+            .get(trip.0 as usize)
+            .map(|s| s.as_str())
     }
 
     /// Internal `TripId` for a GTFS `trip_id` string, if known.
@@ -256,8 +451,8 @@ impl RaptorIndex {
     /// out-of-bounds, which indicates a stale or corrupt `graph.bin`.
     pub fn validate(&self) -> Result<(), String> {
         let n_services = self.transit_services.len();
-        let n_routes   = self.transit_routes.len();
-        let n_trips    = self.transit_trips.len();
+        let n_routes = self.transit_routes.len();
+        let n_trips = self.transit_trips.len();
         let n_patterns = self.transit_patterns.len();
 
         for (i, trip) in self.transit_trips.iter().enumerate() {
@@ -331,13 +526,14 @@ mod tests {
     #[test]
     fn validate_consistent_trips_ok() {
         let mut idx = RaptorIndex::new();
-        idx.transit_services.push(crate::ingestion::gtfs::ServicePattern {
-            days_of_week: 0x1f,
-            start_date: 0,
-            end_date: u32::MAX,
-            added_dates: vec![],
-            removed_dates: vec![],
-        });
+        idx.transit_services
+            .push(crate::ingestion::gtfs::ServicePattern {
+                days_of_week: 0x1f,
+                start_date: 0,
+                end_date: u32::MAX,
+                added_dates: vec![],
+                removed_dates: vec![],
+            });
         idx.transit_routes.push(crate::ingestion::gtfs::RouteInfo {
             route_short_name: "1".into(),
             route_long_name: "Line 1".into(),
@@ -370,13 +566,14 @@ mod tests {
     #[test]
     fn validate_bad_route_id_returns_error() {
         let mut idx = RaptorIndex::new();
-        idx.transit_services.push(crate::ingestion::gtfs::ServicePattern {
-            days_of_week: 0x1f,
-            start_date: 0,
-            end_date: u32::MAX,
-            added_dates: vec![],
-            removed_dates: vec![],
-        });
+        idx.transit_services
+            .push(crate::ingestion::gtfs::ServicePattern {
+                days_of_week: 0x1f,
+                start_date: 0,
+                end_date: u32::MAX,
+                added_dates: vec![],
+                removed_dates: vec![],
+            });
         idx.transit_trips.push(make_trip(9999, 0));
         let err = idx.validate().unwrap_err();
         assert!(err.contains("route_id"), "unexpected error: {err}");
@@ -386,7 +583,8 @@ mod tests {
     #[test]
     fn validate_bad_pattern_trip_returns_error() {
         let mut idx = RaptorIndex::new();
-        idx.transit_pattern_trips.push(crate::ingestion::gtfs::TripId(9999));
+        idx.transit_pattern_trips
+            .push(crate::ingestion::gtfs::TripId(9999));
         let err = idx.validate().unwrap_err();
         assert!(err.contains("pattern_trips"), "unexpected error: {err}");
         assert!(err.contains("rebuild"), "no rebuild hint: {err}");
@@ -407,11 +605,38 @@ mod tests {
         idx.transit_trip_ids = vec!["trip_a".into(), "trip_b".into(), "trip_c".into()];
         idx.build_runtime_indices();
 
-        assert_eq!(idx.trip_id_str(crate::ingestion::gtfs::TripId(1)), Some("trip_b"));
-        assert_eq!(idx.trip_index_of("trip_c"), Some(crate::ingestion::gtfs::TripId(2)));
-        assert_eq!(idx.trip_index_of("trip_a"), Some(crate::ingestion::gtfs::TripId(0)));
+        assert_eq!(
+            idx.trip_id_str(crate::ingestion::gtfs::TripId(1)),
+            Some("trip_b")
+        );
+        assert_eq!(
+            idx.trip_index_of("trip_c"),
+            Some(crate::ingestion::gtfs::TripId(2))
+        );
+        assert_eq!(
+            idx.trip_index_of("trip_a"),
+            Some(crate::ingestion::gtfs::TripId(0))
+        );
         assert_eq!(idx.trip_index_of("nope"), None);
         assert_eq!(idx.trip_id_str(crate::ingestion::gtfs::TripId(99)), None);
+    }
+
+    #[test]
+    fn representatives_k_defaults_to_six() {
+        assert_eq!(RaptorIndex::new().representatives_k, 6);
+    }
+
+    #[test]
+    fn systematic_cv_defaults_to_five_percent() {
+        assert_eq!(RaptorIndex::new().systematic_cv, 0.05);
+    }
+
+    #[test]
+    fn balance_defaults_present() {
+        assert_eq!(
+            RaptorIndex::new().balance,
+            crate::structures::cost::BalanceWeights::default()
+        );
     }
 
     #[test]

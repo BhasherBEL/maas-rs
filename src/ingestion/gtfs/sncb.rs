@@ -1,11 +1,11 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use kdtree::{KdTree, distance::squared_euclidean};
 use osmpbf::{Element, ElementReader};
 
-use crate::structures::{Graph, LatLng, NodeID};
 use super::load_gtfs_with_hook;
+use crate::structures::{Graph, LatLng, NodeID};
 
 // ── Railway way filter ────────────────────────────────────────────────────────
 
@@ -323,14 +323,18 @@ pub fn load_gtfs_sncb(
         match RailwayGraph::build(osm_path) {
             Ok(rg) => rg,
             Err(e) => {
-                tracing::error!("failed to build railway graph: {e} — falling back to generic GTFS load");
+                tracing::error!(
+                    "failed to build railway graph: {e} — falling back to generic GTFS load"
+                );
                 return load_gtfs_with_hook(gtfs_path, g, |_, _| None);
             }
         }
     };
 
     let patterns_before = g.transit_pattern_count();
-    load_gtfs_with_hook(gtfs_path, g, |trip, _| sncb_bikes_decision(trip.bikes_allowed))?;
+    load_gtfs_with_hook(gtfs_path, g, |trip, _| {
+        sncb_bikes_decision(trip.bikes_allowed)
+    })?;
     let patterns_after = g.transit_pattern_count();
 
     let mut n_computed = 0usize;
@@ -346,7 +350,9 @@ pub fn load_gtfs_sncb(
             Some((pts, idx, had_fallback)) => {
                 g.set_pattern_shape(p, pts, idx);
                 n_computed += 1;
-                if had_fallback { n_partial += 1; }
+                if had_fallback {
+                    n_partial += 1;
+                }
             }
             None => n_failed += 1,
         }
@@ -371,14 +377,26 @@ mod tests {
     fn sncb_allows_bikes_by_default() {
         // SNCB permits bikes on all trains, so a trip with no GTFS bike info
         // must still resolve to allowed.
-        assert_eq!(sncb_bikes_decision(BikesAllowedType::NoBikeInfo), Some(true));
-        assert_eq!(sncb_bikes_decision(BikesAllowedType::Unknown(7)), Some(true));
+        assert_eq!(
+            sncb_bikes_decision(BikesAllowedType::NoBikeInfo),
+            Some(true)
+        );
+        assert_eq!(
+            sncb_bikes_decision(BikesAllowedType::Unknown(7)),
+            Some(true)
+        );
     }
 
     #[test]
     fn sncb_respects_explicit_gtfs_bike_info() {
-        assert_eq!(sncb_bikes_decision(BikesAllowedType::AtLeastOneBike), Some(true));
-        assert_eq!(sncb_bikes_decision(BikesAllowedType::NoBikesAllowed), Some(false));
+        assert_eq!(
+            sncb_bikes_decision(BikesAllowedType::AtLeastOneBike),
+            Some(true)
+        );
+        assert_eq!(
+            sncb_bikes_decision(BikesAllowedType::NoBikesAllowed),
+            Some(false)
+        );
     }
 
     /// Build a RailwayGraph where consecutive nodes are connected in a chain.
@@ -390,7 +408,12 @@ mod tests {
         let n = nodes.len();
         let mut adj = vec![Vec::new(); n];
         for i in 0..n.saturating_sub(1) {
-            let d = haversine_m(nodes[i].lat, nodes[i].lon, nodes[i + 1].lat, nodes[i + 1].lon);
+            let d = haversine_m(
+                nodes[i].lat,
+                nodes[i].lon,
+                nodes[i + 1].lat,
+                nodes[i + 1].lon,
+            );
             adj[i].push((i + 1, d as u32));
             adj[i + 1].push((i, d as u32));
         }
@@ -471,8 +494,14 @@ mod tests {
     fn test_dijkstra_unreachable() {
         // Two isolated nodes (no edges between them)
         let nodes = vec![
-            RailwayNode { lat: 50.0, lon: 4.0 },
-            RailwayNode { lat: 51.0, lon: 5.0 },
+            RailwayNode {
+                lat: 50.0,
+                lon: 4.0,
+            },
+            RailwayNode {
+                lat: 51.0,
+                lon: 5.0,
+            },
         ];
         let mut tree: KdTree<f64, usize, [f64; 2]> = KdTree::new(2);
         let _ = tree.add([50.0, 4.0], 0usize);
@@ -494,7 +523,10 @@ mod tests {
         // succeed using the second candidate (node 0).
         let mut rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
         // Add an isolated node 3
-        rg.nodes.push(RailwayNode { lat: 49.0, lon: 3.0 });
+        rg.nodes.push(RailwayNode {
+            lat: 49.0,
+            lon: 3.0,
+        });
         rg.adj.push(Vec::new());
         let _ = rg.tree.add([49.0, 3.0], 3usize);
 
@@ -521,7 +553,10 @@ mod tests {
         let candidates = [vec![0usize], vec![2usize], vec![4usize]];
         let mut all_pts: Vec<LatLng> = Vec::new();
         let mut stop_idx: Vec<u32> = Vec::new();
-        all_pts.push(LatLng { latitude: rg.nodes[0].lat, longitude: rg.nodes[0].lon });
+        all_pts.push(LatLng {
+            latitude: rg.nodes[0].lat,
+            longitude: rg.nodes[0].lon,
+        });
         stop_idx.push(0);
         for i in 1..candidates.len() {
             let path = best_dijkstra(&rg, &candidates[i - 1], &candidates[i]).unwrap();
@@ -544,9 +579,20 @@ mod tests {
         // Stop 2 has no valid candidates — simulates "no railway nearby"
         let candidates: &[&[usize]] = &[&[0], &[2], &[]];
 
-        let stop_coords = [LatLng { latitude: 50.0,  longitude: 4.0 },
-            LatLng { latitude: 50.01, longitude: 4.0 },
-            LatLng { latitude: 50.02, longitude: 4.0 }];
+        let stop_coords = [
+            LatLng {
+                latitude: 50.0,
+                longitude: 4.0,
+            },
+            LatLng {
+                latitude: 50.01,
+                longitude: 4.0,
+            },
+            LatLng {
+                latitude: 50.02,
+                longitude: 4.0,
+            },
+        ];
 
         let mut all_pts: Vec<LatLng> = Vec::new();
         let mut stop_idx: Vec<u32> = Vec::new();
@@ -571,8 +617,8 @@ mod tests {
 
         assert_eq!(routed, 1, "first segment should be routed");
         assert_eq!(stop_idx[0], 0);
-        assert_eq!(stop_idx[1], 2);   // routed 0→2 via nodes 0,1,2
-        assert_eq!(stop_idx[2], 3);   // fallback: one extra straight-line point
+        assert_eq!(stop_idx[1], 2); // routed 0→2 via nodes 0,1,2
+        assert_eq!(stop_idx[2], 3); // fallback: one extra straight-line point
         assert_eq!(all_pts.len(), 4);
     }
 }

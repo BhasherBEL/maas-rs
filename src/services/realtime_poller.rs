@@ -26,19 +26,20 @@ pub fn build_feeds(cfg: &RealtimeConfig, graph: Arc<Graph>) -> Vec<Box<dyn Realt
     cfg.feeds
         .iter()
         .map(|f| match f {
-            RealtimeFeedConfig::GtfsRt { name, url, headers } => Box::new(GtfsRtFeed::new(
-                name.clone(),
-                url.clone(),
-                headers.clone(),
-            )) as Box<dyn RealtimeFeed>,
-            RealtimeFeedConfig::Stib { name, waiting_time_url, headers } => {
-                Box::new(StibFeed::new(
-                    name.clone(),
-                    waiting_time_url.clone(),
-                    headers.clone(),
-                    graph.clone(),
-                )) as Box<dyn RealtimeFeed>
+            RealtimeFeedConfig::GtfsRt { name, url, headers } => {
+                Box::new(GtfsRtFeed::new(name.clone(), url.clone(), headers.clone()))
+                    as Box<dyn RealtimeFeed>
             }
+            RealtimeFeedConfig::Stib {
+                name,
+                waiting_time_url,
+                headers,
+            } => Box::new(StibFeed::new(
+                name.clone(),
+                waiting_time_url.clone(),
+                headers.clone(),
+                graph.clone(),
+            )) as Box<dyn RealtimeFeed>,
         })
         .collect()
 }
@@ -60,7 +61,11 @@ pub fn build_index(graph: &Graph, delays: &[TripDelay], generated_at: i64) -> Re
 
 /// Poll every feed once. Returns the folded index and whether at least one feed
 /// succeeded (used to decide whether to publish or keep the last good index).
-fn poll_cycle(graph: &Graph, feeds: &[Box<dyn RealtimeFeed>], fetcher: &Fetcher) -> (RealtimeIndex, bool) {
+fn poll_cycle(
+    graph: &Graph,
+    feeds: &[Box<dyn RealtimeFeed>],
+    fetcher: &Fetcher,
+) -> (RealtimeIndex, bool) {
     let mut all: Vec<TripDelay> = Vec::new();
     let mut any_success = false;
     for feed in feeds {
@@ -96,7 +101,11 @@ pub fn spawn(graph: SharedGraph, realtime: SharedRealtime, config: Arc<Config>) 
         Duration::from_secs(cfg.request_timeout_secs),
     ));
     let interval = Duration::from_secs(cfg.poll_interval_secs.max(1));
-    tracing::info!(feeds = feeds.len(), interval_secs = cfg.poll_interval_secs, "realtime poller started");
+    tracing::info!(
+        feeds = feeds.len(),
+        interval_secs = cfg.poll_interval_secs,
+        "realtime poller started"
+    );
 
     tokio::spawn(async move {
         loop {
@@ -139,14 +148,39 @@ mod tests {
         g.raptor.build_runtime_indices();
 
         let delays = vec![
-            TripDelay { trip_id: "t1".into(), stop_id: Some("s9".into()), stop_sequence: None, delay: 120 },
-            TripDelay { trip_id: "t0".into(), stop_id: Some("s5".into()), stop_sequence: None, delay: 60 },
+            TripDelay {
+                trip_id: "t1".into(),
+                stop_id: Some("s9".into()),
+                stop_sequence: None,
+                delay: 120,
+            },
+            TripDelay {
+                trip_id: "t0".into(),
+                stop_id: Some("s5".into()),
+                stop_sequence: None,
+                delay: 60,
+            },
             // unknown trip — dropped
-            TripDelay { trip_id: "ghost".into(), stop_id: Some("s0".into()), stop_sequence: None, delay: 30 },
+            TripDelay {
+                trip_id: "ghost".into(),
+                stop_id: Some("s0".into()),
+                stop_sequence: None,
+                delay: 30,
+            },
             // unknown stop — dropped
-            TripDelay { trip_id: "t0".into(), stop_id: Some("nope".into()), stop_sequence: None, delay: 30 },
+            TripDelay {
+                trip_id: "t0".into(),
+                stop_id: Some("nope".into()),
+                stop_sequence: None,
+                delay: 30,
+            },
             // no stop_id — dropped (no stop reference)
-            TripDelay { trip_id: "t0".into(), stop_id: None, stop_sequence: Some(2), delay: 30 },
+            TripDelay {
+                trip_id: "t0".into(),
+                stop_id: None,
+                stop_sequence: Some(2),
+                delay: 30,
+            },
         ];
 
         let idx = build_index(&g, &delays, 42);

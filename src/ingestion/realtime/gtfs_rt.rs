@@ -132,8 +132,18 @@ mod tests {
         assert_eq!(
             delays,
             vec![
-                TripDelay { trip_id: "trip_x".into(), stop_id: Some("stop_1".into()), stop_sequence: Some(1), delay: 60 },
-                TripDelay { trip_id: "trip_x".into(), stop_id: Some("stop_2".into()), stop_sequence: Some(2), delay: 180 },
+                TripDelay {
+                    trip_id: "trip_x".into(),
+                    stop_id: Some("stop_1".into()),
+                    stop_sequence: Some(1),
+                    delay: 60
+                },
+                TripDelay {
+                    trip_id: "trip_x".into(),
+                    stop_id: Some("stop_2".into()),
+                    stop_sequence: Some(2),
+                    delay: 180
+                },
             ]
         );
     }
@@ -148,7 +158,12 @@ mod tests {
         // Only the stop with a delay survives.
         assert_eq!(
             delays,
-            vec![TripDelay { trip_id: "trip_y".into(), stop_id: Some("stop_5".into()), stop_sequence: Some(5), delay: -30 }]
+            vec![TripDelay {
+                trip_id: "trip_y".into(),
+                stop_id: Some("stop_5".into()),
+                stop_sequence: Some(5),
+                delay: -30
+            }]
         );
     }
 
