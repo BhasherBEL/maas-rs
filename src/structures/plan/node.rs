@@ -1,6 +1,6 @@
 use async_graphql::{Enum, SimpleObject};
 
-use crate::structures::{Graph, NodeData, NodeID};
+use crate::structures::{Graph, NodeID};
 
 #[derive(Debug, Enum, Clone, Copy, PartialEq, PartialOrd, Ord, Eq)]
 pub enum PlanNodeType {
@@ -18,21 +18,17 @@ pub struct PlanNode {
 
 impl PlanNode {
     pub fn from_node_id(g: &Graph, id: NodeID) -> Option<PlanNode> {
-        let node = g.get_node(id)?;
-
-        match node {
-            NodeData::OsmNode(node) => Some(PlanNode {
-                lat: node.lat_lng.latitude,
-                lon: node.lat_lng.longitude,
-                mode: PlanNodeType::Osm,
-                name: None,
-            }),
-            NodeData::TransitStop(node) => Some(PlanNode {
-                lat: node.lat_lng.latitude,
-                lon: node.lat_lng.longitude,
-                mode: PlanNodeType::TransitStop,
-                name: Some(node.name.clone()),
-            }),
-        }
+        let (loc, name) = g.plan_node_info(id)?;
+        let mode = if name.is_some() {
+            PlanNodeType::TransitStop
+        } else {
+            PlanNodeType::Osm
+        };
+        Some(PlanNode {
+            lat: loc.latitude,
+            lon: loc.longitude,
+            mode,
+            name,
+        })
     }
 }

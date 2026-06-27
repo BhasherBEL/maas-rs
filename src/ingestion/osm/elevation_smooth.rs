@@ -101,6 +101,7 @@ fn rdp(points: &[(f64, f64)], a: usize, b: usize, epsilon: f64, keep: &mut [bool
 /// Smoothed per-segment signed deltas (meters) for consecutive nodes, derived
 /// from `smooth_profile`. Returned vector has `points.len() - 1` entries; their
 /// sum equals `smoothed(last) − smoothed(first)` (additivity preserved).
+#[cfg(test)]
 pub fn smoothed_deltas(points: &[(f64, f64)], epsilon: f64) -> Vec<f64> {
     let z = smooth_profile(points, epsilon);
     z.windows(2).map(|w| w[1] - w[0]).collect()

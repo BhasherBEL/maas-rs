@@ -646,6 +646,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![],
+            edges: vec![],
         };
         let mut leg = sample_walk_leg();
         leg.alternatives = vec![opt(100), opt(250)];
@@ -678,6 +679,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![],
+            edges: vec![],
         };
         let mut leg = sample_walk_leg();
         leg.alternatives = vec![opt(100), opt(250)];
@@ -712,6 +714,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![],
+            edges: vec![],
         };
         let board = 30_000u32;
         let p50_0 = 200u32;
@@ -737,5 +740,187 @@ mod tests {
             "leave_by = board - p95 of selected option"
         );
         assert_eq!(reselected.duration, p50_1);
+    }
+
+    /// P3f drop gate: `previous_departures_on` / `next_departures_on` must (a) not panic
+    /// and (b) return byte-identical results before and after `drop_full_node_arrays()`.
+    /// Uses a 2-trip fixture so `next_departures_on` returns a non-empty list, proving the
+    /// path actually traverses timetable data rather than short-circuiting to empty.
+    #[test]
+    fn leg_alternatives_drop_gate_identical() {
+        use crate::{
+            ingestion::gtfs::{
+                AgencyId, RouteId, RouteInfo, ServiceId, ServicePattern, StopTime,
+                TimetableSegment, TripId, TripInfo, TripSegment,
+            },
+            structures::{
+                BikeAttrs, EdgeData, Graph, LatLng, NodeData, OsmNodeData,
+                StreetEdgeData, TransitEdgeData, TransitStopData,
+                contraction::ContractedGraph,
+                cost::VarGen,
+                raptor::{Lookup, PatternInfo},
+            },
+        };
+        use gtfs_structures::{Availability, RouteType};
+
+        let mut g = Graph::new();
+
+        let origin = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "origin".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.000 },
+        }));
+        let j_a = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "jA".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.003 },
+        }));
+        let j_b = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "jB".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.030 },
+        }));
+        let dest = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "dest".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.033 },
+        }));
+        let stop_a = g.add_node(NodeData::TransitStop(TransitStopData {
+            name: "Stop A".into(),
+            id: "A".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.003 },
+            accessibility: Availability::Available,
+        }));
+        let stop_b = g.add_node(NodeData::TransitStop(TransitStopData {
+            name: "Stop B".into(),
+            id: "B".into(),
+            lat_lng: LatLng { latitude: 50.000, longitude: 4.030 },
+            accessibility: Availability::Available,
+        }));
+
+        let bidir = |g: &mut Graph, a: crate::structures::NodeID, b: crate::structures::NodeID, len: usize| {
+            for (o, d) in [(a, b), (b, a)] {
+                g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                    origin: o, destination: d, length: len, partial: false,
+                    foot: true, bike: true, car: true,
+                    attrs: BikeAttrs::road_default(), elev_delta: 0,
+                    surface_speed: 100, var_gen: VarGen::NONE,
+                }));
+            }
+        };
+        bidir(&mut g, origin, j_a, 300);
+        bidir(&mut g, j_a, j_b, 500);
+        bidir(&mut g, j_b, dest, 300);
+
+        for (stop, junc) in [(stop_a, j_a), (stop_b, j_b)] {
+            for (o, d) in [(stop, junc), (junc, stop)] {
+                g.add_edge(o, EdgeData::Street(StreetEdgeData {
+                    origin: o, destination: d, length: 5, partial: true,
+                    foot: true, bike: false, car: false,
+                    attrs: BikeAttrs::road_default(), elev_delta: 0,
+                    surface_speed: 100, var_gen: VarGen::NONE,
+                }));
+            }
+        }
+
+        g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+            origin: stop_a, destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 2 },
+            length: 1900,
+        }));
+
+        g.add_transit_services(vec![ServicePattern {
+            days_of_week: 0x7F, start_date: 0, end_date: 9999,
+            added_dates: vec![], removed_dates: vec![],
+        }]);
+        g.add_transit_routes(vec![RouteInfo {
+            route_short_name: "1".into(), route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None,
+        }]);
+        g.add_transit_trips(vec![
+            TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+            TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        ]);
+        g.add_transit_departures(vec![
+            TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 8 * 3600, arrival: 8 * 3600 + 600, service_id: ServiceId(0) },
+            TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 9 * 3600, arrival: 9 * 3600 + 600, service_id: ServiceId(0) },
+        ]);
+
+        {
+            let ss = g.transit_pattern_stops_len();
+            g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+            g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+            let ts = g.transit_pattern_trips_len();
+            g.push_transit_pattern_trip(TripId(0));
+            g.push_transit_pattern_trip(TripId(1));
+            g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 2 });
+            let sts = g.transit_pattern_stop_times_len();
+            // Column-major: stop 0 (stop_a): trip 0 at 8:00, trip 1 at 9:00
+            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600, departure: 8 * 3600 });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600 });
+            // Column-major: stop 1 (stop_b): trip 0 at 8:10, trip 1 at 9:10
+            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600 });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
+            g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
+            g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 2 });
+        }
+
+        g.build_raptor_index();
+        g.set_node_contraction(true);
+        let mut cg = ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted_default();
+
+        // Route directly by NodeID (bypasses coordinate snapping), using the same
+        // parameters as `t4_drop_g_then_route_identical` — date=0 (2000-01-01),
+        // weekday=0x7F (all days), querying at 7:50 to board the 8:00 trip.
+        let plans_before = g.raptor(origin, dest, 7 * 3600 + 50 * 60, 0, 0x7F, 10 * 60);
+
+        let transit_leg_before = plans_before
+            .iter()
+            .find_map(|p| {
+                p.legs.iter().find_map(|l| {
+                    if let PlanLeg::Transit(t) = l { Some(t.clone()) } else { None }
+                })
+            })
+            .expect("pre-drop plan must contain a transit leg");
+
+        let prev_before = transit_leg_before.previous_departures_on(&g, 3).expect("pre-drop previous_departures_on");
+        let next_before = transit_leg_before.next_departures_on(&g, 3).expect("pre-drop next_departures_on");
+        assert!(
+            !next_before.is_empty(),
+            "next_departures_on must return the 9:00 alternative pre-drop (2-trip fixture)"
+        );
+
+        g.drop_full_node_arrays();
+        assert_eq!(g.node_count(), 0, "g arrays dropped");
+
+        let plans_after = g.raptor(origin, dest, 7 * 3600 + 50 * 60, 0, 0x7F, 10 * 60);
+
+        let transit_leg_after = plans_after
+            .iter()
+            .find_map(|p| {
+                p.legs.iter().find_map(|l| {
+                    if let PlanLeg::Transit(t) = l { Some(t.clone()) } else { None }
+                })
+            })
+            .expect("post-drop plan must contain a transit leg");
+
+        let prev_after = transit_leg_after.previous_departures_on(&g, 3).expect("post-drop previous_departures_on");
+        let next_after = transit_leg_after.next_departures_on(&g, 3).expect("post-drop next_departures_on");
+
+        let starts_ends = |legs: &[PlanTransitLeg]| -> Vec<(u32, u32)> {
+            legs.iter().map(|l| (l.start, l.end)).collect()
+        };
+
+        assert_eq!(
+            starts_ends(&prev_before),
+            starts_ends(&prev_after),
+            "previous_departures_on must be byte-identical pre/post drop"
+        );
+        assert_eq!(
+            starts_ends(&next_before),
+            starts_ends(&next_after),
+            "next_departures_on must be byte-identical pre/post drop"
+        );
     }
 }

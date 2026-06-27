@@ -23,30 +23,59 @@ fn apply_signed_delay(t: u32, delay: i32) -> u32 {
 }
 
 impl Graph {
-    pub(super) fn build_walk_plan(
+    /// Direct walk plan keyed on projected snap coordinates (`ep`) for the geometry, so a
+    /// coord-snapped origin/destination survives the interior-node drop. `None` ⇒ NodeID
+    /// path, byte-identical.
+    pub(super) fn build_walk_plan_ep(
         &self,
         origin: NodeID,
         destination: NodeID,
         start_time: u32,
         walk_secs: u32,
+        ep: Option<&super::QueryEndpoints>,
     ) -> Plan {
-        self.build_street_plan(
+        self.build_street_plan_ep(
             origin,
             destination,
             start_time,
             walk_secs,
             StreetProfile::Foot,
+            ep,
         )
     }
 
-    /// Direct street-only plan (the whole journey walked or ridden).
-    pub(super) fn build_street_plan(
+    /// `build_street_plan` keyed on projected snap coordinates (`ep`) for the geometry.
+    /// `None` ⇒ NodeID path, byte-identical.
+    pub(super) fn build_street_plan_ep(
         &self,
         origin: NodeID,
         destination: NodeID,
         start_time: u32,
         secs: u32,
         profile: StreetProfile,
+        ep: Option<&super::QueryEndpoints>,
+    ) -> Plan {
+        let geometry = match ep {
+            Some(ep) if self.use_contracted() => self.street_path_geom_coords(
+                ep.origin,
+                ep.destination,
+                profile,
+            ),
+            _ => self.street_path_geom(origin, destination, profile),
+        };
+        self.build_street_plan_geom(origin, destination, start_time, secs, profile, geometry)
+    }
+
+    /// Shared body of `build_street_plan_ep`: assembles the single-leg
+    /// street plan from a precomputed `geometry`.
+    fn build_street_plan_geom(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        secs: u32,
+        profile: StreetProfile,
+        geometry: Vec<PlanCoordinate>,
     ) -> Plan {
         let end = start_time + secs;
         let (speed, mode) = match profile {
@@ -82,7 +111,7 @@ impl Graph {
                 steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                     length, secs, to_place,
                 ))],
-                geometry: self.street_path(origin, destination, profile),
+                geometry,
                 alternatives: vec![],
                 leave_by: None,
             })],
@@ -114,6 +143,72 @@ impl Graph {
         self.build_bike_plan(origin, destination, start_time, u32::MAX, bike)
     }
 
+    /// Direct bike plan keyed on projected snap coordinates (`ep`) when a contracted query
+    /// supplies them — routes the bike leg over the contracted graph (g-free) so it survives
+    /// the interior-node drop. `None`/flag-off ⇒ the NodeID/`Endpoint` path, unchanged.
+    pub(super) fn build_bike_plan_ep(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        max_secs: u32,
+        bike: &crate::structures::BikeCost,
+        ep: Option<&super::QueryEndpoints>,
+    ) -> Option<Plan> {
+        if let Some(ep) = ep
+            && self.use_contracted()
+        {
+            return self.build_bike_plan_arena(
+                ep.origin,
+                ep.destination,
+                start_time,
+                max_secs,
+                bike,
+            );
+        }
+        self.build_bike_plan(
+            Endpoint::Node(origin),
+            Endpoint::Node(destination),
+            start_time,
+            max_secs,
+            bike,
+        )
+    }
+
+    /// A direct bike plan over the contracted graph from projected snap coords, g-free.
+    /// Bridges each coord to its bounding junction (arena seg R-tree, no g) and routes
+    /// junction-to-junction via the multi-objective engine, whose representatives carry
+    /// the arena per-edge data so the reconstructed leg (geometry/steps/metrics) reads no
+    /// `g`. The street-enrichment post-pass overwrites this leg with its own contracted
+    /// alternatives; this provides the g-free base + the from/to junction scaffold. `None`
+    /// if either coord can't snap or no route exists. `max_secs` is the deadline window.
+    fn build_bike_plan_arena(
+        &self,
+        origin: crate::structures::LatLng,
+        destination: crate::structures::LatLng,
+        start_time: u32,
+        max_secs: u32,
+        bike: &crate::structures::BikeCost,
+    ) -> Option<Plan> {
+        let cg = self.contracted.as_ref().unwrap();
+        let radius = self.raptor.edge_snap_radius_m;
+        let o = cg.foot_bounding_junction(self, origin.latitude, origin.longitude, radius)?;
+        let d = cg.foot_bounding_junction(self, destination.latitude, destination.longitude, radius)?;
+        let plan = self.multiobj_direct_plan(
+            o,
+            d,
+            crate::structures::cost::RoutingMode::Bike,
+            crate::structures::cost::LegRole::Neutral,
+            bike,
+            start_time,
+        )?;
+        // Honor the deadline window the legacy builder enforced.
+        if plan.end.saturating_sub(start_time) > max_secs {
+            return None;
+        }
+        Some(plan)
+    }
+
     pub(super) fn build_bike_plan(
         &self,
         origin: Endpoint,
@@ -134,69 +229,17 @@ impl Graph {
         // Stitch the projection stubs (edge-snapped origin/destination) around the
         // node path so geometry and the per-edge run list both start/end at the
         // exact projection points.
-        let coord = |c: crate::structures::LatLng| PlanCoordinate {
-            lat: c.latitude,
-            lon: c.longitude,
-        };
-        let lead_off = if p.lead.is_some() { 1 } else { 0 };
-        let mut geometry: Vec<PlanCoordinate> = Vec::new();
-        if let Some((proj, _)) = p.lead {
-            geometry.push(coord(proj));
-        }
-        geometry.extend(p.nodes.iter().map(|&n| self.node_coord(n)));
-        if let Some((proj, _)) = p.tail {
-            geometry.push(coord(proj));
-        }
-        let mut cedges: Vec<super::raptor_access::BikeEdge> = Vec::new();
-        if let Some((_, be)) = p.lead {
-            cedges.push(be);
-        }
-        cedges.extend(p.edges.iter().copied());
-        if let Some((_, be)) = p.tail {
-            cedges.push(be);
-        }
-
-        // Group consecutive edges by ride/push into steps so the client can show
-        // (and time) dismount stretches distinctly. Each step covers the inclusive
-        // geometry range [start_idx, i].
-        let mut steps: Vec<PlanLegStep> = Vec::new();
-        let mut i = 0;
-        let mut cum_time = 0u32;
-        while i < cedges.len() {
-            let push = cedges[i].push;
-            let start_idx = i;
-            let (mut run_len, mut run_time) = (0usize, 0u32);
-            while i < cedges.len() && cedges[i].push == push {
-                run_len += cedges[i].length;
-                run_time += cedges[i].time;
-                i += 1;
-            }
-            cum_time += run_time;
-            // Edge k connects geometry[k]→geometry[k+1]; the run ends at geometry[i].
-            let node_id = if i >= lead_off && i - lead_off < p.nodes.len() {
-                p.nodes[i - lead_off]
-            } else {
-                destination.node()
-            };
-            steps.push(PlanLegStep::Walk(PlanWalkLegStep {
-                length: run_len,
-                time: run_time,
-                place: PlanPlace {
-                    node_id,
-                    stop_position: None,
-                    arrival: Some(start_time + cum_time),
-                    departure: None,
-                },
-                dismount: push,
-                geom_start: start_idx,
-                geom_end: i,
-            }));
-        }
-        if steps.is_empty() {
-            steps.push(PlanLegStep::Walk(PlanWalkLegStep::plain(
-                p.length, p.secs, to_place,
-            )));
-        }
+        let (geometry, steps) = self.stitch_bike_leg(
+            &p.nodes,
+            &p.edges,
+            p.lead,
+            p.tail,
+            start_time,
+            destination.node(),
+            to_place.clone(),
+            p.length,
+            p.secs,
+        );
 
         Some(Plan {
             legs: vec![PlanLeg::Walk(PlanWalkLeg {
@@ -229,6 +272,92 @@ impl Graph {
             }],
             expected_end: end,
         })
+    }
+
+    /// Stitch an edge-snapped bike leg's geometry and ride/push steps from a node
+    /// path plus optional lead/tail projection stubs. Shared by `build_bike_plan`
+    /// (the cost-routed direct leg) and the enrich post-pass, so a snapped route
+    /// ends at the exact on-edge projection rather than its representative node.
+    /// `to` and the totals are used only for the degenerate empty-path fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stitch_bike_leg(
+        &self,
+        nodes: &[NodeID],
+        edges: &[super::raptor_access::BikeEdge],
+        lead: Option<(crate::structures::LatLng, super::raptor_access::BikeEdge)>,
+        tail: Option<(crate::structures::LatLng, super::raptor_access::BikeEdge)>,
+        start_time: u32,
+        dest_node: NodeID,
+        to: PlanPlace,
+        total_length: usize,
+        total_secs: u32,
+    ) -> (Vec<PlanCoordinate>, Vec<PlanLegStep>) {
+        let coord = |c: crate::structures::LatLng| PlanCoordinate {
+            lat: c.latitude,
+            lon: c.longitude,
+        };
+        let lead_off = if lead.is_some() { 1 } else { 0 };
+        let mut geometry: Vec<PlanCoordinate> = Vec::new();
+        if let Some((proj, _)) = lead {
+            geometry.push(coord(proj));
+        }
+        geometry.extend(nodes.iter().map(|&n| self.node_coord(n)));
+        if let Some((proj, _)) = tail {
+            geometry.push(coord(proj));
+        }
+        let mut cedges: Vec<super::raptor_access::BikeEdge> = Vec::new();
+        if let Some((_, be)) = lead {
+            cedges.push(be);
+        }
+        cedges.extend(edges.iter().copied());
+        if let Some((_, be)) = tail {
+            cedges.push(be);
+        }
+
+        // Group consecutive edges by ride/push into steps so the client can show
+        // (and time) dismount stretches distinctly. Each step covers the inclusive
+        // geometry range [start_idx, i].
+        let mut steps: Vec<PlanLegStep> = Vec::new();
+        let mut i = 0;
+        let mut cum_time = 0u32;
+        while i < cedges.len() {
+            let push = cedges[i].push;
+            let start_idx = i;
+            let (mut run_len, mut run_time) = (0usize, 0u32);
+            while i < cedges.len() && cedges[i].push == push {
+                run_len += cedges[i].length;
+                run_time += cedges[i].time;
+                i += 1;
+            }
+            cum_time += run_time;
+            // Edge k connects geometry[k]→geometry[k+1]; the run ends at geometry[i].
+            let node_id = if i >= lead_off && i - lead_off < nodes.len() {
+                nodes[i - lead_off]
+            } else {
+                dest_node
+            };
+            steps.push(PlanLegStep::Walk(PlanWalkLegStep {
+                length: run_len,
+                time: run_time,
+                place: PlanPlace {
+                    node_id,
+                    stop_position: None,
+                    arrival: Some(start_time + cum_time),
+                    departure: None,
+                },
+                dismount: push,
+                geom_start: start_idx,
+                geom_end: i,
+            }));
+        }
+        if steps.is_empty() {
+            steps.push(PlanLegStep::Walk(PlanWalkLegStep::plain(
+                total_length,
+                total_secs,
+                to,
+            )));
+        }
+        (geometry, steps)
     }
 
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
@@ -539,7 +668,7 @@ impl Graph {
                             steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                                 length, first_walk, to_place,
                             ))],
-                            geometry: self.street_path(origin, stop_node, access_profile),
+                            geometry: self.street_path_geom(origin, stop_node, access_profile),
                             alternatives: vec![],
                             leave_by: None,
                         };
@@ -585,7 +714,7 @@ impl Graph {
                         steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                             length, best_walk, to_place,
                         ))],
-                        geometry: self.street_path(stop_node, destination, egress_profile),
+                        geometry: self.street_path_geom(stop_node, destination, egress_profile),
                         alternatives: vec![],
                         leave_by: None,
                     };
@@ -827,7 +956,7 @@ impl Graph {
                     steps: vec![PlanLegStep::Walk(PlanWalkLegStep::plain(
                         length, duration, to_place,
                     ))],
-                    geometry: self.walk_path(from_node, to_node),
+                    geometry: self.street_path_geom(from_node, to_node, StreetProfile::Foot),
                     alternatives: vec![],
                     leave_by: None,
                 }));
@@ -894,23 +1023,38 @@ impl Graph {
             let mut steps = Vec::with_capacity(ap - bp);
             let mut total_length = 0usize;
             for s in (bp + 1)..=ap {
-                let seg_len = self.nodes_distance(pat_stops[s - 1], pat_stops[s]);
+                let seg_len = self.transit_seg_length(pat_stops[s - 1], pat_stops[s]);
                 total_length += seg_len;
 
                 let arr = times[s * n_trips + t].arrival;
                 let prev_dep = times[(s - 1) * n_trips + t].departure;
 
-                let timetable_segment = self.edges[pat_stops[s - 1].0]
-                    .iter()
-                    .find_map(|e| match e {
-                        EdgeData::Transit(te)
-                            if te.destination == pat_stops[s] && te.route_id == route_id =>
-                        {
-                            Some(te.timetable_segment)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(TimetableSegment { start: 0, len: 0 });
+                // The contracted path reads the precomputed g-free side-table (survives the
+                // node-contraction drop); flag-off scans `g.edges` (the oracle).
+                let scan = || {
+                    self.edges[pat_stops[s - 1].0]
+                        .iter()
+                        .find_map(|e| match e {
+                            EdgeData::Transit(te)
+                                if te.destination == pat_stops[s] && te.route_id == route_id =>
+                            {
+                                Some(te.timetable_segment)
+                            }
+                            _ => None,
+                        })
+                };
+                let timetable_segment = if self.use_contracted() {
+                    let t = self
+                        .raptor
+                        .transit_pattern_segment_timetables
+                        .get(p)
+                        .and_then(|segs| segs.get(s - 1).copied());
+                    debug_assert!(t.is_some(), "contracted segment-timetable side-table miss (pattern {p})");
+                    t.or_else(|| (!self.nodes.is_empty()).then(scan).flatten())
+                } else {
+                    scan()
+                }
+                .unwrap_or(TimetableSegment { start: 0, len: 0 });
 
                 let departure_index = if s == bp + 1 {
                     self.raptor.transit_departures
@@ -956,7 +1100,15 @@ impl Graph {
                             })
                             .collect()
                     }
-                    None => (bp..=ap).map(|s| self.node_coord(pat_stops[s])).collect(),
+                    None => (bp..=ap)
+                        .map(|s| {
+                            let loc = self.node_loc(pat_stops[s]);
+                            crate::structures::plan::PlanCoordinate {
+                                lat: loc.latitude,
+                                lon: loc.longitude,
+                            }
+                        })
+                        .collect(),
                 };
 
             legs.push(PlanLeg::Transit(PlanTransitLeg {
@@ -1742,6 +1894,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![NodeID(0), NodeID(1)],
+            edges: vec![],
         };
         let options = vec![opt(100, 130), opt(150, 165)];
         let board = 30_000u32;
@@ -1777,6 +1930,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![NodeID(0), NodeID(1)],
+            edges: vec![],
         };
         let options = vec![opt(120, 160), opt(180, 220)];
         let alight = 32_400u32;
@@ -2359,6 +2513,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![],
+            edges: vec![],
         }
     }
 

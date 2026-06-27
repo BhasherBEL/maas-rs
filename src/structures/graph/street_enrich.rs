@@ -7,11 +7,13 @@
 use std::collections::HashMap;
 
 use super::Graph;
+use super::raptor_access::BikeEdge;
 use crate::structures::cost::{BalanceWeights, LegRole, RoutingMode};
 use crate::structures::plan::{
-    LegOption, Plan, PlanLeg, PlanPlace, PlanWalkLeg, highlight_index, initial_cursor,
+    DismountRun, LegOption, Plan, PlanCoordinate, PlanLeg, PlanPlace, PlanWalkLeg, highlight_index,
+    initial_cursor,
 };
-use crate::structures::{BikeCost, Mode, NodeID};
+use crate::structures::{BikeCost, Endpoint, LatLng, Mode, NodeID, StreetEdgeData, Surface};
 
 impl Graph {
     pub fn enrich_street_legs(
@@ -19,6 +21,8 @@ impl Graph {
         plans: &mut [Plan],
         origin: NodeID,
         destination: NodeID,
+        bike_origin: Endpoint,
+        bike_dest: Endpoint,
         bike: &BikeCost,
         terminal_deadline: bool,
     ) {
@@ -32,6 +36,8 @@ impl Graph {
                 plan,
                 origin,
                 destination,
+                bike_origin,
+                bike_dest,
                 bike,
                 terminal_deadline,
                 &mut memo,
@@ -51,6 +57,8 @@ impl Graph {
         plan: &mut Plan,
         origin: NodeID,
         destination: NodeID,
+        bike_origin: Endpoint,
+        bike_dest: Endpoint,
         bike: &BikeCost,
         terminal_deadline: bool,
         memo: &mut HashMap<(NodeID, NodeID, RoutingMode, LegRole), Vec<LegOption>>,
@@ -61,16 +69,45 @@ impl Graph {
             for i in 0..n {
                 if let PlanLeg::Walk(w) = &plan.legs[i] {
                     let mode = mode_of(w.street_mode);
-                    if self.street_enrich_gated(mode, w.length) {
-                        continue;
-                    }
+                    let gated = self.street_enrich_gated(mode, w.length);
                     let role = if terminal_deadline {
                         LegRole::Deadline
                     } else {
                         LegRole::Neutral
                     };
-                    let opts = options(self, w.from.node_id, w.to.node_id, mode, role, bike, memo);
-                    if let Some(new) = self.rebuild_leg(w, &opts, mode, bike, None) {
+                    // A direct bike leg is the only edge-snapped case: route between
+                    // the projection-bearing edge ends and stitch the lead/tail stubs
+                    // so every alternative (and the chosen route) reaches the exact
+                    // clicked point, not its representative node. A gated (too-long) bike
+                    // leg still gets snapped — just without alternatives — via the
+                    // cost-routed single-leg builder, so long rides don't end short.
+                    let new = if mode == RoutingMode::Bike && self.use_contracted() {
+                        // Contracted: the leg's endpoints are already bounding junctions
+                        // (set by build_bike_plan_arena) and the bike scaffold is junction-
+                        // to-junction without projection stubs. Route junction-to-junction
+                        // via the g-free leg-option path, same as walk/transit access.
+                        if gated {
+                            None
+                        } else {
+                            let opts =
+                                options(self, w.from.node_id, w.to.node_id, mode, role, bike, memo);
+                            self.rebuild_leg(w, &opts, mode, bike, None)
+                        }
+                    } else if mode == RoutingMode::Bike {
+                        if gated {
+                            self.build_bike_plan(bike_origin, bike_dest, w.start, u32::MAX, bike)
+                                .and_then(first_walk_leg)
+                        } else {
+                            self.rebuild_bike_direct_leg(w, bike_origin, bike_dest, role, bike, memo)
+                        }
+                    } else if gated {
+                        None
+                    } else {
+                        let opts =
+                            options(self, w.from.node_id, w.to.node_id, mode, role, bike, memo);
+                        self.rebuild_leg(w, &opts, mode, bike, None)
+                    };
+                    if let Some(new) = new {
                         plan.legs[i] = PlanLeg::Walk(new);
                     }
                 }
@@ -128,7 +165,8 @@ impl Graph {
                             arrival: Some(end),
                             departure: None,
                         };
-                        let steps = self.street_steps(&chosen.nodes, mode, bike, alight, to);
+                        let steps =
+                            self.street_steps(&chosen.nodes, &chosen.edges, mode, bike, alight, to);
                         let mut new = w.clone();
                         new.to = to;
                         new.end = end;
@@ -189,7 +227,7 @@ impl Graph {
             arrival: Some(end),
             departure: None,
         };
-        leg.steps = self.street_steps(&chosen.nodes, mode, bike, start, to);
+        leg.steps = self.street_steps(&chosen.nodes, &chosen.edges, mode, bike, start, to);
         leg.from = PlanPlace {
             node_id: leg.from.node_id,
             stop_position: None,
@@ -207,6 +245,182 @@ impl Graph {
         leg.alternatives = opts.to_vec();
         leg.leave_by = leave_by;
         Some(leg)
+    }
+
+    /// Rebuild an edge-snapped direct bike leg: route between the projection-bearing
+    /// edge ends (a one-way segment forces the only legal end, not the nearer one),
+    /// then stitch the lead/tail stubs into every alternative and the chosen route so
+    /// they all reach the exact clicked point. Replaces the old node-to-node rebuild,
+    /// which ended the leg at a representative node up to a snap-radius short.
+    fn rebuild_bike_direct_leg(
+        &self,
+        old: &PlanWalkLeg,
+        origin_ep: Endpoint,
+        dest_ep: Endpoint,
+        role: LegRole,
+        bike: &BikeCost,
+        memo: &mut HashMap<(NodeID, NodeID, RoutingMode, LegRole), Vec<LegOption>>,
+    ) -> Option<PlanWalkLeg> {
+        // The lead/tail edge ends are taken from the cost-optimal bike path, not the
+        // nearer-by-stub guess: the natural approach can reach the farther end first,
+        // so picking the nearer one forces a doubling-back overshoot past the clicked
+        // point. `bike_cost_path` resolves both ends jointly (one-way aware).
+        let bp = self.bike_cost_path(origin_ep, dest_ep, u32::MAX, bike)?;
+        let from_n = *bp.nodes.first()?;
+        let to_n = *bp.nodes.last()?;
+        let lead = self.endpoint_stub_at(origin_ep, from_n, true);
+        let tail = self.endpoint_stub_at(dest_ep, to_n, false);
+        let mut opts = options(self, from_n, to_n, RoutingMode::Bike, role, bike, memo);
+        if opts.is_empty() {
+            return None;
+        }
+        for opt in &mut opts {
+            self.fold_bike_stubs(opt, &lead, &tail, bike);
+        }
+        let cur = initial_cursor(&opts, &self.raptor.balance);
+        let chosen = opts[cur].clone();
+        let start = old.start;
+        let end = start + chosen.p50;
+        let to = PlanPlace {
+            node_id: to_n,
+            stop_position: None,
+            arrival: Some(end),
+            departure: None,
+        };
+        let edges = self.bike_edges(&chosen.nodes, bike);
+        let lead_be = lead.as_ref().map(|(p, e)| (*p, bike_edge_of(e, bike)));
+        let tail_be = tail.as_ref().map(|(p, e)| (*p, bike_edge_of(e, bike)));
+        let (geometry, steps) = self.stitch_bike_leg(
+            &chosen.nodes,
+            &edges,
+            lead_be,
+            tail_be,
+            start,
+            to_n,
+            to.clone(),
+            chosen.length,
+            chosen.p50,
+        );
+        let mut leg = old.clone();
+        leg.from = PlanPlace {
+            node_id: from_n,
+            stop_position: None,
+            arrival: None,
+            departure: Some(start),
+        };
+        leg.to = to;
+        leg.start = start;
+        leg.end = end;
+        leg.duration = chosen.p50;
+        leg.length = chosen.length;
+        leg.cycleroute_length = chosen.cycleroute_length;
+        leg.elevation_gain = chosen.elevation_gain;
+        leg.geometry = geometry;
+        leg.steps = steps;
+        leg.alternatives = opts;
+        leg.leave_by = None;
+        Some(leg)
+    }
+
+    fn bike_edges(&self, nodes: &[NodeID], bike: &BikeCost) -> Vec<BikeEdge> {
+        self.path_edges(nodes)
+            .map(|s| BikeEdge {
+                push: BikeCost::is_push(&s.attrs),
+                length: s.length,
+                time: bike.edge_time(s),
+            })
+            .collect()
+    }
+
+    /// Fold the lead/tail projection stubs into one snapped alternative: prepend/append
+    /// the projection to its geometry, add the stub's displayed totals, and recompute
+    /// its dismount runs over `[lead] + path + [tail]`. The cost-axis projections
+    /// (time/surface/D+/cycleway/variance) are left untouched — the same stub is added
+    /// to every option, so the highlight ranking is invariant, and a ≤ snap-radius stub
+    /// is display-negligible on those axes.
+    fn fold_bike_stubs(
+        &self,
+        opt: &mut LegOption,
+        lead: &Option<(LatLng, StreetEdgeData)>,
+        tail: &Option<(LatLng, StreetEdgeData)>,
+        bike: &BikeCost,
+    ) {
+        let mut pushes: Vec<bool> = Vec::new();
+        if let Some((_, e)) = lead {
+            pushes.push(BikeCost::is_push(&e.attrs));
+        }
+        pushes.extend(self.path_edges(&opt.nodes).map(|s| BikeCost::is_push(&s.attrs)));
+        if let Some((_, e)) = tail {
+            pushes.push(BikeCost::is_push(&e.attrs));
+        }
+        let mut runs: Vec<DismountRun> = Vec::new();
+        let mut st: Option<usize> = None;
+        for (i, &p) in pushes.iter().enumerate() {
+            if p {
+                st.get_or_insert(i);
+            } else if let Some(s) = st.take() {
+                runs.push(DismountRun { start: s, end: i });
+            }
+        }
+        if let Some(s) = st.take() {
+            runs.push(DismountRun {
+                start: s,
+                end: pushes.len(),
+            });
+        }
+        opt.dismount_runs = runs;
+        if let Some((proj, e)) = lead {
+            apply_stub(opt, *proj, e, false, bike);
+        }
+        if let Some((proj, e)) = tail {
+            apply_stub(opt, *proj, e, true, bike);
+        }
+    }
+}
+
+fn first_walk_leg(plan: Plan) -> Option<PlanWalkLeg> {
+    plan.legs.into_iter().find_map(|l| match l {
+        PlanLeg::Walk(w) => Some(w),
+        _ => None,
+    })
+}
+
+fn bike_edge_of(e: &StreetEdgeData, bike: &BikeCost) -> BikeEdge {
+    BikeEdge {
+        push: BikeCost::is_push(&e.attrs),
+        length: e.length,
+        time: bike.edge_time(e),
+    }
+}
+
+/// Add one projection stub to an option's geometry and displayed totals. `at_end`
+/// appends (tail); otherwise prepends (lead).
+fn apply_stub(opt: &mut LegOption, proj: LatLng, e: &StreetEdgeData, at_end: bool, bike: &BikeCost) {
+    let l = e.length;
+    let t = bike.edge_time(e);
+    let c = PlanCoordinate {
+        lat: proj.latitude,
+        lon: proj.longitude,
+    };
+    if at_end {
+        opt.geometry.push(c);
+    } else {
+        opt.geometry.insert(0, c);
+    }
+    opt.length += l;
+    opt.p50 += t;
+    opt.p95 += t;
+    if e.attrs.surface == Surface::Unpaved {
+        opt.unpaved_length += l;
+    }
+    if BikeCost::is_push(&e.attrs) {
+        opt.dismount_length += l;
+    }
+    if let Some(cl) = opt.cycleroute_length {
+        opt.cycleroute_length = Some(cl + if e.attrs.cycleroute { l } else { 0 });
+    }
+    if let Some(g) = opt.elevation_gain {
+        opt.elevation_gain = Some(g + e.elev_delta.max(0) as usize);
     }
 }
 
@@ -436,7 +650,15 @@ mod tests {
             expected_end: 900,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(acc) = &plans[0].legs[0] else {
             panic!()
         };
@@ -509,7 +731,15 @@ mod tests {
             expected_end: alight + 90,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, s, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            s,
+            s,
+            Endpoint::Node(s),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(eg) = plans[0].legs.last().unwrap() else {
             panic!()
         };
@@ -560,7 +790,15 @@ mod tests {
             expected_end: 400,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(w) = &plans[0].legs[0] else {
             panic!()
         };
@@ -590,7 +828,15 @@ mod tests {
             }],
             expected_end: 400,
         }];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(w) = &plans[0].legs[0] else {
             panic!()
         };
@@ -616,7 +862,15 @@ mod tests {
             expected_end: 400,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(w) = &plans[0].legs[0] else {
             panic!()
         };
@@ -650,7 +904,15 @@ mod tests {
             expected_end: 900,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(acc) = &plans[0].legs[0] else {
             panic!()
         };
@@ -687,7 +949,15 @@ mod tests {
             expected_end: alight + 90,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, s, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            s,
+            s,
+            Endpoint::Node(s),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(eg) = plans[0].legs.last().unwrap() else {
             panic!()
         };
@@ -727,7 +997,15 @@ mod tests {
             expected_end: 400,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(w) = &plans[0].legs[0] else {
             panic!()
         };
@@ -758,7 +1036,15 @@ mod tests {
             expected_end: 400,
         };
         let mut plans = vec![plan];
-        g.enrich_street_legs(&mut plans, o, s, &bike, false);
+        g.enrich_street_legs(
+            &mut plans,
+            o,
+            s,
+            Endpoint::Node(o),
+            Endpoint::Node(s),
+            &bike,
+            false,
+        );
         let PlanLeg::Walk(w) = &plans[0].legs[0] else {
             panic!()
         };

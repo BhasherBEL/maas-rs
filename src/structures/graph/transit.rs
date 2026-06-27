@@ -8,7 +8,7 @@ use crate::{
         TripInfo, TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, EdgeData, LatLng, NodeData, NodeID,
+        DelayCDF, EdgeData, LatLng, NodeID,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -105,17 +105,37 @@ impl Graph {
             .transit_stop_to_node
             .iter()
             .enumerate()
-            .filter_map(|(stop_idx, &node_id)| match &self.nodes[node_id.0] {
-                NodeData::TransitStop(stop) => Some((
+            .map(|(stop_idx, &node_id)| {
+                let loc = self.node_loc(node_id);
+                (
                     stop_idx,
-                    stop.name.clone(),
-                    stop.lat_lng.latitude,
-                    stop.lat_lng.longitude,
+                    self.raptor.transit_stop_names[stop_idx].clone(),
+                    loc.latitude,
+                    loc.longitude,
                     display_route_type(stop_mode[stop_idx].unwrap_or(RouteType::Bus)).to_string(),
-                )),
-                _ => None,
+                )
             })
             .collect()
+    }
+
+    /// G-free plan-node resolution for a `NodeID`: its coordinate (via `node_loc`,
+    /// so it survives the interior-node drop) and, when the node is a transit stop,
+    /// its display name (from the serialized `transit_stop_names`, not `g.nodes`).
+    /// With `g` present this is byte-identical to reading `NodeData` directly.
+    pub fn plan_node_info(&self, id: NodeID) -> Option<(crate::structures::LatLng, Option<String>)> {
+        if self.nodes.is_empty() {
+            self.contracted.as_ref()?;
+        } else {
+            self.nodes.get(id.0)?;
+        }
+        let loc = self.node_loc(id);
+        let compact = self.raptor.transit_node_to_stop[id.0];
+        let name = if compact != u32::MAX {
+            Some(self.raptor.transit_stop_names[compact as usize].clone())
+        } else {
+            None
+        };
+        Some((loc, name))
     }
 
     /// Returns all agencies with their routes as owned data.
@@ -511,16 +531,36 @@ impl Graph {
             let boarding_stop_node = pat_stops[boarding_pos as usize];
             let next_stop_node = pat_stops[boarding_pos as usize + 1];
             let route_id: RouteId = self.raptor.transit_patterns[pattern_id.0 as usize].route;
-            let ts = match self.edges[boarding_stop_node.0]
-                .iter()
-                .find_map(|e| match e {
+            // Edge timetable from `g.edges`. Unavailable once the interior arrays are
+            // dropped — the contracted path reads the precomputed side-table instead.
+            let scan = || {
+                self.edges[boarding_stop_node.0].iter().find_map(|e| match e {
                     EdgeData::Transit(te)
                         if te.destination == next_stop_node && te.route_id == route_id =>
                     {
                         Some(te.timetable_segment)
                     }
                     _ => None,
-                }) {
+                })
+            };
+            let from_table = || {
+                self.raptor
+                    .transit_pattern_segment_timetables
+                    .get(pattern_id.0 as usize)
+                    .and_then(|segs| segs.get(boarding_pos as usize).copied())
+            };
+            let resolved = if self.use_contracted() {
+                let t = from_table();
+                debug_assert!(
+                    t.is_some(),
+                    "contracted segment-timetable side-table miss (pattern {})",
+                    pattern_id.0
+                );
+                t.or_else(|| (!self.nodes.is_empty()).then(scan).flatten())
+            } else {
+                scan()
+            };
+            let ts = match resolved {
                 Some(ts) => ts,
                 None => continue,
             };

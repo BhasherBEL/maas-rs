@@ -15,7 +15,7 @@ use super::{Graph, PrevCtx};
 use crate::structures::cost::{
     RoutingMode, TimeMoments, edge_moments, edge_time_penalty, edge_variance,
 };
-use crate::structures::{BikeCost, EdgeData, NodeID};
+use crate::structures::{BikeCost, EdgeData, NodeID, StreetEdgeData};
 
 impl Graph {
     /// Sum per-edge time moments along `nodes` (a fixed path) for `mode`, then add
@@ -25,6 +25,50 @@ impl Graph {
         if nodes.len() < 2 {
             return TimeMoments::ZERO;
         }
+        let steps: Vec<(StreetEdgeData, (f64, f64))> = nodes
+            .windows(2)
+            .filter_map(|w| {
+                self.edges[w[0].0].iter().find_map(|e| match e {
+                    EdgeData::Street(s) if s.destination == w[1] => {
+                        Some((*s, self.dir_between(w[0], w[1])))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        self.annotate_steps(&steps, mode)
+    }
+
+    /// As [`annotate_path`], but from carried arena `(edge, dir, far)` steps — g-free.
+    /// Empty carried (flag-off / off-contract) ⇒ falls back to `annotate_path(nodes)`,
+    /// byte-identical to before. Used in contracted plan reconstruction.
+    pub(super) fn annotate_path_edges(
+        &self,
+        nodes: &[NodeID],
+        carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
+        mode: RoutingMode,
+    ) -> TimeMoments {
+        if !self.use_contracted() || carried.is_empty() {
+            return self.annotate_path(nodes, mode);
+        }
+        let steps: Vec<(StreetEdgeData, (f64, f64))> =
+            carried.iter().map(|(e, dir, _)| (*e, *dir)).collect();
+        self.annotate_steps(&steps, mode)
+    }
+
+    /// Mean seconds over `recon` edges for a non-bike mode (Walk/Drive), where the
+    /// per-edge mean does not depend on direction, so a dummy dir is sound. g-free.
+    pub(super) fn annotate_steps_secs(&self, recon: &[StreetEdgeData], mode: RoutingMode) -> u32 {
+        let steps: Vec<(StreetEdgeData, (f64, f64))> =
+            recon.iter().map(|e| (*e, (0.0, 0.0))).collect();
+        self.annotate_steps(&steps, mode).mean.round() as u32
+    }
+
+    fn annotate_steps(
+        &self,
+        steps: &[(StreetEdgeData, (f64, f64))],
+        mode: RoutingMode,
+    ) -> TimeMoments {
         let speed = match mode {
             RoutingMode::Walk => self.raptor.walking_speed_mps,
             RoutingMode::Bike => self.raptor.cycling_speed_mps,
@@ -39,16 +83,9 @@ impl Graph {
         // [p50,p95] reflects the SAME corner slow-down, dismount stop, and dismount
         // uncertainty the route was chosen on.
         let mut prev: Option<PrevCtx> = None;
-        for w in nodes.windows(2) {
-            let Some(street) = self.edges[w[0].0].iter().find_map(|e| match e {
-                EdgeData::Street(s) if s.destination == w[1] => Some(s),
-                _ => None,
-            }) else {
-                incoming = None;
-                prev = None;
-                continue;
-            };
-            let this_dir = self.dir_between(w[0], w[1]);
+        for (street, this_dir) in steps {
+            let street = &street;
+            let this_dir = *this_dir;
             let mut mean = if mode == RoutingMode::Bike {
                 bike.edge_time(street) as f64 + edge_time_penalty(street, &model)
             } else {

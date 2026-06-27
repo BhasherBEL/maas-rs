@@ -86,7 +86,9 @@ default_routing:
   max_snap_distance_m: 10000
   cycling_speed_mps: 4.2
   driving_speed_mps: 11.0
-  vehicle_access_secs: 1200
+  vehicle_access_secs: 1200       # bike/car access budget floor (s) — short trips keep ~5 km bike
+  vehicle_access_fraction: 0.06   # budget grows to 6% of the crow-flies (walk-time) trip…
+  vehicle_access_max_secs: 2700   # …capped at 45 min so a long trip can bike to a distant hub
   bike_profile:
     allow_steps: true
     allow_dismount: true   # false = forbid push (dismount) ways; routes detour around them
@@ -106,7 +108,7 @@ default_routing:
     max_speed: 36
     s_c_x: 0.55
     c_r: 0.006
-    biker_power: 70
+    biker_power: 100        # ~5.9 m/s flat cruise (fit commuter heading to the station)
     # Speed-change physics: a cyclist loses time whenever forced off cruise speed —
     # slowing for a tight corner, or stopping to dismount. The lost time is the time to
     # brake to a target speed and re-accelerate back to cruise (re-accel from the power
@@ -116,7 +118,11 @@ default_routing:
     # at cruise. A dismount run is one stop (decel→0) + one restart (accel→cruise).
     brake_decel: 2.5          # braking deceleration (m/s²) for a corner slow-down or a stop
     accel_rate: 1.0           # forward acceleration (m/s²) getting back to speed after a stop/corner
-    lateral_accel: 2.5        # comfortable cornering lateral accel (m/s²)
+    lateral_accel: 3.5        # comfortable cornering lateral accel (m/s²) on roads (~0.36 g)
+    lateral_accel_infra: 8.0  # cornering tolerance on bike infra — cycleways are efficient to
+                              # follow, so their curves/junctions are near-free (only hairpins slow)
+    corner_min_len_m: 10.0    # floor on segment length for a corner's radius — a short junction
+                              # connector / fine digitization can't fabricate a hairpin slow-down
     push_speed_mps: 0.9       # pushing a dismounted bike (m/s) — slower than free walking (1.2)
     steps_push_speed_mps: 0.25 # hauling a bike up/down stairs (m/s) — slower still
   # Stochastic access/egress times. Walk/bike/drive times are log-normal: the
@@ -150,6 +156,10 @@ default_routing:
   # budgets, so it is off. (~3.6× fewer labels but only ~30% wall-clock, as the
   # per-edge cost dominates.) Kept for future work.
   multiobj_contract: false
+  # P3f node contraction. On (default): build the contracted graph, DROP the interior-node
+  # arrays (frees ~0.7-0.8GB, street queries ~2.4x faster), route on the contracted graph.
+  # Off: full-graph routing — requires a rebuild (a contracted graph.bin can't serve it).
+  node_contraction: true
   # Whether D+ (ascent) is a bike SELECTION axis. false (default): D+ is displayed but
   # does not pick routes — the gradient power model already prices climbing into Time, so
   # a separate min-D+ axis only manufactured absurd extremes (a ~1.5 km walk to shave a

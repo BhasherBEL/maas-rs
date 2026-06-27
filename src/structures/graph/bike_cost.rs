@@ -330,6 +330,19 @@ impl BikeCost {
     /// ≫ mud). Shared by `edge_time` and the speed-change (corner/stop) model so
     /// both see one speed.
     pub fn cruise_speed(&self, e: &StreetEdgeData) -> f64 {
+        // Surface multiplies the solved cruise AFTER the gradient power-solve, so a
+        // gravel uphill is `gravel_factor × uphill_speed`. Pushes never reach here:
+        // `edge_time` returns at push speed before calling `cruise_speed`, and the
+        // distribution/multiobj callers pass `cruise: 0.0` for push edges.
+        (self.cruise_speed_geom(e) * Self::surface_factor(e)).max(0.5)
+    }
+
+    /// Cruise speed from the grade power-solve ONLY, before the surface factor. This is
+    /// the reference for the corner/stop speed-change model: braking is driven by
+    /// geometry (a bend) and stops (a dismount), NOT by pavement texture. Surface
+    /// belongs in `edge_time` (rough pavement just takes longer); letting it cap the
+    /// corner speed would charge a phantom brake/accelerate at every surface change.
+    pub fn cruise_speed_geom(&self, e: &StreetEdgeData) -> f64 {
         let p = &self.profile;
         let length = e.length as f64;
         let theta = if length > 0.0 {
@@ -359,11 +372,7 @@ impl BikeCost {
             }
             0.5 * (lo + hi)
         };
-        // Surface multiplies the solved cruise AFTER the gradient power-solve, so a
-        // gravel uphill is `gravel_factor × uphill_speed`. Pushes never reach here:
-        // `edge_time` returns at push speed before calling `cruise_speed`, and the
-        // distribution/multiobj callers pass `cruise: 0.0` for push edges.
-        (v * Self::surface_factor(e)).max(0.5)
+        v.max(0.5)
     }
 
     /// Speed at which a push (dismount) edge is timed: `steps_push_speed_mps` on
@@ -417,7 +426,10 @@ impl BikeCost {
         if Self::is_push(&this.attrs) {
             return 0.0;
         }
-        let v_c = self.cruise_speed(this);
+        // Surface-independent cruise: corners/stops drive braking, not pavement texture
+        // (which lives in `edge_time`). Capping the corner speed at the surface-laden
+        // cruise would charge a phantom decel/accel at every surface change.
+        let v_c = self.cruise_speed_geom(this);
         let Some(prev) = prev else {
             return v_c;
         };
@@ -433,8 +445,19 @@ impl BikeCost {
         if theta <= 1e-6 || min_len <= 0.0 {
             return v_c;
         }
-        let r = min_len / theta;
-        (self.profile.lateral_accel.max(0.0) * r).sqrt().min(v_c)
+        // Following bike infrastructure is efficient by design: take its curves and
+        // through-junctions near cruise (only a true hairpin slows), so use the higher
+        // infra lateral tolerance. Roads keep the conservative everyday-cornering value.
+        let on_infra = this.attrs.cycleroute
+            || this.attrs.isbike
+            || matches!(this.attrs.highway, HighwayClass::Cycleway);
+        let lat = if on_infra {
+            self.profile.lateral_accel_infra
+        } else {
+            self.profile.lateral_accel
+        };
+        let r = min_len.max(self.profile.corner_min_len_m) / theta;
+        (lat.max(0.0) * r).sqrt().min(v_c)
     }
 
     /// Lost time (s) at the vertex into `this` edge: the change between the carried
@@ -702,8 +725,11 @@ mod tests {
         assert!((bc.decel_secs(6.0, 0.0) - 6.0 / p.brake_decel).abs() < 1e-9);
     }
 
+    // A plain rideable ROAD edge (not bike infra), so the geometric corner model
+    // (radius from segment length) governs its turns — bike infra takes corners near
+    // cruise via `lateral_accel_infra` and is covered separately.
     fn ride_edge(len: usize) -> StreetEdgeData {
-        edge(attrs(HighwayClass::Tertiary, true, Surface::Paved), len, 0)
+        edge(attrs(HighwayClass::Tertiary, false, Surface::Paved), len, 0)
     }
 
     #[test]
@@ -734,6 +760,28 @@ mod tests {
         };
         let c_long = bc.speed_change_secs(Some(long_prev), &long_this, right);
         assert_eq!(c_long, 0.0, "a 90° spread over long edges needs no slow-down");
+    }
+
+    #[test]
+    fn infra_corner_is_near_free_unlike_road() {
+        // Following bike infrastructure is efficient by design: the same tight 90° turn
+        // over short edges that costs time on a road is taken near cruise on a cycleway
+        // (higher `lateral_accel_infra`), so it costs ~0.
+        let bc = BikeCost::new(BikeProfile::default(), 1.2);
+        let road = ride_edge(8); // isbike = false
+        let infra = edge(attrs(HighwayClass::Cycleway, true, Surface::Paved), 8, 0);
+        let right = (0.0, 1.0);
+        let prev = |e: &StreetEdgeData| PrevCtx {
+            dir: (1.0, 0.0),
+            len: 8.0,
+            cruise: bc.cruise_speed(e),
+            push: false,
+            speed: bc.cruise_speed(e),
+        };
+        let c_road = bc.speed_change_secs(Some(prev(&road)), &road, right);
+        let c_infra = bc.speed_change_secs(Some(prev(&infra)), &infra, right);
+        assert!(c_road > 0.0, "a tight road corner costs time");
+        assert_eq!(c_infra, 0.0, "the same corner on a cycleway is near-free");
     }
 
     #[test]
@@ -838,8 +886,11 @@ mod tests {
         let turn = (deg.to_radians().cos(), deg.to_radians().sin());
         let e = ride_edge(seg);
         let v_c = bc.cruise_speed(&e);
-        let r = (seg as f64) / deg.to_radians();
-        let v_turn = (BikeProfile::default().lateral_accel * r).sqrt().min(v_c);
+        // The corner radius floors the segment length (a short connector can't pivot
+        // tighter than ~a bike length), matching the model's `corner_min_len_m`.
+        let p = BikeProfile::default();
+        let r = (seg as f64).max(p.corner_min_len_m) / deg.to_radians();
+        let v_turn = (p.lateral_accel * r).sqrt().min(v_c);
         let one_decel = bc.decel_secs(v_c, v_turn);
         assert!(one_decel > 0.0, "the bend is tight enough to require slowing");
 

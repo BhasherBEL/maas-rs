@@ -38,6 +38,11 @@ pub struct LegOption {
     pub geometry: Vec<PlanCoordinate>,
     #[graphql(skip)]
     pub nodes: Vec<NodeID>,
+    /// Per-step arena edges aligned to `nodes.windows(2)`, carried from the contracted
+    /// search so step reconstruction is g-free. Empty when reconstructed off the full
+    /// graph (`path_edges`); `street_steps`/stub-folding fall back to `path_edges` then.
+    #[graphql(skip)]
+    pub edges: Vec<crate::structures::StreetEdgeData>,
 }
 
 /// Index of the highlighted "balanced" option: min-max normalize each axis across
@@ -136,6 +141,7 @@ mod tests {
             cycleroute_length: None,
             geometry: vec![],
             nodes: vec![],
+            edges: vec![],
         }
     }
 

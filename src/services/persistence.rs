@@ -15,7 +15,15 @@ const MAGIC: &[u8; 4] = b"MAAS";
 pub const OSM_SCHEMA_VERSION: u32 = 6;
 /// Bump when any `Graph`/`RaptorIndex` field changes layout (or, like v5, the baked
 /// `elev_delta` edge values change meaning).
-pub const GRAPH_SCHEMA_VERSION: u32 = 6;
+/// v7: `Graph` gained a serialized `contracted: Option<ContractedGraph>` (P3 node
+///     contraction).
+/// v8: `RaptorIndex` gained `transit_pattern_segment_timetables` (g-free transit-leg
+///     reconstruction for the node-contraction drop).
+/// v9: `RaptorIndex` gained `transit_stop_names` (g-free stop-name resolution for the
+///     explain survey + plan nodes after the interior-node drop empties `g.nodes`).
+/// v10: P3f cutover — node_contraction default ON, the interior-node arrays are DROPPED
+///      at build/restore, so graph.bin carries empty `nodes`/`edges` + the contracted graph.
+pub const GRAPH_SCHEMA_VERSION: u32 = 10;
 
 const HEADER_LEN: usize = 8;
 
@@ -65,6 +73,10 @@ pub fn load_graph(path: &str) -> Result<Graph, String> {
     graph.raptor.build_runtime_indices();
     // Rebuild the #[serde(skip)] spatial edge index for edge-aware snapping.
     graph.build_edge_index();
+    // Rebuild the contracted graph's #[serde(skip)] segment R-tree (P3 node contraction).
+    if let Some(cg) = graph.contracted.as_mut() {
+        cg.build_seg_index();
+    }
     tracing::info!("graph restored from {path}");
     Ok(graph)
 }
@@ -184,6 +196,72 @@ mod tests {
             matches!(ep, Endpoint::OnEdge { .. }),
             "edge index rebuilt on load"
         );
+    }
+
+    #[test]
+    fn contracted_graph_survives_round_trip() {
+        use crate::structures::{
+            BikeAttrs, EdgeData, LatLng, NodeData, OsmNodeData, StreetEdgeData, cost::VarGen,
+        };
+        let dir = std::env::temp_dir().join("maas_persist_contracted_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graph.bin");
+        let path_s = path.to_str().unwrap();
+
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng { latitude: lat, longitude: lon },
+            })
+        };
+        let mut g = Graph::new();
+        // A straight chain a-b-c-d-e: b,c,d are degree-2 interior pass-throughs that the
+        // union contraction collapses into super-edges between junctions a and e.
+        let coords = [
+            ("a", 50.000, 4.0000),
+            ("b", 50.000, 4.0010),
+            ("c", 50.000, 4.0020),
+            ("d", 50.000, 4.0030),
+            ("e", 50.000, 4.0040),
+        ];
+        let ids: Vec<_> = coords.iter().map(|&(id, lat, lon)| g.add_node(mk(id, lat, lon))).collect();
+        let edge = |o, d| {
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                partial: false,
+                length: 71,
+                foot: true,
+                bike: true,
+                car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        for w in ids.windows(2) {
+            g.add_edge(w[0], edge(w[0], w[1]));
+            g.add_edge(w[1], edge(w[1], w[0]));
+        }
+        // build_raptor_index() populates transit_node_to_stop, which the contraction reads.
+        g.build_raptor_index();
+        g.set_node_contraction(true);
+
+        let mut cg = crate::structures::contraction::ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        assert!(cg.junction_count() >= 2, "endpoints a,e are junctions");
+        g.contracted = Some(cg);
+
+        save_graph(&g, path_s).unwrap();
+        let mut loaded = load_graph(path_s).unwrap();
+        // Move the contracted graph out so it can borrow `loaded` immutably below; this
+        // also proves load_graph populated it (None ⇒ unwrap panics).
+        let cg = loaded.contracted.take().expect("contracted survives the round trip");
+        // load_graph rebuilt the serde-skipped seg_index; a coord near a chain edge
+        // midpoint resolves to its bounding junctions.
+        let entries = cg.walk_entries_arena(&loaded, 50.000, 4.0015, 100.0);
+        assert!(!entries.is_empty(), "snap near an edge yields junction entries");
     }
 
     #[test]

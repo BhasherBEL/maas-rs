@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::{
-        AgencyInfo, RouteInfo, ServicePattern, StopTime, TripId, TripInfo, TripSegment,
+        AgencyInfo, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId, TripInfo,
+        TripSegment,
     },
     structures::{
         DelayCDF, LatLng, NodeID,
@@ -57,6 +58,12 @@ pub struct RaptorIndex {
     #[serde(skip)]
     pub stop_id_to_index: HashMap<String, usize>,
 
+    /// Display name per compact stop index (parallel to `transit_stop_ids`). Names
+    /// live only in `NodeData::TransitStop`, so this serialized copy is what plan and
+    /// explain reconstruction read after the interior-node drop empties `g.nodes`.
+    #[serde(default)]
+    pub transit_stop_names: Vec<String>,
+
     #[serde(default)]
     pub transit_stop_reverse_transfers: Vec<(usize, u32)>,
     #[serde(default)]
@@ -66,6 +73,14 @@ pub struct RaptorIndex {
     pub transit_pattern_shapes: Vec<Vec<LatLng>>,
     #[serde(default)]
     pub transit_pattern_shape_stop_idx: Vec<Vec<u32>>,
+
+    /// Per pattern, per inter-stop segment (index `s-1` for the edge stop `s-1`→`s`),
+    /// the transit edge's `timetable_segment`. Precomputed at build time from `g.edges`
+    /// so transit-leg plan reconstruction needs no `g` once the interior arrays are
+    /// dropped (node contraction). Empty unless built; reconstruction falls back to the
+    /// `g.edges` scan when empty (flag-off / pre-cutover graphs).
+    #[serde(default)]
+    pub transit_pattern_segment_timetables: Vec<Vec<TimetableSegment>>,
 
     #[serde(default)]
     pub railway_nodes: Vec<(f64, f64)>,
@@ -89,6 +104,14 @@ pub struct RaptorIndex {
     // nearest stops instead of stopping at the first local result.
     #[serde(skip, default = "RaptorIndex::default_vehicle_access_secs")]
     pub vehicle_access_secs: u32,
+
+    // The vehicle (bike/car) access budget scales with trip length: a longer journey
+    // justifies riding farther to reach a better hub. Budget = crow-flies time ×
+    // `vehicle_access_fraction`, clamped to [`vehicle_access_secs`, `vehicle_access_max_secs`].
+    #[serde(skip, default = "RaptorIndex::default_vehicle_access_fraction")]
+    pub vehicle_access_fraction: f64,
+    #[serde(skip, default = "RaptorIndex::default_vehicle_access_max_secs")]
+    pub vehicle_access_max_secs: u32,
 
     // Runtime tuning params, applied from config.yaml at startup — not serialized,
     // so adding them does not change the `graph.bin` (postcard) layout.
@@ -154,6 +177,12 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_multiobj_contract")]
     pub multiobj_contract: bool,
 
+    /// Build + persist the all-mode (union) contracted graph into `graph.bin` (P3 node
+    /// contraction). Default false ⇒ no contracted graph is built and graph.bin is
+    /// unchanged. Tuning param applied from config at startup — not serialized.
+    #[serde(skip, default = "RaptorIndex::default_node_contraction")]
+    pub node_contraction: bool,
+
     /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false: with the
     /// gradient-aware power model climbing is already priced in Time, so a separate
     /// "minimize D+ at any cost" axis only manufactures absurd extremes (a long walk to
@@ -182,10 +211,10 @@ pub struct RaptorIndex {
     pub multiobj_street: bool,
 
     /// Max scalar leg length (metres) to enrich with multi-objective alternatives
-    /// for non-walk street modes (bike/car). Bike/car alternatives come from a few
-    /// fast scalar A* searches (`scalarized_leg_options`), bounded by the corridor, so
-    /// this is a high safety net against pathological cross-country legs rather than a
-    /// hard perf cliff. Walk legs are never gated. Tuning param — applied at startup.
+    /// for non-walk street modes (bike/car). Bike/car alternatives come from
+    /// `multiobj_leg_options` (Pareto front, corridor-budgeted), so this is a high
+    /// safety net against pathological cross-country legs rather than a hard perf cliff.
+    /// Walk legs are never gated. Tuning param — applied at startup.
     #[serde(skip, default = "RaptorIndex::default_multiobj_street_max_len_m")]
     pub multiobj_street_max_len_m: usize,
 
@@ -251,12 +280,14 @@ impl RaptorIndex {
             trip_id_to_index: HashMap::new(),
             transit_stop_ids: Vec::new(),
             stop_id_to_index: HashMap::new(),
+            transit_stop_names: Vec::new(),
 
             transit_stop_reverse_transfers: Vec::new(),
             transit_idx_stop_reverse_transfers: Vec::new(),
 
             transit_pattern_shapes: Vec::new(),
             transit_pattern_shape_stop_idx: Vec::new(),
+            transit_pattern_segment_timetables: Vec::new(),
 
             railway_nodes: Vec::new(),
             railway_adj: Vec::new(),
@@ -266,6 +297,8 @@ impl RaptorIndex {
             cycling_speed_mps: Self::default_cycling_speed_mps(),
             driving_speed_mps: Self::default_driving_speed_mps(),
             vehicle_access_secs: Self::default_vehicle_access_secs(),
+            vehicle_access_fraction: Self::default_vehicle_access_fraction(),
+            vehicle_access_max_secs: Self::default_vehicle_access_max_secs(),
             reliability_bucket_edges: Self::default_reliability_bucket_edges(),
             arrival_slack_secs: Self::default_arrival_slack_secs(),
             max_window_secs: Self::default_max_window_secs(),
@@ -279,6 +312,7 @@ impl RaptorIndex {
             bike_bucket_cyc_k: Self::default_bike_bucket_cyc_k(),
             bike_bucket_dpl_k: Self::default_bike_bucket_dpl_k(),
             multiobj_contract: Self::default_multiobj_contract(),
+            node_contraction: Self::default_node_contraction(),
             bike_select_dplus: Self::default_bike_select_dplus(),
             variance_model: Self::default_variance_model(),
             cost_weights: Self::default_cost_weights(),
@@ -309,7 +343,15 @@ impl RaptorIndex {
     }
 
     pub fn default_vehicle_access_secs() -> u32 {
-        20 * 60 // 20 min budget: ~5 km by bike, ~13 km by car, to reach a real hub
+        20 * 60 // 20 min floor: ~5 km by bike, ~13 km by car, to reach a real hub
+    }
+
+    pub fn default_vehicle_access_fraction() -> f64 {
+        0.06 // ~6% of the crow-flies (walk-time) trip: only long journeys grow past the floor
+    }
+
+    pub fn default_vehicle_access_max_secs() -> u32 {
+        45 * 60 // hard ceiling so a very long trip's access Dijkstra stays bounded
     }
 
     pub fn default_reliability_bucket_edges() -> Vec<f32> {
@@ -361,6 +403,15 @@ impl RaptorIndex {
         // bucketing (per-cell eviction at junctions-only) and can drop the cycleway
         // extreme at tight budgets. Available behind config for future work.
         false
+    }
+
+    pub fn default_node_contraction() -> bool {
+        // P3f cutover: on by default. Building the contracted graph and dropping the
+        // interior-node arrays frees ~0.7-0.8GB and speeds street-dominated queries
+        // ~2.4x; routing runs entirely on the contracted graph. Set
+        // `default_routing.node_contraction: false` in config.yaml to disable (requires
+        // a rebuild — a contracted graph.bin cannot serve full-graph routing).
+        true
     }
 
     pub fn default_bike_select_dplus() -> bool {

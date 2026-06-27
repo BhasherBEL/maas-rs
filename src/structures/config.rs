@@ -251,6 +251,13 @@ pub struct RoutingDefaultConfig {
     /// Access-radius floor (seconds) for bike/car modes. When absent, 1200 s.
     #[serde(default)]
     pub vehicle_access_secs: Option<u32>,
+    /// Fraction of the crow-flies (walk-time) trip the bike/car access budget grows to,
+    /// above the floor. When absent, 0.06.
+    #[serde(default)]
+    pub vehicle_access_fraction: Option<f64>,
+    /// Ceiling (seconds) on the dynamic bike/car access budget. When absent, 2700 s.
+    #[serde(default)]
+    pub vehicle_access_max_secs: Option<u32>,
     /// Reliability bucket edges (sorted, strictly increasing, each in (0,1)) used to
     /// quantize plan reliability. When absent, defaults to [0.50, 0.80, 0.95].
     #[serde(default)]
@@ -294,6 +301,11 @@ pub struct RoutingDefaultConfig {
     /// defaults OFF. Absent ⇒ compiled-in default (disabled).
     #[serde(default)]
     pub multiobj_contract: Option<bool>,
+    /// Build + persist the all-mode (union) contracted graph into `graph.bin` so it
+    /// survives load (the P3 node-contraction structure). Default OFF ⇒ graph.bin is
+    /// byte-identical to today; routing is unchanged either way (T1 is reversible).
+    #[serde(default)]
+    pub node_contraction: Option<bool>,
     /// Whether D+ is a bike selection axis. Absent ⇒ compiled default (false: D+ is
     /// displayed-only; Time already prices climbing via the gradient power model).
     #[serde(default)]
