@@ -11,16 +11,52 @@ impl Graph {
     pub fn build_raptor_index(&mut self) {
         self.build_compact_stop_index();
         self.build_stop_patterns();
+        self.build_pattern_segment_timetables();
         self.build_stop_transfers();
         self.build_reverse_transfers();
         self.raptor.build_runtime_indices();
         self.build_edge_index();
     }
 
+    /// Precompute, per pattern and per inter-stop segment, the transit edge's
+    /// `timetable_segment` by scanning `g.edges` while the full graph is present. Plan
+    /// reconstruction reads this instead of `self.edges[..]`, so transit legs survive the
+    /// node-contraction drop of the interior-node arrays.
+    fn build_pattern_segment_timetables(&mut self) {
+        use crate::ingestion::gtfs::TimetableSegment;
+        use crate::structures::EdgeData;
+
+        let mut per_pattern: Vec<Vec<TimetableSegment>> =
+            Vec::with_capacity(self.raptor.transit_idx_pattern_stops.len());
+        for (p, lookup) in self.raptor.transit_idx_pattern_stops.iter().enumerate() {
+            let stops = lookup.of(&self.raptor.transit_pattern_stops);
+            let route_id = self.raptor.transit_patterns[p].route;
+            let mut segs: Vec<TimetableSegment> = Vec::with_capacity(stops.len().saturating_sub(1));
+            for w in stops.windows(2) {
+                let (from, to) = (w[0], w[1]);
+                let tt = self.edges[from.0]
+                    .iter()
+                    .find_map(|e| match e {
+                        EdgeData::Transit(te)
+                            if te.destination == to && te.route_id == route_id =>
+                        {
+                            Some(te.timetable_segment)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(TimetableSegment { start: 0, len: 0 });
+                segs.push(tt);
+            }
+            per_pattern.push(segs);
+        }
+        self.raptor.transit_pattern_segment_timetables = per_pattern;
+    }
+
     fn build_compact_stop_index(&mut self) {
         self.raptor.transit_node_to_stop = vec![u32::MAX; self.nodes.len()];
         self.raptor.transit_stop_to_node.clear();
         self.raptor.transit_stop_ids.clear();
+        self.raptor.transit_stop_names.clear();
         self.raptor.transit_stops_tree = KdTree::new(2);
 
         for (i, node) in self.nodes.iter().enumerate() {
@@ -29,6 +65,7 @@ impl Graph {
                 self.raptor.transit_node_to_stop[i] = compact as u32;
                 self.raptor.transit_stop_to_node.push(NodeID(i));
                 self.raptor.transit_stop_ids.push(stop.id.clone());
+                self.raptor.transit_stop_names.push(stop.name.clone());
                 let loc = node.loc();
                 let _ = self
                     .raptor

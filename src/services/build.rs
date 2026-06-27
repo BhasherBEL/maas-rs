@@ -196,6 +196,12 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(v) = routing.vehicle_access_secs {
         g.set_vehicle_access_secs(v);
     }
+    if let Some(v) = routing.vehicle_access_fraction {
+        g.set_vehicle_access_fraction(v);
+    }
+    if let Some(v) = routing.vehicle_access_max_secs {
+        g.set_vehicle_access_max_secs(v);
+    }
     if let Some(edges) = routing.reliability_bucket_edges.clone() {
         g.set_reliability_bucket_edges(edges);
     }
@@ -222,6 +228,9 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     }
     if let Some(on) = routing.multiobj_contract {
         g.set_multiobj_contract(on);
+    }
+    if let Some(on) = routing.node_contraction {
+        g.set_node_contraction(on);
     }
     if let Some(on) = routing.bike_select_dplus {
         g.raptor.set_bike_select_dplus(on);
@@ -253,6 +262,51 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(b) = routing.balance {
         g.set_balance(b);
     }
+    // Cost-bake the contracted bike adjacency once the bike profile / cost params are in
+    // place, so the multi-objective bike search traverses super-edges in O(1). Only when
+    // enabled (default off ⇒ no extra build time or memory).
+    if g.raptor.multiobj_contract {
+        g.build_and_bake_bike_contracted();
+    }
+    // Build + persist the all-mode (union) contracted graph (P3 node contraction). On a
+    // restore it is already present (deserialized from graph.bin, seg_index rebuilt in
+    // load_graph), so the is_none() guard skips the rebuild — it only fires on a fresh
+    // build. No routing change in T1; the full node/edge arrays are kept.
+    if g.raptor.node_contraction && g.contracted.is_none() {
+        let mut cg = crate::structures::contraction::ContractedGraph::from_graph_union(g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+    }
+    // Cost-bake bike onto the union cg's super-edges so the bike search can run on it (T3).
+    // Separate from the build above: `SuperEdge.baked` is serde-skipped, so a restored union
+    // cg has `baked = None` and must be re-baked here on every startup (build AND restore).
+    if g.raptor.node_contraction && g.contracted.is_some() {
+        g.bake_bike_on_contracted_default();
+    }
+}
+
+/// Enforce the node-contraction runtime invariant for a graph about to be served or
+/// persisted. Call AFTER [`apply_routing_defaults`] (so `node_contraction` is the
+/// effective value). When contraction is on, drop the interior-node arrays — the P3f
+/// memory win; routing then runs entirely on `g.contracted`. Returns `Err` when the
+/// graph was built contracted (interior arrays already dropped) but contraction is now
+/// OFF: such a graph cannot serve full-graph routing and must be rebuilt from osm.bin
+/// (a `graph.bin` schema match does not protect this reverse direction).
+pub fn finalize_contraction(g: &mut Graph) -> Result<(), String> {
+    if !g.raptor.node_contraction {
+        if g.node_count() == 0 && g.contracted.is_some() {
+            return Err(
+                "graph.bin was built with node_contraction enabled (interior node arrays \
+                 dropped); rebuild with `--build --save` to disable node_contraction"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if g.contracted.is_some() {
+        g.drop_full_node_arrays();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

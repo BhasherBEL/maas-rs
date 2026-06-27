@@ -54,7 +54,7 @@ impl Graph {
     /// per meter math (same arithmetic as the historical walk path), or `None`
     /// when the profile cannot use the edge.
     #[inline]
-    fn edge_secs(&self, street: &StreetEdgeData, profile: StreetProfile) -> Option<u32> {
+    pub(super) fn edge_secs(&self, street: &StreetEdgeData, profile: StreetProfile) -> Option<u32> {
         let speed_mps = match profile {
             StreetProfile::Foot if street.foot => self.raptor.walking_speed_mps,
             StreetProfile::Foot => return None,
@@ -74,19 +74,102 @@ impl Graph {
     }
 
     pub(super) fn node_coord(&self, id: NodeID) -> PlanCoordinate {
-        let loc = self.nodes[id.0].loc();
+        let loc = self.node_loc(id);
         PlanCoordinate {
             lat: loc.latitude,
             lon: loc.longitude,
         }
     }
 
-    /// Returns the sequence of OSM nodes forming the shortest walking path
-    /// from `origin` to `destination`, converted to lat/lon coordinates.
+    /// Coordinate of a node, g-free once the interior arrays are dropped. Every NodeID
+    /// reachable post-drop (query endpoints, transit stops, junction path nodes) is a
+    /// junction, so its position survives in the contracted graph's `junction_coord`.
+    /// With `g` present (flag-off or pre-drop) this is byte-identical to
+    /// `self.nodes[id].loc()`.
+    pub(super) fn node_loc(&self, id: NodeID) -> crate::structures::LatLng {
+        if self.nodes.is_empty() {
+            let cg = self
+                .contracted
+                .as_ref()
+                .expect("contracted graph present after the interior-node drop");
+            cg.junction_coord[cg.junction_of[id.0] as usize]
+        } else {
+            self.nodes[id.0].loc()
+        }
+    }
+
+    /// Inter-stop segment length (meters) for a transit leg, g-free post-drop. Mirrors
+    /// [`Graph::nodes_distance`]'s `* 0.99` haversine discount.
+    pub(super) fn transit_seg_length(&self, a: NodeID, b: NodeID) -> usize {
+        (self.node_loc(a).dist(self.node_loc(b)) * 0.99) as usize
+    }
+
+    /// Profile-aware leg geometry that routes over the contracted graph when enabled,
+    /// else the full-graph `street_path`. Flag-off ⇒ byte-identical to `street_path`.
     ///
-    /// Falls back to a two-point straight line if no path is found.
-    pub(super) fn walk_path(&self, origin: NodeID, destination: NodeID) -> Vec<PlanCoordinate> {
-        self.street_path(origin, destination, StreetProfile::Foot)
+    /// When `use_contracted()`, the polyline is rebuilt from super-edge segment coords
+    /// (`street_path_arena`) — g-free traversal. The endpoint COORDS still come from
+    /// `node_coord` here (a `g.nodes` read, valid until the P3f drop); the snapping
+    /// cutover (T2) swaps that coord source to the arena snap. A transit-stop endpoint's
+    /// coord comes from its junction coord (stops are junctions), so it survives the drop.
+    pub(super) fn street_path_geom(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        profile: StreetProfile,
+    ) -> Vec<PlanCoordinate> {
+        if !self.use_contracted() {
+            return self.street_path(origin, destination, profile);
+        }
+        let cg = self.contracted.as_ref().unwrap();
+        let o = self.geom_node_coord(origin, cg);
+        let d = self.geom_node_coord(destination, cg);
+        let radius = self.raptor.edge_snap_radius_m;
+        cg.street_path_arena(self, o.lat, o.lon, d.lat, d.lon, profile, radius)
+            .into_iter()
+            .map(|c| PlanCoordinate { lat: c.latitude, lon: c.longitude })
+            .collect()
+    }
+
+    /// Profile-aware leg geometry between two PROJECTED snap coordinates over the
+    /// contracted graph (`street_path_arena`). Used for a coord-snapped origin/destination
+    /// whose interior node is gone, so the polyline survives the drop. The endpoints are
+    /// the exact projection points (never a junction shortcut).
+    pub(super) fn street_path_geom_coords(
+        &self,
+        origin: crate::structures::LatLng,
+        destination: crate::structures::LatLng,
+        profile: StreetProfile,
+    ) -> Vec<PlanCoordinate> {
+        let cg = self.contracted.as_ref().unwrap();
+        let radius = self.raptor.edge_snap_radius_m;
+        cg.street_path_arena(
+            self,
+            origin.latitude,
+            origin.longitude,
+            destination.latitude,
+            destination.longitude,
+            profile,
+            radius,
+        )
+        .into_iter()
+        .map(|c| PlanCoordinate { lat: c.latitude, lon: c.longitude })
+        .collect()
+    }
+
+    /// Coordinate of a snapped endpoint for contracted geometry: a junction (incl. every
+    /// transit stop) resolves to its g-free `junction_coord`; any other node falls back to
+    /// `node_coord` (valid until the P3f drop — T2 replaces interior-node coords with the
+    /// arena snap point). Keeps geometry endpoints stable across the flag.
+    fn geom_node_coord(
+        &self,
+        id: NodeID,
+        cg: &super::contraction::ContractedGraph,
+    ) -> PlanCoordinate {
+        if let Some(c) = cg.junction_coord_of(id) {
+            return PlanCoordinate { lat: c.latitude, lon: c.longitude };
+        }
+        self.node_coord(id)
     }
 
     pub(super) fn street_path(
@@ -247,7 +330,7 @@ impl Graph {
     /// stay on car edges or *park and walk* onto a foot edge (→ Walking); once
     /// Walking, only foot edges are usable (the car has been left behind).
     #[inline]
-    fn car_edge_step(&self, street: &StreetEdgeData, walking: bool) -> Option<(u32, bool)> {
+    pub(super) fn car_edge_step(&self, street: &StreetEdgeData, walking: bool) -> Option<(u32, bool)> {
         let secs = |speed_mps: f64| {
             let speed_mms = (speed_mps * 1000.0) as u32;
             (street.length as u64 * 1000 / speed_mms as u64) as u32
@@ -262,7 +345,16 @@ impl Graph {
     }
 
     pub(super) fn nearest_stop_secs(&self, node: NodeID, straight_line_secs: u32) -> u32 {
-        let loc = self.nodes[node.0].loc();
+        self.nearest_stop_secs_coord(self.node_loc(node), straight_line_secs)
+    }
+
+    /// `nearest_stop_secs` keyed directly on a coordinate (the projected arena snap),
+    /// avoiding a `g.nodes` read so it survives the interior-node drop.
+    pub(super) fn nearest_stop_secs_coord(
+        &self,
+        loc: crate::structures::LatLng,
+        straight_line_secs: u32,
+    ) -> u32 {
         self.raptor
             .transit_stops_tree
             .nearest(&[loc.latitude, loc.longitude], 1, &squared_euclidean)
@@ -359,7 +451,7 @@ impl Graph {
     /// A synthetic partial-length copy of `e` (a stub of `len` meters along it),
     /// elevation prorated. Used to charge the bit of an edge between a projected
     /// endpoint and the edge's node.
-    fn partial_edge(e: &StreetEdgeData, len: usize) -> StreetEdgeData {
+    pub(super) fn partial_edge(e: &StreetEdgeData, len: usize) -> StreetEdgeData {
         let frac = if e.length == 0 {
             0.0
         } else {
@@ -378,6 +470,44 @@ impl Graph {
             surface_speed: 100,
             var_gen: e.var_gen,
         }
+    }
+
+    /// The partial-edge stub (projection coordinate + stub edge) bridging a chosen
+    /// graph node `end` and an on-edge projection, for an edge-snapped [`Endpoint`].
+    /// `at_origin` selects the lead (proj→end, ridden along `other→end`) vs tail
+    /// (end→proj, ridden along `end→other`) direction. `None` when the endpoint is a
+    /// plain node, `end` is not one of its edge ends, or that direction is illegal.
+    /// The caller passes the cost-optimal `end` (from `bike_cost_path`), so a one-way
+    /// or doubling-back approach is resolved jointly, not by nearer-stub guessing.
+    pub(super) fn endpoint_stub_at(
+        &self,
+        ep: Endpoint,
+        end: NodeID,
+        at_origin: bool,
+    ) -> Option<(LatLng, StreetEdgeData)> {
+        let Endpoint::OnEdge {
+            a,
+            b,
+            dist_a,
+            dist_b,
+            proj,
+        } = ep
+        else {
+            return None;
+        };
+        let (e, other, d) = if end == a {
+            (a, b, dist_a)
+        } else if end == b {
+            (b, a, dist_b)
+        } else {
+            return None;
+        };
+        let edge = if at_origin {
+            self.street_edge_between(other, e)
+        } else {
+            self.street_edge_between(e, other)
+        }?;
+        Some((proj, Self::partial_edge(edge, d)))
     }
 
     /// Cost-routed bike path between two [`Endpoint`]s. A `Node` endpoint is the
@@ -641,6 +771,19 @@ impl Graph {
         max_secs: u32,
         bike: &BikeCost,
     ) -> Vec<(usize, u32)> {
+        if self.use_contracted() {
+            let cg = self.contracted.as_ref().unwrap();
+            let times = self.bike_dijkstra_union(origin, max_secs, bike, cg);
+            let mut stops: Vec<(usize, u32)> = times
+                .iter()
+                .filter_map(|(&jn, &secs)| {
+                    let compact = self.raptor.transit_node_to_stop[jn.0];
+                    (compact != u32::MAX).then_some((compact as usize, secs))
+                })
+                .collect();
+            stops.sort_unstable_by_key(|&(stop, _)| stop);
+            return stops;
+        }
         let times = self.bike_cost_dijkstra(origin, max_secs, bike);
         let mut stops = Vec::new();
         for (&node, &secs) in &times {
@@ -649,7 +792,6 @@ impl Graph {
                 stops.push((compact as usize, secs));
             }
         }
-        // Stable order (see `nearby_stops_profile`).
         stops.sort_unstable_by_key(|&(stop, _)| stop);
         stops
     }

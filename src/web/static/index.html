@@ -2041,15 +2041,15 @@ function buildItinerary(plan, idx, onLeg) {
       b.appendChild(bc);
       it.appendChild(b);
 
-      if (isOpen) between.forEach(name => {
+      if (isOpen) between.forEach(s => {
         const m = mkEl('div', 'it-row');
-        m.appendChild(mkEl('div', 'it-t'));
+        m.appendChild(mkTimeCell(s.t != null ? { s: fmtTime(s.t), rt: 'dim' } : null));
         const mr = mkEl('div', 'it-rail');
         const mln = mkEl('span', 'ln'); mln.style.setProperty('--lc', bg); mr.appendChild(mln);
         const mnd = mkEl('span', 'nd mid'); mnd.style.setProperty('--lc', bg); mr.appendChild(mnd);
         m.appendChild(mr);
         const mc = mkEl('div', 'it-c it-mid');
-        mc.appendChild(mkEl('span', 'it-midstop', name));
+        mc.appendChild(mkEl('span', 'it-midstop', s.name));
         m.appendChild(mc);
         it.appendChild(m);
       });

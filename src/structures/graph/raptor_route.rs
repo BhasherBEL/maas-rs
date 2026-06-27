@@ -5,7 +5,7 @@ use gtfs_structures::RouteType;
 use crate::{
     ingestion::gtfs::{StopTime, TripId},
     structures::{
-        ALL_STATES, ActiveModes, NodeData, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
+        ALL_STATES, ActiveModes, NodeID, RealtimeIndex, ReliabilityBuckets, ScenarioBag,
         VehicleState,
         plan::{
             AccessInfo, CandidateStatus, ExplainResult, Plan, PlanCandidate, PlanCoordinate,
@@ -15,7 +15,17 @@ use crate::{
     },
 };
 
-use super::{BikeCost, Endpoint, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
+use super::{BikeCost, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
+
+/// Projected snap coordinates for a contracted (flag-on) query. The origin/destination
+/// `NodeID`s threaded alongside are bounding junctions (stable identity, survive the
+/// interior-node drop); these coordinates are the PROJECTED foot-snap points, used for
+/// plan endpoint geometry, the straight-line heuristic, and coord-based access/egress —
+/// never a junction shortcut. `None` ⇒ flag-off, the NodeID path stays byte-identical.
+pub struct QueryEndpoints {
+    pub origin: crate::structures::LatLng,
+    pub destination: crate::structures::LatLng,
+}
 
 /// Per-query mode resolution: the active vehicle states plus per-state
 /// access/egress stop lists (walk/ride seconds, relative to the endpoint).
@@ -339,6 +349,146 @@ impl LabelSet {
 }
 
 impl Graph {
+    /// True when the all-mode contracted graph should drive WALK/CAR/RAPTOR-access
+    /// routing (flag on AND the union graph is present). Flag-off ⇒ always false ⇒
+    /// every branch below stays byte-identical to the full-graph path.
+    pub fn use_contracted(&self) -> bool {
+        self.raptor.node_contraction && self.contracted.is_some()
+    }
+
+    /// Foot access/egress stops within `max_secs` of `origin`. Routes over the
+    /// contracted graph when enabled (`nearby_stops_union`), else the full graph.
+    fn foot_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
+        if self.use_contracted() {
+            let cg = self.contracted.as_ref().unwrap();
+            self.nearby_stops_union(origin, max_secs, cg)
+        } else {
+            self.nearby_stops(origin, max_secs)
+        }
+    }
+
+    /// Foot access/egress stops within `max_secs` of a coord-snapped endpoint when a
+    /// contracted query supplies the projected coordinate (`coord`) — g-free, surviving the
+    /// interior-node drop. Without it, falls back to the NodeID `foot_nearby_stops`.
+    fn foot_nearby_stops_ep(
+        &self,
+        origin: NodeID,
+        max_secs: u32,
+        coord: Option<crate::structures::LatLng>,
+    ) -> Vec<(usize, u32)> {
+        if let Some(c) = coord
+            && self.use_contracted()
+        {
+            let cg = self.contracted.as_ref().unwrap();
+            let radius = self.raptor.edge_snap_radius_m;
+            return cg.nearby_stops_arena(self, c.latitude, c.longitude, radius, max_secs);
+        }
+        self.foot_nearby_stops(origin, max_secs)
+    }
+
+    /// Car access/egress stops within `max_secs` of `origin`. Mirrors
+    /// `nearby_stops_union` but over the phased car search; identical shape and
+    /// (sorted) order to `nearby_stops_profile(Car)`.
+    fn car_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
+        if self.use_contracted() {
+            let cg = self.contracted.as_ref().unwrap();
+            let dist = self.car_dijkstra_union(origin, max_secs, cg);
+            let mut stops: Vec<(usize, u32)> = dist
+                .iter()
+                .filter_map(|(&jn, &secs)| {
+                    let compact = self.raptor.transit_node_to_stop[jn.0];
+                    (compact != u32::MAX).then_some((compact as usize, secs))
+                })
+                .collect();
+            stops.sort_unstable_by_key(|&(stop, _)| stop);
+            stops
+        } else {
+            self.nearby_stops_profile(origin, max_secs, StreetProfile::Car)
+        }
+    }
+
+    /// Foot seconds `origin`→`destination` (`u32::MAX` = unreachable). Routes over
+    /// the contracted graph when enabled, else a full-graph walk Dijkstra.
+    fn walk_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> u32 {
+        if self.use_contracted() {
+            let cg = self.contracted.as_ref().unwrap();
+            cg.walk_secs_point_to_point(self, origin, destination, bound)
+                .unwrap_or(u32::MAX)
+        } else {
+            self.walk_dijkstra(origin, bound)
+                .get(&destination)
+                .copied()
+                .unwrap_or(u32::MAX)
+        }
+    }
+
+    /// Foot seconds `origin`→`destination` keyed on the PROJECTED snap coordinates when a
+    /// contracted query supplies them (`ep`) — g-free, so it survives the interior-node
+    /// drop. Without `ep` (flag-off, or junction-keyed callers) falls back to the NodeID
+    /// `walk_secs_to`, byte-identical.
+    fn walk_secs_to_ep(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        bound: u32,
+        ep: Option<&QueryEndpoints>,
+    ) -> u32 {
+        if let Some(ep) = ep
+            && self.use_contracted()
+        {
+            let cg = self.contracted.as_ref().unwrap();
+            let radius = self.raptor.edge_snap_radius_m;
+            return cg
+                .walk_secs_coord_to_coord(self, ep.origin, ep.destination, radius, bound)
+                .unwrap_or(u32::MAX);
+        }
+        self.walk_secs_to(origin, destination, bound)
+    }
+
+    /// Straight-line meters between endpoints, using the PROJECTED snap coordinates when a
+    /// contracted query supplies them (`ep`), else `nodes_distance`. The 0.99 haversine
+    /// discount matches `nodes_distance` so the heuristic is identical for junction inputs.
+    fn endpoint_distance(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        ep: Option<&QueryEndpoints>,
+    ) -> usize {
+        match ep {
+            Some(ep) => (ep.origin.dist(ep.destination) * 0.99) as usize,
+            None => self.nodes_distance(origin, destination),
+        }
+    }
+
+    /// Seconds to the nearest transit stop from a query origin, keyed on the projected
+    /// snap coordinate when available (g-free), else `nearest_stop_secs(node)`.
+    fn nearest_stop_secs_ep(
+        &self,
+        origin: NodeID,
+        straight_line_secs: u32,
+        coord: Option<crate::structures::LatLng>,
+    ) -> u32 {
+        match coord {
+            Some(c) => self.nearest_stop_secs_coord(c, straight_line_secs),
+            None => self.nearest_stop_secs(origin, straight_line_secs),
+        }
+    }
+
+    /// Car seconds `origin`→`destination` (`None` = unreachable). Routes over the
+    /// contracted graph when enabled, else a full-graph car Dijkstra.
+    fn car_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> Option<u32> {
+        if self.use_contracted() {
+            let cg = self.contracted.as_ref().unwrap();
+            self.car_dijkstra_union(origin, bound, cg)
+                .get(&destination)
+                .copied()
+        } else {
+            self.street_dijkstra(origin, bound, StreetProfile::Car)
+                .get(&destination)
+                .copied()
+        }
+    }
+
     /// Retry loop shared by `raptor` and `raptor_range`.
     ///
     /// Doubles `access_secs` until `try_routing` returns a non-empty result or
@@ -357,6 +507,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
         mut try_routing: F,
     ) -> Vec<Plan>
     where
@@ -365,10 +516,7 @@ impl Graph {
         // No transit mode selected: the direct street plans are the whole answer.
         if !am.wants_transit() {
             let walk_secs = if am.wants_direct_walk() {
-                self.walk_dijkstra(origin, u32::MAX)
-                    .get(&destination)
-                    .copied()
-                    .unwrap_or(u32::MAX)
+                self.walk_secs_to_ep(origin, destination, u32::MAX, ep)
             } else {
                 u32::MAX
             };
@@ -380,20 +528,22 @@ impl Graph {
                 walk_secs,
                 bike,
                 terminal_deadline,
+                ep,
             );
             return Self::finalize_plans(plans, buckets);
         }
 
-        let straight_line_secs = (self.nodes_distance(origin, destination) as f64
-            / self.raptor.walking_speed_mps) as u32;
+        let straight_line_secs =
+            (self.endpoint_distance(origin, destination, ep) as f64 / self.raptor.walking_speed_mps)
+                as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
-            .nearest_stop_secs(origin, straight_line_secs)
+            .nearest_stop_secs_ep(origin, straight_line_secs, ep.map(|e| e.origin))
             .max(min_access_secs);
 
         loop {
-            let mc = self.build_mode_context(am, origin, destination, access_secs, bike);
+            let mc = self.build_mode_context(am, origin, destination, access_secs, bike, ep);
 
             if mc.any_access() && mc.any_egress() {
                 let mut results = try_routing(&mc, access_secs);
@@ -407,6 +557,7 @@ impl Graph {
                         bike,
                         terminal_deadline,
                         &mut results,
+                        ep,
                     );
                     return Self::finalize_plans(results, buckets);
                 }
@@ -415,12 +566,7 @@ impl Graph {
             access_secs = access_secs.saturating_mul(2);
 
             if access_secs >= straight_line_secs && walk_only_secs.is_none() {
-                walk_only_secs = Some(
-                    self.walk_dijkstra(origin, u32::MAX)
-                        .get(&destination)
-                        .copied()
-                        .unwrap_or(u32::MAX),
-                );
+                walk_only_secs = Some(self.walk_secs_to_ep(origin, destination, u32::MAX, ep));
             }
 
             if let Some(actual) = walk_only_secs
@@ -434,6 +580,7 @@ impl Graph {
                     actual,
                     bike,
                     terminal_deadline,
+                    ep,
                 );
                 return Self::finalize_plans(plans, buckets);
             }
@@ -459,6 +606,14 @@ impl Graph {
             .collect()
     }
 
+    /// The bike/car access budget (seconds) for a trip whose crow-flies walk-time is
+    /// `crow_secs`: a fraction of the trip, clamped to the floor (short trips keep the
+    /// local radius) and the ceiling (keep the access Dijkstra bounded).
+    pub(crate) fn vehicle_access_budget(&self, crow_secs: u32) -> u32 {
+        ((self.raptor.vehicle_access_fraction * crow_secs as f64) as u32)
+            .clamp(self.raptor.vehicle_access_secs, self.raptor.vehicle_access_max_secs)
+    }
+
     /// Per-profile access/egress stop discovery for the active states. Each list
     /// is computed only when some active state needs it: foot access for
     /// `Walked`/`CarEgress`, bike access for the bike states, car access for
@@ -471,17 +626,21 @@ impl Graph {
         destination: NodeID,
         access_secs: u32,
         bike: &BikeCost,
+        ep: Option<&QueryEndpoints>,
     ) -> ModeContext<'a> {
         use VehicleState::*;
         let has = |s| am.state_of(s).is_some();
         // Foot access stays local (the nearest-stop radius). Bike/car reach a
-        // better hub farther out, so their discovery is floored to a wider radius
-        // — without inflating the foot lists (which would surface local
-        // walk+transit noise).
-        let vehicle_secs = access_secs.max(self.raptor.vehicle_access_secs);
+        // better hub farther out, so their discovery uses a wider budget that scales
+        // with trip length — on a long journey you would ride farther to reach a
+        // well-connected hub. Clamped to a floor (short trips keep the local radius)
+        // and a ceiling (keep the access Dijkstra bounded).
+        let crow_secs = (self.endpoint_distance(origin, destination, ep) as f64
+            / self.raptor.walking_speed_mps) as u32;
+        let vehicle_secs = access_secs.max(self.vehicle_access_budget(crow_secs));
 
         let foot_access = if has(Walked) || has(CarEgress) {
-            self.access_times(self.nearby_stops(origin, access_secs))
+            self.access_times(self.foot_nearby_stops_ep(origin, access_secs, ep.map(|e| e.origin)))
         } else {
             vec![]
         };
@@ -491,12 +650,16 @@ impl Graph {
             vec![]
         };
         let car_access = if has(CarParked) {
-            self.access_times(self.nearby_stops_profile(origin, vehicle_secs, StreetProfile::Car))
+            self.access_times(self.car_nearby_stops(origin, vehicle_secs))
         } else {
             vec![]
         };
         let foot_egress = if has(Walked) || has(BikeDropped) || has(CarParked) {
-            self.egress_times(self.nearby_stops(destination, access_secs))
+            self.egress_times(self.foot_nearby_stops_ep(
+                destination,
+                access_secs,
+                ep.map(|e| e.destination),
+            ))
         } else {
             vec![]
         };
@@ -506,11 +669,7 @@ impl Graph {
             vec![]
         };
         let car_egress = if has(CarEgress) {
-            self.egress_times(self.nearby_stops_profile(
-                destination,
-                vehicle_secs,
-                StreetProfile::Car,
-            ))
+            self.egress_times(self.car_nearby_stops(destination, vehicle_secs))
         } else {
             vec![]
         };
@@ -553,6 +712,7 @@ impl Graph {
     /// bike+transit plan must also beat plain cycling); walk-direct only when
     /// `WALK` is selected without `WALK_TRANSIT` (with it, the legacy
     /// walk-fallback semantics apply unchanged).
+    #[allow(clippy::too_many_arguments)]
     fn append_bounded_direct_plans(
         &self,
         am: &ActiveModes,
@@ -563,6 +723,7 @@ impl Graph {
         bike: &BikeCost,
         _terminal_deadline: bool,
         results: &mut Vec<Plan>,
+        ep: Option<&QueryEndpoints>,
     ) {
         let best_end = match results.iter().map(|p| p.end).min() {
             Some(e) => e,
@@ -571,36 +732,27 @@ impl Graph {
         let bound = best_end.saturating_sub(start_time).saturating_add(slack);
 
         if (am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some())
-            && let Some(scalar) = self.build_bike_plan(
-                Endpoint::Node(origin),
-                Endpoint::Node(destination),
-                start_time,
-                bound,
-                bike,
-            )
+            && let Some(scalar) =
+                self.build_bike_plan_ep(origin, destination, start_time, bound, bike, ep)
         {
             results.push(scalar);
         }
         if am.wants_direct_car() {
-            if let Some(&secs) = self
-                .street_dijkstra(origin, bound, StreetProfile::Car)
-                .get(&destination)
-            {
-                results.push(self.build_street_plan(
+            if let Some(secs) = self.car_secs_to(origin, destination, bound) {
+                results.push(self.build_street_plan_ep(
                     origin,
                     destination,
                     start_time,
                     secs,
                     StreetProfile::Car,
+                    ep,
                 ));
             }
         }
         if am.wants_direct_walk() && !am.selected(crate::structures::Mode::WalkTransit) {
-            if let Some(&secs) = self
-                .street_dijkstra(origin, bound, StreetProfile::Foot)
-                .get(&destination)
-            {
-                results.push(self.build_walk_plan(origin, destination, start_time, secs));
+            let secs = self.walk_secs_to_ep(origin, destination, bound, ep);
+            if secs < u32::MAX {
+                results.push(self.build_walk_plan_ep(origin, destination, start_time, secs, ep));
             }
         }
     }
@@ -616,33 +768,28 @@ impl Graph {
         walk_secs: u32,
         bike: &BikeCost,
         _terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
     ) -> Vec<Plan> {
         let mut plans = Vec::new();
         if walk_secs < u32::MAX {
-            plans.push(self.build_walk_plan(origin, destination, start_time, walk_secs));
+            plans.push(self.build_walk_plan_ep(origin, destination, start_time, walk_secs, ep));
         }
         if am.wants_direct_bike() || am.state_of(VehicleState::BikeInHand).is_some() {
-            if let Some(scalar) = self.build_bike_plan(
-                Endpoint::Node(origin),
-                Endpoint::Node(destination),
-                start_time,
-                u32::MAX,
-                bike,
-            ) {
+            if let Some(scalar) =
+                self.build_bike_plan_ep(origin, destination, start_time, u32::MAX, bike, ep)
+            {
                 plans.push(scalar);
             }
         }
         if am.wants_direct_car() {
-            if let Some(&car_secs) = self
-                .street_dijkstra(origin, u32::MAX, StreetProfile::Car)
-                .get(&destination)
-            {
-                plans.push(self.build_street_plan(
+            if let Some(car_secs) = self.car_secs_to(origin, destination, u32::MAX) {
+                plans.push(self.build_street_plan_ep(
                     origin,
                     destination,
                     start_time,
                     car_secs,
                     StreetProfile::Car,
+                    ep,
                 ));
             }
         }
@@ -770,6 +917,42 @@ impl Graph {
         bike: &BikeCost,
         terminal_deadline: bool,
     ) -> Vec<Plan> {
+        self.raptor_tuned_rt_modes_ep(
+            origin,
+            destination,
+            start_time,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            am,
+            bike,
+            terminal_deadline,
+            None,
+        )
+    }
+
+    /// `raptor_tuned_rt_modes` carrying the projected snap coordinates (`ep`) for g-free
+    /// contracted access/geometry. `None` ⇒ NodeID path, byte-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_tuned_rt_modes_ep(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+        am: &ActiveModes,
+        bike: &BikeCost,
+        terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
+    ) -> Vec<Plan> {
         self.with_access_search(
             origin,
             destination,
@@ -780,6 +963,7 @@ impl Graph {
             am,
             bike,
             terminal_deadline,
+            ep,
             |mc, access_secs| {
                 self.raptor_inner(
                     mc,
@@ -889,11 +1073,8 @@ impl Graph {
                             (0..n_states).any(|s| labels[k][stop_idx * n_states + s].is_reached());
                         if reached {
                             let node_id = self.raptor.transit_stop_to_node[stop_idx];
-                            let loc = self.nodes[node_id.0].loc();
-                            let name = match &self.nodes[node_id.0] {
-                                NodeData::TransitStop(s) => s.name.clone(),
-                                _ => String::new(),
-                            };
+                            let loc = self.node_loc(node_id);
+                            let name = self.raptor.transit_stop_names[stop_idx].clone();
                             let path = self.path_to_stop(stop_idx, k, origin, &labels, n_states);
                             let arrival_secs = (0..n_states)
                                 .map(|s| labels[k][stop_idx * n_states + s].earliest())
@@ -1172,7 +1353,7 @@ impl Graph {
         while let Some(l) = min_label_at(k, stop) {
             let trace = l.trace;
             let to_node = self.raptor.transit_stop_to_node[stop];
-            let to_loc = self.nodes[to_node.0].loc();
+            let to_loc = self.node_loc(to_node);
 
             if trace.is_transit() {
                 let p = trace.pattern as usize;
@@ -1183,7 +1364,7 @@ impl Graph {
 
                 let geometry: Vec<PlanCoordinate> = (bp..=ap)
                     .map(|i| {
-                        let loc = self.nodes[pat_stops[i].0].loc();
+                        let loc = self.node_loc(pat_stops[i]);
                         PlanCoordinate {
                             lat: loc.latitude,
                             lon: loc.longitude,
@@ -1208,7 +1389,7 @@ impl Graph {
             } else if trace.is_transfer() {
                 let from = trace.from_stop as usize;
                 let from_node = self.raptor.transit_stop_to_node[from];
-                let from_loc = self.nodes[from_node.0].loc();
+                let from_loc = self.node_loc(from_node);
                 legs.push(StopPathLeg {
                     is_transit: false,
                     route_label: String::new(),
@@ -1227,7 +1408,7 @@ impl Graph {
                 // k stays the same for transfers
             } else {
                 // Access walk: origin → this stop
-                let from_loc = self.nodes[origin.0].loc();
+                let from_loc = self.node_loc(origin);
                 legs.push(StopPathLeg {
                     is_transit: false,
                     route_label: String::new(),
@@ -1254,6 +1435,7 @@ impl Graph {
     ///
     /// The closure returns `Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>`:
     /// `None` = no result yet, widen radius; `Some(...)` = routing succeeded.
+    #[allow(clippy::too_many_arguments)]
     fn with_access_search_debug<F>(
         &self,
         origin: NodeID,
@@ -1262,22 +1444,24 @@ impl Graph {
         min_access_secs: u32,
         am: &ActiveModes,
         bike: &BikeCost,
+        ep: Option<&QueryEndpoints>,
         mut try_routing: F,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, AccessInfo, Vec<StopReach>)
     where
         F: FnMut(&ModeContext, u32) -> Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>,
     {
-        let straight_line_secs = (self.nodes_distance(origin, destination) as f64
-            / self.raptor.walking_speed_mps) as u32;
+        let straight_line_secs =
+            (self.endpoint_distance(origin, destination, ep) as f64 / self.raptor.walking_speed_mps)
+                as u32;
 
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
-            .nearest_stop_secs(origin, straight_line_secs)
+            .nearest_stop_secs_ep(origin, straight_line_secs, ep.map(|e| e.origin))
             .max(min_access_secs);
         let mut attempts: u32 = 0;
 
         loop {
-            let mc = self.build_mode_context(am, origin, destination, access_secs, bike);
+            let mc = self.build_mode_context(am, origin, destination, access_secs, bike, ep);
 
             if mc.any_access()
                 && mc.any_egress()
@@ -1299,12 +1483,7 @@ impl Graph {
             attempts += 1;
 
             if access_secs >= straight_line_secs && walk_only_secs.is_none() {
-                walk_only_secs = Some(
-                    self.walk_dijkstra(origin, u32::MAX)
-                        .get(&destination)
-                        .copied()
-                        .unwrap_or(u32::MAX),
-                );
+                walk_only_secs = Some(self.walk_secs_to_ep(origin, destination, u32::MAX, ep));
             }
 
             if let Some(actual) = walk_only_secs
@@ -1318,6 +1497,7 @@ impl Graph {
                     actual,
                     bike,
                     false,
+                    ep,
                 );
                 let candidates = plans
                     .iter()
@@ -1413,6 +1593,7 @@ impl Graph {
             rt,
             &ActiveModes::default(),
             &self.default_bike_cost(),
+            None,
         )
     }
 
@@ -1430,6 +1611,7 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        ep: Option<&QueryEndpoints>,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -1438,6 +1620,7 @@ impl Graph {
             min_access_secs,
             am,
             bike,
+            ep,
             |mc, access_secs| {
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     mc,
@@ -1459,13 +1642,31 @@ impl Graph {
                 }
             },
         );
+        let (oc, dc) = self.explain_endpoint_coords(origin, destination, ep);
         ExplainResult {
             plans,
             candidates,
             access,
             stops_reached,
-            origin: self.node_coord(origin),
-            destination: self.node_coord(destination),
+            origin: oc,
+            destination: dc,
+        }
+    }
+
+    /// Endpoint coordinates for an `ExplainResult`: the projected snap coords when a
+    /// contracted query supplies them (g-free, survive the drop), else `node_coord`.
+    fn explain_endpoint_coords(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        ep: Option<&QueryEndpoints>,
+    ) -> (PlanCoordinate, PlanCoordinate) {
+        match ep {
+            Some(ep) => (
+                PlanCoordinate { lat: ep.origin.latitude, lon: ep.origin.longitude },
+                PlanCoordinate { lat: ep.destination.latitude, lon: ep.destination.longitude },
+            ),
+            None => (self.node_coord(origin), self.node_coord(destination)),
         }
     }
 
@@ -1523,6 +1724,7 @@ impl Graph {
             rt,
             &ActiveModes::default(),
             &self.default_bike_cost(),
+            None,
         )
     }
 
@@ -1541,6 +1743,7 @@ impl Graph {
         rt: &RealtimeIndex,
         am: &ActiveModes,
         bike: &BikeCost,
+        ep: Option<&QueryEndpoints>,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -1549,6 +1752,7 @@ impl Graph {
             min_access_secs,
             am,
             bike,
+            ep,
             |mc, access_secs| {
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     mc,
@@ -1623,13 +1827,14 @@ impl Graph {
                 Some((final_plans, all_candidates, probe_stops))
             },
         );
+        let (oc, dc) = self.explain_endpoint_coords(origin, destination, ep);
         ExplainResult {
             plans,
             candidates,
             access,
             stops_reached,
-            origin: self.node_coord(origin),
-            destination: self.node_coord(destination),
+            origin: oc,
+            destination: dc,
         }
     }
 
@@ -2290,6 +2495,43 @@ impl Graph {
         bike: &BikeCost,
         terminal_deadline: bool,
     ) -> Vec<Plan> {
+        self.raptor_range_tuned_rt_modes_ep(
+            origin,
+            destination,
+            start_time,
+            window_secs,
+            date,
+            weekday,
+            min_access_secs,
+            buckets,
+            slack,
+            rt,
+            am,
+            bike,
+            terminal_deadline,
+            None,
+        )
+    }
+
+    /// `raptor_range_tuned_rt_modes` carrying the projected snap coordinates (`ep`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_range_tuned_rt_modes_ep(
+        &self,
+        origin: NodeID,
+        destination: NodeID,
+        start_time: u32,
+        window_secs: u32,
+        date: u32,
+        weekday: u8,
+        min_access_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+        am: &ActiveModes,
+        bike: &BikeCost,
+        terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
+    ) -> Vec<Plan> {
         // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
         // interesting departures, which are processed **latest → earliest** so a
         // later-departing journey prunes earlier ones. `best` is reset per pass (it
@@ -2309,6 +2551,7 @@ impl Graph {
             am,
             bike,
             terminal_deadline,
+            ep,
             |mc, access_secs| {
                 let probe = self.raptor_inner(
                     mc,
@@ -2450,6 +2693,7 @@ impl Graph {
             am,
             &self.default_bike_cost(),
             false,
+            None,
             |mc, access_secs| {
                 let probe = self.raptor_inner(
                     mc,
@@ -2619,6 +2863,7 @@ impl Graph {
             &ActiveModes::default(),
             &self.default_bike_cost(),
             false,
+            None,
         )
     }
 
@@ -2637,8 +2882,9 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_tuned_rt_modes(
+        let mut plans = self.raptor_tuned_rt_modes_ep(
             origin,
             destination,
             start_time,
@@ -2651,10 +2897,11 @@ impl Graph {
             am,
             bike,
             terminal_deadline,
+            ep,
         );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
-            let overnight = self.raptor_tuned_rt_modes(
+            let overnight = self.raptor_tuned_rt_modes_ep(
                 origin,
                 destination,
                 start_time + 86400,
@@ -2667,6 +2914,7 @@ impl Graph {
                 am,
                 bike,
                 terminal_deadline,
+                ep,
             );
             let normalized: Vec<Plan> = overnight
                 .into_iter()
@@ -2711,6 +2959,7 @@ impl Graph {
             &ActiveModes::default(),
             &self.default_bike_cost(),
             false,
+            None,
         )
     }
 
@@ -2730,8 +2979,9 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         terminal_deadline: bool,
+        ep: Option<&QueryEndpoints>,
     ) -> Vec<Plan> {
-        let mut plans = self.raptor_range_tuned_rt_modes(
+        let mut plans = self.raptor_range_tuned_rt_modes_ep(
             origin,
             destination,
             start_time,
@@ -2745,10 +2995,11 @@ impl Graph {
             am,
             bike,
             terminal_deadline,
+            ep,
         );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
-            let overnight = self.raptor_range_tuned_rt_modes(
+            let overnight = self.raptor_range_tuned_rt_modes_ep(
                 origin,
                 destination,
                 start_time + 86400,
@@ -2762,6 +3013,7 @@ impl Graph {
                 am,
                 bike,
                 terminal_deadline,
+                ep,
             );
             let normalized: Vec<Plan> = overnight
                 .into_iter()
@@ -2962,6 +3214,18 @@ mod label_tests {
 #[cfg(test)]
 mod street_time_tests {
     use crate::structures::{Graph, StreetTimeModel};
+
+    #[test]
+    fn vehicle_access_budget_scales_then_clamps() {
+        // Defaults: floor 1200 s, fraction 0.06, ceiling 2700 s.
+        let g = Graph::new();
+        // Short trip ⇒ floored to the local radius.
+        assert_eq!(g.vehicle_access_budget(10_000), 1200, "short trip keeps the floor");
+        // Mid/long trip ⇒ scales with the crow-flies time (0.06 × 30000 = 1800).
+        assert_eq!(g.vehicle_access_budget(30_000), 1800, "long trip rides farther");
+        // Very long trip ⇒ clamped to the ceiling.
+        assert_eq!(g.vehicle_access_budget(100_000), 2700, "ceiling bounds the search");
+    }
 
     #[test]
     fn access_buffers_egress_is_mean() {

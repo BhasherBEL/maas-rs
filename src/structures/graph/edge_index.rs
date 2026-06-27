@@ -8,6 +8,9 @@ use crate::structures::StreetEdgeData;
 #[derive(Clone, Debug)]
 pub struct EdgeEnvelope {
     pub edge: StreetEdgeData,
+    /// Global segment index into `ContractedGraph::segs` when this index is built over
+    /// the arena (P3f snapping); `u32::MAX` for a full-graph edge index.
+    pub seg_id: u32,
     ax: f64,
     ay: f64,
     bx: f64,
@@ -40,7 +43,7 @@ impl PointDistance for EdgeEnvelope {
 
 /// Bulk-loaded R*-tree over street-edge bodies for nearest-edge snapping. Built
 /// on load/build from the graph's nodes+edges, never serialized.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct EdgeIndex {
     tree: RTree<EdgeEnvelope>,
     m_lat: f64,
@@ -54,11 +57,28 @@ impl EdgeIndex {
         edges: impl Iterator<Item = (StreetEdgeData, (f64, f64), (f64, f64))>,
         ref_lat: f64,
     ) -> Self {
+        Self::build_inner(edges.map(|(e, a, b)| (e, u32::MAX, a, b)), ref_lat)
+    }
+
+    /// Build over arena segments, tagging each envelope with its global segment index so a
+    /// snap resolves to the owning super-edge (P3f, g-free snapping).
+    pub fn build_segs(
+        segs: impl Iterator<Item = (StreetEdgeData, u32, (f64, f64), (f64, f64))>,
+        ref_lat: f64,
+    ) -> Self {
+        Self::build_inner(segs, ref_lat)
+    }
+
+    fn build_inner(
+        edges: impl Iterator<Item = (StreetEdgeData, u32, (f64, f64), (f64, f64))>,
+        ref_lat: f64,
+    ) -> Self {
         let m_lat = 111_320.0_f64;
         let m_lon = 111_320.0_f64 * ref_lat.to_radians().cos();
         let items: Vec<EdgeEnvelope> = edges
-            .map(|(edge, (alat, alon), (blat, blon))| EdgeEnvelope {
+            .map(|(edge, seg_id, (alat, alon), (blat, blon))| EdgeEnvelope {
                 edge,
+                seg_id,
                 ax: alon * m_lon,
                 ay: alat * m_lat,
                 bx: blon * m_lon,
@@ -70,6 +90,27 @@ impl EdgeIndex {
             m_lat,
             m_lon,
         }
+    }
+
+    /// Like [`Self::nearest_usable`] but also returns the matched segment id (P3f).
+    pub fn nearest_usable_seg(
+        &self,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+        usable: impl Fn(&StreetEdgeData) -> bool,
+    ) -> Option<(StreetEdgeData, u32, f64)> {
+        let q = [lon * self.m_lon, lat * self.m_lat];
+        let r2 = radius_m * radius_m;
+        for (e, d2) in self.tree.nearest_neighbor_iter_with_distance_2(q) {
+            if d2 > r2 {
+                break;
+            }
+            if usable(&e.edge) {
+                return Some((e.edge, e.seg_id, d2.sqrt()));
+            }
+        }
+        None
     }
 
     /// Nearest `usable` edge to `(lat, lon)` by perpendicular body distance, within

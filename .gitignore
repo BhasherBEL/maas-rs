@@ -8,3 +8,7 @@ design/
 cache/
 design2/
 reports/
+scripts/p3_ab_out/
+
+# Superpowers workflow scratch (briefs, ledgers, reports)
+.superpowers/

@@ -118,6 +118,16 @@ pub struct BikeProfile {
     /// Comfortable lateral (centripetal) acceleration (m/s²) a cyclist accepts in a
     /// bend; the cornering speed is `sqrt(lateral_accel · radius)`.
     pub lateral_accel: f64,
+    /// Higher lateral tolerance (m/s²) applied when entering bike infrastructure
+    /// (cycleway / cycle route / signed bike way): following a dedicated cycleway is
+    /// efficient by design, so its curves and through-junctions are taken near cruise
+    /// — only a genuine hairpin still slows. Roads keep the conservative `lateral_accel`.
+    pub lateral_accel_infra: f64,
+    /// Floor (m) on the segment length used to derive a corner's radius
+    /// (`r = max(min_seg_len, corner_min_len) / θ`). A cyclist cannot pivot tighter
+    /// than roughly a bike-length, so finely digitized geometry or a short junction
+    /// connector must not fabricate a hairpin radius and a phantom slow-down.
+    pub corner_min_len_m: f64,
     /// Speed (m/s) of pushing a dismounted bike on a non-stairs way (slower than free
     /// walking — a loaded bike is awkward to maneuver).
     pub push_speed_mps: f64,
@@ -158,10 +168,12 @@ impl Default for BikeProfile {
             max_speed: 36.0,
             s_c_x: 0.55,
             c_r: 0.006,
-            biker_power: 70.0,
+            biker_power: 100.0,
             brake_decel: 2.5,
             accel_rate: 1.0,
-            lateral_accel: 2.5,
+            lateral_accel: 3.5,
+            lateral_accel_infra: 8.0,
+            corner_min_len_m: 10.0,
             push_speed_mps: 0.9,
             steps_push_speed_mps: 0.25,
         }
@@ -242,7 +254,7 @@ mod tests {
         assert_eq!(p.highway.cycleway, 1.0);
         assert_eq!(p.highway.trunk, 10.0);
         assert_eq!(p.downhillcost, 100.0);
-        assert_eq!(p.biker_power, 70.0);
+        assert_eq!(p.biker_power, 100.0);
         assert!(p.avoid_unsafe && p.stick_to_cycleroutes);
     }
 

@@ -11,6 +11,7 @@ use crate::{
 use raptor_index::RaptorIndex;
 
 mod bike_cost;
+pub mod contraction;
 mod edge_index;
 mod multiobj;
 mod multiobj_plan;
@@ -29,6 +30,7 @@ mod transit;
 
 pub use bike_cost::{BikeCost, PrevCtx};
 pub use raptor_access::StreetProfile;
+pub use raptor_route::QueryEndpoints;
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 
 /// A routing terminal: either an exact graph node, or a point projected onto the
@@ -85,6 +87,17 @@ pub struct Graph {
     pub raptor: RaptorIndex,
     #[serde(skip, default)]
     edge_index: edge_index::EdgeIndex,
+    /// Auxiliary contracted bike adjacency (degree-2 chains baked into super-edges).
+    /// Built on demand via [`Graph::build_bike_contracted`]; `None` ⇒ the bike search
+    /// uses the full graph / on-the-fly contraction (unchanged production behaviour).
+    #[serde(skip, default)]
+    bike_contracted: Option<contraction::ContractedGraph>,
+    /// All-mode (union) contracted graph for P3 node contraction. Unlike
+    /// `bike_contracted`, this one **is serialized** into `graph.bin` (its serde-skipped
+    /// `seg_index` R-tree is rebuilt post-load). `None` ⇒ contraction disabled. T1 keeps
+    /// the full node/edge arrays alongside it; no routing change yet.
+    #[serde(default)]
+    pub contracted: Option<contraction::ContractedGraph>,
 }
 
 #[derive(Serialize)]
@@ -122,7 +135,50 @@ impl Graph {
             id_mapper: HashMap::new(),
             raptor: RaptorIndex::new(),
             edge_index: edge_index::EdgeIndex::default(),
+            bike_contracted: None,
+            contracted: None,
         }
+    }
+
+    /// Build (or rebuild) the auxiliary contracted bike adjacency. Call after the graph
+    /// is built/loaded and `build_raptor_index` has run (it reads `transit_node_to_stop`).
+    pub fn build_bike_contracted(&mut self) {
+        self.bike_contracted = Some(contraction::ContractedGraph::from_graph(self));
+    }
+
+    #[cfg(test)]
+    pub(super) fn bike_contracted(&self) -> Option<&contraction::ContractedGraph> {
+        self.bike_contracted.as_ref()
+    }
+
+    /// The contracted graph the bike multi-objective search reads. With `node_contraction`
+    /// the search runs on the **serialized union** cg (`self.contracted`, which survives the
+    /// P3 drop of `g`); otherwise on the legacy serde-skipped bike-only `bike_contracted`
+    /// (gated by `multiobj_contract`). Both expose the same fields the search touches.
+    pub(super) fn bike_cg(&self) -> Option<&contraction::ContractedGraph> {
+        if self.raptor.node_contraction {
+            self.contracted.as_ref()
+        } else {
+            self.bike_contracted.as_ref()
+        }
+    }
+
+    /// Build + cost-bake the contracted bike adjacency using the graph's configured bike
+    /// profile. Call once at startup (after the raptor index + bike profile are set) when
+    /// `multiobj_contract` is enabled, so the bike multi-objective search runs on
+    /// cost-baked super-edges.
+    pub fn build_and_bake_bike_contracted(&mut self) {
+        let bike = self.default_bike_cost();
+        self.build_bike_contracted();
+        self.bake_bike_contracted(&bike);
+    }
+
+    /// Cost-bake bike onto the already-built union contracted graph (`self.contracted`) using
+    /// the configured bike profile. Call after `g.contracted` exists and `node_contraction`
+    /// is on, on every startup (the bake is serde-skipped). No-op if `self.contracted` is None.
+    pub fn bake_bike_on_contracted_default(&mut self) {
+        let bike = self.default_bike_cost();
+        self.bake_bike_on_contracted(&bike);
     }
 
     pub fn to_osm_postcard(&self) -> Result<Vec<u8>, String> {
@@ -145,6 +201,8 @@ impl Graph {
             id_mapper: o.id_mapper,
             raptor: RaptorIndex::new(),
             edge_index: edge_index::EdgeIndex::default(),
+            bike_contracted: None,
+            contracted: None,
         })
     }
 
@@ -186,6 +244,10 @@ impl Graph {
 
     pub fn set_multiobj_contract(&mut self, on: bool) {
         self.raptor.multiobj_contract = on;
+    }
+
+    pub fn set_node_contraction(&mut self, on: bool) {
+        self.raptor.node_contraction = on;
     }
 
     pub fn set_variance_model(&mut self, m: crate::structures::cost::VarianceModel) {
@@ -235,6 +297,14 @@ impl Graph {
 
     pub fn set_vehicle_access_secs(&mut self, secs: u32) {
         self.raptor.vehicle_access_secs = secs;
+    }
+
+    pub fn set_vehicle_access_fraction(&mut self, f: f64) {
+        self.raptor.vehicle_access_fraction = f;
+    }
+
+    pub fn set_vehicle_access_max_secs(&mut self, secs: u32) {
+        self.raptor.vehicle_access_max_secs = secs;
     }
 
     /// Sets reliability bucket edges after validating they are sorted, strictly
@@ -417,9 +487,6 @@ impl Graph {
     }
 
     pub fn nodes_distance(&self, a: NodeID, b: NodeID) -> usize {
-        let node_a = &self.nodes[a.0];
-        let node_b = &self.nodes[b.0];
-
-        (node_a.loc().dist(node_b.loc()) * 0.99) as usize
+        (self.node_loc(a).dist(self.node_loc(b)) * 0.99) as usize
     }
 }

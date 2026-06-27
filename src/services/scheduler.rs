@@ -15,7 +15,9 @@ use crate::ingestion::cache::{
     SourceLocation, gtfs_content_hash, load_feed_hashes, load_last_checked, resolve_source,
     save_feed_hashes, save_input_labels, save_last_checked,
 };
-use crate::services::build::{apply_routing_defaults, build_gtfs_phase, gtfs_input_labels};
+use crate::services::build::{
+    apply_routing_defaults, build_gtfs_phase, finalize_contraction, gtfs_input_labels,
+};
 use crate::services::persistence::{load_osm_graph, save_graph_with_rollback};
 use crate::structures::{Config, Graph, Ingestor};
 
@@ -121,6 +123,9 @@ fn run_update_cycle(graph: &SharedGraph, config: &Config, cache_dir: &str) -> Re
     let mut new_graph = build_gtfs_phase(osm, &config.build, cache_dir, false)
         .ok_or_else(|| "GTFS rebuild failed".to_string())?;
     apply_routing_defaults(&mut new_graph, &config.default_routing);
+    // P3f: drop the interior arrays before persisting + swapping in, else the background
+    // refresh silently reverts the memory win and saves a bloated graph.bin.
+    finalize_contraction(&mut new_graph)?;
 
     save_graph_with_rollback(&new_graph, &config.build.output)?;
     save_feed_hashes(cache_dir, &new_hashes)?;

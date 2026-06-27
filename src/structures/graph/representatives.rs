@@ -275,6 +275,7 @@ mod tests {
     fn path(time: f64, surface: f64) -> ParetoPath {
         ParetoPath {
             nodes: vec![NodeID(0)],
+            edges: Vec::new(),
             cost: CostVector::from_active(&[Axis::Time, Axis::Surface], &[time, surface]),
             elev_buffer: (0.0, 0.0),
         }

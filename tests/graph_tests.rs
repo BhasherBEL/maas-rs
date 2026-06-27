@@ -4946,6 +4946,7 @@ fn raptor_explain_supports_bike_modes() {
         &RealtimeIndex::new(),
         &am,
         &BikeCost::new(BikeProfile::default(), 1.2),
+        None,
     );
     assert!(!res.access.fell_back_to_walk_only);
     assert!(res.plans.iter().any(|p| transit_leg_count(p) == 2));
@@ -5397,5 +5398,1330 @@ fn transit_access_egress_multiobj_alternatives_and_leave_by() {
     assert!(
         egress_leg.is_some(),
         "transit plan must have an egress walk leg with multiobj alternatives"
+    );
+}
+
+// ── P3 node-contraction T2: flag-on == flag-off end-to-end ───────────────────
+
+/// Builds a small transit graph whose street network has long degree-2 chains
+/// between the transit-stop junctions, so the union contraction genuinely
+/// collapses interior nodes. Two bus stops (A, B) sit on OSM junctions joined by
+/// a 6-segment foot/bike/car chain; `origin` and `dest` junctions hang off each
+/// stop by their own short chains. A single bus trip runs A→B.
+fn contraction_t2_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let origin = g.add_node(osm_node("origin", 50.000, 4.0000));
+    let j_a = g.add_node(osm_node("jA", 50.000, 4.0030));
+    let j_b = g.add_node(osm_node("jB", 50.000, 4.0300));
+    let dest = g.add_node(osm_node("dest", 50.000, 4.0330));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.0031));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.0299));
+
+    let bidir = |g: &mut Graph, a: NodeID, b: NodeID, m: usize, car: bool| {
+        let mk = |o: NodeID, d: NodeID| {
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                length: m,
+                partial: false,
+                foot: true,
+                bike: true,
+                car,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        g.add_edge(a, mk(a, b));
+        g.add_edge(b, mk(b, a));
+    };
+
+    // A degree-2 chain of `n` interior OSM nodes from `a` to `b`. `car` gates car
+    // passability of the whole chain (the middle A→B chain is foot/bike-only so a
+    // CarDropOff plan — drive→stop_A, bus→stop_B, walk→dest — survives instead of
+    // being dominated by an all-the-way direct drive).
+    let chain = |g: &mut Graph,
+                 a: NodeID,
+                 b: NodeID,
+                 lon_a: f64,
+                 lon_b: f64,
+                 n: usize,
+                 tag: &str,
+                 car: bool| {
+        let lat = 50.000;
+        let mut prev = a;
+        for i in 0..n {
+            let f = (i + 1) as f64 / (n + 1) as f64;
+            let lon = lon_a + (lon_b - lon_a) * f;
+            let nid = g.add_node(osm_node(&format!("{tag}_{i}"), lat, lon));
+            bidir(g, prev, nid, 100, car);
+            prev = nid;
+        }
+        bidir(g, prev, b, 100, car);
+    };
+
+    chain(&mut g, origin, j_a, 4.0000, 4.0030, 2, "oa", true);
+    chain(&mut g, j_a, j_b, 4.0030, 4.0300, 6, "ab", false);
+    chain(&mut g, j_b, dest, 4.0300, 4.0330, 2, "bd", true);
+
+    // Stop snap edges (partial, foot-only) onto their junctions.
+    let snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        let mut e = |o: NodeID, d: NodeID| {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial: true,
+                    foot: true,
+                    bike: false,
+                    car: false,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        };
+        e(stop, osm);
+        e(osm, stop);
+    };
+    snap(&mut g, stop_a, j_a, 8);
+    snap(&mut g, stop_b, j_b, 8);
+
+    // One bus trip A→B.
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 1 },
+            length: 1900,
+        }),
+    );
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "1".into(),
+        route_long_name: "Bus 1".into(),
+        route_type: RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None,
+        route_id: RouteId(0),
+        service_id: ServiceId(0),
+        bikes_allowed: None,
+    }]);
+    g.add_transit_departures(vec![TripSegment {
+        trip_id: TripId(0),
+        origin_stop_sequence: 0,
+        destination_stop_sequence: 1,
+        departure: 9 * 3600,
+        arrival: 9 * 3600 + 600,
+        service_id: ServiceId(0),
+    }]);
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600,
+            departure: 9 * 3600,
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 600,
+            departure: 9 * 3600 + 600,
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: 1,
+        });
+    }
+
+    g.build_raptor_index();
+    (g, origin, dest)
+}
+
+/// T2 gate: the same RAPTOR query over the SAME graph must yield byte-identical
+/// plans whether routed over the full graph (`node_contraction=false`) or the
+/// union contracted graph (`=true`). Exercises RAPTOR foot access/egress, the
+/// transit core, and (via flag) the contracted walk Dijkstra — including plan
+/// geometry (`build_walk_plan`/`street_path` reconstruction over `g`).
+#[test]
+fn t2_contracted_plans_match_full_graph() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    // Flag off — baseline.
+    let (g_off, origin, dest) = contraction_t2_graph();
+    let off = g_off.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+
+    // Flag on — build the union contracted graph exactly as production does.
+    let (mut g_on, _, _) = contraction_t2_graph();
+    g_on.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g_on);
+    cg.build_seg_index();
+    g_on.contracted = Some(cg);
+
+    // Sanity: contraction actually collapsed interior nodes.
+    let junctions = g_on.contracted.as_ref().unwrap().junction_count();
+    assert!(
+        junctions < g_on.node_count(),
+        "contraction must remove interior nodes (junctions={junctions}, nodes={})",
+        g_on.node_count()
+    );
+
+    let on = g_on.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+
+    use maas_rs::structures::plan::Plan;
+    let cmp = |off: &[Plan], on: &[Plan], label: &str| {
+        assert_eq!(off.len(), on.len(), "{label}: plan count differs");
+        for (a, b) in off.iter().zip(on.iter()) {
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "{label}: contracted plan differs from full-graph plan"
+            );
+        }
+    };
+    assert!(!on.is_empty(), "walk-transit: expected a plan");
+    cmp(&off, &on, "walk-transit");
+
+    // An interior origin (a removed degree-2 chain node) — production snaps to one
+    // ~81% of the time, so this is the realistic input that crosses the
+    // `node_walk_entries` junction-bridge inside the contracted helpers.
+    let interior = {
+        use maas_rs::structures::NodeData;
+        (0..g_on.node_count())
+            .map(NodeID)
+            .find(|&n| {
+                matches!(g_on.get_node(n), Some(NodeData::OsmNode(o)) if o.eid.starts_with("ab_"))
+            })
+            .expect("an interior ab_* chain node")
+    };
+    assert_eq!(
+        g_on.contracted.as_ref().unwrap().junction_of[interior.0],
+        u32::MAX,
+        "ab_* node must be interior (removed), not a junction"
+    );
+    let off_i = g_off.raptor(interior, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    let on_i = g_on.raptor(interior, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    assert!(!on_i.is_empty(), "interior-origin: expected a plan");
+    cmp(&off_i, &on_i, "interior-origin");
+
+    // Direct WALK (step 2): no-transit walk routes over the contracted walk
+    // Dijkstra when on. (Direct CAR cannot cross the foot/bike-only middle chain,
+    // so a car-only plan is unreachable in both — still compared for parity.)
+    for mode in [Mode::Walk, Mode::Car] {
+        let am = ActiveModes::new(&[mode]);
+        let off_d = g_off.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &am);
+        let on_d = g_on.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &am);
+        cmp(&off_d, &on_d, &format!("direct {mode:?}"));
+    }
+    let walk_am = ActiveModes::new(&[Mode::Walk]);
+    assert!(
+        !g_on
+            .raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &walk_am)
+            .is_empty(),
+        "direct walk: expected a plan"
+    );
+
+    // Car-to-transit (step 3): CarDropOff drives to a boarding stop then rides
+    // transit — the only path that exercises `car_nearby_stops` (the hand-rolled
+    // car-access wrapper around `car_dijkstra_union`).
+    let car_am = ActiveModes::new(&[Mode::CarDropOff]);
+    let off_c = g_off.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &car_am);
+    let on_c = g_on.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &car_am);
+    cmp(&off_c, &on_c, "car-drop-off");
+    assert!(
+        on_c
+            .iter()
+            .any(|p| p.mode == Mode::CarDropOff && transit_leg_count(p) >= 1),
+        "car-drop-off must produce a drive→board→transit plan; got {:?}",
+        on_c.iter().map(|p| (p.mode, transit_leg_count(p))).collect::<Vec<_>>()
+    );
+}
+
+/// T4.3 the FINAL g-free proof: route a plan, DROP the interior-node arrays
+/// (`drop_full_node_arrays` — the P3f memory win), then re-route the SAME query and
+/// assert the plan is non-vacuous and BYTE-IDENTICAL to the pre-drop one. Only a
+/// drop-then-route test can catch a lingering `g.nodes`/`g.edges` read that the flag-
+/// on==flag-off gates (which keep `g`) cannot.
+///
+/// SCOPE (honest): **JUNCTION endpoints** via `raptor_modes`/`raptor`, covering direct
+/// Walk, walk-transit, and car-drop-off→transit:
+///   - JUNCTION endpoints (not `route()`/coords): the snapping path is NOT yet g-free
+///     (coord-threading is deferred — `snap_node` still reads the g kdtree), so a
+///     coord-routed post-drop query would error by design. Junctions hit the g-free
+///     `node_walk_entries` junction branch + `junction_coord` geometry.
+///   - Transit legs ARE now g-free: stop coords come from `node_loc` (contracted
+///     `junction_coord`) and the `timetable_segment` from the precomputed
+///     `transit_pattern_segment_timetables` side-table — so transit-leg reconstruction
+///     and `previous_departures` no longer read `g`. This gate proves traversal +
+///     geometry + reconstruction are g-free for every junction-routed mode.
+#[test]
+fn t4_drop_g_then_route_identical() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let (mut g, origin, dest) = contraction_t2_graph();
+    // `origin`/`dest` are degree-1 chain ends ⇒ junctions; routing from them avoids the
+    // (not-yet-g-free) snapping path.
+    g.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+
+    assert!(
+        g.contracted.as_ref().unwrap().junction_of[origin.0] != u32::MAX,
+        "origin must be a junction"
+    );
+
+    use maas_rs::structures::plan::Plan;
+    let dbg = |ps: &[Plan]| ps.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>();
+
+    // Plans BEFORE the drop (contracted, g still present): direct Walk, walk-transit
+    // (RAPTOR core + transit-leg reconstruction), and car-drop-off (drive→board→ride,
+    // exercising the `previous_departures` timetable lookup in transit.rs).
+    let walk = ActiveModes::new(&[Mode::Walk]);
+    let before_walk = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &walk);
+    let before_transit = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    let car = ActiveModes::new(&[Mode::CarDropOff]);
+    let before_car = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &car);
+    assert!(!before_walk.is_empty(), "pre-drop: expected a Walk plan");
+    assert!(
+        before_transit.iter().any(|p| transit_leg_count(p) >= 1),
+        "pre-drop: expected a transit plan"
+    );
+    assert!(
+        before_car.iter().any(|p| p.mode == Mode::CarDropOff && transit_leg_count(p) >= 1),
+        "pre-drop: expected a car-drop-off→transit plan"
+    );
+
+    // THE IRREVERSIBLE STEP: free the interior-node arrays.
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "node arrays must be empty after the drop");
+
+    // Re-route the SAME queries against the dropped graph — must not panic, must match.
+    let after_walk = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &walk);
+    let after_transit = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    let after_car = g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &car);
+    assert_eq!(
+        dbg(&before_walk),
+        dbg(&after_walk),
+        "post-drop Walk plan must equal the pre-drop contracted plan"
+    );
+    assert_eq!(
+        dbg(&before_transit),
+        dbg(&after_transit),
+        "post-drop walk-transit plan must equal pre-drop (g-free transit-leg reconstruction)"
+    );
+    assert_eq!(
+        dbg(&before_car),
+        dbg(&after_car),
+        "post-drop car-drop-off→transit plan must equal pre-drop (g-free previous_departures)"
+    );
+}
+
+/// EXPLAIN drop gate: the `raptorExplain` survey (`stops_reached` + per-leg path
+/// geometry) and plan stop-name/coord resolution read `g.nodes` for transit-stop
+/// names + coordinates. After `drop_full_node_arrays()` empties `g.nodes`, those reads
+/// panic (the live-server crash this fix targets). With the serialized
+/// `transit_stop_names` + `node_loc`, `route_explain` must (a) not panic post-drop and
+/// (b) be byte-identical pre/post drop. The literal-name assertion below additionally
+/// guards a *consistently-wrong* names field (which equality alone would pass).
+#[test]
+fn t4_explain_drop_gate_identical() {
+    use maas_rs::routing::routing_raptor::route_explain;
+    use maas_rs::structures::contraction::ContractedGraph;
+    use maas_rs::structures::plan::PlanNode;
+    use chrono::{NaiveDate, NaiveTime};
+
+    let (mut g, _origin, _dest) = contraction_t2_graph();
+    g.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+    g.bake_bike_on_contracted_default();
+
+    // Stop A / Stop B are the 5th/6th nodes added in `contraction_t2_graph`.
+    let (stop_a, stop_b) = (NodeID(4), NodeID(5));
+
+    // Coord query spanning origin→dest so RAPTOR reaches the stops (walk-transit).
+    let q = RouteQuery {
+        from_lat: 50.000,
+        from_lng: 4.0000,
+        to_lat: 50.000,
+        to_lng: 4.0330,
+        date: NaiveDate::from_ymd_opt(2026, 6, 23).unwrap(),
+        time: NaiveTime::from_hms_opt(8, 50, 0).unwrap(),
+        window_minutes: None,
+        min_access_secs: Some(600),
+        arrival_slack_secs: None,
+        reliability_bucket_edges: None,
+        modes: Some(vec![Mode::Walk, Mode::WalkTransit]),
+        bike_profile: None,
+        terminal_deadline: false,
+    };
+
+    let before = route_explain(&g, &q, &RealtimeIndex::new()).expect("pre-drop explain");
+    assert!(
+        !before.stops_reached.is_empty(),
+        "explain must reach the bus stops pre-drop"
+    );
+    // Names must come through populated (not the consistently-wrong empty string).
+    assert!(
+        before.stops_reached.iter().any(|s| s.name == "Stop A"),
+        "stops_reached must carry the literal stop name pre-drop"
+    );
+
+    // Plan-node resolution (the GraphQL render layer) for a transit stop.
+    let node_before = PlanNode::from_node_id(&g, stop_a).expect("plan node pre-drop");
+    assert!(
+        format!("{node_before:?}").contains("Stop A"),
+        "PlanNode must carry the transit-stop name pre-drop"
+    );
+
+    // THE IRREVERSIBLE STEP.
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "arrays dropped");
+
+    let after = route_explain(&g, &q, &RealtimeIndex::new())
+        .expect("post-drop explain must not panic/error");
+    assert_eq!(
+        format!("{:?}", before.stops_reached),
+        format!("{:?}", after.stops_reached),
+        "explain stops_reached must be byte-identical pre/post drop"
+    );
+    assert_eq!(
+        before.plans.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>(),
+        after.plans.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>(),
+        "explain plans must be byte-identical pre/post drop"
+    );
+
+    // Direct plan-node assertions post-drop: name from `transit_stop_names`, coord from
+    // `node_loc` (stops are junctions). Equality + literal-name catches a silent vanish.
+    for (stop, want) in [(stop_a, "Stop A"), (stop_b, "Stop B")] {
+        let node_after = PlanNode::from_node_id(&g, stop).expect("plan node post-drop");
+        assert!(
+            format!("{node_after:?}").contains(want),
+            "post-drop PlanNode must carry {want} (g-free transit_stop_names)"
+        );
+    }
+    assert_eq!(
+        format!("{node_before:?}"),
+        format!("{:?}", PlanNode::from_node_id(&g, stop_a).unwrap()),
+        "PlanNode must be byte-identical pre/post drop"
+    );
+
+    // `gtfsStops` is a separate live GraphQL query (not on the explain call graph), so
+    // it needs its own post-drop assertion: it must not panic and must carry both stop
+    // names with their coordinates from `transit_stop_names` + `node_loc`.
+    let stops = g.gtfs_stops();
+    assert!(
+        stops.iter().any(|(_, name, lat, _, _)| name == "Stop A" && *lat != 0.0),
+        "gtfs_stops must carry Stop A name + coord post-drop (g-free)"
+    );
+    assert!(
+        stops.iter().any(|(_, name, _, _, _)| name == "Stop B"),
+        "gtfs_stops must carry Stop B name post-drop (g-free)"
+    );
+}
+
+/// ENUMERATION (exploratory, ignored): drop `g`, then attempt EVERY junction-routed
+/// mode inside `catch_unwind` so every remaining `g.nodes`/`g.edges` read surfaces at
+/// once as a panic with its location — converting the "which paths still read g?"
+/// unknown into a complete list before the mechanical g-free work. Prints a table; does
+/// not assert. Run: `cargo test --test graph_tests t4_enumerate_g_reads -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn t4_enumerate_g_reads_after_drop() {
+    use maas_rs::structures::contraction::ContractedGraph;
+    use std::panic::{self, AssertUnwindSafe};
+
+    let (mut g, origin, dest) = contraction_t2_graph();
+    g.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "arrays dropped");
+
+    // Silence the default panic printer so the table is readable; capture the location.
+    use std::sync::{Arc, Mutex};
+    let loc: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let loc_h = loc.clone();
+    panic::set_hook(Box::new(move |info| {
+        if let Some(l) = info.location() {
+            *loc_h.lock().unwrap() = format!("{}:{}", l.file(), l.line());
+        }
+    }));
+    let run = |label: &str, f: &dyn Fn() -> usize| {
+        let res = panic::catch_unwind(AssertUnwindSafe(f));
+        match res {
+            Ok(n) => println!("  OK    {label:24} -> {n} plan(s)"),
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("<non-string panic>");
+                println!("  PANIC {label:24} -> {msg}  @ {}", loc.lock().unwrap());
+            }
+        }
+    };
+
+    println!("=== g-read enumeration (junction-routed, post-drop) ===");
+    for (label, am) in [
+        ("walk", ActiveModes::new(&[Mode::Walk])),
+        ("bike", ActiveModes::new(&[Mode::Bike])),
+        ("car", ActiveModes::new(&[Mode::Car])),
+    ] {
+        run(label, &|| {
+            g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &am).len()
+        });
+    }
+    run("walk-transit (raptor)", &|| {
+        g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60).len()
+    });
+    run("car-drop-off", &|| {
+        let am = ActiveModes::new(&[Mode::CarDropOff]);
+        g.raptor_modes(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60, &am).len()
+    });
+    let _ = panic::take_hook();
+}
+
+/// LOCAL CUTOVER SMOKE TEST against the real dropped graph. Loads the v9
+/// `graph_on.bin` (node_contraction build, interior arrays dropped), mirrors
+/// production startup (set the flag + re-bake the serde-skipped bike cost), then
+/// routes the cutover script's OD pairs through the FULL production `route()` path
+/// (snap → RAPTOR → enrichment) and asserts no panic — catching g-reads the
+/// synthetic oracles miss because they never produce real transit plans with
+/// access/egress walk-leg enrichment. Run:
+///   cargo test --release --test graph_tests cutover_real_dropped_graph -- --ignored --nocapture
+#[test]
+#[ignore]
+fn cutover_real_dropped_graph_no_panic() {
+    use chrono::{NaiveDate, NaiveTime};
+    use maas_rs::routing::routing_raptor::{route, RouteQuery};
+    use maas_rs::services::persistence::load_graph;
+    use maas_rs::structures::cost::{LegRole, RoutingMode};
+    use maas_rs::structures::{BikeCost, BikeProfile, Config, RealtimeIndex};
+
+    let rt = RealtimeIndex::new();
+    let date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
+    let time = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+    // Transit OD pairs (RAPTOR-dominated): exercise access/egress + reconstruction.
+    let ods = [
+        (50.846, 4.352, 50.881, 4.717),
+        (50.880, 4.702, 50.846, 4.352),
+        (50.860, 4.360, 50.900, 4.480),
+        (50.821, 4.392, 50.901, 4.484),
+        (51.035, 3.710, 51.210, 4.416),
+    ];
+    // Short street OD pairs (~1-3 km): a pure point-to-point street search is where
+    // node contraction's fewer-nodes win actually shows (no RAPTOR transit loop to
+    // dominate). Long cross-Belgium pairs are avoided (direct Pareto safety net).
+    let street_ods = [
+        (50.846, 4.352, 50.860, 4.360),
+        (50.880, 4.702, 50.870, 4.690),
+        (51.035, 3.710, 51.050, 3.730),
+    ];
+
+    // Per-flag captured metrics for an OFF↔ON comparison.
+    let mut transit_end = [[0u32; 5]; 2];
+    let mut transit_ms = [[0f64; 5]; 2];
+    let mut street_ms = [[0f64; 3]; 2]; // walk+bike summed per pair
+
+    for (fi, &(label, path, flag)) in [
+        ("OFF", "graph_off.bin", false),
+        ("ON", "graph_on.bin", true),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut g = load_graph(path).expect(path);
+        let mut config = Config::load("config.yaml").expect("config.yaml");
+        config.default_routing.node_contraction = Some(flag);
+        maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+        let bike = BikeCost::new(BikeProfile::default(), g.raptor.walking_speed_mps);
+        eprintln!("=== {} ({}, node_count={}) ===", label, path, g.node_count());
+
+        for (i, &(fl, fg, tl, tg)) in ods.iter().enumerate() {
+            let q = RouteQuery {
+                from_lat: fl, from_lng: fg, to_lat: tl, to_lng: tg,
+                date, time,
+                window_minutes: None, min_access_secs: None, arrival_slack_secs: None,
+                reliability_bucket_edges: None, modes: None, bike_profile: None,
+                terminal_deadline: false,
+            };
+            let t = std::time::Instant::now();
+            let plans = route(&g, &q, &rt).expect("route must not error");
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            let best_end = plans.iter().map(|p| p.end).min().unwrap_or(0);
+            transit_end[fi][i] = best_end;
+            transit_ms[fi][i] = ms;
+            eprintln!("transit OD {}: {} plans  end={}  wall={:.1}ms", i + 1, plans.len(), best_end, ms);
+        }
+
+        for (i, &(fl, fg, tl, tg)) in street_ods.iter().enumerate() {
+            let o = g.nearest_node(fl, fg).expect("origin snaps");
+            let d = g.nearest_node(tl, tg).expect("dest snaps");
+            let mut sum = 0.0;
+            for mode in [RoutingMode::Walk, RoutingMode::Bike] {
+                let t = std::time::Instant::now();
+                let _ = g.multiobj_direct_plan(o, d, mode, LegRole::Neutral, &bike, 28_800);
+                sum += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            street_ms[fi][i] = sum;
+            eprintln!("street OD {}: walk+bike wall={:.1}ms", i + 1, sum);
+        }
+    }
+
+    // OD3 access-stop set: node-snap (= OFF foot access) vs edge-snap (= ON production),
+    // both on the ON graph. Quantifies the arrival-time regression: a differing reachable
+    // set (or differing access secs for shared stops) moves the boarded train.
+    {
+        let mut g = load_graph("graph_on.bin").expect("graph_on.bin");
+        let mut config = Config::load("config.yaml").expect("config.yaml");
+        config.default_routing.node_contraction = Some(true);
+        maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+        let secs = g.raptor.min_access_secs;
+        let radius = g.raptor.edge_snap_radius_m;
+        let (fl, fg) = (50.860, 4.360);
+        let origin = g.nearest_node(fl, fg).expect("origin");
+        let node_snap: std::collections::HashMap<usize, u32> =
+            g.nearby_stops(origin, secs).into_iter().collect();
+        let cg = g.contracted.as_ref().expect("cg");
+        let edge_snap: std::collections::HashMap<usize, u32> =
+            cg.nearby_stops_arena(&g, fl, fg, radius, secs).into_iter().collect();
+        let only_node: Vec<_> = node_snap.keys().filter(|k| !edge_snap.contains_key(k)).collect();
+        let only_edge: Vec<_> = edge_snap.keys().filter(|k| !node_snap.contains_key(k)).collect();
+        let mut shared_diff = 0;
+        for (k, &ns) in &node_snap {
+            if let Some(&es) = edge_snap.get(k) {
+                if ns.abs_diff(es) > 30 {
+                    shared_diff += 1;
+                }
+            }
+        }
+        eprintln!(
+            "=== OD3 access diff (secs={}): node-snap={} edge-snap={} | only_node={} only_edge={} shared_secs_diff>30s={}",
+            secs, node_snap.len(), edge_snap.len(), only_node.len(), only_edge.len(), shared_diff
+        );
+    }
+
+    eprintln!("\n========== OFF vs ON ==========");
+    for i in 0..5 {
+        eprintln!(
+            "transit OD {}: end OFF={} ON={} (Δ={:+}s)  wall OFF={:.0}ms ON={:.0}ms",
+            i + 1, transit_end[0][i], transit_end[1][i],
+            transit_end[1][i] as i64 - transit_end[0][i] as i64,
+            transit_ms[0][i], transit_ms[1][i],
+        );
+    }
+    for i in 0..3 {
+        let (off, on) = (street_ms[0][i], street_ms[1][i]);
+        eprintln!(
+            "street  OD {}: wall OFF={:.1}ms ON={:.1}ms  speedup={:.2}x",
+            i + 1, off, on, if on > 0.0 { off / on } else { 0.0 }
+        );
+    }
+}
+
+/// DROP GATE for transit plans: loads the real `graph_on.bin`, mirrors production
+/// startup (flag on + re-bake), routes the cutover OD pairs ONCE with g present
+/// (baseline), then `drop_full_node_arrays()` and routes them AGAIN — asserting no
+/// panic AND byte-identical plans. This is the oracle for re-enabling the P3f memory
+/// drop: it exercises real transit access/egress walk-leg ENRICHMENT (the surface the
+/// junction-endpoint oracles never reach), which still reads `g` via `path_edges`.
+///   cargo test --release --test graph_tests transit_enrich_drop_gate -- --ignored --nocapture
+#[test]
+#[ignore]
+fn transit_enrich_drop_gate() {
+    use chrono::{NaiveDate, NaiveTime};
+    use maas_rs::routing::routing_raptor::{route, RouteQuery};
+    use maas_rs::services::persistence::load_graph;
+    use maas_rs::structures::{Config, RealtimeIndex};
+
+    use maas_rs::structures::Mode;
+
+    let mut g = load_graph("graph_on.bin").expect("graph_on.bin");
+    let mut config = Config::load("config.yaml").expect("config.yaml");
+    config.default_routing.node_contraction = Some(true);
+    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+
+    let rt = RealtimeIndex::new();
+    let date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
+    let time = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+    let ods = [
+        (50.846, 4.352, 50.881, 4.717),
+        (50.880, 4.702, 50.846, 4.352),
+        (50.860, 4.360, 50.900, 4.480),
+        (50.821, 4.392, 50.901, 4.484),
+        (51.035, 3.710, 51.210, 4.416),
+    ];
+    let q = |fl, fg, tl, tg, modes: Option<Vec<Mode>>| RouteQuery {
+        from_lat: fl, from_lng: fg, to_lat: tl, to_lng: tg,
+        date, time,
+        window_minutes: None, min_access_secs: None, arrival_slack_secs: None,
+        reliability_bucket_edges: None, modes, bike_profile: None,
+        terminal_deadline: false,
+    };
+
+    let before: Vec<_> = ods
+        .iter()
+        .map(|&(fl, fg, tl, tg)| route(&g, &q(fl, fg, tl, tg, None), &rt).expect("pre-drop route"))
+        .collect();
+
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "g dropped");
+
+    for (i, &(fl, fg, tl, tg)) in ods.iter().enumerate() {
+        let after = route(&g, &q(fl, fg, tl, tg, None), &rt).expect("post-drop route must not error");
+        assert_eq!(
+            after.len(), before[i].len(),
+            "OD {}: plan count changed post-drop ({} -> {})", i + 1, before[i].len(), after.len()
+        );
+        for (b, a) in before[i].iter().zip(&after) {
+            assert_eq!(a.end, b.end, "OD {}: arrival changed post-drop", i + 1);
+            assert_eq!(a.legs.len(), b.legs.len(), "OD {}: leg count changed post-drop", i + 1);
+        }
+        eprintln!("OD {}: {} plans identical pre/post drop", i + 1, after.len());
+    }
+
+    // Multi-mode no-panic check post-drop: bike-to-transit and park&ride exercise the
+    // bike/car access + enrichment paths the default walk-transit query never touches.
+    for (label, modes) in [
+        ("bike-to-transit", vec![Mode::WalkTransit, Mode::BikeToTransit]),
+        ("park&ride", vec![Mode::WalkTransit, Mode::CarDropOff]),
+    ] {
+        for (i, &(fl, fg, tl, tg)) in ods.iter().enumerate() {
+            let _ = route(&g, &q(fl, fg, tl, tg, Some(modes.clone())), &rt)
+                .unwrap_or_else(|e| panic!("post-drop {label} OD {} errored: {e:?}", i + 1));
+        }
+        eprintln!("{label}: 5 ODs routed post-drop, no panic");
+    }
+}
+
+/// Master synthetic oracle: proves the entire served query surface (all 6 modes,
+/// route_explain, gtfs_stops) is g-free after drop_full_node_arrays() on the
+/// contracted synthetic fixture. Runs in-suite without graph_on.bin.
+///
+/// GATE RESULT (2026-06-26): Walk/Bike/Car/WalkTransit/CarDropOff are byte-identical
+/// pre/post drop. BikeToTransit diverges (plan end 33262→32879): the bike-access-leg
+/// enrichment still reads g.edges via path_edges. Task 3 fixes this path.
+#[test]
+fn all_modes_drop_gate_identical() {
+    use chrono::{NaiveDate, NaiveTime};
+    use maas_rs::routing::routing_raptor::route_explain;
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let (mut g, _origin, _dest) = contraction_t2_graph();
+    g.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+    g.bake_bike_on_contracted_default();
+
+    let rt = RealtimeIndex::new();
+    let date = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+    let time = NaiveTime::from_hms_opt(8, 50, 0).unwrap();
+
+    let q = |modes: Option<Vec<Mode>>| RouteQuery {
+        from_lat: 50.000,
+        from_lng: 4.000,
+        to_lat: 50.000,
+        to_lng: 4.033,
+        date,
+        time,
+        window_minutes: None,
+        min_access_secs: Some(600),
+        arrival_slack_secs: None,
+        reliability_bucket_edges: None,
+        modes,
+        bike_profile: None,
+        terminal_deadline: false,
+    };
+
+    let all_modes = [
+        vec![Mode::Walk],
+        vec![Mode::Bike],
+        vec![Mode::Car],
+        vec![Mode::WalkTransit],
+        vec![Mode::BikeToTransit],
+        vec![Mode::CarDropOff],
+    ];
+
+    let before: Vec<Vec<_>> = all_modes
+        .iter()
+        .map(|m| route(&g, &q(Some(m.clone())), &rt).expect("pre-drop route must succeed"))
+        .collect();
+    let before_explain = route_explain(&g, &q(None), &rt);
+    let before_stops = g.gtfs_stops();
+
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "node arrays must be empty after drop");
+
+    fn leg_geometry(leg: &PlanLeg) -> &Vec<maas_rs::structures::plan::PlanCoordinate> {
+        match leg {
+            PlanLeg::Transit(l) => &l.geometry,
+            PlanLeg::Walk(l) => &l.geometry,
+        }
+    }
+
+    let mut diverged: Vec<String> = Vec::new();
+    for (i, m) in all_modes.iter().enumerate() {
+        let after = route(&g, &q(Some(m.clone())), &rt)
+            .unwrap_or_else(|e| panic!("mode {m:?} errored post-drop: {e:?}"));
+        if after.len() != before[i].len() {
+            diverged.push(format!("{m:?} plan count {} -> {}", before[i].len(), after.len()));
+            continue;
+        }
+        for (p, (b, a)) in before[i].iter().zip(&after).enumerate() {
+            if a.end != b.end {
+                diverged.push(format!("{m:?} plan {p} end {} -> {}", b.end, a.end));
+            }
+            if a.legs.len() != b.legs.len() {
+                diverged.push(format!(
+                    "{m:?} plan {p} leg count {} -> {}",
+                    b.legs.len(),
+                    a.legs.len()
+                ));
+            } else {
+                for (j, (bl, al)) in b.legs.iter().zip(&a.legs).enumerate() {
+                    let bg = leg_geometry(bl);
+                    let ag = leg_geometry(al);
+                    if format!("{bg:?}") != format!("{ag:?}") {
+                        diverged.push(format!("{m:?} plan {p} leg {j} geometry differs"));
+                    }
+                }
+            }
+        }
+    }
+
+    let after_explain = route_explain(&g, &q(None), &rt);
+    if format!("{:?}", before_explain) != format!("{:?}", after_explain) {
+        diverged.push("route_explain diverged".to_string());
+    }
+
+    let after_stops = g.gtfs_stops();
+    if format!("{:?}", before_stops) != format!("{:?}", after_stops) {
+        diverged.push("gtfs_stops diverged".to_string());
+    }
+
+    assert!(
+        diverged.is_empty(),
+        "post-drop g-reads detected (Task 3 fixes these): {:?}",
+        diverged
+    );
+}
+
+/// P3f drop gate: `gtfs_agencies_with_routes()` reads only `raptor.*` so it must
+/// be g-free. Assert it returns byte-identical output pre/post `drop_full_node_arrays()`.
+/// Also asserts the function returns the agency name + its route, so the test is not
+/// vacuous: the fixture adds one agency before the drop.
+#[test]
+fn gtfs_agencies_drop_gate_identical() {
+    use maas_rs::ingestion::gtfs::AgencyInfo;
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let (mut g, _origin, _dest) = contraction_t2_graph();
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "TestBus".into(),
+        url: "https://test.example".into(),
+        timezone: "Europe/Brussels".into(),
+    }]);
+    g.set_node_contraction(true);
+    let mut cg = ContractedGraph::from_graph_union(&g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+    g.bake_bike_on_contracted_default();
+
+    let before = g.gtfs_agencies_with_routes();
+    assert!(
+        before.iter().any(|(_, name, _, routes)| name == "TestBus" && !routes.is_empty()),
+        "pre-drop agencies must contain TestBus with at least one route"
+    );
+
+    g.drop_full_node_arrays();
+    assert_eq!(g.node_count(), 0, "g arrays dropped");
+
+    let after = g.gtfs_agencies_with_routes();
+    assert_eq!(
+        format!("{:?}", before),
+        format!("{:?}", after),
+        "gtfs_agencies_with_routes must be byte-identical pre/post drop"
+    );
+}
+
+/// Unit test for the `finalize_contraction` state-machine guard.
+/// Exercises all four cases: happy-path drop, idempotent re-call, dangerous
+/// contraction-off-but-already-dropped (Err), and normal contraction-off (no-op Ok).
+#[test]
+fn finalize_contraction_guard() {
+    use maas_rs::services::build::finalize_contraction;
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    // (a) Happy path: node_contraction on + contracted present + nodes present.
+    // finalize_contraction must drop interior arrays and return Ok.
+    {
+        let (mut g, _, _) = contraction_t2_graph();
+        let node_count_before = g.node_count();
+        assert!(node_count_before > 0, "fixture must have nodes before drop");
+        g.set_node_contraction(true);
+        let mut cg = ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+
+        let result = finalize_contraction(&mut g);
+        assert!(result.is_ok(), "happy-path finalize must return Ok; got {:?}", result);
+        assert_eq!(g.node_count(), 0, "finalize must drop interior arrays");
+    }
+
+    // (b) Idempotent: node_contraction on + contracted present + already dropped.
+    // Calling finalize_contraction again must return Ok and leave node_count at 0.
+    {
+        let (mut g, _, _) = contraction_t2_graph();
+        g.set_node_contraction(true);
+        let mut cg = ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        finalize_contraction(&mut g).expect("first call");
+        assert_eq!(g.node_count(), 0, "first call dropped");
+
+        let result = finalize_contraction(&mut g);
+        assert!(result.is_ok(), "idempotent second call must return Ok; got {:?}", result);
+        assert_eq!(g.node_count(), 0, "node_count must remain 0 after idempotent call");
+    }
+
+    // (c) Dangerous case: nodes already dropped, contracted present, but contraction OFF.
+    // finalize_contraction must return Err (graph cannot serve full routing).
+    {
+        let (mut g, _, _) = contraction_t2_graph();
+        g.set_node_contraction(true);
+        let mut cg = ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        finalize_contraction(&mut g).expect("drop");
+        assert_eq!(g.node_count(), 0);
+
+        g.set_node_contraction(false);
+        let result = finalize_contraction(&mut g);
+        assert!(
+            result.is_err(),
+            "dropped graph with contraction=off must return Err; got {:?}", result
+        );
+    }
+
+    // (d) Normal off: node_contraction off + nodes present + no contracted graph.
+    // finalize_contraction must return Ok and NOT drop (node_count unchanged).
+    {
+        let (mut g, _, _) = contraction_t2_graph();
+        let count_before = g.node_count();
+        assert!(count_before > 0, "fixture must have nodes");
+
+        let result = finalize_contraction(&mut g);
+        assert!(result.is_ok(), "normal-off finalize must return Ok; got {:?}", result);
+        assert_eq!(g.node_count(), count_before, "normal-off must not drop nodes");
+    }
+}
+
+/// Equivalence test: `bike_dijkstra_union` (arena) matches `bike_cost_dijkstra` (full
+/// graph) for both access (from S1) and egress (from S2) over a multi-segment
+/// super-edge with a BEND at I1 and non-zero `elev_delta` on every segment.
+/// g is PRESENT (not dropped) so `bike_dijkstra_union` is called directly —
+/// not via the dispatch in `bike_nearby_stops` — making this the RED canary that
+/// fails to compile until the function is implemented.
+#[test]
+fn bike_nearby_stops_arena_matches_g() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let mut g = Graph::new();
+
+    let s1 = g.add_node(transit_stop("S1", 50.000, 4.000));
+    let i1 = g.add_node(osm_node("I1", 50.001, 4.001));
+    let i2 = g.add_node(osm_node("I2", 50.001, 4.002));
+    let s2 = g.add_node(transit_stop("S2", 50.000, 4.003));
+
+    let mk = |o: NodeID, d: NodeID, len: usize, elev: i16| {
+        EdgeData::Street(StreetEdgeData {
+            origin: o,
+            destination: d,
+            length: len,
+            partial: false,
+            foot: true,
+            bike: true,
+            car: false,
+            attrs: bike_attrs(HighwayClass::Cycleway, true, Surface::Paved),
+            elev_delta: elev,
+            surface_speed: 100,
+            var_gen: VarGen::NONE,
+        })
+    };
+
+    g.add_edge(s1, mk(s1, i1, 150, 5));
+    g.add_edge(i1, mk(i1, s1, 150, -5));
+    g.add_edge(i1, mk(i1, i2, 120, -3));
+    g.add_edge(i2, mk(i2, i1, 120, 3));
+    g.add_edge(i2, mk(i2, s2, 130, 8));
+    g.add_edge(s2, mk(s2, i2, 130, -8));
+
+    g.build_raptor_index();
+
+    let bc = BikeCost::new(BikeProfile::default(), 1.2);
+    let max_secs = 3600u32;
+
+    let collect = |times: HashMap<NodeID, u32>, tnts: &Vec<u32>| {
+        let mut stops: Vec<(usize, u32)> = times
+            .iter()
+            .filter_map(|(&node, &secs)| {
+                let c = tnts[node.0];
+                (c != u32::MAX).then_some((c as usize, secs))
+            })
+            .collect();
+        stops.sort_unstable_by_key(|&(s, _)| s);
+        stops
+    };
+
+    let tnts = g.raptor.transit_node_to_stop.clone();
+    let full_s1 = collect(g.bike_cost_dijkstra(s1, max_secs, &bc), &tnts);
+    let full_s2 = collect(g.bike_cost_dijkstra(s2, max_secs, &bc), &tnts);
+
+    g.set_node_contraction(true);
+    let cg = ContractedGraph::from_graph_union(&g);
+
+    let se = cg
+        .super_edge(s1, i1)
+        .expect("S1->S2 super-edge via I1");
+    assert!(
+        se.seg_len >= 2,
+        "fixture must keep a multi-segment super-edge to exercise corner/elevation replay (seg_len={})",
+        se.seg_len
+    );
+
+    let arena_s1 = collect(g.bike_dijkstra_union(s1, max_secs, &bc, &cg), &tnts);
+    let arena_s2 = collect(g.bike_dijkstra_union(s2, max_secs, &bc, &cg), &tnts);
+
+    assert_eq!(full_s1, arena_s1, "access from S1: arena must match full graph");
+    assert_eq!(full_s2, arena_s2, "egress from S2: arena must match full graph");
+}
+
+/// Diagnostic: attempt to force `bike_dijkstra_union` (arena) and `bike_cost_dijkstra`
+/// (full graph) to disagree on a stop's arrival time via the "diamond tie-break" mechanism.
+///
+/// Mechanism under test: a diamond O→M1→S and O→M2→S where
+///   cost(O→M1) == cost(O→M2)  [exact u64 tie, forces tiebreak by id]
+///   cost(O→M1→S) == cost(O→M2→S)  [also tied, so second-place winner can't update S]
+///   time(O→M1→S) != time(O→M2→S)  [different arrivals → divergence if different id wins]
+///
+/// For divergence to occur the two searches must pop M1/M2 in OPPOSITE order:
+///   full-graph heaps by (cost, NodeID, …) → M1 pops first when M1.0 < M2.0
+///   arena heaps by    (cost, ji, …)       → M2 pops first when ji(M2) < ji(M1)
+///
+/// BUT: ContractedGraph::build() iterates `for u in 0..n` (ascending NodeID) and pushes
+/// non-interior nodes into `junctions` in encounter order, so ji is strictly monotone with
+/// NodeID: ji(M1) < ji(M2) iff M1.0 < M2.0. The orderings are IDENTICAL. Inversion is
+/// impossible and the mechanism can never fire. This test constructs the tightest possible
+/// diamond (exact u64 cost tie on both hops) and confirms both searches agree.
+#[test]
+#[ignore]
+fn bike_cost_tie_divergence_demo() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let mut g = Graph::new();
+
+    let o = g.add_node(osm_node("o", 50.000, 4.000));
+    let m1 = g.add_node(osm_node("m1", 50.001, 4.001));
+    let m2 = g.add_node(osm_node("m2", 49.999, 4.001));
+    let s = g.add_node(transit_stop("S", 50.000, 4.002));
+
+    assert!(o.0 < m1.0 && m1.0 < m2.0, "NodeID ordering: O < M1 < M2");
+
+    let cyc_attrs = bike_attrs(HighwayClass::Cycleway, true, Surface::Paved);
+    let prim_attrs = bike_attrs(HighwayClass::Primary, false, Surface::Paved);
+
+    let mk = |origin: NodeID, dest: NodeID, attrs: BikeAttrs, len: usize| {
+        EdgeData::Street(StreetEdgeData {
+            origin,
+            destination: dest,
+            length: len,
+            partial: false,
+            foot: true,
+            bike: true,
+            car: false,
+            attrs,
+            elev_delta: 0,
+            surface_speed: 100,
+            var_gen: VarGen::NONE,
+        })
+    };
+
+    g.add_edge(o, mk(o, m1, cyc_attrs, 110));
+    g.add_edge(o, mk(o, m2, prim_attrs, 30));
+    g.add_edge(m1, mk(m1, s, cyc_attrs, 22));
+    g.add_edge(m2, mk(m2, s, prim_attrs, 6));
+    g.add_edge(s, mk(s, m1, cyc_attrs, 22));
+    g.add_edge(s, mk(s, m2, prim_attrs, 6));
+
+    g.build_raptor_index();
+
+    let mut p = BikeProfile::default();
+    p.turncost = 0.0;
+    let bc = BikeCost::new(p, 1.2);
+
+    let cf_cyc: f64 = 0.5 + 1.0;
+    let cf_prim: f64 = 0.5 + 3.0 + 2.0;
+    let cost_o_m1 = (110.0_f64 * cf_cyc * 1000.0) as u64;
+    let cost_o_m2 = (30.0_f64 * cf_prim * 1000.0) as u64;
+    let cost_m1_s = (22.0_f64 * cf_cyc * 1000.0) as u64;
+    let cost_m2_s = (6.0_f64 * cf_prim * 1000.0) as u64;
+    assert_eq!(cost_o_m1, cost_o_m2, "first-hop cost tie must be exact");
+    assert_eq!(cost_m1_s, cost_m2_s, "second-hop cost tie must be exact");
+
+    let t_o_m1 = bc.edge_time(&StreetEdgeData {
+        origin: o, destination: m1, length: 110, partial: false,
+        foot: true, bike: true, car: false, attrs: cyc_attrs,
+        elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+    });
+    let t_m1_s = bc.edge_time(&StreetEdgeData {
+        origin: m1, destination: s, length: 22, partial: false,
+        foot: true, bike: true, car: false, attrs: cyc_attrs,
+        elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+    });
+    let t_o_m2 = bc.edge_time(&StreetEdgeData {
+        origin: o, destination: m2, length: 30, partial: false,
+        foot: true, bike: true, car: false, attrs: prim_attrs,
+        elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+    });
+    let t_m2_s = bc.edge_time(&StreetEdgeData {
+        origin: m2, destination: s, length: 6, partial: false,
+        foot: true, bike: true, car: false, attrs: prim_attrs,
+        elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+    });
+    let time_via_m1 = t_o_m1 + t_m1_s;
+    let time_via_m2 = t_o_m2 + t_m2_s;
+    assert_ne!(time_via_m1, time_via_m2, "arrival times must differ (different path lengths)");
+
+    let full = g.bike_cost_dijkstra(o, 3600, &bc);
+    let full_s = full.get(&s).copied();
+
+    g.set_node_contraction(true);
+    let cg = ContractedGraph::from_graph_union(&g);
+
+    let ji_m1 = cg.junction_of[m1.0];
+    let ji_m2 = cg.junction_of[m2.0];
+    assert!(
+        ji_m1 < ji_m2,
+        "ji order must track NodeID order (ji_m1={ji_m1} ji_m2={ji_m2}): inversion is impossible"
+    );
+
+    let arena = g.bike_dijkstra_union(o, 3600, &bc, &cg);
+    let arena_s = arena.get(&s).copied();
+
+    assert_eq!(
+        full_s, arena_s,
+        "both searches must agree on S arrival despite exact cost tie: \
+        divergence requires ji order to invert NodeID order, which cannot happen \
+        (ji is assigned in ascending NodeID scan)"
+    );
+
+    assert_eq!(
+        full_s,
+        Some(time_via_m1),
+        "M1 (lower NodeID/ji) wins the tie in BOTH searches → arrival = time via M1 ({time_via_m1}s), \
+        NOT time via M2 ({time_via_m2}s)"
+    );
+}
+
+/// Equivalence test: one mid-chain segment is bike-impassable (bikeaccess=false,
+/// footaccess=false → `edge_cost` returns None). `bike_dijkstra_union` and
+/// `bike_cost_dijkstra` must both dead-end the search at that segment and produce
+/// identical stop sets. Non-vacuous: asserts S2 is absent from S1 results AND that
+/// S1 IS reachable from S2 (via the passable reverse I2→I1 direction).
+#[test]
+fn bike_nearby_stops_arena_impassable_segment() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let mut g = Graph::new();
+
+    let s1 = g.add_node(transit_stop("S1", 50.100, 4.100));
+    let i1 = g.add_node(osm_node("I1", 50.101, 4.101));
+    let i2 = g.add_node(osm_node("I2", 50.101, 4.102));
+    let s2 = g.add_node(transit_stop("S2", 50.100, 4.103));
+
+    let mk = |o: NodeID, d: NodeID, len: usize| EdgeData::Street(StreetEdgeData {
+        origin: o,
+        destination: d,
+        length: len,
+        partial: false,
+        foot: true,
+        bike: true,
+        car: false,
+        attrs: bike_attrs(HighwayClass::Cycleway, true, Surface::Paved),
+        elev_delta: 0,
+        surface_speed: 100,
+        var_gen: VarGen::NONE,
+    });
+
+    let mut blocked_attrs = bike_attrs(HighwayClass::Cycleway, true, Surface::Paved);
+    blocked_attrs.bikeaccess = false;
+    blocked_attrs.footaccess = false;
+    let mk_blocked = |o: NodeID, d: NodeID, len: usize| EdgeData::Street(StreetEdgeData {
+        origin: o,
+        destination: d,
+        length: len,
+        partial: false,
+        foot: false,
+        bike: true,
+        car: false,
+        attrs: blocked_attrs,
+        elev_delta: 0,
+        surface_speed: 100,
+        var_gen: VarGen::NONE,
+    });
+
+    g.add_edge(s1, mk(s1, i1, 150));
+    g.add_edge(i1, mk(i1, s1, 150));
+    g.add_edge(i1, mk_blocked(i1, i2, 120));
+    g.add_edge(i2, mk(i2, i1, 120));
+    g.add_edge(i2, mk(i2, s2, 130));
+    g.add_edge(s2, mk(s2, i2, 130));
+
+    g.build_raptor_index();
+
+    let bc = BikeCost::new(BikeProfile::default(), 1.2);
+    let max_secs = 3600u32;
+
+    let tnts = g.raptor.transit_node_to_stop.clone();
+    let collect = |times: HashMap<NodeID, u32>, tnts: &Vec<u32>| {
+        let mut stops: Vec<(usize, u32)> = times
+            .iter()
+            .filter_map(|(&node, &secs)| {
+                let c = tnts[node.0];
+                (c != u32::MAX).then_some((c as usize, secs))
+            })
+            .collect();
+        stops.sort_unstable_by_key(|&(s, _)| s);
+        stops
+    };
+
+    let full_s1 = collect(g.bike_cost_dijkstra(s1, max_secs, &bc), &tnts);
+    let full_s2 = collect(g.bike_cost_dijkstra(s2, max_secs, &bc), &tnts);
+
+    g.set_node_contraction(true);
+    let cg = ContractedGraph::from_graph_union(&g);
+
+    let arena_s1 = collect(g.bike_dijkstra_union(s1, max_secs, &bc, &cg), &tnts);
+    let arena_s2 = collect(g.bike_dijkstra_union(s2, max_secs, &bc, &cg), &tnts);
+
+    assert_eq!(full_s1, arena_s1, "access from S1: arena must match full graph");
+    assert_eq!(full_s2, arena_s2, "egress from S2: arena must match full graph");
+
+    let s2_stop = tnts[s2.0] as usize;
+    assert!(
+        !full_s1.iter().any(|&(s, _)| s == s2_stop),
+        "S2 must be unreachable from S1 (blocked by impassable I1→I2 segment)"
+    );
+    let s1_stop = tnts[s1.0] as usize;
+    assert!(
+        full_s2.iter().any(|&(s, _)| s == s1_stop),
+        "S1 must be reachable from S2 via the passable I2→I1 reverse direction"
+    );
+}
+
+/// Equivalence test: `max_secs` budget fires mid-super-edge, excluding the far stop.
+/// Both `bike_dijkstra_union` and `bike_cost_dijkstra` must exclude the same stop.
+/// Non-vacuous: asserts the origin stop IS present (0 s) and the far stop IS absent.
+#[test]
+fn bike_nearby_stops_arena_max_secs_cap() {
+    use maas_rs::structures::contraction::ContractedGraph;
+
+    let mut g = Graph::new();
+
+    let s1 = g.add_node(transit_stop("S1", 50.200, 4.200));
+    let i1 = g.add_node(osm_node("I1", 50.201, 4.200));
+    let i2 = g.add_node(osm_node("I2", 50.201, 4.201));
+    let s2 = g.add_node(transit_stop("S2", 50.200, 4.202));
+
+    let mk = |o: NodeID, d: NodeID, len: usize| EdgeData::Street(StreetEdgeData {
+        origin: o,
+        destination: d,
+        length: len,
+        partial: false,
+        foot: true,
+        bike: true,
+        car: false,
+        attrs: bike_attrs(HighwayClass::Cycleway, true, Surface::Paved),
+        elev_delta: 0,
+        surface_speed: 100,
+        var_gen: VarGen::NONE,
+    });
+
+    g.add_edge(s1, mk(s1, i1, 100));
+    g.add_edge(i1, mk(i1, s1, 100));
+    g.add_edge(i1, mk(i1, i2, 100));
+    g.add_edge(i2, mk(i2, i1, 100));
+    g.add_edge(i2, mk(i2, s2, 100));
+    g.add_edge(s2, mk(s2, i2, 100));
+
+    g.build_raptor_index();
+
+    let bc = BikeCost::new(BikeProfile::default(), 1.2);
+    let max_secs = 25u32;
+
+    let tnts = g.raptor.transit_node_to_stop.clone();
+    let collect = |times: HashMap<NodeID, u32>, tnts: &Vec<u32>| {
+        let mut stops: Vec<(usize, u32)> = times
+            .iter()
+            .filter_map(|(&node, &secs)| {
+                let c = tnts[node.0];
+                (c != u32::MAX).then_some((c as usize, secs))
+            })
+            .collect();
+        stops.sort_unstable_by_key(|&(s, _)| s);
+        stops
+    };
+
+    let full_s1 = collect(g.bike_cost_dijkstra(s1, max_secs, &bc), &tnts);
+    let full_s2 = collect(g.bike_cost_dijkstra(s2, max_secs, &bc), &tnts);
+
+    g.set_node_contraction(true);
+    let cg = ContractedGraph::from_graph_union(&g);
+
+    let arena_s1 = collect(g.bike_dijkstra_union(s1, max_secs, &bc, &cg), &tnts);
+    let arena_s2 = collect(g.bike_dijkstra_union(s2, max_secs, &bc, &cg), &tnts);
+
+    assert_eq!(full_s1, arena_s1, "access from S1: arena must match full graph");
+    assert_eq!(full_s2, arena_s2, "egress from S2: arena must match full graph");
+
+    let s1_stop = tnts[s1.0] as usize;
+    let s2_stop = tnts[s2.0] as usize;
+
+    assert!(
+        full_s1.iter().any(|&(s, _)| s == s1_stop),
+        "S1 must appear in its own result as origin (0 s)"
+    );
+    assert!(
+        !full_s1.iter().any(|&(s, _)| s == s2_stop),
+        "S2 must be excluded from S1 results (max_secs cap fires before reaching S2)"
+    );
+    assert!(
+        full_s2.iter().any(|&(s, _)| s == s2_stop),
+        "S2 must appear in its own result as origin (0 s)"
+    );
+    assert!(
+        !full_s2.iter().any(|&(s, _)| s == s1_stop),
+        "S1 must be excluded from S2 results (max_secs cap fires before reaching S1)"
     );
 }

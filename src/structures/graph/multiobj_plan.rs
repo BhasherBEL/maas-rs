@@ -5,7 +5,7 @@
 //! highlighted leg. Weights touch only the cursor; the option set is untouched.
 
 use super::Graph;
-use crate::structures::cost::{Axis, BalanceWeights, LegRole, RoutingMode};
+use crate::structures::cost::{Axis, LegRole, RoutingMode};
 use crate::structures::graph::bike_cost::BikeCost;
 use crate::structures::plan::{
     ArrivalScenario, LegOption, Plan, PlanLeg, PlanLegStep, PlanPlace, PlanWalkLeg,
@@ -36,39 +36,10 @@ impl Graph {
                 true,
             )
             .iter()
-            .map(|p| self.leg_option(&p.nodes, p.cost, mode, bike, 0))
+            .map(|p| self.leg_option(&p.nodes, &p.edges, p.cost, mode, bike, 0))
             .collect::<Vec<_>>();
         let opts = Graph::dedup_leg_options(opts);
         self.select_diverse(opts, self.raptor.alt_max_share_factor)
-    }
-
-    /// Diverse alternatives for a bike/car leg via weighted-sum scalarization: run
-    /// the balanced weighting plus one single-axis "champion" per active axis
-    /// (fastest / flattest / most-paved / most-cycleroute / calmest), then dedup.
-    /// Each is a fast scalar A* (`scalar_repr_path`); the balanced route's length
-    /// bounds the champion detours so a near-degenerate weighting can't wander.
-    fn scalarized_leg_options(
-        &self,
-        from: NodeID,
-        to: NodeID,
-        mode: RoutingMode,
-        bike: &BikeCost,
-    ) -> Vec<LegOption> {
-        let balanced = self.raptor.balance;
-        let Some(base) = self.scalar_repr_path(from, to, mode, bike, &balanced, None) else {
-            return Vec::new();
-        };
-        let base_len: usize = self.path_edges(&base.nodes).map(|s| s.length).sum();
-        let cap = ((1.0 + self.raptor.distance_budget) * base_len as f64) as u32;
-
-        let mut opts = vec![self.leg_option(&base.nodes, base.cost, mode, bike, 0)];
-        for &axis in mode.axes() {
-            let w = champion_weights(axis, self.raptor.champion_time_tiebreak);
-            if let Some(p) = self.scalar_repr_path(from, to, mode, bike, &w, Some(cap)) {
-                opts.push(self.leg_option(&p.nodes, p.cost, mode, bike, 0));
-            }
-        }
-        Graph::dedup_leg_options(opts)
     }
 
     /// Drop options weakly dominated on the DISPLAYED objectives, each bucketed to
@@ -150,17 +121,42 @@ impl Graph {
         if total == 0 { 0.0 } else { shared as f64 / total as f64 }
     }
 
+    pub(crate) fn shared_fraction_edges(
+        &self,
+        p: &[StreetEdgeData],
+        q: &[StreetEdgeData],
+    ) -> f64 {
+        use std::collections::HashSet;
+        let qset: HashSet<(usize, usize)> =
+            q.iter().map(|e| (e.origin.0, e.destination.0)).collect();
+        let mut total = 0usize;
+        let mut shared = 0usize;
+        for s in p {
+            total += s.length;
+            if qset.contains(&(s.origin.0, s.destination.0)) {
+                shared += s.length;
+            }
+        }
+        if total == 0 { 0.0 } else { shared as f64 / total as f64 }
+    }
+
     /// Greedily keep options (in their incoming rank order) that share at most
     /// `max_share` of their length with every already-kept, higher-ranked option —
     /// ADGW limited-sharing applied pairwise, replacing display-granularity dedup so
     /// two geometrically near-identical routes are never both surfaced.
     pub(crate) fn select_diverse(&self, opts: Vec<LegOption>, max_share: f64) -> Vec<LegOption> {
+        let carried = self.use_contracted();
         let mut kept: Vec<LegOption> = Vec::new();
         for o in opts {
-            if kept
-                .iter()
-                .all(|k| self.shared_fraction(&o.nodes, &k.nodes) <= max_share)
-            {
+            let diverse = kept.iter().all(|k| {
+                let share = if carried && !o.edges.is_empty() && !k.edges.is_empty() {
+                    self.shared_fraction_edges(&o.edges, &k.edges)
+                } else {
+                    self.shared_fraction(&o.nodes, &k.nodes)
+                };
+                share <= max_share
+            });
+            if diverse {
                 kept.push(o);
             }
         }
@@ -206,7 +202,7 @@ impl Graph {
             arrival: Some(end),
             departure: None,
         };
-        let steps = self.street_steps(&chosen.nodes, mode, bike, start_time, to);
+        let steps = self.street_steps(&chosen.nodes, &chosen.edges, mode, bike, start_time, to);
 
         Some(Plan {
             legs: vec![PlanLeg::Walk(PlanWalkLeg {
@@ -242,18 +238,66 @@ impl Graph {
         })
     }
 
+    /// Per-step street edges for a reconstructed path. When the contracted search
+    /// carried arena edges (`carried` non-empty under `use_contracted()`), they are the
+    /// g-free authority; otherwise re-derive from `path_edges(nodes)` (flag-off / off-
+    /// contract, byte-identical to before). Returns owned edges so the carried far-coords
+    /// can be dropped (geometry is built separately from them).
+    pub(super) fn recon_edges(
+        &self,
+        nodes: &[NodeID],
+        carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
+    ) -> Vec<StreetEdgeData> {
+        if self.use_contracted() && !carried.is_empty() {
+            carried.iter().map(|(e, _, _)| *e).collect()
+        } else {
+            self.path_edges(nodes).copied().collect()
+        }
+    }
+
+    /// Geometry of a reconstructed path. Under the contracted graph the node coords come
+    /// from the carried far-coords (interior nodes have no `junction_coord`, so
+    /// `node_coord` would panic post-drop); flag-off / off-contract uses `node_coord`.
+    fn recon_geometry(
+        &self,
+        nodes: &[NodeID],
+        carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
+    ) -> Vec<crate::structures::plan::PlanCoordinate> {
+        if self.use_contracted() && !carried.is_empty() {
+            let mut geom = Vec::with_capacity(carried.len() + 1);
+            if let Some(&first) = nodes.first() {
+                let o = self.node_loc(first);
+                geom.push(crate::structures::plan::PlanCoordinate {
+                    lat: o.latitude,
+                    lon: o.longitude,
+                });
+            }
+            for (_, _, far) in carried {
+                geom.push(crate::structures::plan::PlanCoordinate {
+                    lat: far.latitude,
+                    lon: far.longitude,
+                });
+            }
+            geom
+        } else {
+            nodes.iter().map(|&n| self.node_coord(n)).collect()
+        }
+    }
+
     fn leg_option(
         &self,
         nodes: &[NodeID],
+        carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
         cost: crate::structures::cost::CostVector,
         mode: RoutingMode,
         bike: &BikeCost,
         _start_time: u32,
     ) -> LegOption {
-        let (p50f, p95f) = self.annotate_path(nodes, mode).bracket();
-        let length: usize = self.path_edges(nodes).map(|s| s.length).sum();
-        let unpaved_length: usize = self
-            .path_edges(nodes)
+        let recon = self.recon_edges(nodes, carried);
+        let (p50f, p95f) = self.annotate_path_edges(nodes, carried, mode).bracket();
+        let length: usize = recon.iter().map(|s| s.length).sum();
+        let unpaved_length: usize = recon
+            .iter()
             .filter(|s| s.attrs.surface == crate::structures::Surface::Unpaved)
             .map(|s| s.length)
             .sum();
@@ -268,7 +312,7 @@ impl Graph {
         let elevation_gain = if mode == RoutingMode::Bike {
             let mut ehbu = 0.0;
             let mut asc = 0.0;
-            for s in self.path_edges(nodes) {
+            for s in &recon {
                 let (charged, new_ehbu) =
                     bike.walk_ascent_step(ehbu, s.elev_delta as f64, s.length as f64);
                 asc += charged;
@@ -285,7 +329,8 @@ impl Graph {
             None
         };
         let dismount_length: usize = if mode == RoutingMode::Bike {
-            self.path_edges(nodes)
+            recon
+                .iter()
                 .filter(|s| BikeCost::is_push(&s.attrs))
                 .map(|s| s.length)
                 .sum()
@@ -295,7 +340,7 @@ impl Graph {
         let mut dismount_runs: Vec<crate::structures::plan::DismountRun> = Vec::new();
         if mode == RoutingMode::Bike {
             let mut run_start: Option<usize> = None;
-            for (i, s) in self.path_edges(nodes).enumerate() {
+            for (i, s) in recon.iter().enumerate() {
                 if BikeCost::is_push(&s.attrs) {
                     run_start.get_or_insert(i);
                 } else if let Some(st) = run_start.take() {
@@ -309,6 +354,7 @@ impl Graph {
                 });
             }
         }
+        let geometry = self.recon_geometry(nodes, carried);
         LegOption {
             time: cost.get(Axis::Time),
             dplus,
@@ -323,13 +369,18 @@ impl Graph {
             dismount_runs,
             elevation_gain,
             cycleroute_length,
-            geometry: nodes.iter().map(|&n| self.node_coord(n)).collect(),
+            geometry,
             nodes: nodes.to_vec(),
+            edges: if self.use_contracted() {
+                recon
+            } else {
+                Vec::new()
+            },
         }
     }
 
     /// Iterator over the street edges connecting consecutive `nodes`.
-    fn path_edges<'a>(
+    pub(super) fn path_edges<'a>(
         &'a self,
         nodes: &'a [NodeID],
     ) -> impl Iterator<Item = &'a StreetEdgeData> + 'a {
@@ -344,20 +395,33 @@ impl Graph {
     /// Build leg steps for a chosen path. Walk/Drive ⇒ one plain step. Bike ⇒ group
     /// consecutive ride/push runs (push = `BikeCost::is_push`) into dismount-aware
     /// steps, mirroring `build_bike_plan`.
-    pub(super) fn street_steps(
+    /// `recon` carries the per-step arena edges (from `LegOption::edges`); when present
+    /// under `use_contracted()` they are the g-free authority, else `path_edges(nodes)`.
+    pub(crate) fn street_steps(
         &self,
         nodes: &[NodeID],
+        recon: &[StreetEdgeData],
         mode: RoutingMode,
         bike: &BikeCost,
         start_time: u32,
         to: PlanPlace,
     ) -> Vec<PlanLegStep> {
+        let use_carried = self.use_contracted() && !recon.is_empty();
+        let owned: Vec<StreetEdgeData> = if use_carried {
+            Vec::new()
+        } else {
+            self.path_edges(nodes).copied().collect()
+        };
+        let edges: &[StreetEdgeData] = if use_carried { recon } else { &owned };
         if mode != RoutingMode::Bike {
-            let length: usize = self.path_edges(nodes).map(|s| s.length).sum();
-            let secs = self.annotate_path(nodes, mode).mean.round() as u32;
+            let length: usize = edges.iter().map(|s| s.length).sum();
+            let secs = if use_carried {
+                self.annotate_steps_secs(recon, mode)
+            } else {
+                self.annotate_path(nodes, mode).mean.round() as u32
+            };
             return vec![PlanLegStep::Walk(PlanWalkLegStep::plain(length, secs, to))];
         }
-        let edges: Vec<&StreetEdgeData> = self.path_edges(nodes).collect();
         let mut steps: Vec<PlanLegStep> = Vec::new();
         let mut i = 0;
         let mut cum_time = 0u32;
@@ -370,7 +434,7 @@ impl Graph {
             let (mut run_len, mut run_time) = (0usize, 0u32);
             while i < edges.len() && BikeCost::is_push(&edges[i].attrs) == push {
                 run_len += edges[i].length;
-                run_time += bike.edge_time(edges[i]);
+                run_time += bike.edge_time(&edges[i]);
                 i += 1;
             }
             cum_time += run_time;
@@ -397,25 +461,11 @@ impl Graph {
     }
 }
 
-/// Weighting that minimises primarily `target` (weight 1.0) with a small Time
-/// tiebreak (`tiebreak`, config-driven); the Time champion is pure time. Each drives
-/// one scalarized alternative.
-fn champion_weights(target: Axis, tiebreak: f64) -> BalanceWeights {
-    let unit = |a: Axis| if a == target { 1.0 } else { 0.0 };
-    BalanceWeights {
-        time: if target == Axis::Time { 1.0 } else { tiebreak },
-        dplus: unit(Axis::Dplus),
-        surface: unit(Axis::Surface),
-        cycleway_deficit: unit(Axis::CyclewayDeficit),
-        variance: unit(Axis::Variance),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::structures::cost::VarGen;
-    use crate::structures::cost::{Axis, LegRole, RoutingMode};
+    use crate::structures::cost::{LegRole, RoutingMode};
     use crate::structures::plan::PlanLeg;
     use crate::structures::{
         BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, NodeID, OsmNodeData, StreetEdgeData,
@@ -460,109 +510,6 @@ mod tests {
         g.add_edge(a, edge(a, c, 90, Surface::Paved));
         g.add_edge(c, edge(c, b, 90, Surface::Paved));
         (g, a, b)
-    }
-
-    #[test]
-    fn scalar_champions_diversify_bike_route_by_objective() {
-        let (g, a, b) = detour_graph();
-        let bike = g.default_bike_cost();
-        // Fastest weighting → the short rough direct edge (a→b).
-        let fast = g
-            .scalar_repr_path(a, b, RoutingMode::Bike, &bike, &champion_weights(Axis::Time, 0.1), None)
-            .expect("fast route");
-        assert_eq!(fast.nodes.len(), 2, "fastest bike route is the direct edge");
-        // Most-paved weighting → the longer smooth detour (a→c→b).
-        let smooth = g
-            .scalar_repr_path(
-                a,
-                b,
-                RoutingMode::Bike,
-                &bike,
-                &champion_weights(Axis::Surface, 0.1),
-                None,
-            )
-            .expect("smooth route");
-        assert_eq!(smooth.nodes.len(), 3, "most-paved bike route is the detour");
-        assert_ne!(fast.nodes, smooth.nodes, "objectives pick different routes");
-    }
-
-    /// Short rough direct edge (100 m unpaved) vs a smooth paved detour (220 m): the
-    /// detour wins the Surface axis (220 < 100×2.5) yet costs ~½ min more, so both
-    /// survive display-granularity dedup as distinct fastest/most-paved alternatives.
-    fn wide_detour_graph() -> (Graph, NodeID, NodeID) {
-        let mut g = Graph::new();
-        g.set_distance_budget(f64::INFINITY);
-        let mk = |id: &str, lat: f64, lon: f64| {
-            NodeData::OsmNode(OsmNodeData {
-                eid: id.into(),
-                lat_lng: LatLng {
-                    latitude: lat,
-                    longitude: lon,
-                },
-            })
-        };
-        let a = g.add_node(mk("a", 50.000, 4.0000));
-        let c = g.add_node(mk("c", 50.0010, 4.0010));
-        let b = g.add_node(mk("b", 50.000, 4.0020));
-        g.build_raptor_index();
-        let edge = |o: NodeID, d: NodeID, len: usize, s: Surface| {
-            let mut at = BikeAttrs::road_default();
-            at.highway = HighwayClass::Residential;
-            at.surface = s;
-            EdgeData::Street(StreetEdgeData {
-                origin: o,
-                destination: d,
-                partial: false,
-                length: len,
-                foot: true,
-                bike: true,
-                car: false,
-                attrs: at,
-                elev_delta: 0,
-                surface_speed: 100,
-                var_gen: VarGen::NONE,
-            })
-        };
-        g.add_edge(a, edge(a, b, 100, Surface::Unpaved));
-        g.add_edge(a, edge(a, c, 110, Surface::Paved));
-        g.add_edge(c, edge(c, b, 110, Surface::Paved));
-        (g, a, b)
-    }
-
-    #[test]
-    fn scalarized_leg_options_returns_diverse_bike_alternatives() {
-        let (g, a, b) = wide_detour_graph();
-        let bike = g.default_bike_cost();
-        let opts = g.scalarized_leg_options(a, b, RoutingMode::Bike, &bike);
-        assert!(
-            opts.len() >= 2,
-            "scalarized bike options span the surface trade-off"
-        );
-        let max_len = opts.iter().map(|o| o.length).max().unwrap();
-        let min_len = opts.iter().map(|o| o.length).min().unwrap();
-        assert!(max_len > min_len, "alternatives differ in length");
-        for o in &opts {
-            assert!(o.p95 >= o.p50, "bracket ordered p95 >= p50");
-        }
-    }
-
-    #[test]
-    fn scalar_repr_path_respects_length_cap() {
-        // With a cap below the detour length, the most-paved champion can't take the
-        // 180 m detour and must fall back to the 100 m direct edge.
-        let (g, a, b) = detour_graph();
-        let bike = g.default_bike_cost();
-        let capped = g
-            .scalar_repr_path(
-                a,
-                b,
-                RoutingMode::Bike,
-                &bike,
-                &champion_weights(Axis::Surface, 0.1),
-                Some(120),
-            )
-            .expect("a route within the cap");
-        assert_eq!(capped.nodes.len(), 2, "cap forces the direct edge");
     }
 
     #[test]
@@ -1056,7 +1003,7 @@ mod tests {
             bike: &BikeCost,
         ) -> LegOption {
             // cost vector irrelevant to shared_fraction/select_diverse; ZERO is fine here.
-            self.leg_option(nodes, crate::structures::cost::CostVector::ZERO, mode, bike, 0)
+            self.leg_option(nodes, &[], crate::structures::cost::CostVector::ZERO, mode, bike, 0)
         }
     }
 
@@ -1115,6 +1062,7 @@ mod tests {
                 cycleroute_length: None,
                 geometry: vec![],
                 nodes: vec![],
+                edges: vec![],
             }
         }
         let opts = vec![
@@ -1156,6 +1104,7 @@ mod tests {
                 cycleroute_length: None,
                 geometry: vec![],
                 nodes: vec![],
+                edges: vec![],
             }
         }
         // A is 20 s faster (raw) but rougher; B is smoother (raw) but slower. They
@@ -1191,6 +1140,7 @@ mod tests {
                 cycleroute_length: None,
                 geometry: vec![],
                 nodes: vec![],
+                edges: vec![],
             }
         }
         let kept = Graph::dedup_leg_options(vec![opt(600, 9000.0), opt(660, 200.0)]);
