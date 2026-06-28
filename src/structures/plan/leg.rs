@@ -864,7 +864,6 @@ mod tests {
         }
 
         g.build_raptor_index();
-        g.set_node_contraction(true);
         let mut cg = ContractedGraph::from_graph_union(&g);
         cg.build_seg_index();
         g.contracted = Some(cg);

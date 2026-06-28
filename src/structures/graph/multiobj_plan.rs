@@ -11,7 +11,7 @@ use crate::structures::plan::{
     ArrivalScenario, LegOption, Plan, PlanLeg, PlanLegStep, PlanPlace, PlanWalkLeg,
     PlanWalkLegStep, initial_cursor,
 };
-use crate::structures::{EdgeData, Mode, NodeID, StreetEdgeData};
+use crate::structures::{Mode, NodeID, StreetEdgeData};
 
 impl Graph {
     /// Time-agnostic representative options for a street leg `from → to` under
@@ -93,34 +93,6 @@ impl Graph {
             .collect()
     }
 
-    /// Length-weighted fraction of path `p` whose directed edges also appear in `q`.
-    /// 1.0 = `p` fully retraces `q`; 0.0 = disjoint. Basis for ADGW limited-sharing.
-    pub(crate) fn shared_fraction(&self, p: &[NodeID], q: &[NodeID]) -> f64 {
-        use std::collections::HashSet;
-        let qset: HashSet<(usize, usize)> =
-            q.windows(2).map(|w| (w[0].0, w[1].0)).collect();
-        let mut total = 0usize;
-        let mut shared = 0usize;
-        for s in self.path_edges(p) {
-            total += s.length;
-        }
-        for w in p.windows(2) {
-            if qset.contains(&(w[0].0, w[1].0)) {
-                if let Some(s) = self
-                    .edges[w[0].0]
-                    .iter()
-                    .find_map(|e| match e {
-                        EdgeData::Street(s) if s.destination == w[1] => Some(s),
-                        _ => None,
-                    })
-                {
-                    shared += s.length;
-                }
-            }
-        }
-        if total == 0 { 0.0 } else { shared as f64 / total as f64 }
-    }
-
     pub(crate) fn shared_fraction_edges(
         &self,
         p: &[StreetEdgeData],
@@ -145,14 +117,13 @@ impl Graph {
     /// ADGW limited-sharing applied pairwise, replacing display-granularity dedup so
     /// two geometrically near-identical routes are never both surfaced.
     pub(crate) fn select_diverse(&self, opts: Vec<LegOption>, max_share: f64) -> Vec<LegOption> {
-        let carried = self.use_contracted();
         let mut kept: Vec<LegOption> = Vec::new();
         for o in opts {
             let diverse = kept.iter().all(|k| {
-                let share = if carried && !o.edges.is_empty() && !k.edges.is_empty() {
+                let share = if !o.edges.is_empty() && !k.edges.is_empty() {
                     self.shared_fraction_edges(&o.edges, &k.edges)
                 } else {
-                    self.shared_fraction(&o.nodes, &k.nodes)
+                    0.0
                 };
                 share <= max_share
             });
@@ -238,50 +209,43 @@ impl Graph {
         })
     }
 
-    /// Per-step street edges for a reconstructed path. When the contracted search
-    /// carried arena edges (`carried` non-empty under `use_contracted()`), they are the
-    /// g-free authority; otherwise re-derive from `path_edges(nodes)` (flag-off / off-
-    /// contract, byte-identical to before). Returns owned edges so the carried far-coords
-    /// can be dropped (geometry is built separately from them).
+    /// Per-step street edges for a reconstructed path, from the carried arena edges
+    /// (the g-free authority). Empty carried ⇒ empty. Returns owned edges so the
+    /// carried far-coords can be dropped (geometry is built separately from them).
     pub(super) fn recon_edges(
         &self,
-        nodes: &[NodeID],
+        _nodes: &[NodeID],
         carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
     ) -> Vec<StreetEdgeData> {
-        if self.use_contracted() && !carried.is_empty() {
-            carried.iter().map(|(e, _, _)| *e).collect()
-        } else {
-            self.path_edges(nodes).copied().collect()
-        }
+        carried.iter().map(|(e, _, _)| *e).collect()
     }
 
-    /// Geometry of a reconstructed path. Under the contracted graph the node coords come
-    /// from the carried far-coords (interior nodes have no `junction_coord`, so
-    /// `node_coord` would panic post-drop); flag-off / off-contract uses `node_coord`.
+    /// Geometry of a reconstructed path from the carried far-coords (interior nodes
+    /// have no `junction_coord`, so `node_coord` would panic post-drop). Empty
+    /// carried ⇒ empty geometry.
     fn recon_geometry(
         &self,
         nodes: &[NodeID],
         carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
     ) -> Vec<crate::structures::plan::PlanCoordinate> {
-        if self.use_contracted() && !carried.is_empty() {
-            let mut geom = Vec::with_capacity(carried.len() + 1);
-            if let Some(&first) = nodes.first() {
-                let o = self.node_loc(first);
-                geom.push(crate::structures::plan::PlanCoordinate {
-                    lat: o.latitude,
-                    lon: o.longitude,
-                });
-            }
-            for (_, _, far) in carried {
-                geom.push(crate::structures::plan::PlanCoordinate {
-                    lat: far.latitude,
-                    lon: far.longitude,
-                });
-            }
-            geom
-        } else {
-            nodes.iter().map(|&n| self.node_coord(n)).collect()
+        if carried.is_empty() {
+            return Vec::new();
         }
+        let mut geom = Vec::with_capacity(carried.len() + 1);
+        if let Some(&first) = nodes.first() {
+            let o = self.node_loc(first);
+            geom.push(crate::structures::plan::PlanCoordinate {
+                lat: o.latitude,
+                lon: o.longitude,
+            });
+        }
+        for (_, _, far) in carried {
+            geom.push(crate::structures::plan::PlanCoordinate {
+                lat: far.latitude,
+                lon: far.longitude,
+            });
+        }
+        geom
     }
 
     fn leg_option(
@@ -371,32 +335,14 @@ impl Graph {
             cycleroute_length,
             geometry,
             nodes: nodes.to_vec(),
-            edges: if self.use_contracted() {
-                recon
-            } else {
-                Vec::new()
-            },
+            edges: recon,
         }
-    }
-
-    /// Iterator over the street edges connecting consecutive `nodes`.
-    pub(super) fn path_edges<'a>(
-        &'a self,
-        nodes: &'a [NodeID],
-    ) -> impl Iterator<Item = &'a StreetEdgeData> + 'a {
-        nodes.windows(2).filter_map(move |w| {
-            self.edges[w[0].0].iter().find_map(|e| match e {
-                EdgeData::Street(s) if s.destination == w[1] => Some(s),
-                _ => None,
-            })
-        })
     }
 
     /// Build leg steps for a chosen path. Walk/Drive ⇒ one plain step. Bike ⇒ group
     /// consecutive ride/push runs (push = `BikeCost::is_push`) into dismount-aware
-    /// steps, mirroring `build_bike_plan`.
-    /// `recon` carries the per-step arena edges (from `LegOption::edges`); when present
-    /// under `use_contracted()` they are the g-free authority, else `path_edges(nodes)`.
+    /// steps. `recon` carries the per-step arena edges (from `LegOption::edges`) and
+    /// is the g-free authority; empty ⇒ a degenerate zero-length/zero-time step.
     pub(crate) fn street_steps(
         &self,
         nodes: &[NodeID],
@@ -406,20 +352,10 @@ impl Graph {
         start_time: u32,
         to: PlanPlace,
     ) -> Vec<PlanLegStep> {
-        let use_carried = self.use_contracted() && !recon.is_empty();
-        let owned: Vec<StreetEdgeData> = if use_carried {
-            Vec::new()
-        } else {
-            self.path_edges(nodes).copied().collect()
-        };
-        let edges: &[StreetEdgeData] = if use_carried { recon } else { &owned };
+        let edges: &[StreetEdgeData] = recon;
         if mode != RoutingMode::Bike {
             let length: usize = edges.iter().map(|s| s.length).sum();
-            let secs = if use_carried {
-                self.annotate_steps_secs(recon, mode)
-            } else {
-                self.annotate_path(nodes, mode).mean.round() as u32
-            };
+            let secs = self.annotate_steps_secs(recon, mode);
             return vec![PlanLegStep::Walk(PlanWalkLegStep::plain(length, secs, to))];
         }
         let mut steps: Vec<PlanLegStep> = Vec::new();
@@ -472,6 +408,16 @@ mod tests {
         Surface,
     };
 
+    /// Build + bake the contracted graph so reconstruction carries the arena edges —
+    /// production is contraction-only, so the leg/step builders read carried `.edges`.
+    fn enable_contraction(g: &mut Graph) {
+        use crate::structures::contraction::ContractedGraph;
+        let mut cg = ContractedGraph::from_graph_union(g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted_default();
+    }
+
     fn detour_graph() -> (Graph, NodeID, NodeID) {
         let mut g = Graph::new();
         g.set_distance_budget(f64::INFINITY);
@@ -509,12 +455,16 @@ mod tests {
         g.add_edge(a, edge(a, b, 100, Surface::Unpaved));
         g.add_edge(a, edge(a, c, 90, Surface::Paved));
         g.add_edge(c, edge(c, b, 90, Surface::Paved));
+        // b has no outgoing edges, so the contraction builder would skip it (k=0) and
+        // no super-edge would reach b. A back-edge makes b a proper junction endpoint.
+        g.add_edge(b, edge(b, a, 100, Surface::Paved));
         (g, a, b)
     }
 
     #[test]
     fn direct_plan_has_alternatives_with_brackets_and_balanced_leg() {
-        let (g, a, b) = detour_graph();
+        let (mut g, a, b) = detour_graph();
+        enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let plan = g
             .multiobj_direct_plan(a, b, RoutingMode::Walk, LegRole::Neutral, &bike, 30_000)
@@ -615,7 +565,6 @@ mod tests {
         g.set_bike_bucket_cyc_k(0.11);
         g.set_bike_bucket_dpl_k(0.013);
         g.set_distance_budget(0.15);
-        g.set_multiobj_contract(false);
         eprintln!("E2E load+index={:.1?}", t0.elapsed());
         let bike = g.default_bike_cost();
 
@@ -870,13 +819,27 @@ mod tests {
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Bike, LegRole::Neutral, &bike);
         assert!(!opts.is_empty(), "a legal route must exist");
         for o in &opts {
-            let ww: usize = g
-                .path_edges(&o.nodes)
+            // Re-derive the per-step edges from the node path (the former
+            // `path_edges` derivation); this synthetic graph is not contracted so
+            // the carried `.edges` are empty here.
+            let edges: Vec<&StreetEdgeData> = o
+                .nodes
+                .windows(2)
+                .filter_map(|w| {
+                    g.edges[w[0].0].iter().find_map(|e| match e {
+                        EdgeData::Street(s) if s.destination == w[1] => Some(s),
+                        _ => None,
+                    })
+                })
+                .collect();
+            let ww: usize = edges
+                .iter()
                 .filter(|e| e.attrs.wrong_way)
                 .map(|e| e.length)
                 .sum();
             assert_eq!(ww, 0, "no alternative may ride against a one-way");
-            assert!(o.length >= 900, "must take the legal detour, got {}", o.length);
+            let length: usize = edges.iter().map(|e| e.length).sum();
+            assert!(length >= 900, "must take the legal detour, got {length}");
         }
     }
 
@@ -942,6 +905,7 @@ mod tests {
     fn multiobj_leg_options_returns_front_for_a_connected_leg() {
         let (mut g, a, b) = detour_graph();
         g.set_distance_budget(f64::INFINITY);
+        enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Walk, LegRole::Neutral, &bike);
         assert!(opts.len() >= 2, "leg options surface the front");
@@ -989,6 +953,9 @@ mod tests {
         g.add_edge(a, e(a, b, 100, 8)); // short, climbs 8 m
         g.add_edge(a, e(a, c, 400, 0)); // long, flat
         g.add_edge(c, e(c, b, 400, 0));
+        // b has no outgoing edges; a back-edge makes it a proper junction endpoint
+        // so contraction reaches it (otherwise the builder skips it, k=0).
+        g.add_edge(b, e(b, a, 100, -8));
         // The only trade-off here is climb-vs-flat, so exercise the D+-as-selection
         // path (off by default; on real graphs Time prices climbing instead).
         g.raptor.set_bike_select_dplus(true);
@@ -1002,8 +969,29 @@ mod tests {
             mode: RoutingMode,
             bike: &BikeCost,
         ) -> LegOption {
+            // Derive the carried arena steps from the node path (the former
+            // `path_edges` derivation) so `.edges` is the g-free authority the
+            // production reconstruction now reads.
+            let carried: Vec<(StreetEdgeData, (f64, f64), LatLng)> = nodes
+                .windows(2)
+                .filter_map(|w| {
+                    self.edges[w[0].0].iter().find_map(|e| match e {
+                        EdgeData::Street(s) if s.destination == w[1] => {
+                            Some((*s, self.dir_between(w[0], w[1]), self.node_loc(w[1])))
+                        }
+                        _ => None,
+                    })
+                })
+                .collect();
             // cost vector irrelevant to shared_fraction/select_diverse; ZERO is fine here.
-            self.leg_option(nodes, &[], crate::structures::cost::CostVector::ZERO, mode, bike, 0)
+            self.leg_option(
+                nodes,
+                &carried,
+                crate::structures::cost::CostVector::ZERO,
+                mode,
+                bike,
+                0,
+            )
         }
     }
 
@@ -1014,7 +1002,10 @@ mod tests {
         // Two genuinely distinct routes share 0% -> both kept.
         let direct = g.leg_option_for_nodes_test(&[a, b], RoutingMode::Bike, &bike);
         let detour = g.leg_option_for_nodes_test(&[a, /*c*/ NodeID(1), b], RoutingMode::Bike, &bike);
-        assert!(g.shared_fraction(&direct.nodes, &detour.nodes) < 0.01, "disjoint routes");
+        assert!(
+            g.shared_fraction_edges(&direct.edges, &detour.edges) < 0.01,
+            "disjoint routes"
+        );
         let kept = g.select_diverse(vec![direct.clone(), detour.clone()], 0.6);
         assert_eq!(kept.len(), 2, "distinct routes both kept");
         // A duplicate of the first shares 100% -> dropped.
@@ -1027,7 +1018,8 @@ mod tests {
         use crate::structures::Surface;
         // Reuse detour_graph shape but add an elevation trade-off: direct short+climby,
         // detour long+flat. Both are on the (Time, D+) front.
-        let (g, a, b) = climb_detour_graph();
+        let (mut g, a, b) = climb_detour_graph();
+        enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Bike, LegRole::Neutral, &bike);
         for o in &opts {
@@ -1193,6 +1185,11 @@ mod tests {
         };
         g.add_edge(a, mk_e(a, m, 100, ride));
         g.add_edge(m, mk_e(m, b, 100, push));
+        // Reverse edges make `m` a degree-2 interior node (contracted away) and a/b
+        // proper junctions, so the a→b super-edge carries both the ride and push steps.
+        g.add_edge(m, mk_e(m, a, 100, ride));
+        g.add_edge(b, mk_e(b, m, 100, push));
+        enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let plan = g
             .multiobj_direct_plan(a, b, RoutingMode::Bike, LegRole::Neutral, &bike, 0)

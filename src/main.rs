@@ -117,13 +117,13 @@ async fn main() {
     };
 
     // Apply config.yaml routing defaults (works for all modes). Must run BEFORE the save
-    // below so any persisted artifact it builds (e.g. the node-contraction `g.contracted`)
+    // below so any persisted artifact it builds (e.g. the contracted `g.contracted`)
     // is written into graph.bin rather than rebuilt in RAM on every restore.
     maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
 
-    // P3f: under node_contraction, drop the interior-node arrays so the served graph (and
-    // any graph.bin saved below) carries only the contracted structure. Errors if a
-    // contracted graph.bin was loaded but contraction is now disabled (rebuild required).
+    // Drop the interior-node arrays so the served graph (and any graph.bin saved below)
+    // carries only the contracted structure. Errors if the loaded graph.bin has no
+    // contracted graph (rebuild required).
     if let Err(e) = maas_rs::services::build::finalize_contraction(&mut g) {
         tracing::error!("{e}");
         return;
@@ -158,9 +158,9 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
         Ok(mut g) => {
             let stored_labels = load_input_labels(cache_dir);
             if stored_labels == current_labels {
-                // Apply defaults + finalize here so a cached contracted graph.bin loaded
-                // while node_contraction is now OFF self-heals (rebuild) instead of serving
-                // broken; the caller re-applies/finalizes idempotently.
+                // Apply defaults + finalize here so a cached graph.bin with no contracted
+                // graph self-heals (rebuild) instead of serving broken; the caller
+                // re-applies/finalizes idempotently.
                 maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
                 match maas_rs::services::build::finalize_contraction(&mut g) {
                     Ok(()) => return Some(g),
@@ -193,12 +193,11 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
     };
 
     let mut g = build_gtfs_phase(osm, &config.build, cache_dir, false)?;
-    // Apply routing defaults before saving so persisted artifacts (e.g. the
-    // node-contraction `g.contracted`) land in graph.bin. The caller re-applies defaults
-    // (idempotent) after this returns.
+    // Apply routing defaults before saving so persisted artifacts (e.g. the contracted
+    // `g.contracted`) land in graph.bin. The caller re-applies defaults (idempotent)
+    // after this returns.
     maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
-    // Drop interior arrays under node_contraction so the saved graph.bin is the contracted
-    // form (a fresh build never trips the dropped-but-disabled guard).
+    // Drop interior arrays so the saved graph.bin is the contracted form.
     if let Err(e) = maas_rs::services::build::finalize_contraction(&mut g) {
         tracing::error!("{e}");
         return None;

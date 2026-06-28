@@ -259,7 +259,7 @@ impl Graph {
     ) -> MultiObjResult {
         let weights = self.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
-        let bike = BikeCost::new(self.raptor.bike_profile, self.raptor.walking_speed_mps);
+        let bike = BikeCost::new(self.raptor.bike_profile);
         self.multiobj_search(
             origin,
             destination,
@@ -487,15 +487,10 @@ impl Graph {
             .try_add(CostVector::ZERO, eps, &Buckets::NONE);
         // On-the-fly degree-2 contraction: skip creating labels at forced single-successor
         // shape vertices, following the chain to the next junction (replayed from the arena).
-        // Bike contracts via EITHER the legacy bike-only path (`multiobj_contract`,
-        // `bike_contracted`) OR the P3 union path (`node_contraction`, `g.contracted`); walk
-        // and drive contract only on the union cg (`use_contracted()` — `bike_contracted` is
-        // bike-only). A direct/access street leg is single-phase, so drive replays the same
-        // per-segment cost as walk. `bike_cg()` returns whichever cg the search reads.
-        let contract = match mode {
-            RoutingMode::Bike => self.raptor.multiobj_contract || self.raptor.node_contraction,
-            RoutingMode::Walk | RoutingMode::Drive => self.use_contracted(),
-        };
+        // All modes contract on the union cg (`g.contracted`). A direct/access street leg is
+        // single-phase, so drive replays the same per-segment cost as walk. `bike_cg()` returns
+        // the cg the search reads.
+        let contract = self.contracted.is_some();
         // Cost-baked super-edges available ⇒ the front paths' demoted axes (D+/Surface/
         // Variance) are canonical during search and must be recomputed exactly at the end.
         // Baking is bike-only; walk/drive replay the per-segment cost exactly in-search.
@@ -1702,7 +1697,7 @@ mod tests {
     #[test]
     fn heuristic_front_equals_uninformed_front() {
         let (g, a, b) = tiny_detour_graph();
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let plain = g.multiobj_search(
@@ -1736,7 +1731,7 @@ mod tests {
     #[test]
     fn heuristic_front_equals_uninformed_front_triple() {
         let (g, a, b) = tiny_triple_graph();
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let plain = g.multiobj_search(
@@ -1832,7 +1827,7 @@ mod tests {
     #[test]
     fn target_pruning_bounds_search_to_destination_front() {
         let (g, a, b) = tiny_target_prune_graph(2000);
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         // No distance budget, so only target pruning can stop the 2000-node chain.
@@ -1988,310 +1983,6 @@ mod tests {
         assert_eq!(set.len(), 2, "no-bucket keeps both trade-offs");
     }
 
-    // ---- on-the-fly degree-2 contraction ----
-
-    /// `a → m1 → m2 → b` is a bikeable degree-2 chain (cycleway, cyc deficit 0);
-    /// `a → b` is a shorter non-cycleway direct edge — a genuine Time↔Cyc trade-off
-    /// so the front has two members, one of which traverses the chain.
-    #[cfg(test)]
-    fn contraction_chain_graph() -> (Graph, NodeID, NodeID) {
-        use crate::structures::cost::VarGen;
-        use crate::structures::{
-            BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData,
-            Surface,
-        };
-        let mut g = Graph::new();
-        let mk = |id: &str, lat: f64, lon: f64| {
-            NodeData::OsmNode(OsmNodeData {
-                eid: id.into(),
-                lat_lng: LatLng { latitude: lat, longitude: lon },
-            })
-        };
-        let a = g.add_node(mk("a", 50.0000, 4.0000));
-        let m1 = g.add_node(mk("m1", 50.0000, 4.0010));
-        let m2 = g.add_node(mk("m2", 50.0000, 4.0020));
-        let b = g.add_node(mk("b", 50.0000, 4.0030));
-        g.build_raptor_index();
-        let edge = |o: NodeID, d: NodeID, len: usize, cycle: bool| {
-            let mut at = BikeAttrs::road_default();
-            at.highway = HighwayClass::Residential;
-            at.surface = Surface::Paved;
-            at.isbike = cycle;
-            EdgeData::Street(StreetEdgeData {
-                origin: o, destination: d, partial: false, length: len,
-                foot: true, bike: true, car: false, attrs: at, elev_delta: 0,
-                surface_speed: 100,
-                var_gen: VarGen::NONE,
-            })
-        };
-        // Bidirectional cycleway chain (m1, m2 become degree-2 pass-throughs).
-        g.add_edge(a, edge(a, m1, 100, true));
-        g.add_edge(m1, edge(m1, a, 100, true));
-        g.add_edge(m1, edge(m1, m2, 100, true));
-        g.add_edge(m2, edge(m2, m1, 100, true));
-        g.add_edge(m2, edge(m2, b, 100, true));
-        g.add_edge(b, edge(b, m2, 100, true));
-        // Shorter non-cycleway direct edge (Time↔Cyc trade-off vs the chain).
-        g.add_edge(a, edge(a, b, 250, false));
-        g.add_edge(b, edge(b, a, 250, false));
-        (g, a, b)
-    }
-
-    fn front_fingerprint(r: &MultiObjResult) -> Vec<(i64, i64, i64, Vec<usize>)> {
-        let mut v: Vec<(i64, i64, i64, Vec<usize>)> = r
-            .front
-            .iter()
-            .map(|p| {
-                (
-                    (p.cost.get(Axis::Time) * 100.0).round() as i64,
-                    (p.cost.get(Axis::CyclewayDeficit) * 100.0).round() as i64,
-                    (p.cost.get(Axis::Dplus) * 100.0).round() as i64,
-                    p.nodes.iter().map(|n| n.0).collect(),
-                )
-            })
-            .collect();
-        v.sort();
-        v
-    }
-
-    #[test]
-    fn contraction_matches_uncontracted_front_and_geometry() {
-        use crate::structures::cost::{Epsilon, LegRole, RoutingMode};
-        let (mut g, a, b) = contraction_chain_graph();
-        g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
-        let bike = g.default_bike_cost();
-        let w = g.raptor.cost_weights;
-        let eps = g.raptor.epsilon;
-        let run = |g: &Graph| {
-            g.multiobj_search(
-                a, b, RoutingMode::Bike, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, true,
-            )
-        };
-        g.raptor.multiobj_contract = false;
-        let off = run(&g);
-        g.raptor.multiobj_contract = true;
-        let on = run(&g);
-        assert!(off.front.len() >= 2, "expected a Time↔Cyc trade-off, got {}", off.front.len());
-        assert_eq!(
-            front_fingerprint(&off),
-            front_fingerprint(&on),
-            "contraction must not change the front cost OR the reconstructed geometry"
-        );
-        // The chain route must still list its shape vertices, not jump a→b.
-        assert!(
-            on.front.iter().any(|p| p.nodes.len() == 4),
-            "contracted chain path must re-expand to the full a→m1→m2→b geometry"
-        );
-    }
-
-    #[test]
-    fn cost_baked_matches_uncontracted_front() {
-        use crate::structures::cost::{Epsilon, LegRole, RoutingMode};
-        use crate::structures::{
-            BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, NodeID, OsmNodeData,
-            StreetEdgeData, Surface,
-        };
-        use crate::structures::cost::VarGen;
-        let mut g = Graph::new();
-        let mk = |id: &str, lat: f64, lon: f64| {
-            NodeData::OsmNode(OsmNodeData {
-                eid: id.into(),
-                lat_lng: LatLng { latitude: lat, longitude: lon },
-            })
-        };
-        // a(jct)-m1-m2-b(jct) cycleway chain + a shorter direct road a-b; spokes pa/pb
-        // make a and b degree-3 junctions (so m1,m2 are the contracted interior).
-        let a = g.add_node(mk("a", 50.0000, 4.0000));
-        let m1 = g.add_node(mk("m1", 50.0003, 4.0010)); // bends → real corner cost
-        let m2 = g.add_node(mk("m2", 50.0000, 4.0020));
-        let b = g.add_node(mk("b", 50.0003, 4.0030));
-        let pa = g.add_node(mk("pa", 50.0010, 4.0000));
-        let pb = g.add_node(mk("pb", 50.0010, 4.0030));
-        g.build_raptor_index();
-        let edge = |o: NodeID, d: NodeID, len: usize, cycle: bool, elev: i16| {
-            let mut at = BikeAttrs::road_default();
-            at.highway = HighwayClass::Residential;
-            at.surface = Surface::Paved;
-            at.isbike = cycle;
-            EdgeData::Street(StreetEdgeData {
-                origin: o, destination: d, partial: false, length: len,
-                foot: true, bike: true, car: false, attrs: at, elev_delta: elev,
-                surface_speed: 100, var_gen: VarGen::NONE,
-            })
-        };
-        let mut bidir = |x: NodeID, y: NodeID, len: usize, cycle: bool, elev: i16| {
-            g.add_edge(x, edge(x, y, len, cycle, elev));
-            g.add_edge(y, edge(y, x, len, cycle, -elev));
-        };
-        bidir(a, m1, 120, true, 3);
-        bidir(m1, m2, 120, true, -1);
-        bidir(m2, b, 120, true, 2);
-        bidir(a, b, 300, false, 0); // shorter road (Time↔Cyc trade-off)
-        bidir(a, pa, 80, true, 0);
-        bidir(b, pb, 80, true, 0);
-        g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
-        let bike = g.default_bike_cost();
-        let w = g.raptor.cost_weights;
-        let eps = g.raptor.epsilon;
-
-        let run = |g: &Graph| {
-            g.multiobj_search(a, b, RoutingMode::Bike, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, true)
-        };
-        g.raptor.multiobj_contract = false;
-        let off = run(&g);
-        g.build_bike_contracted();
-        g.bake_bike_contracted(&bike);
-        g.raptor.multiobj_contract = true;
-        let baked = run(&g);
-
-        assert!(off.front.len() >= 2, "expected a Time↔Cyc trade-off, got {}", off.front.len());
-        assert_eq!(
-            front_fingerprint(&off),
-            front_fingerprint(&baked),
-            "cost-baked front (cost + geometry) must equal the un-contracted search"
-        );
-
-        // Interior destination: the guard must let the search stop at m1, not jump past.
-        let run_m1 = |g: &Graph| {
-            g.multiobj_search(a, m1, RoutingMode::Bike, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, true)
-        };
-        g.raptor.multiobj_contract = false;
-        let off_m1 = run_m1(&g);
-        g.raptor.multiobj_contract = true;
-        let baked_m1 = run_m1(&g);
-        assert_eq!(
-            front_fingerprint(&off_m1),
-            front_fingerprint(&baked_m1),
-            "cost-baked must reach an interior destination (m1) via the guard"
-        );
-    }
-
-    #[test]
-    fn union_baked_matches_uncontracted_front() {
-        // The UNION cg splits a bike chain at a node that is bike-degree-2 (collapsed in
-        // bike_contracted) but has an extra FOOT-only branch (so it is a union junction kept
-        // in g.contracted). The shortest bike route passes THROUGH that node, exercising the
-        // baked-exit→live-entry corner correction across a union-only split. The front must be
-        // identical to the un-contracted search.
-        use crate::structures::cost::{Epsilon, LegRole, RoutingMode};
-        use crate::structures::cost::VarGen;
-        use crate::structures::{
-            BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, NodeID, OsmNodeData,
-            StreetEdgeData, Surface,
-        };
-        let mut g = Graph::new();
-        let mk = |id: &str, lat: f64, lon: f64| {
-            NodeData::OsmNode(OsmNodeData {
-                eid: id.into(),
-                lat_lng: LatLng { latitude: lat, longitude: lon },
-            })
-        };
-        // a(jct)-m1-x-m2-b(jct) cycleway chain. `x` is bike-degree-2 (interior for the
-        // bike-only cg) but gets a foot-only branch to `f`, making it a UNION junction — so
-        // g.contracted splits the chain into a→x and x→b (both ≥2 segments). Bends at m1/m2
-        // (and at x via the zig-zag) make the corner correction at x non-trivial. Spokes
-        // pa/pb make a,b junctions; the shorter direct road gives a Time↔Cyc trade-off.
-        let a = g.add_node(mk("a", 50.0000, 4.0000));
-        let m1 = g.add_node(mk("m1", 50.0003, 4.0008));
-        let x = g.add_node(mk("x", 50.0000, 4.0015));
-        let m2 = g.add_node(mk("m2", 50.0004, 4.0022));
-        let b = g.add_node(mk("b", 50.0000, 4.0030));
-        let f = g.add_node(mk("f", 49.9994, 4.0015)); // foot-only branch off x
-        let pa = g.add_node(mk("pa", 50.0010, 4.0000));
-        let pb = g.add_node(mk("pb", 50.0010, 4.0030));
-        g.build_raptor_index();
-        let edge = |o: NodeID, d: NodeID, len: usize, cycle: bool, foot: bool, bike: bool, elev: i16| {
-            let mut at = BikeAttrs::road_default();
-            at.highway = HighwayClass::Residential;
-            at.surface = Surface::Paved;
-            at.isbike = cycle;
-            EdgeData::Street(StreetEdgeData {
-                origin: o, destination: d, partial: false, length: len,
-                foot, bike, car: false, attrs: at, elev_delta: elev,
-                surface_speed: 100, var_gen: VarGen::NONE,
-            })
-        };
-        let mut bidir = |x: NodeID, y: NodeID, len: usize, cycle: bool, elev: i16| {
-            g.add_edge(x, edge(x, y, len, cycle, true, true, elev));
-            g.add_edge(y, edge(y, x, len, cycle, true, true, -elev));
-        };
-        bidir(a, m1, 110, true, 3);
-        bidir(m1, x, 110, true, -2);
-        bidir(x, m2, 110, true, 2);
-        bidir(m2, b, 110, true, -1);
-        bidir(a, b, 320, false, 0); // shorter road (Time↔Cyc trade-off)
-        bidir(a, pa, 80, true, 0);
-        bidir(b, pb, 80, true, 0);
-        // FOOT-ONLY branch off x ⇒ x is a union junction but stays bike-degree-2.
-        g.add_edge(x, edge(x, f, 90, false, true, false, 0));
-        g.add_edge(f, edge(f, x, 90, false, true, false, 0));
-
-        g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
-        let bike = g.default_bike_cost();
-        let w = g.raptor.cost_weights;
-        let eps = g.raptor.epsilon;
-        let run = |g: &Graph| {
-            g.multiobj_search(a, b, RoutingMode::Bike, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, true)
-        };
-
-        // Uncontracted oracle.
-        g.raptor.multiobj_contract = false;
-        g.raptor.node_contraction = false;
-        let off = run(&g);
-
-        // Build + bake bike on the UNION cg, switch to node_contraction.
-        let mut cg = crate::structures::contraction::ContractedGraph::from_graph_union(&g);
-        cg.build_seg_index();
-        g.contracted = Some(cg);
-        g.bake_bike_on_contracted(&bike);
-
-        // Sanity: x is a union junction whose bounding super-edges are baked (≥2 segments),
-        // so the route through x exercises the baked-exit→live-entry handoff.
-        {
-            let cg = g.contracted.as_ref().unwrap();
-            assert_ne!(cg.junction_of[x.0], u32::MAX, "x must be a union junction (foot branch)");
-            assert_eq!(cg.junction_of[m1.0], u32::MAX, "m1 must be union-interior");
-            let se_to_x = cg.super_edge(a, m1).expect("a→x super-edge via m1");
-            assert!(se_to_x.seg_len >= 2 && se_to_x.baked.is_some(),
-                "a→x must be a baked ≥2-segment super-edge");
-            let se_from_x = cg.super_edge(x, m2).expect("x→b super-edge via m2");
-            assert!(se_from_x.seg_len >= 2 && se_from_x.baked.is_some(),
-                "x→b must be a baked ≥2-segment super-edge");
-        }
-
-        g.raptor.node_contraction = true;
-        let on = run(&g);
-
-        assert!(off.front.len() >= 2, "expected a Time↔Cyc trade-off, got {}", off.front.len());
-        assert_eq!(
-            front_fingerprint(&off),
-            front_fingerprint(&on),
-            "union-baked front (cost + geometry) must equal the un-contracted search"
-        );
-        // The chain route must re-expand through x (a→m1→x→m2→b).
-        assert!(
-            on.front.iter().any(|p| p.nodes.iter().any(|n| n.0 == x.0) && p.nodes.len() == 5),
-            "contracted route must re-expand the full a→m1→x→m2→b geometry through x"
-        );
-
-        // Interior destination under the UNION cg: `m1` is BOTH union-interior and
-        // bike-interior, so `dest_guard_junctions` must walk (via bike_neighbours_of) while
-        // reading union `junction_of` and let the search stop at m1 — the one branch the
-        // mechanical bike_cg() switch introduced that the front check above doesn't touch.
-        let run_m1 = |g: &Graph| {
-            g.multiobj_search(a, m1, RoutingMode::Bike, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, true)
-        };
-        g.raptor.node_contraction = false;
-        let off_m1 = run_m1(&g);
-        g.raptor.node_contraction = true;
-        let on_m1 = run_m1(&g);
-        assert_eq!(
-            front_fingerprint(&off_m1),
-            front_fingerprint(&on_m1),
-            "union dest_guard must reach the interior destination m1"
-        );
-    }
-
     #[test]
     fn bucket_still_dominance_prunes() {
         // A strictly-dominated label is rejected regardless of which cell it lands
@@ -2307,7 +1998,7 @@ mod tests {
     #[test]
     fn distance_budget_prunes_long_detours() {
         let (g, a, b) = tiny_detour_graph();
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let tight = g.multiobj_search(
@@ -2351,7 +2042,7 @@ mod tests {
     fn walk_front_min_time_matches_scalar_dijkstra() {
         let (g, a, b) = tiny_detour_graph();
         let scalar = g.walk_dijkstra(a, u32::MAX);
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(
@@ -2425,7 +2116,7 @@ mod tests {
     fn variance_axis_is_always_on_signal_tradeoff() {
         use crate::structures::cost::Axis;
         let (g, a, b) = tiny_signal_choice_graph();
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(
@@ -2468,7 +2159,7 @@ mod tests {
         let (mut g, a, b) = tiny_signal_choice_graph();
         g.set_representatives_k(6);
         let cv = g.raptor.systematic_cv;
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(
@@ -2513,7 +2204,7 @@ mod tests {
         // ~2.4 km apart in central Brussels.
         let (_, &o) = g.nearest_node_dist(50.841, 4.415).expect("o");
         let (_, &d) = g.nearest_node_dist(50.845, 4.381).expect("d");
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = g.raptor.epsilon;
         let budget = g.raptor.distance_budget;
@@ -2531,140 +2222,6 @@ mod tests {
                     r.front.len()
                 );
             }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn bike_10km_bottleneck_diag() {
-        use crate::structures::cost::{Axis, RoutingMode};
-        use std::time::Instant;
-        let path = "data/belgium-latest.osm.pbf";
-        let dem = crate::ingestion::osm::Dem::load("data/belgium-DTM-20m.tif").ok();
-        let mut g = Graph::new();
-        let t0 = Instant::now();
-        crate::ingestion::osm::load_pbf_file(path, dem.as_ref(), 4.0, &Default::default(), &mut g).unwrap();
-        g.build_raptor_index();
-        eprintln!("DIAG load+index={:.1?} nodes={}", t0.elapsed(), g.nodes.len());
-        // ~10 km bike route across Brussels on the full Belgium network.
-        let (do_, &o) = g.nearest_node_dist(50.796, 4.298).expect("o");
-        let (dd, &d) = g.nearest_node_dist(50.878, 4.402).expect("d");
-        let fly = g.nodes[o.0].loc().dist(g.nodes[d.0].loc());
-        eprintln!("DIAG fly_dist={:.0}m snap_o={:.0}m snap_d={:.0}m", fly, do_, dd);
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
-        let w = g.raptor.cost_weights;
-
-        // Degree distribution: how many nodes are degree-2 pass-throughs (exactly two
-        // distinct street neighbours, not a transit stop) — the contraction ceiling.
-        {
-            let mut deg2 = 0usize;
-            let mut bikeable = 0usize;
-            for u in 0..g.nodes.len() {
-                if g.raptor.transit_node_to_stop[u] != u32::MAX {
-                    continue;
-                }
-                let Some(neigh) = g.edges.get(u) else { continue };
-                let mut nbrs: Vec<usize> = neigh
-                    .iter()
-                    .filter_map(|e| match e {
-                        EdgeData::Street(s) if s.bike => Some(s.destination.0),
-                        _ => None,
-                    })
-                    .collect();
-                if nbrs.is_empty() {
-                    continue;
-                }
-                bikeable += 1;
-                nbrs.sort_unstable();
-                nbrs.dedup();
-                if nbrs.len() == 2 {
-                    deg2 += 1;
-                }
-            }
-            eprintln!(
-                "DIAG degree2_passthrough={} of bikeable={} ({:.1}%) total_nodes={}",
-                deg2,
-                bikeable,
-                100.0 * deg2 as f64 / bikeable.max(1) as f64,
-                g.nodes.len()
-            );
-        }
-
-        // GRID BUCKETING sweep on (CyclewayDeficit, Dplus). Cell size = k·D. ε stays at
-        // default (within-cell near-dup killer). Bar: total_labels ≤ ~1.6M (≈2s) AND
-        // min-cyc ≈ 1700 (the cycleway extreme preserved). Watch min-cyc as budget
-        // tightens — the extreme is a length detour and too-tight budget drops it.
-        // (label, cyc_k, dpl_k, budget)
-        // (label, cyc_k, dpl_k, budget, contract). F0 vs F1: A/B equality (contraction
-        // must not change the front). F1-F5: perf of contraction across budgets.
-        // (label, cyc_k, dpl_k, budget, contract, baked). F0 off / F1 re-walk on /
-        // FB baked on must all be IDENTICAL; FB should beat F0 and F1 on time.
-        // Budget sweep: OFF vs cost-BAKED at each budget. The fronts must stay IDENTICAL
-        // across budgets (the `multiobj_contract` bucketing interaction is the concern),
-        // and BAKED should win on time everywhere.
-        g.raptor.bike_bucket_cyc_k = 0.11;
-        g.raptor.bike_bucket_dpl_k = 0.013;
-        let budgets = [0.15f64, 0.2, 0.3, 0.5, 1.0];
-        let mut candidates: Vec<(String, f64, bool)> = Vec::new();
-        for &b in &budgets {
-            candidates.push((format!("OFF   bud={b:.2}"), b, false));
-            candidates.push((format!("BAKED bud={b:.2}"), b, true));
-        }
-        let tbake = Instant::now();
-        g.build_bike_contracted();
-        g.bake_bike_contracted(&bike);
-        let baked_cg = g.bike_contracted.take();
-        eprintln!("DIAG bake={:.1?}", tbake.elapsed());
-        let mut fingerprints: Vec<Vec<(i64, i64, i64)>> = Vec::new();
-        for (label, budget, baked) in &candidates {
-            g.raptor.multiobj_contract = *baked;
-            g.bike_contracted = if *baked { baked_cg.clone() } else { None };
-            let eps = g.raptor.epsilon;
-            super::TRANS_N.with(|c| c.set(0));
-            let t = Instant::now();
-            let r = g.multiobj_search(
-                o,
-                d,
-                RoutingMode::Bike,
-                LegRole::Neutral,
-                &bike,
-                &w,
-                &eps,
-                *budget,
-                true,
-            );
-            let el = t.elapsed();
-            let mut fp: Vec<(i64, i64, i64)> = r
-                .front
-                .iter()
-                .map(|p| {
-                    (
-                        p.cost.get(Axis::Time).round() as i64,
-                        p.cost.get(Axis::CyclewayDeficit).round() as i64,
-                        p.cost.get(Axis::Dplus).round() as i64,
-                    )
-                })
-                .collect();
-            fp.sort();
-            let trans_n = super::TRANS_N.with(|c| c.get());
-            let min_cyc = fp.iter().map(|x| x.1).min();
-            eprintln!(
-                "DIAG [{}] {:.2?} labels={} front={} min_cyc={:?} transitions={}",
-                label, el, r.total_labels, fp.len(), min_cyc, trans_n
-            );
-            fingerprints.push(fp);
-        }
-        // Per-budget A/B: OFF (even idx) vs BAKED (odd idx) must be identical.
-        for (i, b) in budgets.iter().enumerate() {
-            eprintln!(
-                "DIAG A/B bud={:.2} off==baked : {}",
-                b,
-                if fingerprints[2 * i] == fingerprints[2 * i + 1] {
-                    "IDENTICAL ✓"
-                } else {
-                    "DIVERGED ✗"
-                }
-            );
         }
     }
 
@@ -2689,7 +2246,7 @@ mod tests {
         let (_, &d) = g.nearest_node_dist(50.851, 4.358).expect("dest snaps");
         eprintln!("SMOKE origin={:?} dest={:?}", o, d);
 
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = g.raptor.epsilon;
         let budget = g.raptor.distance_budget;
@@ -2783,7 +2340,7 @@ mod tests {
         // the hysteresis (5 m buffer) must absorb it → ~0 m on the Dplus axis.
         g.add_edge(a, mk_edge(a, b, 80, 2));
         g.add_edge(b, mk_edge(b, c, 80, -2));
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(
@@ -2849,7 +2406,7 @@ mod tests {
                 var_gen: VarGen::NONE,
             }),
         );
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(
@@ -2913,7 +2470,7 @@ mod tests {
         g.add_edge(a, mk_edge(a, b, 137));
         g.add_edge(b, mk_edge(b, c, 211));
         let scalar = g.walk_dijkstra(a, u32::MAX);
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
         let res = g.multiobj_search(

@@ -151,15 +151,6 @@ default_routing:
   # a city leg (~2 s); 0.02 ≈ 5 (~2.8 s). Costs per-node frontier on long legs (gated).
   bike_bucket_cyc_k: 0.025
   bike_bucket_dpl_k: 0.013
-  # On-the-fly degree-2 contraction in the bike search. Cost-exact only without lossy
-  # pruning; it interacts with bucketing and can drop the cycleway extreme at tight
-  # budgets, so it is off. (~3.6× fewer labels but only ~30% wall-clock, as the
-  # per-edge cost dominates.) Kept for future work.
-  multiobj_contract: false
-  # P3f node contraction. On (default): build the contracted graph, DROP the interior-node
-  # arrays (frees ~0.7-0.8GB, street queries ~2.4x faster), route on the contracted graph.
-  # Off: full-graph routing — requires a rebuild (a contracted graph.bin can't serve it).
-  node_contraction: true
   # Whether D+ (ascent) is a bike SELECTION axis. false (default): D+ is displayed but
   # does not pick routes — the gradient power model already prices climbing into Time, so
   # a separate min-D+ axis only manufactured absurd extremes (a ~1.5 km walk to shave a

@@ -206,7 +206,7 @@ mod tests {
     fn multiobj_representatives_returns_at_most_k_paths_from_origin_to_dest() {
         let (mut g, a, b) = tiny_two_route_graph();
         g.set_representatives_k(1);
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
         let reps = g.multiobj_representatives(a, b, RoutingMode::Walk, LegRole::Neutral, &bike);
         assert!(!reps.is_empty(), "a route exists");
         assert!(reps.len() <= 1, "trimmed to representatives_k");
@@ -226,7 +226,7 @@ mod tests {
         g.build_raptor_index();
         let (_, &o) = g.nearest_node_dist(50.846, 4.352).expect("origin snaps");
         let (_, &d) = g.nearest_node_dist(50.851, 4.358).expect("dest snaps");
-        let bike = BikeCost::new(g.raptor.bike_profile, g.raptor.walking_speed_mps);
+        let bike = BikeCost::new(g.raptor.bike_profile);
 
         let full = g.multiobj_search(
             o,

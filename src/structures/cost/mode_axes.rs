@@ -135,7 +135,7 @@ pub fn edge_cost_vector(
     this_dir: (f64, f64),
 ) -> Option<CostVector> {
     match mode {
-        RoutingMode::Bike => bike_vector(e, profile, weights, model, speed_mps, incoming, this_dir),
+        RoutingMode::Bike => bike_vector(e, profile, weights, model, incoming, this_dir),
         RoutingMode::Walk => walk_vector(e, weights, model, speed_mps),
         RoutingMode::Drive => drive_vector(e, model, speed_mps),
     }
@@ -158,11 +158,10 @@ fn bike_vector(
     profile: &BikeProfile,
     weights: &CostWeights,
     model: &VarianceModel,
-    speed_mps: f64,
     incoming: Option<(f64, f64)>,
     this_dir: (f64, f64),
 ) -> Option<CostVector> {
-    let bc = BikeCost::new(*profile, speed_mps.max(0.1));
+    let bc = BikeCost::new(*profile);
     bc.edge_cost(e, incoming, this_dir)?;
     let len = e.length as f64;
     let mut cv = CostVector::ZERO;

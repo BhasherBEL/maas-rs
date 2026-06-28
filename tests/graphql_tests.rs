@@ -60,6 +60,36 @@ fn data_obj(resp: async_graphql::Response) -> async_graphql::indexmap::IndexMap<
     }
 }
 
+fn enable_contraction(g: &mut maas_rs::structures::Graph) {
+    use maas_rs::structures::contraction::ContractedGraph;
+    let mut cg = ContractedGraph::from_graph_union(g);
+    cg.build_seg_index();
+    g.contracted = Some(cg);
+    g.bake_bike_on_contracted_default();
+}
+
+/// Minimal bidirectional foot edge for contraction tests that need the arena-snap R-tree
+/// to find a segment near query coordinates.
+fn foot_street(
+    origin: maas_rs::structures::NodeID,
+    destination: maas_rs::structures::NodeID,
+    length: usize,
+) -> maas_rs::structures::EdgeData {
+    maas_rs::structures::EdgeData::Street(maas_rs::structures::StreetEdgeData {
+        origin,
+        destination,
+        length,
+        partial: false,
+        foot: true,
+        bike: false,
+        car: false,
+        attrs: maas_rs::structures::BikeAttrs::road_default(),
+        elev_delta: 0,
+        surface_speed: 100,
+        var_gen: maas_rs::structures::cost::VarGen::NONE,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -173,8 +203,12 @@ fn graphql_raptor_accepts_modes_argument() {
 #[test]
 fn graphql_raptor_rejects_empty_modes() {
     let mut g = Graph::new();
-    g.add_node(osm_node("n0", 50.0, 4.0));
+    let n0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    let n1 = g.add_node(osm_node("n1", 50.001, 4.001));
+    g.add_edge(n0, foot_street(n0, n1, 150));
+    g.add_edge(n1, foot_street(n1, n0, 150));
     g.build_raptor_index();
+    enable_contraction(&mut g);
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
@@ -209,7 +243,9 @@ fn graphql_walk_only_plan_exposes_walk_mode() {
             var_gen: maas_rs::structures::cost::VarGen::NONE,
         }),
     );
+    g.add_edge(b, foot_street(b, a, 80));
     g.build_raptor_index();
+    enable_contraction(&mut g);
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
@@ -430,9 +466,12 @@ fn graphql_gtfs_agencies_returns_agency_and_routes() {
 #[test]
 fn graphql_raptor_explain_stops_reached_empty_no_transit() {
     let mut g = Graph::new();
-    g.add_node(osm_node("n0", 50.0, 4.0));
-    g.add_node(osm_node("n1", 50.01, 4.01));
+    let n0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    let n1 = g.add_node(osm_node("n1", 50.01, 4.01));
+    g.add_edge(n0, foot_street(n0, n1, 1400));
+    g.add_edge(n1, foot_street(n1, n0, 1400));
     g.build_raptor_index();
+    enable_contraction(&mut g);
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
@@ -460,9 +499,12 @@ fn graphql_raptor_explain_stops_reached_empty_no_transit() {
 #[test]
 fn graphql_raptor_explain_origin_destination_present() {
     let mut g = Graph::new();
-    g.add_node(osm_node("n0", 50.0, 4.0));
-    g.add_node(osm_node("n1", 50.01, 4.01));
+    let n0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    let n1 = g.add_node(osm_node("n1", 50.01, 4.01));
+    g.add_edge(n0, foot_street(n0, n1, 1400));
+    g.add_edge(n1, foot_street(n1, n0, 1400));
     g.build_raptor_index();
+    enable_contraction(&mut g);
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
@@ -505,10 +547,16 @@ fn graphql_raptor_explain_origin_destination_present() {
 fn graphql_raptor_explain_stops_reached_access_stop_round_zero() {
     let mut g = Graph::new();
     // OSM node close to origin
-    let _osm0 = g.add_node(osm_node("n0", 50.0, 4.0));
+    let n0 = g.add_node(osm_node("n0", 50.0, 4.0));
     // Transit stop ~111m from origin (within MAX_TRANSFER_DISTANCE_M=1000), snapped to n0
     g.add_node(transit_stop("Test Stop", 50.001, 4.0));
+    // OSM node near destination (50.02, 4.02); bidirectional edge gives contraction a foot
+    // segment the arena-snap can find for both query endpoints.
+    let n2 = g.add_node(osm_node("n2", 50.02, 4.02));
+    g.add_edge(n0, foot_street(n0, n2, 2800));
+    g.add_edge(n2, foot_street(n2, n0, 2800));
     g.build_raptor_index();
+    enable_contraction(&mut g);
 
     let schema = build_schema(shared(g));
     let resp = execute_sync(
@@ -577,6 +625,7 @@ fn graphql_walk_plan_alternatives_resolve_with_brackets() {
     g.add_edge(a, mk_edge(a, b, 100, Surface::Unpaved));
     g.add_edge(a, mk_edge(a, c, 90, Surface::Paved));
     g.add_edge(c, mk_edge(c, b, 90, Surface::Paved));
+    enable_contraction(&mut g);
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
@@ -807,6 +856,7 @@ fn graphql_transit_plan_access_leg_has_alternatives_and_leave_by() {
     g.set_distance_budget(f64::INFINITY);
     g.set_multiobj_street(true);
     g.build_raptor_index();
+    enable_contraction(&mut g);
 
     let schema = build_schema(shared(g));
     let resp = execute_sync(

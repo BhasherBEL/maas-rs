@@ -246,7 +246,6 @@ mod tests {
         }
         // build_raptor_index() populates transit_node_to_stop, which the contraction reads.
         g.build_raptor_index();
-        g.set_node_contraction(true);
 
         let mut cg = crate::structures::contraction::ContractedGraph::from_graph_union(&g);
         cg.build_seg_index();

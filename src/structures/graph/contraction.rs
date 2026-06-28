@@ -338,8 +338,13 @@ impl ContractedGraph {
         let mut junction_of = vec![u32::MAX; n];
         let mut junctions: Vec<NodeID> = Vec::new();
         for u in 0..n {
-            if conn.neighbours(g, u).1 == 0 {
-                continue; // no edge of this connectivity ⇒ irrelevant to this graph
+            // A transit stop is always a junction (even with no street edge of this
+            // connectivity — e.g. reached only by riding to it): its coordinate must
+            // survive the interior-node drop so plan/explain reconstruction can resolve it.
+            let is_stop =
+                g.raptor.transit_node_to_stop.get(u).copied().unwrap_or(u32::MAX) != u32::MAX;
+            if conn.neighbours(g, u).1 == 0 && !is_stop {
+                continue; // no edge of this connectivity and not a transit stop ⇒ irrelevant
             }
             if !Self::is_interior(g, u, &indeg, conn) {
                 junction_of[u] = junctions.len() as u32;
@@ -1666,7 +1671,7 @@ impl Graph {
     /// `cg.adjacency`, `cg.junction_coord`) instead of `g.nodes`/`g.edges`, so it
     /// survives `drop_full_node_arrays()`. Returns min-cost-route arrival seconds per
     /// reachable junction (keyed by `NodeID`). Stop junctions are dead-ends for
-    /// through-routing (same as `bike_cost_dijkstra`). Gated by `use_contracted()`.
+    /// through-routing (same as `bike_cost_dijkstra`). Gated by `contracted.is_some()`.
     pub fn bike_dijkstra_union(
         &self,
         origin: NodeID,
@@ -1765,41 +1770,12 @@ impl Graph {
         self.edge_index = super::edge_index::EdgeIndex::default();
     }
 
-    /// Cost-bake every ≥2-segment super-edge so the bike multi-objective search adds its
-    /// cost in O(1) (+ two live corners) instead of replaying segments. Replays from the
-    /// self-contained arena (edges + far-coords), so baking — like walk — needs no
-    /// `g.nodes`/`g.edges` topology, only `g.raptor` cost params.
-    pub fn bake_bike_contracted(&mut self, bike: &BikeCost) {
-        let Some(mut cg) = self.bike_contracted.take() else {
-            return;
-        };
-        // Pass 1: compute (immutable borrow of cg.segs/junction_coord/adjacency).
-        let mut baked: Vec<Option<Box<BakedCost>>> = Vec::new();
-        for adj in &cg.adjacency {
-            for se in adj {
-                let start = cg.junction_coord[cg.junction_of[se.from.0] as usize];
-                baked.push(self.bake_super_edge(cg.seg_slice(se), start, bike).map(Box::new));
-            }
-        }
-        // Pass 2: assign.
-        let mut it = baked.into_iter();
-        for adj in cg.adjacency.iter_mut() {
-            for se in adj.iter_mut() {
-                se.baked = it.next().flatten();
-            }
-        }
-        self.bike_contracted = Some(cg);
-    }
-
     /// Cost-bake bike cost onto the **union** contracted graph's super-edges (`self.contracted`),
     /// so the bike multi-objective search can run on the serialized union cg (which survives
-    /// dropping `g`) instead of the serde-skipped `bike_contracted`. Identical mechanics to
-    /// [`Graph::bake_bike_contracted`], but the union super-edges may be SHORTER (split at
-    /// union-only junctions a bike-only chain would pass through); `bake_super_edge` replays
-    /// whatever segments a super-edge owns, and the live entry-corner correction at each
-    /// junction makes the front identical regardless of where the splits fall. Called from
-    /// `apply_routing_defaults` when `node_contraction` is on — also on the RESTORE path, since
-    /// `SuperEdge.baked` is serde-skipped (a deserialized union cg has `baked = None`).
+    /// dropping `g`). `bake_super_edge` replays whatever segments a super-edge owns, and the
+    /// live entry-corner correction at each junction makes the front identical regardless of
+    /// where the splits fall. Called from `apply_routing_defaults` — also on the RESTORE path,
+    /// since `SuperEdge.baked` is serde-skipped (a deserialized union cg has `baked = None`).
     pub fn bake_bike_on_contracted(&mut self, bike: &BikeCost) {
         let Some(mut cg) = self.contracted.take() else {
             return;
@@ -2100,6 +2076,40 @@ mod tests {
         (g, a, b, m1, m2)
     }
 
+    #[test]
+    fn transit_stop_without_street_edge_is_a_junction() {
+        // A stop reachable only by transit (no foot stub / no street edge) must STILL be a
+        // junction, so its coordinate survives `drop_full_node_arrays()`. Otherwise the
+        // `raptorExplain` stops-reached survey (`node_loc`) panics on the dropped graph
+        // (index out of bounds: junction_of[stop] == u32::MAX).
+        use crate::structures::TransitStopData;
+        use gtfs_structures::Availability;
+        let mut g = Graph::new();
+        let a = osm(&mut g, "a", 50.000, 4.000);
+        let b = osm(&mut g, "b", 50.000, 4.001);
+        bidir_bike(&mut g, a, b);
+        let stop = g.add_node(NodeData::TransitStop(TransitStopData {
+            name: "Island Stop".into(),
+            id: "S".into(),
+            lat_lng: LatLng {
+                latitude: 50.002,
+                longitude: 4.002,
+            },
+            accessibility: Availability::Available,
+        }));
+        g.build_raptor_index();
+        assert_ne!(
+            g.raptor.transit_node_to_stop[stop.0],
+            u32::MAX,
+            "fixture: the stop must be registered in transit_node_to_stop"
+        );
+        let cg = ContractedGraph::from_graph_union(&g);
+        assert!(
+            cg.junction_coord_of(stop).is_some(),
+            "a transit stop with no street edge must still be a junction so its coord survives the drop"
+        );
+    }
+
     /// Replay a super-edge's chain through the per-segment bike cost, from `start`.
     fn replay_secs(g: &Graph, start: NodeID, se: &SuperEdge, bike: &BikeCost) -> f64 {
         use super::super::bike_cost::{BikeCost as BC, PrevCtx};
@@ -2221,42 +2231,6 @@ mod tests {
         assert_eq!(direct, via, "same-chain m1→m2 must be the direct hop, not via a junction");
     }
 
-    /// `street_path_arena` reconstructs the same polyline as the full-graph `street_path`
-    /// for junction endpoints — proving the point-to-point early-exit (which stops once no
-    /// junction can beat the best route+stub total, instead of flooding every junction) is
-    /// exact, not just fast. Without the bound the search settled all ~1.7M Belgium junctions
-    /// per leg, making contracted routing ~20x slower; the bound must not change the result.
-    #[test]
-    fn street_path_arena_matches_full_and_is_bounded() {
-        use super::super::raptor_access::StreetProfile;
-        let (g, a, b, _m1, _m2) = chain_graph();
-        let mut cg = ContractedGraph::from_graph_union(&g);
-        cg.build_seg_index();
-        let radius = g.raptor.edge_snap_radius_m;
-        for &(o, d) in &[(a, b), (b, a)] {
-            let oc = g.nodes[o.0].loc();
-            let dc = g.nodes[d.0].loc();
-            let arena =
-                cg.street_path_arena(&g, oc.latitude, oc.longitude, dc.latitude, dc.longitude, StreetProfile::Foot, radius);
-            let full = g.street_path(o, d, StreetProfile::Foot);
-            assert_eq!(
-                arena.len(),
-                full.len(),
-                "o={o:?} d={d:?}: arena polyline {} pts != full {} pts",
-                arena.len(),
-                full.len()
-            );
-            for (av, fv) in arena.iter().zip(&full) {
-                assert!(
-                    (av.latitude - fv.lat).abs() < 1e-9 && (av.longitude - fv.lon).abs() < 1e-9,
-                    "o={o:?} d={d:?}: arena pt {av:?} != full pt ({},{})",
-                    fv.lat,
-                    fv.lon
-                );
-            }
-        }
-    }
-
     /// Junction-level walk times over union super-edges match the node-by-node
     /// `street_dijkstra(Foot)` exactly — the P3c-walk equivalence gate.
     #[test]
@@ -2354,7 +2328,6 @@ mod tests {
     #[test]
     fn bake_after_drop_is_gfree() {
         let (mut g, _a, _b, _m1, _m2) = chain_graph();
-        g.set_node_contraction(true);
         let mut cg = ContractedGraph::from_graph_union(&g);
         cg.build_seg_index();
         g.contracted = Some(cg);
@@ -2377,11 +2350,12 @@ mod tests {
     fn bike_entries_arena_forward_matches_g_replay() {
         use crate::structures::cost::Axis;
         let (mut g, a, b, m1, m2) = chain_graph();
-        g.build_bike_contracted();
         let bike = g.default_bike_cost();
-        g.bake_bike_contracted(&bike);
-        let mut cg = g.bike_contracted().unwrap().clone();
+        let mut cg = ContractedGraph::from_graph_union(&g);
         cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted(&bike);
+        let cg = g.contracted.take().unwrap();
 
         // Snap a point clearly mid-segment on the m1→m2 hop (away from junctions a,b).
         let pm1 = g.nodes[m1.0].loc();
@@ -2447,7 +2421,7 @@ mod tests {
     fn superedge_replay_equals_uncontracted_chain_cost() {
         let (g, a, b, m1, m2) = chain_graph();
         let cg = ContractedGraph::from_graph(&g);
-        let bike = BikeCost::new(BikeProfile::default(), 1.2);
+        let bike = BikeCost::new(BikeProfile::default());
 
         // Baseline: walk the real node chain a→m1→m2→b on the full graph.
         let chain = [a, m1, m2, b];
@@ -2643,10 +2617,12 @@ mod tests {
     fn baked_traverse_equals_replay_on_front_axes() {
         use crate::structures::cost::Axis;
         let (mut g, a, b, m1, _m2) = chain_graph();
-        g.build_bike_contracted();
-        let bike = BikeCost::new(BikeProfile::default(), 1.2);
-        g.bake_bike_contracted(&bike);
-        let cg = g.bike_contracted().unwrap();
+        let bike = BikeCost::new(BikeProfile::default());
+        let mut cg = ContractedGraph::from_graph_union(&g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted(&bike);
+        let cg = g.contracted.as_ref().unwrap();
         let se = cg.super_edge(a, m1).expect("a→ super-edge");
         let baked = se.baked.as_ref().expect("baked (≥2 segments)");
 
@@ -3112,10 +3088,11 @@ mod tests {
         g.build_raptor_index();
         g.build_edge_index();
         let bike = g.default_bike_cost();
-        g.build_bike_contracted();
-        g.bake_bike_contracted(&bike);
-        let mut cg = g.bike_contracted().unwrap().clone();
+        let mut cg = ContractedGraph::from_graph_union(&g);
         cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted(&bike);
+        let cg = g.contracted.take().unwrap();
 
         // g-oracle: from OnEdge end `e` (entered from `other`, stub `stub_len` to `e`), ride
         // the partial stub then the bike chain away from `other` to a junction, replaying via

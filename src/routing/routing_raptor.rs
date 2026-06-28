@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
 use crate::ingestion::gtfs::date_to_days;
 use crate::structures::plan::{ExplainResult, Plan};
 use crate::structures::{
-    ActiveModes, Endpoint, Graph, Mode, NodeID, RealtimeIndex, ReliabilityBuckets,
+    ActiveModes, Graph, Mode, RealtimeIndex, ReliabilityBuckets,
     valid_reliability_edges,
 };
 
@@ -37,46 +37,6 @@ pub struct RouteQuery {
 /// else the graph's configured default.
 fn resolve_bike_profile(graph: &Graph, query: &RouteQuery) -> crate::structures::BikeProfile {
     query.bike_profile.unwrap_or(graph.raptor.bike_profile)
-}
-
-/// Edge-snap a coordinate for a bike: prefer the nearest *rideable* edge so a bike
-/// isn't dropped onto a footway and forced to push from the first metre; only fall
-/// back to a foot-only edge when no bike edge is in range. `None` when edge snapping
-/// is off or no usable edge is within range/guard.
-fn bike_edge_endpoint(graph: &Graph, lat: f64, lng: f64) -> Option<Endpoint> {
-    if !graph.raptor.edge_snap {
-        return None;
-    }
-    let radius = graph.raptor.edge_snap_radius_m;
-    let guard = graph.raptor.max_snap_distance_m as f64;
-    let snap = graph
-        .snap_to_edge(lat, lng, radius, |s| s.bike)
-        .or_else(|| graph.snap_to_edge(lat, lng, radius, |s| s.foot));
-    let (ep, perp) = snap?;
-    (perp <= guard).then_some(ep)
-}
-
-/// The bike-snapped origin/destination [`Endpoint`]s for a query: the nearest
-/// rideable edge projection, falling back to the snapped node when no edge is in
-/// range. Fed to `enrich_street_legs`, which routes a direct bike leg between these
-/// (stitching the on-edge stubs) so the leg starts/ends at the exact clicked points.
-fn bike_endpoints(
-    graph: &Graph,
-    query: &RouteQuery,
-    origin: NodeID,
-    destination: NodeID,
-) -> (Endpoint, Endpoint) {
-    // Contracted routing uses the junction-to-junction bike scaffold (no on-edge
-    // projection stubs), and `snap_to_edge` reads the dropped g kdtree — so bridge to
-    // the bounding-junction NodeIDs directly. Enrich routes these junction-to-junction.
-    if graph.use_contracted() {
-        return (Endpoint::Node(origin), Endpoint::Node(destination));
-    }
-    let o = bike_edge_endpoint(graph, query.from_lat, query.from_lng)
-        .unwrap_or(Endpoint::Node(origin));
-    let d = bike_edge_endpoint(graph, query.to_lat, query.to_lng)
-        .unwrap_or(Endpoint::Node(destination));
-    (o, d)
 }
 
 /// Resolves the effective buckets + slack for a query, honouring per-request overrides
@@ -124,7 +84,9 @@ fn arena_snap_node(
     lng: f64,
     endpoint: &str,
 ) -> Result<(crate::structures::NodeID, crate::structures::LatLng), async_graphql::Error> {
-    let cg = graph.contracted.as_ref().unwrap();
+    let Some(cg) = graph.contracted.as_ref() else {
+        return Err(async_graphql::Error::new(format!("No node near {endpoint}")));
+    };
     let radius = graph.raptor.edge_snap_radius_m;
     let (proj, dist_m) = cg
         .arena_snap_proj(lat, lng, radius, |s| s.foot)
@@ -140,27 +102,6 @@ fn arena_snap_node(
         .foot_bounding_junction(graph, lat, lng, radius)
         .ok_or_else(|| async_graphql::Error::new(format!("No node near {endpoint}")))?;
     Ok((junction, proj))
-}
-
-/// Snap a query coordinate to the street network, rejecting coordinates that
-/// land farther than the configured snap-distance guard.
-fn snap_node(
-    graph: &Graph,
-    lat: f64,
-    lng: f64,
-    endpoint: &str,
-) -> Result<crate::structures::NodeID, async_graphql::Error> {
-    let (dist_m, node) = graph
-        .nearest_node_dist(lat, lng)
-        .ok_or_else(|| async_graphql::Error::new(format!("No node near {endpoint}")))?;
-    let max = graph.raptor.max_snap_distance_m;
-    if dist_m > max as f64 {
-        return Err(async_graphql::Error::new(format!(
-            "{endpoint} is too far from the network (nearest node {:.0} m away, max {} m)",
-            dist_m, max
-        )));
-    }
-    Ok(*node)
 }
 
 use crate::structures::QueryEndpoints;
@@ -184,7 +125,7 @@ fn resolve_query_params(
     let date = date_to_days(query.date);
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
 
-    let (origin, destination, endpoints) = if graph.use_contracted() {
+    let (origin, destination, endpoints) = {
         let (o, o_coord) = arena_snap_node(graph, query.from_lat, query.from_lng, "departure")?;
         let (d, d_coord) = arena_snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
         (
@@ -195,10 +136,6 @@ fn resolve_query_params(
                 destination: d_coord,
             }),
         )
-    } else {
-        let o = snap_node(graph, query.from_lat, query.from_lng, "departure")?;
-        let d = snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
-        (o, d, None)
     };
 
     let min_access = query
@@ -219,10 +156,7 @@ pub fn route(
     let (buckets, slack) = resolve_tuning(graph, query)?;
     let am = resolve_modes(query)?;
 
-    let bike = crate::structures::BikeCost::new(
-        resolve_bike_profile(graph, query),
-        graph.raptor.walking_speed_mps,
-    );
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let mut plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
@@ -260,13 +194,10 @@ pub fn route(
         ),
     };
 
-    let (bike_origin, bike_dest) = bike_endpoints(graph, query, origin, destination);
     graph.enrich_street_legs(
         &mut plans,
         origin,
         destination,
-        bike_origin,
-        bike_dest,
         &bike,
         query.terminal_deadline,
     );
@@ -293,10 +224,7 @@ pub fn route_explain(
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
-    let bike = crate::structures::BikeCost::new(
-        resolve_bike_profile(graph, query),
-        graph.raptor.walking_speed_mps,
-    );
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let mut result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
@@ -332,13 +260,10 @@ pub fn route_explain(
         ),
     };
 
-    let (bike_origin, bike_dest) = bike_endpoints(graph, query, origin, destination);
     graph.enrich_street_legs(
         &mut result.plans,
         origin,
         destination,
-        bike_origin,
-        bike_dest,
         &bike,
         query.terminal_deadline,
     );
@@ -349,18 +274,43 @@ pub fn route_explain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structures::{LatLng, NodeData, OsmNodeData};
+    use crate::structures::{LatLng, NodeData, NodeID, OsmNodeData};
+
+    fn enable_contraction(g: &mut Graph) {
+        use crate::structures::contraction::ContractedGraph;
+        let mut cg = ContractedGraph::from_graph_union(g);
+        cg.build_seg_index();
+        g.contracted = Some(cg);
+        g.bake_bike_on_contracted_default();
+    }
 
     fn graph_with_node_at(lat: f64, lon: f64) -> Graph {
         let mut g = Graph::new();
-        g.add_node(NodeData::OsmNode(OsmNodeData {
+        let n1 = g.add_node(NodeData::OsmNode(OsmNodeData {
             eid: "n1".to_string(),
             lat_lng: LatLng {
                 latitude: lat,
                 longitude: lon,
             },
         }));
+        // Add a second node a few metres away so the contracted seg index has a segment
+        // to return (an isolated node produces an empty seg index).
+        let n2 = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "n2".to_string(),
+            lat_lng: LatLng {
+                latitude: lat + 0.0001,
+                longitude: lon + 0.0001,
+            },
+        }));
+        street(&mut g, n1, n2, 15, true, true);
+        street(&mut g, n2, n1, 15, true, true);
         g.build_raptor_index();
+        // Extend snap-search radius to the whole world so a far-away query (e.g. Paris)
+        // still finds the segment and returns a large dist_m → "too far" distance error
+        // rather than "no node near".  Default radius (300 m) would let the distant query
+        // exit the R-tree before reaching any segment, silencing the guard we're testing.
+        g.raptor.edge_snap_radius_m = f64::MAX;
+        enable_contraction(&mut g);
         g
     }
 
@@ -473,6 +423,11 @@ mod tests {
         g.add_edge(a, e(a, b, 100, Surface::Unpaved));
         g.add_edge(a, e(a, c, 90, Surface::Paved));
         g.add_edge(c, e(c, b, 90, Surface::Paved));
+        // b has no outgoing edges in the one-directional test graph, so the contracted
+        // graph builder skips it (k=0) and no super-edge reaches b.  A back-edge makes
+        // b a proper junction so both forward paths (a→b direct, a→c→b) are findable.
+        g.add_edge(b, e(b, a, 100, Surface::Unpaved));
+        enable_contraction(&mut g);
         let q = RouteQuery {
             from_lat: 50.000,
             from_lng: 4.000,
@@ -553,6 +508,11 @@ mod tests {
         g.add_edge(a, e(a, b, 100, 8));
         g.add_edge(a, e(a, c, 400, 0));
         g.add_edge(c, e(c, b, 400, 0));
+        // b has no outgoing edges in the one-directional test graph, so the contracted
+        // graph builder skips it (k=0) and no super-edge reaches b.  A back-edge makes
+        // b a proper junction so both forward paths (a→b direct, a→c→b) are findable.
+        g.add_edge(b, e(b, a, 100, -8));
+        enable_contraction(&mut g);
         let q = RouteQuery {
             from_lat: 50.000,
             from_lng: 4.000,
@@ -587,8 +547,8 @@ mod tests {
     /// contraction on, DROP the interior-node arrays, and re-route the SAME coordinates —
     /// the full plans (including endpoint geometry) must be BYTE-IDENTICAL. This fails
     /// today because snapping (`snap_node` → `nearest_node_dist`) reads the dropped g
-    /// kdtree. It passes once snapping is arena-based and gated on `use_contracted()` so
-    /// flag-on snaps via the segment R-tree whether or not g is present — making the drop
+    /// kdtree. It passes once snapping is arena-based and gated on `contracted.is_some()` so
+    /// it snaps via the segment R-tree whether or not g is present — making the drop
     /// behaviorally a no-op (the same uniform-arena discipline as traversal/geometry/
     /// transit). Bike is baked so the bike-snap path is actually exercised.
     ///
@@ -612,65 +572,9 @@ mod tests {
         );
     }
 
-    /// CORRECTNESS companion to the drop oracle (the enrich-surface t2 analog): with
-    /// `g` PRESENT in both runs and JUNCTION endpoints (no snapping confound), the
-    /// contracted reconstruction (`leg_option`/`street_steps` off carried arena edges)
-    /// must be byte-identical to the full-graph reconstruction (off `path_edges`). The
-    /// drop oracle is g-freeness only (before/after are both flag-on, so a consistently-
-    /// wrong carry-through passes it); this gate catches a wrong contracted
-    /// reconstruction. Calls the leg-option/step builders directly so it depends only on
-    /// reconstruction, not the flag-off/flag-on snapping policy difference.
-    #[test]
-    fn contracted_leg_options_match_full_graph() {
-        use crate::structures::cost::{LegRole, RoutingMode};
-        use crate::structures::BikeCost;
-        use crate::structures::NodeID;
-        use crate::structures::plan::PlanPlace;
-
-        let g_off = coord_drop_gate_graph(false);
-        let g_on = coord_drop_gate_graph(true);
-        let bike = BikeCost::new(g_off.raptor.bike_profile, g_off.raptor.walking_speed_mps);
-        // a → b: the whole [a,i1,i2,i3,b] chain. Both endpoints are junctions, so there
-        // is no snapping; only the per-edge reconstruction differs across the flag.
-        let (a, b) = (NodeID(0), NodeID(4));
-        for mode in [RoutingMode::Bike, RoutingMode::Walk, RoutingMode::Drive] {
-            let off = g_off.multiobj_leg_options(a, b, mode, LegRole::Neutral, &bike);
-            let on = g_on.multiobj_leg_options(a, b, mode, LegRole::Neutral, &bike);
-            let to = PlanPlace {
-                node_id: b,
-                stop_position: None,
-                arrival: None,
-                departure: None,
-            };
-            let steps_off =
-                g_off.street_steps(&off[0].nodes, &off[0].edges, mode, &bike, 0, to.clone());
-            let steps_on = g_on.street_steps(&on[0].nodes, &on[0].edges, mode, &bike, 0, to);
-            assert_eq!(
-                format!("{steps_off:?}"),
-                format!("{steps_on:?}"),
-                "{mode:?}: contracted street steps must match full-graph street steps"
-            );
-            // `edges` is the internal arena carry (graphql-skipped); flag-off never
-            // populates it, so clear it before comparing the user-facing reconstruction.
-            // Its correctness is exercised by the street_steps equality above + the drop
-            // oracle's geometry/step equality.
-            let strip = |mut v: Vec<crate::structures::plan::LegOption>| {
-                for o in &mut v {
-                    o.edges.clear();
-                }
-                v
-            };
-            assert_eq!(
-                format!("{:?}", strip(off)),
-                format!("{:?}", strip(on)),
-                "{mode:?}: contracted leg options must match full-graph leg options"
-            );
-        }
-    }
-
     /// Chain a — i1 — i2 — i3 — b: i1..i3 are degree-2 interior (contracted away),
     /// a and b are degree-1 junctions. A coordinate near i2 snaps mid-super-edge.
-    /// `contract` ⇒ build + bake the union contracted graph and flip `node_contraction`.
+    /// `contract` ⇒ build + bake the union contracted graph.
     fn coord_drop_gate_graph(contract: bool) -> Graph {
         use crate::structures::contraction::ContractedGraph;
         use crate::structures::{
@@ -719,7 +623,6 @@ mod tests {
         }
 
         if contract {
-            g.set_node_contraction(true);
             let mut cg = ContractedGraph::from_graph_union(&g);
             cg.build_seg_index();
             g.contracted = Some(cg);
@@ -733,178 +636,6 @@ mod tests {
             modes: Some(vec![Mode::Walk, Mode::Bike, Mode::Car]),
             ..query(50.0000, 4.0009, 50.0000, 4.0031)
         }
-    }
-
-    #[test]
-    fn bike_arrival_reaches_projection_on_oneway_dest_edge() {
-        // Destination sits mid-way along a ONEWAY rideable edge a→b, nearer to b.
-        // `Endpoint::node()` would pick b — but b has no edge toward the projection
-        // (the oneway only allows a→proj), so the leg must route to a and ride the
-        // a→proj stub. Regression: enrich re-routed node-to-node to b and ended the
-        // leg ~one stub short of the clicked point. The served leg's final geometry
-        // point must equal the projection, not node b.
-        use crate::structures::plan::PlanLeg;
-        use crate::structures::Mode;
-        let mut g = Graph::new();
-        let o = osm(&mut g, "o", 50.000, 4.000);
-        let a = osm(&mut g, "a", 50.000, 4.001);
-        let b = osm(&mut g, "b", 50.000, 4.003);
-        street(&mut g, o, a, 100, true, true); // access O→A
-        street(&mut g, a, b, 200, true, true); // ONEWAY A→B (no B→A)
-        g.build_raptor_index();
-        g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
-        g.build_edge_index();
-
-        // Click at lon 4.0025 (t=0.75 along A→B): proj nearer to B, so node()=B.
-        let q = RouteQuery {
-            from_lat: 50.000,
-            from_lng: 4.000,
-            to_lat: 50.000,
-            to_lng: 4.0025,
-            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
-            time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
-            window_minutes: None,
-            min_access_secs: None,
-            arrival_slack_secs: None,
-            reliability_bucket_edges: None,
-            modes: Some(vec![Mode::Bike]),
-            bike_profile: None,
-            terminal_deadline: false,
-        };
-        let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
-        let bike = plans
-            .iter()
-            .find(|p| p.mode == Mode::Bike)
-            .expect("a bike plan");
-        let PlanLeg::Walk(leg) = bike.legs.last().expect("a leg") else {
-            panic!("expected a walk leg in a bike plan")
-        };
-        let last = leg.geometry.last().expect("geometry");
-        assert!(
-            (last.lat - 50.000).abs() < 1e-6 && (last.lon - 4.0025).abs() < 1e-6,
-            "leg must end at the on-edge projection (50.000, 4.0025), got ({}, {})",
-            last.lat,
-            last.lon
-        );
-    }
-
-    #[test]
-    fn bike_arrival_does_not_overshoot_to_farther_natural_end() {
-        // Destination on a TWO-WAY edge a(north)–b(south), projected nearer to a (so
-        // the nearer-by-stub heuristic would pick a). But the origin is south, so the
-        // natural route reaches b first; ending at a forces a doubling-back overshoot
-        // north past the clicked point. The cost-optimal end is b — the leg must never
-        // run north of the projection.
-        use crate::structures::plan::PlanLeg;
-        use crate::structures::Mode;
-        let mut g = Graph::new();
-        let o = osm(&mut g, "o", 50.000, 4.000);
-        let b = osm(&mut g, "b", 50.001, 4.000); // south end of the cycleway
-        let a = osm(&mut g, "a", 50.003, 4.000); // north end
-        street(&mut g, o, b, 111, true, true); // O↔b road
-        street(&mut g, b, o, 111, true, true);
-        street(&mut g, a, b, 222, true, true); // a↔b cycleway, two-way
-        street(&mut g, b, a, 222, true, true);
-        g.build_raptor_index();
-        g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
-        g.build_edge_index();
-
-        // Click nearer to a (lat 50.0022 ⇒ ~89 m from a, ~133 m from b).
-        let q = RouteQuery {
-            from_lat: 50.000,
-            from_lng: 4.000,
-            to_lat: 50.0022,
-            to_lng: 4.000,
-            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
-            time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
-            window_minutes: None,
-            min_access_secs: None,
-            arrival_slack_secs: None,
-            reliability_bucket_edges: None,
-            modes: Some(vec![Mode::Bike]),
-            bike_profile: None,
-            terminal_deadline: false,
-        };
-        let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
-        let bike = plans
-            .iter()
-            .find(|p| p.mode == Mode::Bike)
-            .expect("a bike plan");
-        let PlanLeg::Walk(leg) = bike.legs.last().expect("a leg") else {
-            panic!("expected a walk leg")
-        };
-        let max_lat = leg
-            .geometry
-            .iter()
-            .map(|c| c.lat)
-            .fold(f64::NEG_INFINITY, f64::max);
-        assert!(
-            max_lat <= 50.0022 + 1e-4,
-            "route overshot north of the projection to lat {max_lat} (expected ≤ ~50.0022)"
-        );
-        let last = leg.geometry.last().expect("geometry");
-        assert!(
-            (last.lat - 50.0022).abs() < 1e-3,
-            "leg should end at the projection (~50.0022), got {}",
-            last.lat
-        );
-    }
-
-    #[test]
-    fn gated_long_bike_leg_still_snaps_to_projection() {
-        // A bike leg longer than the enrich gate gets no alternatives, but must still
-        // be edge-snapped (single route reaching the exact clicked point) — the old
-        // ungated snapper guaranteed this; the enrich-path rewrite must not regress it.
-        use crate::structures::plan::PlanLeg;
-        use crate::structures::Mode;
-        let mut g = Graph::new();
-        let o = osm(&mut g, "o", 50.000, 4.000);
-        let a = osm(&mut g, "a", 50.000, 4.001);
-        let b = osm(&mut g, "b", 50.000, 4.003);
-        street(&mut g, o, a, 100, true, true);
-        street(&mut g, a, b, 200, true, true); // ONEWAY A→B
-        g.build_raptor_index();
-        g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
-        g.set_multiobj_street_max_len_m(1); // gate every bike leg
-        g.build_edge_index();
-
-        let q = RouteQuery {
-            from_lat: 50.000,
-            from_lng: 4.000,
-            to_lat: 50.000,
-            to_lng: 4.0025,
-            date: NaiveDate::from_ymd_opt(2026, 6, 12).unwrap(),
-            time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
-            window_minutes: None,
-            min_access_secs: None,
-            arrival_slack_secs: None,
-            reliability_bucket_edges: None,
-            modes: Some(vec![Mode::Bike]),
-            bike_profile: None,
-            terminal_deadline: false,
-        };
-        let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
-        let bike = plans
-            .iter()
-            .find(|p| p.mode == Mode::Bike)
-            .expect("a bike plan");
-        let PlanLeg::Walk(leg) = bike.legs.last().expect("a leg") else {
-            panic!("expected a walk leg")
-        };
-        assert!(
-            leg.alternatives.is_empty(),
-            "gated leg carries no picker alternatives"
-        );
-        let last = leg.geometry.last().expect("geometry");
-        assert!(
-            (last.lat - 50.000).abs() < 1e-6 && (last.lon - 4.0025).abs() < 1e-6,
-            "gated leg must still snap to projection (50.000, 4.0025), got ({}, {})",
-            last.lat,
-            last.lon
-        );
     }
 
     fn street(
@@ -935,59 +666,4 @@ mod tests {
         );
     }
 
-    fn osm(g: &mut Graph, id: &str, lat: f64, lon: f64) -> NodeID {
-        g.add_node(NodeData::OsmNode(OsmNodeData {
-            eid: id.into(),
-            lat_lng: LatLng {
-                latitude: lat,
-                longitude: lon,
-            },
-        }))
-    }
-
-    #[test]
-    fn bike_edge_endpoint_prefers_bike_edge_over_nearer_footway() {
-        // A foot-only edge sits closest to the query; a bike edge is a touch
-        // farther. Bike snapping must land on the bike edge, never the footway.
-        let mut g = Graph::new();
-        let fa = osm(&mut g, "fa", 50.0001, 4.000);
-        let fb = osm(&mut g, "fb", 50.0001, 4.006);
-        let ba = osm(&mut g, "ba", 49.9997, 4.000);
-        let bb = osm(&mut g, "bb", 49.9997, 4.006);
-        street(&mut g, fa, fb, 430, true, false);
-        street(&mut g, fb, fa, 430, true, false);
-        street(&mut g, ba, bb, 430, false, true);
-        street(&mut g, bb, ba, 430, false, true);
-        g.build_edge_index();
-
-        let ep = bike_edge_endpoint(&g, 50.0000, 4.003).expect("snaps to an edge");
-        let Endpoint::OnEdge { a, b, .. } = ep else {
-            panic!("expected OnEdge");
-        };
-        assert!(
-            (a == ba && b == bb) || (a == bb && b == ba),
-            "bike snap landed on the footway instead of the bike edge: {a:?},{b:?}"
-        );
-    }
-
-    #[test]
-    fn bike_edge_endpoint_falls_back_to_foot_when_no_bike_edge() {
-        // Only a foot-only edge is in range: a bike with no rideable edge nearby
-        // still snaps onto the footway (it will push from there).
-        let mut g = Graph::new();
-        let fa = osm(&mut g, "fa", 50.0001, 4.000);
-        let fb = osm(&mut g, "fb", 50.0001, 4.006);
-        street(&mut g, fa, fb, 430, true, false);
-        street(&mut g, fb, fa, 430, true, false);
-        g.build_edge_index();
-
-        let ep = bike_edge_endpoint(&g, 50.0000, 4.003).expect("falls back to footway");
-        let Endpoint::OnEdge { a, b, .. } = ep else {
-            panic!("expected OnEdge");
-        };
-        assert!(
-            (a == fa && b == fb) || (a == fb && b == fa),
-            "expected the footway as fallback: {a:?},{b:?}"
-        );
-    }
 }
