@@ -168,21 +168,6 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_bike_bucket_dpl_k")]
     pub bike_bucket_dpl_k: f64,
 
-    /// On-the-fly degree-2 contraction in the bike Pareto search: follow forced
-    /// single-successor chains to the next junction, creating one label there instead
-    /// of at every shape vertex (~81% of OSM nodes). Cost-exact only WITHOUT lossy
-    /// pruning; under bucketing the per-cell eviction happens at junctions only, which
-    /// changes the approximate front, so it defaults OFF (see config). Tuning param —
-    /// not serialized, applied from config at startup.
-    #[serde(skip, default = "RaptorIndex::default_multiobj_contract")]
-    pub multiobj_contract: bool,
-
-    /// Build + persist the all-mode (union) contracted graph into `graph.bin` (P3 node
-    /// contraction). Default false ⇒ no contracted graph is built and graph.bin is
-    /// unchanged. Tuning param applied from config at startup — not serialized.
-    #[serde(skip, default = "RaptorIndex::default_node_contraction")]
-    pub node_contraction: bool,
-
     /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false: with the
     /// gradient-aware power model climbing is already priced in Time, so a separate
     /// "minimize D+ at any cost" axis only manufactures absurd extremes (a long walk to
@@ -311,8 +296,6 @@ impl RaptorIndex {
             epsilon: Self::default_epsilon(),
             bike_bucket_cyc_k: Self::default_bike_bucket_cyc_k(),
             bike_bucket_dpl_k: Self::default_bike_bucket_dpl_k(),
-            multiobj_contract: Self::default_multiobj_contract(),
-            node_contraction: Self::default_node_contraction(),
             bike_select_dplus: Self::default_bike_select_dplus(),
             variance_model: Self::default_variance_model(),
             cost_weights: Self::default_cost_weights(),
@@ -396,22 +379,6 @@ impl RaptorIndex {
 
     pub fn default_bike_bucket_dpl_k() -> f64 {
         0.013
-    }
-
-    pub fn default_multiobj_contract() -> bool {
-        // Off by default: cost-exact only without lossy pruning; it interacts with
-        // bucketing (per-cell eviction at junctions-only) and can drop the cycleway
-        // extreme at tight budgets. Available behind config for future work.
-        false
-    }
-
-    pub fn default_node_contraction() -> bool {
-        // P3f cutover: on by default. Building the contracted graph and dropping the
-        // interior-node arrays frees ~0.7-0.8GB and speeds street-dominated queries
-        // ~2.4x; routing runs entirely on the contracted graph. Set
-        // `default_routing.node_contraction: false` in config.yaml to disable (requires
-        // a rebuild — a contracted graph.bin cannot serve full-graph routing).
-        true
     }
 
     pub fn default_bike_select_dplus() -> bool {

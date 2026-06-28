@@ -349,22 +349,11 @@ impl LabelSet {
 }
 
 impl Graph {
-    /// True when the all-mode contracted graph should drive WALK/CAR/RAPTOR-access
-    /// routing (flag on AND the union graph is present). Flag-off ⇒ always false ⇒
-    /// every branch below stays byte-identical to the full-graph path.
-    pub fn use_contracted(&self) -> bool {
-        self.raptor.node_contraction && self.contracted.is_some()
-    }
-
     /// Foot access/egress stops within `max_secs` of `origin`. Routes over the
     /// contracted graph when enabled (`nearby_stops_union`), else the full graph.
     fn foot_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
-        if self.use_contracted() {
-            let cg = self.contracted.as_ref().unwrap();
-            self.nearby_stops_union(origin, max_secs, cg)
-        } else {
-            self.nearby_stops(origin, max_secs)
-        }
+        let cg = self.contracted.as_ref().unwrap();
+        self.nearby_stops_union(origin, max_secs, cg)
     }
 
     /// Foot access/egress stops within `max_secs` of a coord-snapped endpoint when a
@@ -376,9 +365,7 @@ impl Graph {
         max_secs: u32,
         coord: Option<crate::structures::LatLng>,
     ) -> Vec<(usize, u32)> {
-        if let Some(c) = coord
-            && self.use_contracted()
-        {
+        if let Some(c) = coord {
             let cg = self.contracted.as_ref().unwrap();
             let radius = self.raptor.edge_snap_radius_m;
             return cg.nearby_stops_arena(self, c.latitude, c.longitude, radius, max_secs);
@@ -390,36 +377,25 @@ impl Graph {
     /// `nearby_stops_union` but over the phased car search; identical shape and
     /// (sorted) order to `nearby_stops_profile(Car)`.
     fn car_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
-        if self.use_contracted() {
-            let cg = self.contracted.as_ref().unwrap();
-            let dist = self.car_dijkstra_union(origin, max_secs, cg);
-            let mut stops: Vec<(usize, u32)> = dist
-                .iter()
-                .filter_map(|(&jn, &secs)| {
-                    let compact = self.raptor.transit_node_to_stop[jn.0];
-                    (compact != u32::MAX).then_some((compact as usize, secs))
-                })
-                .collect();
-            stops.sort_unstable_by_key(|&(stop, _)| stop);
-            stops
-        } else {
-            self.nearby_stops_profile(origin, max_secs, StreetProfile::Car)
-        }
+        let cg = self.contracted.as_ref().unwrap();
+        let dist = self.car_dijkstra_union(origin, max_secs, cg);
+        let mut stops: Vec<(usize, u32)> = dist
+            .iter()
+            .filter_map(|(&jn, &secs)| {
+                let compact = self.raptor.transit_node_to_stop[jn.0];
+                (compact != u32::MAX).then_some((compact as usize, secs))
+            })
+            .collect();
+        stops.sort_unstable_by_key(|&(stop, _)| stop);
+        stops
     }
 
     /// Foot seconds `origin`→`destination` (`u32::MAX` = unreachable). Routes over
     /// the contracted graph when enabled, else a full-graph walk Dijkstra.
     fn walk_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> u32 {
-        if self.use_contracted() {
-            let cg = self.contracted.as_ref().unwrap();
-            cg.walk_secs_point_to_point(self, origin, destination, bound)
-                .unwrap_or(u32::MAX)
-        } else {
-            self.walk_dijkstra(origin, bound)
-                .get(&destination)
-                .copied()
-                .unwrap_or(u32::MAX)
-        }
+        let cg = self.contracted.as_ref().unwrap();
+        cg.walk_secs_point_to_point(self, origin, destination, bound)
+            .unwrap_or(u32::MAX)
     }
 
     /// Foot seconds `origin`→`destination` keyed on the PROJECTED snap coordinates when a
@@ -433,9 +409,7 @@ impl Graph {
         bound: u32,
         ep: Option<&QueryEndpoints>,
     ) -> u32 {
-        if let Some(ep) = ep
-            && self.use_contracted()
-        {
+        if let Some(ep) = ep {
             let cg = self.contracted.as_ref().unwrap();
             let radius = self.raptor.edge_snap_radius_m;
             return cg
@@ -477,16 +451,10 @@ impl Graph {
     /// Car seconds `origin`→`destination` (`None` = unreachable). Routes over the
     /// contracted graph when enabled, else a full-graph car Dijkstra.
     fn car_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> Option<u32> {
-        if self.use_contracted() {
-            let cg = self.contracted.as_ref().unwrap();
-            self.car_dijkstra_union(origin, bound, cg)
-                .get(&destination)
-                .copied()
-        } else {
-            self.street_dijkstra(origin, bound, StreetProfile::Car)
-                .get(&destination)
-                .copied()
-        }
+        let cg = self.contracted.as_ref().unwrap();
+        self.car_dijkstra_union(origin, bound, cg)
+            .get(&destination)
+            .copied()
     }
 
     /// Retry loop shared by `raptor` and `raptor_range`.

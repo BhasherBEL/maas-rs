@@ -15,41 +15,20 @@ use super::{Graph, PrevCtx};
 use crate::structures::cost::{
     RoutingMode, TimeMoments, edge_moments, edge_time_penalty, edge_variance,
 };
-use crate::structures::{BikeCost, EdgeData, NodeID, StreetEdgeData};
+use crate::structures::{BikeCost, NodeID, StreetEdgeData};
 
 impl Graph {
-    /// Sum per-edge time moments along `nodes` (a fixed path) for `mode`, then add
-    /// the systematic variance term `(systematic_cv · mean)²`. Returns `ZERO` for a
-    /// path with fewer than two nodes. Use `.bracket()` for `[p50, p95]`.
-    pub fn annotate_path(&self, nodes: &[NodeID], mode: RoutingMode) -> TimeMoments {
-        if nodes.len() < 2 {
-            return TimeMoments::ZERO;
-        }
-        let steps: Vec<(StreetEdgeData, (f64, f64))> = nodes
-            .windows(2)
-            .filter_map(|w| {
-                self.edges[w[0].0].iter().find_map(|e| match e {
-                    EdgeData::Street(s) if s.destination == w[1] => {
-                        Some((*s, self.dir_between(w[0], w[1])))
-                    }
-                    _ => None,
-                })
-            })
-            .collect();
-        self.annotate_steps(&steps, mode)
-    }
-
-    /// As [`annotate_path`], but from carried arena `(edge, dir, far)` steps — g-free.
-    /// Empty carried (flag-off / off-contract) ⇒ falls back to `annotate_path(nodes)`,
-    /// byte-identical to before. Used in contracted plan reconstruction.
+    /// Sum per-edge time moments from carried arena `(edge, dir, far)` steps for
+    /// `mode`, then add the systematic variance term `(systematic_cv · mean)²` —
+    /// g-free. Empty carried ⇒ `ZERO`. Used in contracted plan reconstruction.
     pub(super) fn annotate_path_edges(
         &self,
-        nodes: &[NodeID],
+        _nodes: &[NodeID],
         carried: &[(StreetEdgeData, (f64, f64), crate::structures::LatLng)],
         mode: RoutingMode,
     ) -> TimeMoments {
-        if !self.use_contracted() || carried.is_empty() {
-            return self.annotate_path(nodes, mode);
+        if carried.is_empty() {
+            return TimeMoments::ZERO;
         }
         let steps: Vec<(StreetEdgeData, (f64, f64))> =
             carried.iter().map(|(e, dir, _)| (*e, *dir)).collect();
@@ -122,8 +101,28 @@ mod tests {
     use super::*;
     use crate::structures::cost::VarGen;
     use crate::structures::{
-        BikeAttrs, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData, Surface,
+        BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData, Surface,
     };
+
+    /// Node→steps adapter (the former `annotate_path` body) so these tests exercise
+    /// the same `annotate_steps` code path the production carried/arena route uses.
+    fn moments(g: &Graph, nodes: &[NodeID], mode: RoutingMode) -> TimeMoments {
+        if nodes.len() < 2 {
+            return TimeMoments::ZERO;
+        }
+        let steps: Vec<(StreetEdgeData, (f64, f64))> = nodes
+            .windows(2)
+            .filter_map(|w| {
+                g.edges[w[0].0].iter().find_map(|e| match e {
+                    EdgeData::Street(s) if s.destination == w[1] => {
+                        Some((*s, g.dir_between(w[0], w[1])))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        g.annotate_steps(&steps, mode)
+    }
 
     fn straight_path_graph() -> (Graph, Vec<NodeID>) {
         let mut g = Graph::new();
@@ -166,9 +165,9 @@ mod tests {
     #[test]
     fn empty_or_single_node_path_is_zero() {
         let (g, path) = straight_path_graph();
-        assert_eq!(g.annotate_path(&[], RoutingMode::Walk), TimeMoments::ZERO);
+        assert_eq!(moments(&g, &[], RoutingMode::Walk), TimeMoments::ZERO);
         assert_eq!(
-            g.annotate_path(&path[..1], RoutingMode::Walk),
+            moments(&g, &path[..1], RoutingMode::Walk),
             TimeMoments::ZERO
         );
     }
@@ -179,7 +178,7 @@ mod tests {
         let speed = g.raptor.walking_speed_mps;
         let signal_delay = g.raptor.variance_model.signal_delay_minor;
         let expected_mean = (120.0 / speed).round() + signal_delay + (240.0 / speed).round();
-        let m = g.annotate_path(&path, RoutingMode::Walk);
+        let m = moments(&g, &path, RoutingMode::Walk);
         assert_eq!(
             m.mean, expected_mean,
             "p50 is the sum of per-edge kinematic means plus the signalized edge's delay"
@@ -190,13 +189,13 @@ mod tests {
     fn variance_includes_generators_and_systematic_term() {
         let (mut g, path) = straight_path_graph();
         g.set_systematic_cv(0.0);
-        let indep = g.annotate_path(&path, RoutingMode::Walk);
+        let indep = moments(&g, &path, RoutingMode::Walk);
         assert!(
             indep.var > 0.0,
             "the signalized edge contributes generator variance"
         );
         g.set_systematic_cv(0.1);
-        let widened = g.annotate_path(&path, RoutingMode::Walk);
+        let widened = moments(&g, &path, RoutingMode::Walk);
         assert!(
             widened.var > indep.var,
             "systematic_cv widens total variance"
@@ -217,7 +216,7 @@ mod tests {
         let (mut g, path) = straight_path_graph();
         g.set_systematic_cv(0.0);
         let mode = RoutingMode::Walk;
-        let m = g.annotate_path(&path, mode);
+        let m = moments(&g, &path, mode);
         let model = g.raptor.variance_model;
         let mut axis_sum = 0.0;
         let mut incoming: Option<(f64, f64)> = None;
@@ -243,7 +242,7 @@ mod tests {
     fn systematic_cv_zero_is_pure_independent_sum() {
         let (mut g, path) = straight_path_graph();
         g.set_systematic_cv(0.0);
-        let m = g.annotate_path(&path, RoutingMode::Walk);
+        let m = moments(&g, &path, RoutingMode::Walk);
         let model = g.raptor.variance_model;
         let e_ab = model.variance(VarGen::SIGNALIZED, HighwayClass::Residential);
         let e_bc = model.variance(VarGen::NONE, HighwayClass::Residential);
@@ -268,7 +267,7 @@ mod tests {
                 bike.edge_time(s)
             })
             .sum();
-        let m = g.annotate_path(&path, RoutingMode::Bike);
+        let m = moments(&g, &path, RoutingMode::Bike);
         assert_eq!(
             m.mean,
             kinematic as f64 + model.signal_delay_minor,
@@ -336,7 +335,7 @@ mod tests {
                 bike.edge_time(s)
             })
             .sum();
-        let m = g.annotate_path(&path, RoutingMode::Bike);
+        let m = moments(&g, &path, RoutingMode::Bike);
         assert!(
             m.mean > kinematic as f64,
             "a tight corner adds slow-down time to the displayed p50: {} > {}",
@@ -345,9 +344,7 @@ mod tests {
         );
         // The first edge alone (no preceding edge ⇒ no corner) costs only its kinematic
         // time, confirming the extra in the full path is the per-vertex corner term.
-        let first_only = g
-            .annotate_path(&[path[0], path[1]], RoutingMode::Bike)
-            .mean;
+        let first_only = moments(&g, &[path[0], path[1]], RoutingMode::Bike).mean;
         assert_eq!(
             first_only,
             bike.edge_time(
@@ -432,7 +429,7 @@ mod tests {
                 bike.edge_time(s)
             })
             .sum();
-        let m = g.annotate_path(&path, RoutingMode::Bike);
+        let m = moments(&g, &path, RoutingMode::Bike);
         assert!(
             m.mean > kinematic as f64,
             "a dismount adds a stop+restart to the displayed p50: {} > {}",
@@ -442,7 +439,7 @@ mod tests {
         // The dismount run contributes its once-per-run uncertainty σ² to the bracket.
         let mut g0 = g;
         g0.set_systematic_cv(0.0);
-        let m0 = g0.annotate_path(&path, RoutingMode::Bike);
+        let m0 = moments(&g0, &path, RoutingMode::Bike);
         assert!(
             m0.var >= model.push_sigma * model.push_sigma - 1e-6,
             "dismount uncertainty (push_sigma²) is present in the bracket variance: {}",
@@ -488,9 +485,7 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        let fastest_p50 = g
-            .annotate_path(&fastest_front.nodes, RoutingMode::Walk)
-            .mean;
+        let fastest_p50 = moments(&g, &fastest_front.nodes, RoutingMode::Walk).mean;
 
         // Selection must preserve the fastest path: trimming the SAME front to k
         // representatives must keep its Time-minimum (the user's default fast route).
@@ -539,7 +534,7 @@ mod tests {
             })
             .unwrap();
 
-        let moments = g.annotate_path(&fastest.nodes, RoutingMode::Walk);
+        let moments = moments(&g, &fastest.nodes, RoutingMode::Walk);
         let (p50, p95) = moments.bracket();
         eprintln!(
             "ANNOTATE walk p50={p50:.0}s p95={p95:.0}s var={:.0}",

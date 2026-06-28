@@ -4,11 +4,11 @@ use gtfs_structures::RouteType;
 
 use crate::{
     ingestion::gtfs::{
-        AgencyInfo, RouteId, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId,
+        AgencyInfo, RouteInfo, ServicePattern, StopTime, TimetableSegment, TripId,
         TripInfo, TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, EdgeData, LatLng, NodeID,
+        DelayCDF, LatLng, NodeID,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -526,39 +526,22 @@ impl Graph {
 
             let start_t = boarding_col.partition_point(|st| st.departure < min_boarding);
 
-            // Locate the timetable_segment for the first hop of this pattern so we
-            // can translate trip_id → absolute dep_idx in transit_departures.
-            let boarding_stop_node = pat_stops[boarding_pos as usize];
-            let next_stop_node = pat_stops[boarding_pos as usize + 1];
-            let route_id: RouteId = self.raptor.transit_patterns[pattern_id.0 as usize].route;
-            // Edge timetable from `g.edges`. Unavailable once the interior arrays are
-            // dropped — the contracted path reads the precomputed side-table instead.
-            let scan = || {
-                self.edges[boarding_stop_node.0].iter().find_map(|e| match e {
-                    EdgeData::Transit(te)
-                        if te.destination == next_stop_node && te.route_id == route_id =>
-                    {
-                        Some(te.timetable_segment)
-                    }
-                    _ => None,
-                })
-            };
+            // Timetable_segment for the first hop, to translate trip_id → absolute
+            // dep_idx in transit_departures, read from the precomputed side-table.
             let from_table = || {
                 self.raptor
                     .transit_pattern_segment_timetables
                     .get(pattern_id.0 as usize)
                     .and_then(|segs| segs.get(boarding_pos as usize).copied())
             };
-            let resolved = if self.use_contracted() {
+            let resolved = {
                 let t = from_table();
                 debug_assert!(
                     t.is_some(),
                     "contracted segment-timetable side-table miss (pattern {})",
                     pattern_id.0
                 );
-                t.or_else(|| (!self.nodes.is_empty()).then(scan).flatten())
-            } else {
-                scan()
+                t
             };
             let ts = match resolved {
                 Some(ts) => ts,

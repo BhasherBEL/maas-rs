@@ -295,17 +295,6 @@ pub struct RoutingDefaultConfig {
     pub bike_bucket_cyc_k: Option<f64>,
     #[serde(default)]
     pub bike_bucket_dpl_k: Option<f64>,
-    /// On-the-fly degree-2 contraction in the bike Pareto search. Cost-exact only
-    /// WITHOUT lossy pruning; it interacts with bucketing (per-cell eviction at
-    /// junctions only) and can drop the cycleway extreme at tight budgets, so it
-    /// defaults OFF. Absent ⇒ compiled-in default (disabled).
-    #[serde(default)]
-    pub multiobj_contract: Option<bool>,
-    /// Build + persist the all-mode (union) contracted graph into `graph.bin` so it
-    /// survives load (the P3 node-contraction structure). Default OFF ⇒ graph.bin is
-    /// byte-identical to today; routing is unchanged either way (T1 is reversible).
-    #[serde(default)]
-    pub node_contraction: Option<bool>,
     /// Whether D+ is a bike selection axis. Absent ⇒ compiled default (false: D+ is
     /// displayed-only; Time already prices climbing via the gradient power model).
     #[serde(default)]

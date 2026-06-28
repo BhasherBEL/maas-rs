@@ -3,8 +3,7 @@ use super::raptor_route::{Label, LabelSet, ModeContext};
 use crate::{
     ingestion::gtfs::TimetableSegment,
     structures::{
-        EdgeData, Endpoint, Mode, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag,
-        VehicleState,
+        Mode, NodeID, RealtimeIndex, ReliabilityBuckets, Scenario, ScenarioBag, VehicleState,
         delay::DelayCDF,
         plan::{
             AccessAlternative, ArrivalScenario, CandidateStatus, Plan, PlanCandidate,
@@ -56,7 +55,7 @@ impl Graph {
         ep: Option<&super::QueryEndpoints>,
     ) -> Plan {
         let geometry = match ep {
-            Some(ep) if self.use_contracted() => self.street_path_geom_coords(
+            Some(ep) => self.street_path_geom_coords(
                 ep.origin,
                 ep.destination,
                 profile,
@@ -127,52 +126,20 @@ impl Graph {
         }
     }
 
-    /// Cost-routed direct bike plan: geometry follows the minimum-cost route and
-    /// the duration is its accumulated kinematic time. Returns `None` if the
-    /// destination is unreachable within `max_secs`.
-    /// Public, edge-snap-aware direct bike plan between two [`Endpoint`]s. Used by
-    /// the routing layer to rebuild the door-to-door bike plan once origin and
-    /// destination have been projected onto their nearest rideable edges.
-    pub fn direct_bike_plan(
-        &self,
-        origin: Endpoint,
-        destination: Endpoint,
-        start_time: u32,
-        bike: &crate::structures::BikeCost,
-    ) -> Option<Plan> {
-        self.build_bike_plan(origin, destination, start_time, u32::MAX, bike)
-    }
-
     /// Direct bike plan keyed on projected snap coordinates (`ep`) when a contracted query
     /// supplies them — routes the bike leg over the contracted graph (g-free) so it survives
-    /// the interior-node drop. `None`/flag-off ⇒ the NodeID/`Endpoint` path, unchanged.
+    /// the interior-node drop. Production always supplies `ep`; `None` ⇒ `None`.
     pub(super) fn build_bike_plan_ep(
         &self,
-        origin: NodeID,
-        destination: NodeID,
+        _origin: NodeID,
+        _destination: NodeID,
         start_time: u32,
         max_secs: u32,
         bike: &crate::structures::BikeCost,
         ep: Option<&super::QueryEndpoints>,
     ) -> Option<Plan> {
-        if let Some(ep) = ep
-            && self.use_contracted()
-        {
-            return self.build_bike_plan_arena(
-                ep.origin,
-                ep.destination,
-                start_time,
-                max_secs,
-                bike,
-            );
-        }
-        self.build_bike_plan(
-            Endpoint::Node(origin),
-            Endpoint::Node(destination),
-            start_time,
-            max_secs,
-            bike,
-        )
+        let ep = ep?;
+        self.build_bike_plan_arena(ep.origin, ep.destination, start_time, max_secs, bike)
     }
 
     /// A direct bike plan over the contracted graph from projected snap coords, g-free.
@@ -207,157 +174,6 @@ impl Graph {
             return None;
         }
         Some(plan)
-    }
-
-    pub(super) fn build_bike_plan(
-        &self,
-        origin: Endpoint,
-        destination: Endpoint,
-        start_time: u32,
-        max_secs: u32,
-        bike: &crate::structures::BikeCost,
-    ) -> Option<Plan> {
-        let p = self.bike_cost_path(origin, destination, max_secs, bike)?;
-        let end = start_time + p.secs;
-        let to_place = PlanPlace {
-            node_id: destination.node(),
-            stop_position: None,
-            arrival: Some(end),
-            departure: None,
-        };
-
-        // Stitch the projection stubs (edge-snapped origin/destination) around the
-        // node path so geometry and the per-edge run list both start/end at the
-        // exact projection points.
-        let (geometry, steps) = self.stitch_bike_leg(
-            &p.nodes,
-            &p.edges,
-            p.lead,
-            p.tail,
-            start_time,
-            destination.node(),
-            to_place.clone(),
-            p.length,
-            p.secs,
-        );
-
-        Some(Plan {
-            legs: vec![PlanLeg::Walk(PlanWalkLeg {
-                from: PlanPlace {
-                    node_id: origin.node(),
-                    stop_position: None,
-                    arrival: None,
-                    departure: Some(start_time),
-                },
-                to: to_place,
-                start: start_time,
-                end,
-                duration: p.secs,
-                length: p.length,
-                cycleroute_length: Some(p.cycleroute_length),
-                elevation_gain: Some(p.ascent),
-                street_mode: Mode::Bike,
-                steps,
-                geometry,
-                alternatives: vec![],
-                leave_by: None,
-            })],
-            start: start_time,
-            end,
-            mode: Mode::Bike,
-            access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario {
-                time: end,
-                probability: 1.0,
-            }],
-            expected_end: end,
-        })
-    }
-
-    /// Stitch an edge-snapped bike leg's geometry and ride/push steps from a node
-    /// path plus optional lead/tail projection stubs. Shared by `build_bike_plan`
-    /// (the cost-routed direct leg) and the enrich post-pass, so a snapped route
-    /// ends at the exact on-edge projection rather than its representative node.
-    /// `to` and the totals are used only for the degenerate empty-path fallback.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn stitch_bike_leg(
-        &self,
-        nodes: &[NodeID],
-        edges: &[super::raptor_access::BikeEdge],
-        lead: Option<(crate::structures::LatLng, super::raptor_access::BikeEdge)>,
-        tail: Option<(crate::structures::LatLng, super::raptor_access::BikeEdge)>,
-        start_time: u32,
-        dest_node: NodeID,
-        to: PlanPlace,
-        total_length: usize,
-        total_secs: u32,
-    ) -> (Vec<PlanCoordinate>, Vec<PlanLegStep>) {
-        let coord = |c: crate::structures::LatLng| PlanCoordinate {
-            lat: c.latitude,
-            lon: c.longitude,
-        };
-        let lead_off = if lead.is_some() { 1 } else { 0 };
-        let mut geometry: Vec<PlanCoordinate> = Vec::new();
-        if let Some((proj, _)) = lead {
-            geometry.push(coord(proj));
-        }
-        geometry.extend(nodes.iter().map(|&n| self.node_coord(n)));
-        if let Some((proj, _)) = tail {
-            geometry.push(coord(proj));
-        }
-        let mut cedges: Vec<super::raptor_access::BikeEdge> = Vec::new();
-        if let Some((_, be)) = lead {
-            cedges.push(be);
-        }
-        cedges.extend(edges.iter().copied());
-        if let Some((_, be)) = tail {
-            cedges.push(be);
-        }
-
-        // Group consecutive edges by ride/push into steps so the client can show
-        // (and time) dismount stretches distinctly. Each step covers the inclusive
-        // geometry range [start_idx, i].
-        let mut steps: Vec<PlanLegStep> = Vec::new();
-        let mut i = 0;
-        let mut cum_time = 0u32;
-        while i < cedges.len() {
-            let push = cedges[i].push;
-            let start_idx = i;
-            let (mut run_len, mut run_time) = (0usize, 0u32);
-            while i < cedges.len() && cedges[i].push == push {
-                run_len += cedges[i].length;
-                run_time += cedges[i].time;
-                i += 1;
-            }
-            cum_time += run_time;
-            // Edge k connects geometry[k]→geometry[k+1]; the run ends at geometry[i].
-            let node_id = if i >= lead_off && i - lead_off < nodes.len() {
-                nodes[i - lead_off]
-            } else {
-                dest_node
-            };
-            steps.push(PlanLegStep::Walk(PlanWalkLegStep {
-                length: run_len,
-                time: run_time,
-                place: PlanPlace {
-                    node_id,
-                    stop_position: None,
-                    arrival: Some(start_time + cum_time),
-                    departure: None,
-                },
-                dismount: push,
-                geom_start: start_idx,
-                geom_end: i,
-            }));
-        }
-        if steps.is_empty() {
-            steps.push(PlanLegStep::Walk(PlanWalkLegStep::plain(
-                total_length,
-                total_secs,
-                to,
-            )));
-        }
-        (geometry, steps)
     }
 
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
@@ -1018,8 +834,6 @@ impl Graph {
                 None
             };
 
-            let route_id = self.raptor.transit_patterns[p].route;
-
             let mut steps = Vec::with_capacity(ap - bp);
             let mut total_length = 0usize;
             for s in (bp + 1)..=ap {
@@ -1029,30 +843,14 @@ impl Graph {
                 let arr = times[s * n_trips + t].arrival;
                 let prev_dep = times[(s - 1) * n_trips + t].departure;
 
-                // The contracted path reads the precomputed g-free side-table (survives the
-                // node-contraction drop); flag-off scans `g.edges` (the oracle).
-                let scan = || {
-                    self.edges[pat_stops[s - 1].0]
-                        .iter()
-                        .find_map(|e| match e {
-                            EdgeData::Transit(te)
-                                if te.destination == pat_stops[s] && te.route_id == route_id =>
-                            {
-                                Some(te.timetable_segment)
-                            }
-                            _ => None,
-                        })
-                };
-                let timetable_segment = if self.use_contracted() {
+                let timetable_segment = {
                     let t = self
                         .raptor
                         .transit_pattern_segment_timetables
                         .get(p)
                         .and_then(|segs| segs.get(s - 1).copied());
                     debug_assert!(t.is_some(), "contracted segment-timetable side-table miss (pattern {p})");
-                    t.or_else(|| (!self.nodes.is_empty()).then(scan).flatten())
-                } else {
-                    scan()
+                    t
                 }
                 .unwrap_or(TimetableSegment { start: 0, len: 0 });
 
@@ -2407,10 +2205,7 @@ mod tests {
             .unwrap();
         let (fw_from, fw_to) = first_walk_from;
         eprintln!("SMOKE first_walk from={:?} to={:?}", fw_from, fw_to);
-        let bike_cost = crate::structures::BikeCost::new(
-            crate::structures::BikeProfile::default(),
-            g.raptor.walking_speed_mps,
-        );
+        let bike_cost = crate::structures::BikeCost::new(crate::structures::BikeProfile::default());
         let reps = g.multiobj_representatives(
             fw_from,
             fw_to,
