@@ -66,6 +66,82 @@ pub fn display_route_type(route_type: RouteType) -> &'static str {
     }
 }
 
+/// Harmonize an all-caps feed display name (STIB-style "GARE DU NORD") to title
+/// case so it matches mixed-case feeds (SNCB/DeLijn "Bruxelles-Nord"). Names that
+/// already contain any lowercase ASCII letter are returned UNCHANGED — only fully
+/// upper-cased names are touched, which makes this idempotent.
+///
+/// Title-casing uppercases the first alphabetic char of each part and lowercases
+/// the rest, splitting on hyphens and apostrophes ("ST-GILLES" -> "St-Gilles").
+/// Common French/Dutch particles are kept lowercase ("GARE DU NORD" -> "Gare du
+/// Nord") UNLESS they are the first whitespace word, which is always capitalized
+/// ("DE BROUCKERE" -> "De Brouckere"). This is display only and never feeds the
+/// dedup/grouping normalization, which keys on parent ids and its own lowercase
+/// name folding.
+pub fn harmonize_display_name(name: &str) -> String {
+    const PARTICLES: &[&str] = &[
+        "de", "du", "des", "d", "la", "le", "les", "l", "un", "une", "a", "au", "aux", "et", "en",
+        "sur", "sous", "lez", "van", "der", "den", "op", "ten", "ter", "t", "ver",
+    ];
+
+    if name.chars().any(|c| c.is_ascii_lowercase()) {
+        return name.to_string();
+    }
+
+    fn is_roman_numeral(part: &str) -> bool {
+        part.chars().count() >= 2
+            && part
+                .chars()
+                .all(|c| matches!(c.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+    }
+
+    fn titlecase_part(part: &str) -> String {
+        if is_roman_numeral(part) {
+            return part.to_uppercase();
+        }
+        let mut out = String::with_capacity(part.len());
+        let mut seen_alpha = false;
+        for c in part.chars() {
+            if c.is_alphabetic() && !seen_alpha {
+                out.extend(c.to_uppercase());
+                seen_alpha = true;
+            } else {
+                out.extend(c.to_lowercase());
+            }
+        }
+        out
+    }
+
+    let titlecase_token = |token: &str| -> String {
+        let mut out = String::with_capacity(token.len());
+        let mut part = String::new();
+        for c in token.chars() {
+            if c == '-' || c == '\'' {
+                out.push_str(&titlecase_part(&part));
+                out.push(c);
+                part.clear();
+            } else {
+                part.push(c);
+            }
+        }
+        out.push_str(&titlecase_part(&part));
+        out
+    };
+
+    name.split_whitespace()
+        .enumerate()
+        .map(|(i, word)| {
+            let lower = word.to_lowercase();
+            if i != 0 && PARTICLES.contains(&lower.as_str()) {
+                lower
+            } else {
+                titlecase_token(word)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn sec_to_time(sec: u32) -> String {
     let hours = sec / 3600;
     let minutes = (sec % 3600) / 60;
@@ -141,6 +217,68 @@ mod tests {
         assert_eq!(display_route_type(RouteType::CableCar), "CableCar");
         assert_eq!(display_route_type(RouteType::Other(-1)), "Other");
         assert_eq!(display_route_type(RouteType::Other(999)), "Other");
+    }
+
+    // ── harmonize_display_name ────────────────────────────────────────────────
+
+    #[test]
+    fn harmonize_caps_with_particle() {
+        assert_eq!(harmonize_display_name("GARE DU NORD"), "Gare du Nord");
+    }
+
+    #[test]
+    fn harmonize_single_word() {
+        assert_eq!(harmonize_display_name("MERODE"), "Merode");
+    }
+
+    #[test]
+    fn harmonize_abbreviation_with_period() {
+        assert_eq!(harmonize_display_name("PRINC. ELISABETH"), "Princ. Elisabeth");
+    }
+
+    #[test]
+    fn harmonize_hyphenated_part() {
+        assert_eq!(harmonize_display_name("EGLISE ST-JULIEN"), "Eglise St-Julien");
+    }
+
+    #[test]
+    fn harmonize_first_word_particle_is_capitalized() {
+        assert_eq!(harmonize_display_name("DE BROUCKERE"), "De Brouckere");
+    }
+
+    #[test]
+    fn harmonize_leaves_mixed_case_unchanged() {
+        assert_eq!(harmonize_display_name("Bruxelles-Nord"), "Bruxelles-Nord");
+        assert_eq!(harmonize_display_name("Morkhoven Station"), "Morkhoven Station");
+    }
+
+    #[test]
+    fn harmonize_is_idempotent() {
+        let once = harmonize_display_name("GARE DU NORD");
+        assert_eq!(harmonize_display_name(&once), once);
+    }
+
+    #[test]
+    fn harmonize_apostrophe_part() {
+        assert_eq!(harmonize_display_name("PLACE D'ARMES"), "Place D'Armes");
+    }
+
+    #[test]
+    fn harmonize_keeps_roman_numerals_uppercase() {
+        assert_eq!(harmonize_display_name("ALBERT II"), "Albert II");
+        assert_eq!(harmonize_display_name("LEOPOLD III"), "Leopold III");
+        assert_eq!(harmonize_display_name("ALPHONSE XIII"), "Alphonse XIII");
+    }
+
+    #[test]
+    fn harmonize_single_i_is_titlecased() {
+        assert_eq!(harmonize_display_name("ALBERT I"), "Albert I");
+    }
+
+    #[test]
+    fn harmonize_non_numeral_caps_word_unaffected() {
+        assert_eq!(harmonize_display_name("GARE DU NORD"), "Gare du Nord");
+        assert_eq!(harmonize_display_name("MERODE"), "Merode");
     }
 
     // ── sec_to_time ───────────────────────────────────────────────────────────

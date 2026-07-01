@@ -1,0 +1,22 @@
+{
+  "name": "MaaS Trip Planner",
+  "short_name": "MaaS",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#1c64f2",
+  "background_color": "#f6f7f9",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

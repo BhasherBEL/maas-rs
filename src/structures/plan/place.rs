@@ -22,4 +22,20 @@ impl PlanPlace {
 
         Ok(PlanNode::from_node_id(graph.as_ref(), self.node_id))
     }
+
+    pub async fn stop_id(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
+
+        Ok(graph.stop_id_of_node(self.node_id).map(str::to_string))
+    }
+
+    pub async fn platform(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
+
+        Ok(graph.platform_code_of_node(self.node_id).map(str::to_string))
+    }
 }

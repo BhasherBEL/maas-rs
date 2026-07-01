@@ -16,6 +16,7 @@ pub enum Mode {
     BikeOnTransit,
     CarDropOff,
     CarPickup,
+    BikePickup,
 }
 
 impl Mode {
@@ -25,7 +26,11 @@ impl Mode {
     pub fn burden(self) -> u8 {
         match self {
             Mode::Walk | Mode::WalkTransit => 0,
-            Mode::Bike | Mode::BikeTransit | Mode::BikeToTransit | Mode::BikeOnTransit => 1,
+            Mode::Bike
+            | Mode::BikeTransit
+            | Mode::BikeToTransit
+            | Mode::BikeOnTransit
+            | Mode::BikePickup => 1,
             Mode::Car | Mode::CarDropOff | Mode::CarPickup => 2,
         }
     }
@@ -43,6 +48,7 @@ pub enum VehicleState {
     BikeDropped,
     CarParked,
     CarEgress,
+    BikeEgress,
 }
 
 impl VehicleState {
@@ -53,18 +59,19 @@ impl VehicleState {
     pub fn burden(self) -> u8 {
         match self {
             VehicleState::Walked => 0,
-            VehicleState::BikeInHand | VehicleState::BikeDropped => 1,
+            VehicleState::BikeInHand | VehicleState::BikeDropped | VehicleState::BikeEgress => 1,
             VehicleState::CarParked | VehicleState::CarEgress => 2,
         }
     }
 }
 
-pub const ALL_STATES: [VehicleState; 5] = [
+pub const ALL_STATES: [VehicleState; 6] = [
     VehicleState::Walked,
     VehicleState::BikeInHand,
     VehicleState::BikeDropped,
     VehicleState::CarParked,
     VehicleState::CarEgress,
+    VehicleState::BikeEgress,
 ];
 
 /// Resolved view of the user's mode selection: which RAPTOR vehicle states are
@@ -72,7 +79,7 @@ pub const ALL_STATES: [VehicleState; 5] = [
 #[derive(Debug, Clone)]
 pub struct ActiveModes {
     modes: Vec<Mode>,
-    state_idx: [u8; 5],
+    state_idx: [u8; 6],
     n_states: u8,
 }
 
@@ -85,7 +92,7 @@ impl ActiveModes {
             }
         }
 
-        let mut active = [false; 5];
+        let mut active = [false; 6];
         for &m in &deduped {
             match m {
                 Mode::WalkTransit => active[VehicleState::Walked as usize] = true,
@@ -97,11 +104,12 @@ impl ActiveModes {
                 Mode::BikeOnTransit => active[VehicleState::BikeInHand as usize] = true,
                 Mode::CarDropOff => active[VehicleState::CarParked as usize] = true,
                 Mode::CarPickup => active[VehicleState::CarEgress as usize] = true,
+                Mode::BikePickup => active[VehicleState::BikeEgress as usize] = true,
                 Mode::Walk | Mode::Bike | Mode::Car => {}
             }
         }
 
-        let mut state_idx = [u8::MAX; 5];
+        let mut state_idx = [u8::MAX; 6];
         let mut n_states = 0u8;
         for (i, &on) in active.iter().enumerate() {
             if on {
@@ -171,6 +179,7 @@ impl ActiveModes {
             VehicleState::BikeDropped,
             VehicleState::CarParked,
             VehicleState::CarEgress,
+            VehicleState::BikeEgress,
         ]
         .iter()
         .any(|&s| self.state_of(s).is_some())

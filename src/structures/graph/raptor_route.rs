@@ -25,6 +25,8 @@ use super::{BikeCost, Graph, MAX_ROUNDS, raptor_access::StreetProfile};
 pub struct QueryEndpoints {
     pub origin: crate::structures::LatLng,
     pub destination: crate::structures::LatLng,
+    pub origin_station: Option<Vec<usize>>,
+    pub destination_station: Option<Vec<usize>>,
 }
 
 /// Per-query mode resolution: the active vehicle states plus per-state
@@ -34,6 +36,7 @@ pub(super) struct ModeContext<'a> {
     pub am: &'a ActiveModes,
     pub access: Vec<Vec<(usize, u32)>>,
     pub egress: Vec<Vec<(usize, u32)>>,
+    pub dest_station: Option<Vec<usize>>,
 }
 
 impl<'a> ModeContext<'a> {
@@ -49,12 +52,15 @@ impl<'a> ModeContext<'a> {
         foot_egress: &[(usize, u32)],
         bike_egress: &[(usize, u32)],
         car_egress: &[(usize, u32)],
+        dest_station: Option<&[usize]>,
     ) -> Self {
         let mut access = vec![Vec::new(); am.n_states()];
         let mut egress = vec![Vec::new(); am.n_states()];
         for (sidx, vs) in am.states() {
             access[sidx] = match vs {
-                VehicleState::Walked | VehicleState::CarEgress => foot_access.to_vec(),
+                VehicleState::Walked | VehicleState::CarEgress | VehicleState::BikeEgress => {
+                    foot_access.to_vec()
+                }
                 VehicleState::BikeInHand | VehicleState::BikeDropped => bike_access.to_vec(),
                 VehicleState::CarParked => car_access.to_vec(),
             };
@@ -62,11 +68,16 @@ impl<'a> ModeContext<'a> {
                 VehicleState::Walked | VehicleState::BikeDropped | VehicleState::CarParked => {
                     foot_egress.to_vec()
                 }
-                VehicleState::BikeInHand => bike_egress.to_vec(),
+                VehicleState::BikeInHand | VehicleState::BikeEgress => bike_egress.to_vec(),
                 VehicleState::CarEgress => car_egress.to_vec(),
             };
         }
-        ModeContext { am, access, egress }
+        ModeContext {
+            am,
+            access,
+            egress,
+            dest_station: dest_station.map(|p| p.to_vec()),
+        }
     }
 
     pub fn n_states(&self) -> usize {
@@ -116,6 +127,37 @@ pub(super) const MAX_LABELS: usize = 16;
 #[inline]
 fn apply_delay(scheduled: u32, delay: i32) -> u32 {
     (scheduled as i64 + delay as i64).max(0) as u32
+}
+
+/// One remaining downstream stop of an onboard ride: where the boarded vehicle
+/// will next stop, and when (realtime arrival = scheduled + live delay).
+#[derive(Clone, Copy, Debug)]
+pub struct OnboardSeed {
+    /// Pattern position of this downstream stop (`> current_pos`).
+    pub alighted_at: u32,
+    /// Compact stop index reached.
+    pub at_stop: u32,
+    /// Realtime arrival time at the stop, seconds since midnight.
+    pub arrival: u32,
+}
+
+/// A resolved onboard origin: the boarded trip (identified WITHIN its pattern,
+/// not as a global `TripId`), the current pattern position, and every remaining
+/// downstream stop with its realtime arrival. Seeds the onboard partial-requery.
+#[derive(Clone, Debug)]
+pub struct OnboardRide {
+    /// Pattern carrying the boarded trip.
+    pub pattern: u32,
+    /// Within-pattern index of the boarded trip (position in `transit_pattern_trips`).
+    pub trip_within: u32,
+    /// Global GTFS-internal trip id of the boarded trip (for realtime lookups).
+    pub trip_id: TripId,
+    /// Pattern position the user has just passed / is currently at.
+    pub current_pos: u32,
+    /// Route type of the boarded trip (feeder route type for downstream transfers).
+    pub route_type: Option<RouteType>,
+    /// Remaining downstream stops, in pattern order.
+    pub seeds: Vec<OnboardSeed>,
 }
 
 /// A label currently riding a route during a single `scan_route` pass.
@@ -457,6 +499,214 @@ impl Graph {
             .copied()
     }
 
+    /// Enumerates the onboard ride seeds for a user currently aboard trip
+    /// `trip_within` (within-pattern index) of `pattern`, having passed pattern
+    /// position `current_pos`. Every downstream stop (`pos > current_pos`) is a
+    /// reached label at its realtime arrival (scheduled + `rt.delay`). Stops at or
+    /// before `current_pos` are excluded; arrivals are monotonic non-decreasing.
+    pub fn build_onboard_ride(
+        &self,
+        pattern: u32,
+        trip_within: u32,
+        current_pos: u32,
+        rt: &RealtimeIndex,
+    ) -> OnboardRide {
+        let p = pattern as usize;
+        let t = trip_within as usize;
+        let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
+        let pat_stops =
+            self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
+        let times = self.raptor.transit_idx_pattern_stop_times[p]
+            .of(&self.raptor.transit_pattern_stop_times);
+        let trip_ids =
+            self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
+        let trip_id = trip_ids[t];
+        let route_type = self.route_type_of_trip(trip_id);
+
+        let mut seeds = Vec::new();
+        for pos in (current_pos as usize + 1)..pat_stops.len() {
+            let compact = self.raptor.transit_node_to_stop[pat_stops[pos].0];
+            if compact == u32::MAX {
+                continue;
+            }
+            let sched_arr = times[pos * n_trips + t].arrival;
+            let arrival = apply_delay(sched_arr, rt.delay(trip_id, compact));
+            seeds.push(OnboardSeed {
+                alighted_at: pos as u32,
+                at_stop: compact,
+                arrival,
+            });
+        }
+
+        OnboardRide {
+            pattern,
+            trip_within,
+            trip_id,
+            current_pos,
+            route_type,
+            seeds,
+        }
+    }
+
+    /// Locates a boarded `trip` within its pattern and resolves the current
+    /// pattern position. `from_stop` (compact index) or `from_seq` (pattern
+    /// position) are advisory overrides; without either, the current position is
+    /// the last pattern stop whose realtime departure is `<= now`. Returns
+    /// `(pattern, within-pattern trip index, current_pos)`, or `None` when the
+    /// trip is unknown or the user is already at the trip's final stop (nothing
+    /// downstream to route).
+    pub fn locate_onboard_trip(
+        &self,
+        trip: TripId,
+        from_stop: Option<usize>,
+        from_seq: Option<u32>,
+        now: u32,
+        rt: &RealtimeIndex,
+    ) -> Option<(u32, u32, u32)> {
+        let (p, t) = self
+            .raptor
+            .transit_idx_pattern_trips
+            .iter()
+            .enumerate()
+            .find_map(|(p, lk)| {
+                lk.of(&self.raptor.transit_pattern_trips)
+                    .iter()
+                    .position(|&x| x == trip)
+                    .map(|t| (p, t))
+            })?;
+        let pat_stops =
+            self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
+        let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
+        let times = self.raptor.transit_idx_pattern_stop_times[p]
+            .of(&self.raptor.transit_pattern_stop_times);
+
+        let current_pos = if let Some(stop) = from_stop {
+            pat_stops
+                .iter()
+                .position(|&n| self.raptor.transit_node_to_stop[n.0] as usize == stop)?
+                as u32
+        } else if let Some(seq) = from_seq {
+            seq.min(pat_stops.len().saturating_sub(1) as u32)
+        } else {
+            let mut pos = 0u32;
+            for (i, &node) in pat_stops.iter().enumerate() {
+                let compact = self.raptor.transit_node_to_stop[node.0];
+                let dep = apply_delay(times[i * n_trips + t].departure, rt.delay(trip, compact));
+                if dep <= now {
+                    pos = i as u32;
+                } else {
+                    break;
+                }
+            }
+            pos
+        };
+
+        if current_pos as usize + 1 >= pat_stops.len() {
+            return None;
+        }
+        Some((p as u32, t as u32, current_pos))
+    }
+
+    /// Egress-only onboard partial-requery: seed the boarded trip's remaining
+    /// downstream stops (round 0, one transit leg each) and run the normal rounds
+    /// + transfers onward to a lat/lng `destination`. No access side, no radius
+    /// widening. Phase 1 routes WalkTransit egress (state 0 = `Walked`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn raptor_onboard_tuned_rt_modes_ep(
+        &self,
+        ride: &OnboardRide,
+        destination: NodeID,
+        date: u32,
+        weekday: u8,
+        egress_secs: u32,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+        am: &ActiveModes,
+        ep: Option<&QueryEndpoints>,
+    ) -> Vec<Plan> {
+        if ride.seeds.is_empty() {
+            return Vec::new();
+        }
+        let foot_egress = self.egress_times(self.foot_nearby_stops_ep(
+            destination,
+            egress_secs,
+            ep.map(|e| e.destination),
+        ));
+        let mc = ModeContext::build(am, &[], &[], &[], &foot_egress, &[], &[], None);
+        if !mc.any_egress() {
+            return Vec::new();
+        }
+        let plans = self.raptor_onboard_inner(&mc, ride, date, weekday, destination, buckets, slack, rt);
+        Self::finalize_plans(plans, buckets)
+    }
+
+    /// Production onboard RAPTOR core: allocates the per-pass grids, seeds the
+    /// onboard ride via `run_departure_into`, and extracts. Mirrors the non-debug
+    /// `raptor_inner` setup but injects onboard seeds in place of foot access.
+    #[allow(clippy::too_many_arguments)]
+    fn raptor_onboard_inner(
+        &self,
+        mc: &ModeContext,
+        ride: &OnboardRide,
+        date: u32,
+        weekday: u8,
+        destination: NodeID,
+        buckets: &ReliabilityBuckets,
+        slack: u32,
+        rt: &RealtimeIndex,
+    ) -> Vec<Plan> {
+        let n_stops = self.raptor.transit_stop_to_node.len();
+        let n_states = mc.n_states();
+        let n_cells = n_stops * n_states;
+        let n_patterns = self.raptor.transit_patterns.len();
+
+        let mut best = vec![LabelSet::EMPTY; n_cells];
+        let mut labels = vec![vec![LabelSet::EMPTY; n_cells]; MAX_ROUNDS + 1];
+        let mut marked = Vec::with_capacity(2048);
+        let mut is_marked = vec![false; n_cells];
+        let mut queue = Vec::with_capacity(512);
+        let mut queue_pos = vec![u32::MAX; n_patterns];
+        let mut arena: Vec<Label> = Vec::new();
+
+        self.run_departure_into(
+            mc,
+            0,
+            0,
+            date,
+            weekday,
+            buckets,
+            slack,
+            rt,
+            0,
+            false,
+            &mut best,
+            &mut labels,
+            &mut marked,
+            &mut is_marked,
+            &mut queue,
+            &mut queue_pos,
+            &mut arena,
+            Some(ride),
+        );
+
+        self.extract_with_debug(
+            mc,
+            0,
+            date,
+            weekday,
+            &labels,
+            buckets,
+            destination,
+            destination,
+            rt,
+            None,
+            0,
+            &arena,
+            true,
+        )
+    }
+
     /// Retry loop shared by `raptor` and `raptor_range`.
     ///
     /// Doubles `access_secs` until `try_routing` returns a non-empty result or
@@ -505,6 +755,10 @@ impl Graph {
             (self.endpoint_distance(origin, destination, ep) as f64 / self.raptor.walking_speed_mps)
                 as u32;
 
+        let both_stations = ep.is_some_and(|e| {
+            e.origin_station.is_some() && e.destination_station.is_some()
+        });
+
         let mut walk_only_secs: Option<u32> = None;
         let mut access_secs = self
             .nearest_stop_secs_ep(origin, straight_line_secs, ep.map(|e| e.origin))
@@ -529,6 +783,21 @@ impl Graph {
                     );
                     return Self::finalize_plans(results, buckets);
                 }
+            }
+
+            if both_stations {
+                let actual = self.walk_secs_to_ep(origin, destination, u32::MAX, ep);
+                let plans = self.direct_fallback_plans(
+                    am,
+                    origin,
+                    destination,
+                    start_time,
+                    actual,
+                    bike,
+                    terminal_deadline,
+                    ep,
+                );
+                return Self::finalize_plans(plans, buckets);
             }
 
             access_secs = access_secs.saturating_mul(2);
@@ -607,22 +876,36 @@ impl Graph {
             / self.raptor.walking_speed_mps) as u32;
         let vehicle_secs = access_secs.max(self.vehicle_access_budget(crow_secs));
 
-        let foot_access = if has(Walked) || has(CarEgress) {
+        let station_zero = |platforms: &[usize]| -> Vec<(usize, u32)> {
+            platforms.iter().map(|&s| (s, 0)).collect()
+        };
+        let origin_station = ep.and_then(|e| e.origin_station.as_deref());
+        let dest_station = ep.and_then(|e| e.destination_station.as_deref());
+
+        let foot_access = if let Some(p) = origin_station {
+            station_zero(p)
+        } else if has(Walked) || has(CarEgress) || has(BikeEgress) {
             self.access_times(self.foot_nearby_stops_ep(origin, access_secs, ep.map(|e| e.origin)))
         } else {
             vec![]
         };
-        let bike_access = if has(BikeInHand) || has(BikeDropped) {
+        let bike_access = if let Some(p) = origin_station {
+            station_zero(p)
+        } else if has(BikeInHand) || has(BikeDropped) {
             self.access_times(self.bike_nearby_stops(origin, vehicle_secs, bike))
         } else {
             vec![]
         };
-        let car_access = if has(CarParked) {
+        let car_access = if let Some(p) = origin_station {
+            station_zero(p)
+        } else if has(CarParked) {
             self.access_times(self.car_nearby_stops(origin, vehicle_secs))
         } else {
             vec![]
         };
-        let foot_egress = if has(Walked) || has(BikeDropped) || has(CarParked) {
+        let foot_egress = if let Some(p) = dest_station {
+            station_zero(p)
+        } else if has(Walked) || has(BikeDropped) || has(CarParked) {
             self.egress_times(self.foot_nearby_stops_ep(
                 destination,
                 access_secs,
@@ -631,12 +914,16 @@ impl Graph {
         } else {
             vec![]
         };
-        let bike_egress = if has(BikeInHand) {
+        let bike_egress = if let Some(p) = dest_station {
+            station_zero(p)
+        } else if has(BikeInHand) || has(BikeEgress) {
             self.egress_times(self.bike_nearby_stops(destination, vehicle_secs, bike))
         } else {
             vec![]
         };
-        let car_egress = if has(CarEgress) {
+        let car_egress = if let Some(p) = dest_station {
+            station_zero(p)
+        } else if has(CarEgress) {
             self.egress_times(self.car_nearby_stops(destination, vehicle_secs))
         } else {
             vec![]
@@ -671,6 +958,7 @@ impl Graph {
             &foot_egress,
             &bike_egress,
             &car_egress,
+            dest_station,
         )
     }
 
@@ -1030,6 +1318,7 @@ impl Graph {
             &mut queue,
             &mut queue_pos,
             &mut arena,
+            None,
         );
 
         // Discardable debug survey: only built for `raptor_explain*`.
@@ -1086,6 +1375,7 @@ impl Graph {
             debug_sink,
             0,
             &arena,
+            false,
         );
         (plans, candidates, stops_reached)
     }
@@ -1120,6 +1410,7 @@ impl Graph {
         queue: &mut Vec<usize>,
         queue_pos: &mut [u32],
         arena: &mut Vec<Label>,
+        onboard: Option<&OnboardRide>,
     ) {
         let n_states = mc.n_states();
         let n_cells = best.len();
@@ -1137,50 +1428,91 @@ impl Graph {
         // (extraction and boarding both filter to the current pass's stamp).
         arena.clear();
 
-        for (sidx, _vs) in mc.am.states() {
-            for &(stop, walk) in &mc.access[sidx] {
+        // Seed round 0. Onboard partial-requery seeds the boarded trip's remaining
+        // downstream stops as already-reached transit labels (one transit leg) in
+        // place of foot access; the normal access loop is otherwise untouched.
+        if let Some(ride) = onboard {
+            for seed in &ride.seeds {
                 let lab = Label::arena_push(
                     arena,
                     Label {
-                        bag: ScenarioBag::single(start_time + walk),
-                        route_type: None,
+                        bag: ScenarioBag::single(seed.arrival),
+                        route_type: ride.route_type,
                         reliability: 1.0,
-                        trace: Trace::NONE,
+                        trace: Trace {
+                            pattern: ride.pattern,
+                            trip: ride.trip_within,
+                            boarded_at: ride.current_pos,
+                            alighted_at: seed.alighted_at,
+                            from_stop: u32::MAX,
+                            from_bucket: 0,
+                        },
                         created_by: stamp,
-                        at_stop: stop as u32,
-                        round: 0,
+                        at_stop: seed.at_stop,
+                        round: 1,
                         parent: u32::MAX,
                         arena_id: u32::MAX,
-                        state: sidx as u8,
+                        state: 0,
                     },
                 );
-                let cell = stop * n_states + sidx;
+                let cell = seed.at_stop as usize * n_states;
                 labels[0][cell].insert(lab, buckets);
                 best[cell].insert(lab, buckets);
                 Self::mark(cell, marked, is_marked);
-                // Free drop at the access stop (park & ride).
-                if let Some((in_hand, dropped)) = drop_to
-                    && sidx as u8 == in_hand
-                {
-                    let mut d = lab;
-                    d.state = dropped;
-                    let d = Label::arena_push(arena, d);
-                    let dcell = stop * n_states + dropped as usize;
-                    labels[0][dcell].insert(d, buckets);
-                    best[dcell].insert(d, buckets);
-                    Self::mark(dcell, marked, is_marked);
+            }
+        } else {
+            for (sidx, _vs) in mc.am.states() {
+                for &(stop, walk) in &mc.access[sidx] {
+                    let lab = Label::arena_push(
+                        arena,
+                        Label {
+                            bag: ScenarioBag::single(start_time + walk),
+                            route_type: None,
+                            reliability: 1.0,
+                            trace: Trace::NONE,
+                            created_by: stamp,
+                            at_stop: stop as u32,
+                            round: 0,
+                            parent: u32::MAX,
+                            arena_id: u32::MAX,
+                            state: sidx as u8,
+                        },
+                    );
+                    let cell = stop * n_states + sidx;
+                    labels[0][cell].insert(lab, buckets);
+                    best[cell].insert(lab, buckets);
+                    Self::mark(cell, marked, is_marked);
+                    // Free drop at the access stop (park & ride).
+                    if let Some((in_hand, dropped)) = drop_to
+                        && sidx as u8 == in_hand
+                    {
+                        let mut d = lab;
+                        d.state = dropped;
+                        let d = Label::arena_push(arena, d);
+                        let dcell = stop * n_states + dropped as usize;
+                        labels[0][dcell].insert(d, buckets);
+                        best[dcell].insert(d, buckets);
+                        Self::mark(dcell, marked, is_marked);
+                    }
                 }
             }
         }
 
+        // Round-0 transfer bound: foot access uses the uniform access radius; the
+        // onboard seeds have no access radius, so they extend up to the egress-based
+        // target cutoff (the only bound that keeps onboard transfers finite).
+        let seed_bound = if onboard.is_some() {
+            Self::target_cutoff(best, mc, slack)
+        } else {
+            [start_time + access_secs; ALL_STATES.len()]
+        };
         self.apply_transfers(
             &mut labels[0],
             best,
             buckets,
             marked,
             is_marked,
-            // Round-0 access footpaths share one uniform bound across states.
-            [start_time + access_secs; ALL_STATES.len()],
+            seed_bound,
             stamp,
             arena,
             n_states,
@@ -1877,6 +2209,11 @@ impl Graph {
 
             // 1. Settle arrivals at this stop for every riding label.
             for r in &riding {
+                // GTFS drop_off_type == 1: passengers may not alight here — skip
+                // the label write and keep riding, but do not break the loop.
+                if !col[r.t].alight_allowed {
+                    continue;
+                }
                 // Realtime: shift the scheduled arrival by the live delay for this
                 // trip at this stop (0 when no realtime info — inert default).
                 let arr = apply_delay(col[r.t].arrival, rt.delay(trip_ids[r.t], stop as u32));
@@ -1949,6 +2286,10 @@ impl Graph {
                         if !self.is_trip_active(trip_ids[t], date, weekday) {
                             continue;
                         }
+                        // GTFS pickup_type == 1: passengers may not board here.
+                        if !col[t].board_allowed {
+                            continue;
+                        }
                         // Carrying a bike: only trips that explicitly allow it.
                         if needs_bikes
                             && self.raptor.transit_trips[trip_ids[t].0 as usize].bikes_allowed
@@ -1959,6 +2300,14 @@ impl Graph {
                         // Realtime: effective departure = scheduled + live delay.
                         let trip_dep =
                             apply_delay(col[t].departure, rt.delay(trip_ids[t], stop as u32));
+                        // `t_start` (a `partition_point`) assumes the column is sorted by
+                        // scheduled departure; overtaking trips leave it non-monotonic, so
+                        // guard against boarding a trip that departs before the passenger
+                        // can reach this stop (`min_dep`) — otherwise a label arrives
+                        // before its parent and surfaces as a negative access-walk.
+                        if trip_dep < min_dep {
+                            continue;
+                        }
 
                         // Cumulative reliability — same per-transfer formula as
                         // reconstruction (earliest-based), so buckets agree.
@@ -2582,6 +2931,7 @@ impl Graph {
                         &mut queue,
                         &mut queue_pos,
                         &mut arena,
+                        None,
                     );
                     let plans = self.extract_with_debug(
                         mc,
@@ -2596,6 +2946,7 @@ impl Graph {
                         None,
                         stamp,
                         &arena,
+                        false,
                     );
                     all_plans.extend(plans);
                 }

@@ -1,14 +1,20 @@
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use crate::{
     ingestion::{
-        cache::resolve_source,
+        bestadd::load_bestadd_zip,
+        cache::{SourceLocation, download_to, resolve_source},
         gtfs::{load_gtfs, load_gtfs_sncb, load_gtfs_stib, prepare_sncb},
         osm::{self, Dem},
     },
-    structures::{BuildConfig, DelayCDF, Graph, Ingestor, RoutingDefaultConfig},
+    services::persistence::{load_address_index, save_address_index},
+    structures::{AddressIndex, BuildConfig, DelayCDF, Graph, Ingestor, RoutingDefaultConfig},
 };
+
+/// Re-download the address zip only when it is missing or older than this.
+const ADDRESS_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Run only phase-0 (OSM) ingestors, then call prepare on all non-OSM ingestors.
 /// The returned graph is suitable for serialization to osm.bin.
@@ -31,14 +37,155 @@ pub fn build_osm_phase(
 }
 
 /// Run only phase-1+ (GTFS) ingestors on an existing graph, then finalize.
+/// `station_merge_radius_m` (config `default_routing.station_merge_radius_m`) is
+/// applied to the graph before ingestion so the per-provider orphan-absorption
+/// preprocessor can read it; `None` keeps the compiled-in default.
 pub fn build_gtfs_phase(
     mut g: Graph,
     config: &BuildConfig,
     cache_dir: &str,
     force_download: bool,
+    station_merge_radius_m: Option<f64>,
 ) -> Option<Graph> {
+    if let Some(r) = station_merge_radius_m {
+        g.set_station_merge_radius_m(r);
+    }
     run_phase(config, &mut g, 1, cache_dir, force_download)?;
     finalize(g, config)
+}
+
+/// Apply the configured pedestrian connector cost model onto the graph and bake
+/// the costs into edge lengths so they survive contraction and serde-skip of
+/// `connector_edges`. Must be called after the OSM phase (so `connector_edges` is
+/// populated) and before contraction (so lengths land in super-edge segments).
+/// Absent config fields keep the compiled-in defaults.
+pub fn apply_connector_cost(g: &mut Graph, routing: &RoutingDefaultConfig) {
+    if let Some(c) = routing.connector_cost {
+        let mut cost = crate::ingestion::osm::ConnectorCost::default();
+        if let Some(v) = c.stairs_speed_mps {
+            cost.stairs_speed_mps = v;
+        }
+        if let Some(v) = c.ramp_speed_mps {
+            cost.ramp_speed_mps = v;
+        }
+        if let Some(v) = c.elevator_secs {
+            cost.elevator_secs = v;
+        }
+        if let Some(v) = c.relocation_fallback_secs {
+            cost.relocation_fallback_secs = v;
+        }
+        g.set_connector_cost(cost);
+    }
+    // Bake connector-specific traversal costs into edge lengths so contraction
+    // picks them up. Uses the connector_cost now set (defaults if no config override).
+    // No-op when connector_edges is empty (restore path, tests without connectors).
+    g.bake_connector_lengths(g.connector_cost());
+}
+
+fn file_age(path: &str) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+/// True when `a`'s mtime is strictly newer than `b`'s (both must exist).
+fn file_newer(a: &str, b: &str) -> bool {
+    let ma = std::fs::metadata(a).and_then(|m| m.modified());
+    let mb = std::fs::metadata(b).and_then(|m| m.modified());
+    matches!((ma, mb), (Ok(ta), Ok(tb)) if ta > tb)
+}
+
+/// Load the sibling Belgian address index, or build it from the configured
+/// `best/add` feed. This is **graph-independent** and **safely skippable**:
+///
+/// * No `best/add` input configured ⇒ empty index (feature off).
+/// * Source zip **absent** (remote) ⇒ downloaded once to `cache/<label>.zip` and
+///   cached, then built; on download failure an empty index is returned gracefully
+///   (the server still starts without address search). A present cache is never
+///   re-downloaded.
+/// * Source zip present and **fresh** (< 7 days) ⇒ reused as-is; a cached
+///   `address.bin` at least as new as the zip is loaded without re-parsing.
+/// * Source zip present but **stale** (> 7 days) ⇒ a best-effort weekly refresh
+///   download runs (the operator opted in by providing the file); on failure the
+///   cached zip is kept. The index is then (re)built and persisted to `address.bin`.
+///
+/// Never wired into the hourly auto-update scheduler (which force-downloads every
+/// tick); the only download here is the opt-in stale refresh above.
+pub fn load_or_build_address_index(
+    config: &BuildConfig,
+    cache_dir: &str,
+    address_path: &str,
+    box_coord_epsilon_m: f64,
+) -> AddressIndex {
+    let Some(input) = config
+        .inputs
+        .iter()
+        .find(|i| matches!(i, Ingestor::BeStAdd(_)))
+    else {
+        return AddressIndex::default();
+    };
+
+    let zip_path = match input.location() {
+        Ok(SourceLocation::Local(p)) => {
+            if Path::new(&p).exists() {
+                p
+            } else {
+                tracing::warn!("address feed file '{p}' not found; skipping address index");
+                return AddressIndex::default();
+            }
+        }
+        Ok(SourceLocation::Remote(url)) => {
+            let dest = format!("{cache_dir}/{}.zip", input.label());
+            if !Path::new(&dest).exists() {
+                tracing::info!(
+                    "address feed '{}' not cached; downloading '{url}' to '{dest}'",
+                    input.label()
+                );
+                if let Err(e) = download_to(&url, input.headers(), &dest) {
+                    tracing::warn!("address feed download failed; skipping address index: {e}");
+                    return AddressIndex::default();
+                }
+            }
+            if file_age(&dest).map(|a| a > ADDRESS_MAX_AGE).unwrap_or(false) {
+                tracing::info!("address feed cache is stale; refreshing '{dest}'");
+                if let Err(e) = download_to(&url, input.headers(), &dest) {
+                    tracing::warn!("address feed refresh failed (keeping cached zip): {e}");
+                }
+            }
+            dest
+        }
+        Err(e) => {
+            tracing::warn!("address feed source invalid: {e}; skipping address index");
+            return AddressIndex::default();
+        }
+    };
+
+    if Path::new(address_path).exists() && !file_newer(&zip_path, address_path) {
+        match load_address_index(address_path) {
+            Ok(idx) => {
+                tracing::info!(
+                    "address index restored from {address_path} ({} records)",
+                    idx.record_count()
+                );
+                return idx;
+            }
+            Err(e) => tracing::info!("rebuilding address index ({e})"),
+        }
+    }
+
+    tracing::info!("building address index from '{zip_path}'...");
+    match load_bestadd_zip(&zip_path, box_coord_epsilon_m) {
+        Ok(idx) => {
+            tracing::info!("address index built ({} records)", idx.record_count());
+            if let Err(e) = save_address_index(&idx, address_path) {
+                tracing::warn!("failed to persist address index: {e}");
+            }
+            idx
+        }
+        Err(e) => {
+            tracing::error!("failed to build address index: {e}");
+            AddressIndex::default()
+        }
+    }
 }
 
 fn prepare_ingestor(input: &Ingestor, g: &mut Graph) -> Result<(), String> {
@@ -118,6 +265,7 @@ fn run_phase(
                     .unwrap_or_else(|| c.osm_url.clone());
                 load_gtfs_sncb(&path, &osm_path, g).map_err(|e| e.to_string())
             }
+            Ingestor::BeStAdd(_) => Ok(()),
         };
 
         match result {
@@ -165,7 +313,7 @@ pub fn gtfs_input_labels(config: &BuildConfig) -> Vec<String> {
     let mut labels: Vec<String> = config
         .inputs
         .iter()
-        .filter(|i| i.phase() != 0)
+        .filter(|i| i.phase() != 0 && !matches!(i, Ingestor::BeStAdd(_)))
         .map(|i| i.label().to_string())
         .collect();
     labels.sort();
@@ -181,6 +329,7 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(v) = routing.walking_speed_mps {
         g.set_walking_speed_mps(v);
     }
+    apply_connector_cost(g, routing);
     if let Some(v) = routing.cycling_speed_mps {
         g.set_cycling_speed_mps(v);
     }
@@ -330,7 +479,7 @@ mod tests {
     fn build_gtfs_phase_empty_finalizes() {
         let config = empty_config();
         let g = Graph::new();
-        let result = build_gtfs_phase(g, &config, "cache", false);
+        let result = build_gtfs_phase(g, &config, "cache", false, None);
         assert!(result.is_some());
     }
 }

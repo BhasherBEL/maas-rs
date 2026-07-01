@@ -326,13 +326,18 @@ pub fn load_gtfs_sncb(
                 tracing::error!(
                     "failed to build railway graph: {e} — falling back to generic GTFS load"
                 );
-                return load_gtfs_with_hook(gtfs_path, g, |_, _| None);
+                return load_gtfs_with_hook(
+                    gtfs_path,
+                    g,
+                    super::GtfsProvider::Sncb,
+                    |_, _| None,
+                );
             }
         }
     };
 
     let patterns_before = g.transit_pattern_count();
-    load_gtfs_with_hook(gtfs_path, g, |trip, _| {
+    load_gtfs_with_hook(gtfs_path, g, super::GtfsProvider::Sncb, |trip, _| {
         sncb_bikes_decision(trip.bikes_allowed)
     })?;
     let patterns_after = g.transit_pattern_count();

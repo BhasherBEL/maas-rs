@@ -88,6 +88,18 @@ const _MODE_GLYPH = {
 function modeColor(mode) { return _MODE_COLOR[mode] || '#607d8b'; }
 function modeGlyph(mode) { return _MODE_GLYPH[mode] || '•'; }
 
+const _MODE_MARKER = {
+  Bus: 'B', BUS: 'B', Subway: 'M', METRO: 'M', Rail: 'R', RAIL: 'R',
+  Tramway: 'T', TRAM: 'T', Ferry: 'F', FERRY: 'F', Coach: 'C',
+  CableCar: 'C', Gondola: 'G', Funicular: 'F', Air: 'A', Taxi: 'X',
+};
+function modeMarker(mode) { return _MODE_MARKER[mode] || (mode ? mode[0].toUpperCase() : '•'); }
+
+function safeHex(c) {
+  if (typeof c === 'string' && /^[0-9A-Fa-f]{6}$/.test(c)) return '#' + c;
+  return null;
+}
+
 // Pick black/white text given a background hex (no #).
 function contrastText(hex) {
   if (!hex || hex.length < 6) return '#fff';
@@ -240,19 +252,48 @@ function createContextMenu(map, onFrom, onTo) {
 }
 
 // ── Stop search widget ────────────────────────────────────────
-let _stopsCache = null;
-let _stopsPromise = null;
+let _stationsCache = null;
+let _stationsPromise = null;
 
-function _ensureStops() {
-  if (_stopsPromise) return _stopsPromise;
-  _stopsPromise = gql('{ gtfsStops { name lat lon mode } }')
-    .then(d => { _stopsCache = d?.gtfsStops || []; })
-    .catch(() => { _stopsCache = []; });
-  return _stopsPromise;
+function _ensureStations() {
+  if (_stationsPromise) return _stationsPromise;
+  _stationsPromise = gql('{ gtfsStations { id name lat lon operators lines { mode shortName color textColor } } }')
+    .then(d => { _stationsCache = d?.gtfsStations || []; })
+    .catch(() => { _stationsCache = []; });
+  return _stationsPromise;
+}
+
+function _operatorLabel(operators) {
+  if (!operators || !operators.length) return '🚉';
+  if (operators.length === 1) return operators[0];
+  return operators[0] + ' +' + (operators.length - 1);
+}
+
+let _addressAttr = null;
+let _addressAttrPromise = null;
+function _ensureAttribution() {
+  if (_addressAttrPromise) return _addressAttrPromise;
+  _addressAttrPromise = gql('{ addressAttribution }')
+    .then(d => { _addressAttr = d?.addressAttribution || ''; })
+    .catch(() => { _addressAttr = ''; });
+  return _addressAttrPromise;
+}
+
+function _focusArgs() {
+  const m = typeof window !== 'undefined' && window.map;
+  if (m && typeof m.getCenter === 'function') {
+    try {
+      const c = m.getCenter();
+      if (c && Number.isFinite(c.lat) && Number.isFinite(c.lng)) {
+        return { flat: c.lat, flng: c.lng };
+      }
+    } catch (e) {}
+  }
+  return { flat: null, flng: null };
 }
 
 function createStopSearch(parentEl, placeholder, onChange) {
-  let selLat = null, selLng = null;
+  let selLat = null, selLng = null, selStationId = null;
 
   const wrapper = mkEl('div');
   wrapper.style.cssText = 'position:relative;width:100%';
@@ -270,46 +311,133 @@ function createStopSearch(parentEl, placeholder, onChange) {
   parentEl.appendChild(wrapper);
 
   let highlighted = -1;
+  let stationMatches = [];
+  let addressResults = [];
+  let addrSeq = 0;
+  let addrTimer = null;
+
+  function cancelAddr() { clearTimeout(addrTimer); addrSeq++; addressResults = []; }
 
   function closeDropdown() { drop.style.display = 'none'; highlighted = -1; }
-  function getRows() { return Array.from(drop.children); }
+  function getRows() { return Array.from(drop.querySelectorAll('.row')); }
   function setHighlight(idx) {
     const rows = getRows();
     rows.forEach((r, i) => { r.classList.toggle('hl', i === idx); });
     highlighted = idx;
   }
 
-  function showDropdown(items) {
+  function buildStationRow(s) {
+    const row = mkEl('div', 'row');
+    row.addEventListener('mouseenter', () => setHighlight(getRows().indexOf(row)));
+
+    const head = mkEl('div', 'st-head');
+    const name = mkEl('span', 'name', s.name);
+    head.append(name);
+    if (s.operators && s.operators.length) {
+      const op = mkEl('span', 'op-tag', _operatorLabel(s.operators));
+      op.title = s.operators.join(', ');
+      head.append(op);
+    }
+    row.append(head);
+
+    const lines = Array.isArray(s.lines) ? s.lines : [];
+    const byMode = [];
+    lines.forEach(l => {
+      let g = byMode.find(x => x.mode === l.mode);
+      if (!g) { g = { mode: l.mode, items: [] }; byMode.push(g); }
+      g.items.push(l);
+    });
+    byMode.forEach(g => {
+      const sub = mkEl('div', 'st-mode');
+      const marker = mkEl('span', 'mode-marker', modeMarker(g.mode));
+      marker.title = g.mode;
+      sub.append(marker);
+      const lineWrap = mkEl('div', 'mode-lines');
+      g.items.forEach(l => {
+        const badge = mkEl('span', 'line-badge', l.shortName || '?');
+        const bg = safeHex(l.color);
+        const fg = safeHex(l.textColor);
+        if (bg) { badge.style.background = bg; badge.style.color = fg || '#fff'; badge.classList.add('colored'); }
+        lineWrap.append(badge);
+      });
+      sub.append(lineWrap);
+      row.append(sub);
+    });
+
+    row.addEventListener('mousedown', e => { e.preventDefault(); selectStop(s); });
+    return row;
+  }
+
+  function buildAddressRow(a) {
+    const row = mkEl('div', 'row addr-row');
+    row.addEventListener('mouseenter', () => setHighlight(getRows().indexOf(row)));
+    const head = mkEl('div', 'st-head');
+    head.append(mkEl('span', 'addr-marker', '📍'));
+    head.append(mkEl('span', 'name', a.label));
+    row.append(head);
+    row.addEventListener('mousedown', e => { e.preventDefault(); selectAddress(a); });
+    return row;
+  }
+
+  function renderResults() {
     drop.textContent = '';
     highlighted = -1;
-    if (!items.length) { closeDropdown(); return; }
-    items.slice(0, 12).forEach(s => {
-      const row = mkEl('div', 'row');
-      row.addEventListener('mouseenter', () => setHighlight(getRows().indexOf(row)));
-      const badge = mkEl('span', 'badge', s.mode || '?');
-      const name  = mkEl('span', 'name', s.name);
-      row.append(badge, name);
-      row.addEventListener('mousedown', e => { e.preventDefault(); selectStop(s); });
-      drop.appendChild(row);
-    });
+    const sts = stationMatches.slice(0, 8);
+    const addrs = addressResults.slice(0, 6);
+    if (!sts.length && !addrs.length) { closeDropdown(); return; }
+    sts.forEach(s => drop.appendChild(buildStationRow(s)));
+    if (addrs.length) {
+      drop.appendChild(mkEl('div', 'group-head', 'Addresses'));
+      addrs.forEach(a => drop.appendChild(buildAddressRow(a)));
+      if (_addressAttr) drop.appendChild(mkEl('div', 'addr-attr', _addressAttr));
+    }
     drop.style.display = 'block';
   }
 
   function selectStop(s) {
+    cancelAddr();
     input.value = s.name;
     selLat = s.lat;
     selLng = s.lon;
+    selStationId = s.id != null ? String(s.id) : null;
     closeDropdown();
     if (onChange) onChange({ name: s.name, lat: s.lat, lon: s.lon });
   }
 
+  function selectAddress(a) {
+    cancelAddr();
+    input.value = a.label;
+    selLat = a.lat;
+    selLng = a.lon;
+    selStationId = null;
+    closeDropdown();
+    if (onChange) onChange({ name: a.label, lat: a.lat, lon: a.lon });
+  }
+
   input.addEventListener('input', async () => {
-    const q = input.value.trim().toLowerCase();
-    selLat = null; selLng = null;
-    if (q.length < 2) { closeDropdown(); return; }
-    await _ensureStops();
-    const matches = (_stopsCache || []).filter(s => s.name.toLowerCase().includes(q));
-    showDropdown(matches);
+    addressResults = [];
+    const raw0 = input.value;
+    const raw = input.value.trim();
+    const q = raw.toLowerCase();
+    selLat = null; selLng = null; selStationId = null;
+    if (q.length < 2) { cancelAddr(); closeDropdown(); return; }
+    await _ensureStations();
+    if (input.value !== raw0) return;
+    stationMatches = (_stationsCache || []).filter(s => s.name.toLowerCase().includes(q));
+    renderResults();
+    clearTimeout(addrTimer);
+    const seq = ++addrSeq;
+    addrTimer = setTimeout(async () => {
+      try {
+        const f = _focusArgs();
+        const d = await gql('query($q:String!,$flat:Float,$flng:Float){ searchAddresses(query:$q, limit:6, focusLat:$flat, focusLng:$flng){ id label lat lon } }', { q: raw, flat: f.flat, flng: f.flng });
+        if (seq !== addrSeq) return;
+        addressResults = d?.searchAddresses || [];
+        renderResults();
+      } catch (e) {
+        if (seq === addrSeq) { addressResults = []; renderResults(); }
+      }
+    }, 250);
   });
 
   input.addEventListener('blur', () => setTimeout(closeDropdown, 160));
@@ -326,15 +454,17 @@ function createStopSearch(parentEl, placeholder, onChange) {
     if (e.key === 'Escape') closeDropdown();
   });
 
-  _ensureStops();
+  _ensureStations();
+  _ensureAttribution();
 
   return {
     el: input,
-    setValue(name, lat, lon) { input.value = name; selLat = lat; selLng = lon; },
-    setCoords(lat, lon)      { input.value = lat.toFixed(5) + ', ' + lon.toFixed(5); selLat = lat; selLng = lon; },
-    clear()                  { input.value = ''; selLat = null; selLng = null; },
+    setValue(name, lat, lon, stationId) { cancelAddr(); input.value = name; selLat = lat; selLng = lon; selStationId = stationId != null ? String(stationId) : null; },
+    setCoords(lat, lon)      { cancelAddr(); input.value = lat.toFixed(5) + ', ' + lon.toFixed(5); selLat = lat; selLng = lon; selStationId = null; },
+    clear()                  { cancelAddr(); input.value = ''; selLat = null; selLng = null; selStationId = null; },
     getName()                { return input.value; },
     getLat() { return selLat; },
     getLng() { return selLng; },
+    getStationId() { return selStationId; },
   };
 }

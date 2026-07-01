@@ -5,10 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ingestion::gtfs::{AgencyId, AgencyInfo, RouteId, RouteInfo, TripId, TripInfo},
-    structures::{EdgeData, LatLng, NodeData, NodeID, StreetEdgeData},
+    ingestion::osm::{ConnectorCost, PlatformIndex},
+    structures::{Connector, EdgeData, LatLng, NodeData, NodeID, OsmNodeData, StreetEdgeData},
 };
 
-use raptor_index::RaptorIndex;
+pub use raptor_index::{RaptorIndex, StationInfo, StationLine};
 
 mod bike_cost;
 pub mod contraction;
@@ -16,6 +17,7 @@ mod edge_index;
 mod multiobj;
 mod multiobj_plan;
 mod path_distribution;
+mod platform_reach;
 mod railway;
 mod raptor_access;
 mod raptor_backward;
@@ -29,9 +31,11 @@ mod street_enrich;
 mod transit;
 
 pub use bike_cost::{BikeCost, PrevCtx};
+pub use platform_reach::ConnectorReach;
 pub use raptor_access::StreetProfile;
-pub use raptor_route::QueryEndpoints;
+pub use raptor_route::{OnboardRide, OnboardSeed, QueryEndpoints};
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
+pub use transit::StationBackup;
 
 /// A routing terminal: either an exact graph node, or a point projected onto the
 /// interior of an edge between nodes `a` and `b` (used by edge-aware snapping so a
@@ -92,6 +96,25 @@ pub struct Graph {
     /// no contracted graph (only on a partially-built graph; production always builds it).
     #[serde(default)]
     pub contracted: Option<contraction::ContractedGraph>,
+    /// OSM-derived platform index (Stage A platform matching). Serialized only via
+    /// the OSM view (lives in `osm.bin`, gated by `OSM_SCHEMA_VERSION`); skipped in
+    /// the full-graph (`graph.bin`) serialization since routing never reads it.
+    #[serde(skip, default)]
+    platforms: PlatformIndex,
+    /// OSM `level` (semantic storey) per node, sparse — only nodes on a leveled way
+    /// (platforms, leveled footways). Stage B1 auxiliary OSM data, lives in `osm.bin`
+    /// only (mirrors `platforms`); routing never reads it in B1.
+    #[serde(skip, default)]
+    node_levels: HashMap<NodeID, i16>,
+    /// Pedestrian vertical connectors (stairs/elevator/ramp) keyed by directed node
+    /// pair, classified from the OSM highway tag. Stage B1 auxiliary OSM data,
+    /// `osm.bin` only. Used by the connector-coverage measurement.
+    #[serde(skip, default)]
+    connector_edges: HashMap<(NodeID, NodeID), Connector>,
+    /// Pedestrian connector cost model (config `default_routing.connector_cost`).
+    /// Runtime-only knob for the B1 measurement's added-time stat; not serialized.
+    #[serde(skip, default)]
+    connector_cost: ConnectorCost,
 }
 
 #[derive(Serialize)]
@@ -100,6 +123,9 @@ struct OsmView<'a> {
     edges: &'a Vec<Vec<EdgeData>>,
     nodes_tree: &'a KdTree<f64, NodeID, [f64; 2]>,
     id_mapper: &'a HashMap<String, NodeID>,
+    platforms: &'a PlatformIndex,
+    node_levels: &'a HashMap<NodeID, i16>,
+    connector_edges: &'a HashMap<(NodeID, NodeID), Connector>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +134,11 @@ struct OsmOwned {
     edges: Vec<Vec<EdgeData>>,
     nodes_tree: KdTree<f64, NodeID, [f64; 2]>,
     id_mapper: HashMap<String, NodeID>,
+    platforms: PlatformIndex,
+    #[serde(default)]
+    node_levels: HashMap<NodeID, i16>,
+    #[serde(default)]
+    connector_edges: HashMap<(NodeID, NodeID), Connector>,
 }
 
 pub static MAX_TRANSFER_DISTANCE_M: f64 = 1000.0;
@@ -130,6 +161,10 @@ impl Graph {
             raptor: RaptorIndex::new(),
             edge_index: edge_index::EdgeIndex::default(),
             contracted: None,
+            platforms: PlatformIndex::default(),
+            node_levels: HashMap::new(),
+            connector_edges: HashMap::new(),
+            connector_cost: ConnectorCost::default(),
         }
     }
 
@@ -153,6 +188,9 @@ impl Graph {
             edges: &self.edges,
             nodes_tree: &self.nodes_tree,
             id_mapper: &self.id_mapper,
+            platforms: &self.platforms,
+            node_levels: &self.node_levels,
+            connector_edges: &self.connector_edges,
         };
         postcard::to_allocvec(&view).map_err(|e| format!("Failed to serialize OSM graph: {e}"))
     }
@@ -168,7 +206,114 @@ impl Graph {
             raptor: RaptorIndex::new(),
             edge_index: edge_index::EdgeIndex::default(),
             contracted: None,
+            platforms: o.platforms,
+            node_levels: o.node_levels,
+            connector_edges: o.connector_edges,
+            connector_cost: ConnectorCost::default(),
         })
+    }
+
+    pub fn set_platform_index(&mut self, idx: PlatformIndex) {
+        self.platforms = idx;
+    }
+
+    pub fn platform_index(&self) -> &PlatformIndex {
+        &self.platforms
+    }
+
+    /// Install the Stage B1 auxiliary OSM level/connector data parsed during the
+    /// PBF pass (sparse `node → level` and `connector edge` maps).
+    pub fn set_osm_level_data(
+        &mut self,
+        node_levels: HashMap<NodeID, i16>,
+        connector_edges: HashMap<(NodeID, NodeID), Connector>,
+    ) {
+        self.node_levels = node_levels;
+        self.connector_edges = connector_edges;
+    }
+
+    /// OSM `level` (semantic storey) of a node, if it sits on a leveled way.
+    /// `None` is read as ground level.
+    pub fn node_level(&self, id: NodeID) -> Option<i16> {
+        self.node_levels.get(&id).copied()
+    }
+
+    /// Set a node's `level` (Stage B2a relocation pins a stop to its platform
+    /// storey). Sparse — overrides any existing entry.
+    pub fn set_node_level(&mut self, id: NodeID, level: i16) {
+        self.node_levels.insert(id, level);
+    }
+
+    /// Move a **transit stop**'s anchor coordinate (Stage B2a relocation onto its
+    /// matched OSM platform node). Safe only for transit stops, which are NOT in the
+    /// snap KD-tree, so no `nodes_tree` resync is needed; a no-op on OSM nodes.
+    pub fn relocate_transit_stop(&mut self, id: NodeID, loc: LatLng) {
+        if let Some(NodeData::TransitStop(stop)) = self.nodes.get_mut(id.0) {
+            stop.lat_lng = loc;
+        }
+    }
+
+    /// The pedestrian connector kind of the directed edge `a→b`, if any.
+    pub fn connector_kind(&self, a: NodeID, b: NodeID) -> Option<Connector> {
+        self.connector_edges.get(&(a, b)).copied()
+    }
+
+    pub fn set_connector_cost(&mut self, cost: ConnectorCost) {
+        self.connector_cost = cost;
+    }
+
+    pub fn connector_cost(&self) -> ConnectorCost {
+        self.connector_cost
+    }
+
+    /// Bake connector-specific traversal costs into edge **lengths** so that
+    /// `edge_secs(Foot)` — which always computes `length / walking_speed` — yields
+    /// the correct time even after `connector_edges` is serde-skipped on restore and
+    /// after contraction copies the lengths into super-edge segments.
+    ///
+    /// Must be called after `connector_edges` is populated (post-OSM phase) and
+    /// after `walking_speed_mps` is configured, but **before** contraction builds the
+    /// contracted graph (which bakes the lengths into super-edge segments).
+    ///
+    /// Formula:
+    /// - Stairs/ramp: `new_len = old_len * walk_speed / connector_speed`
+    ///   (so `new_len / walk_speed = old_len / connector_speed`, the correct time)
+    /// - Elevator: `new_len = elevator_secs * walk_speed`
+    ///   (fixed time regardless of physical run length)
+    ///
+    /// No-op when `connector_edges` or `edges` is empty (restore path, pre-OSM, tests).
+    pub fn bake_connector_lengths(&mut self, cost: ConnectorCost) {
+        if self.connector_edges.is_empty() || self.edges.is_empty() {
+            return;
+        }
+        let walk_speed = self.raptor.walking_speed_mps;
+        let pairs: Vec<((NodeID, NodeID), Connector)> =
+            self.connector_edges.iter().map(|(&k, &v)| (k, v)).collect();
+        for ((a, b), kind) in pairs {
+            let Some(edges) = self.edges.get_mut(a.0) else {
+                continue;
+            };
+            for edge in edges.iter_mut() {
+                if let EdgeData::Street(s) = edge {
+                    if s.destination == b {
+                        let old_len = s.length as f64;
+                        let new_len = match kind {
+                            Connector::Steps => {
+                                (old_len * walk_speed / cost.stairs_speed_mps).round() as usize
+                            }
+                            Connector::Ramp => {
+                                (old_len * walk_speed / cost.ramp_speed_mps).round() as usize
+                            }
+                            Connector::Elevator => {
+                                (cost.elevator_secs * walk_speed).round() as usize
+                            }
+                        };
+                        s.length = new_len.max(1);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn set_min_access_secs(&mut self, secs: u32) {
@@ -177,6 +322,18 @@ impl Graph {
 
     pub fn set_walking_speed_mps(&mut self, mps: f64) {
         self.raptor.walking_speed_mps = mps;
+    }
+
+    pub fn walking_speed_mps(&self) -> f64 {
+        self.raptor.walking_speed_mps
+    }
+
+    pub fn set_station_merge_radius_m(&mut self, m: f64) {
+        self.raptor.station_merge_radius_m = m;
+    }
+
+    pub fn station_merge_radius_m(&self) -> f64 {
+        self.raptor.station_merge_radius_m
     }
 
     pub fn set_cycling_speed_mps(&mut self, mps: f64) {
@@ -301,6 +458,20 @@ impl Graph {
         id
     }
 
+    /// Add an OSM node **without** inserting it into the snap KD-tree
+    /// (`nodes_tree`). Used for Stage B1 platform-way nodes: they must be routable
+    /// (edges resolve via `id_mapper`) but must NOT become candidates for GTFS
+    /// stop snapping — otherwise a stop near a newly-imported platform would snap
+    /// to it, silently relocating the stop. Keeping them out of the tree preserves
+    /// today's stop→nearest-street-node snapping exactly.
+    pub fn add_osm_node_unindexed(&mut self, node: OsmNodeData) -> NodeID {
+        let id = NodeID(self.nodes.len());
+        self.id_mapper.insert(node.eid.clone(), id);
+        self.nodes.push(NodeData::OsmNode(node));
+        self.edges.push(Vec::new());
+        id
+    }
+
     pub fn add_edge(&mut self, from: NodeID, edge: EdgeData) {
         self.edges[from.0].push(edge);
     }
@@ -311,6 +482,11 @@ impl Graph {
 
     pub fn get_node(&self, id: NodeID) -> Option<&NodeData> {
         self.nodes.get(id.0)
+    }
+
+    /// Outgoing edges of a node (empty slice if out of bounds).
+    pub fn out_edges(&self, id: NodeID) -> &[EdgeData] {
+        self.edges.get(id.0).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     pub fn node_count(&self) -> usize {

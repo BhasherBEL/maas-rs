@@ -31,6 +31,17 @@ impl DelayCDF {
         })
     }
 
+    /// Returns P(delay ≥ secs) — the upper-tail (survival) probability that the
+    /// actual delay is at least `secs` seconds. Complements [`prob_on_time`]
+    /// (which is P(delay ≤ budget)): on a normalized CDF,
+    /// `prob_at_least(s) == 1.0 − prob_on_time(s − 1)`.
+    pub fn prob_at_least(&self, secs: i32) -> f32 {
+        self.pmf()
+            .filter(|&(delay, _)| delay >= secs)
+            .map(|(_, mass)| mass)
+            .sum()
+    }
+
     /// Probability of making a transfer given a `margin` of slack, accounting
     /// for both this (feeder) delay distribution and the `board`ing vehicle's.
     /// You board iff `D_feeder − D_board ≤ margin`, so assuming the two delays
@@ -366,6 +377,28 @@ mod tests {
         assert_eq!(cdf.prob_on_time(120), 0.50);
         assert_eq!(cdf.prob_on_time(180), 0.80);
         assert_eq!(cdf.prob_on_time(1000), 1.0);
+    }
+
+    #[test]
+    fn prob_at_least_is_upper_tail() {
+        let cdf = make_cdf(); // bins (0,0.1),(60,0.5),(120,0.9),(300,1.0)
+        // pmf: (0,0.1),(60,0.4),(120,0.4),(300,0.1)
+        assert!((cdf.prob_at_least(0) - 1.0).abs() < 1e-6); // all mass at delay >= 0
+        assert!((cdf.prob_at_least(60) - 0.9).abs() < 1e-6); // drop the 0s bin
+        assert!((cdf.prob_at_least(120) - 0.5).abs() < 1e-6);
+        assert!((cdf.prob_at_least(300) - 0.1).abs() < 1e-6);
+        assert!((cdf.prob_at_least(301) - 0.0).abs() < 1e-6); // above the top bin
+    }
+
+    #[test]
+    fn prob_at_least_complements_prob_on_time() {
+        // On a normalized CDF: P(D >= s) == 1 - P(D <= s-1).
+        let cdf = make_cdf_with_early();
+        for s in [-200, -120, -60, -1, 0, 1, 60, 120, 300, 1000] {
+            let lhs = cdf.prob_at_least(s);
+            let rhs = 1.0 - cdf.prob_on_time(s - 1);
+            assert!((lhs - rhs).abs() < 1e-6, "s={s}: {lhs} vs {rhs}");
+        }
     }
 
     // ── pmf / prob_on_time_vs (two-delay convolution) ─────────────────────────

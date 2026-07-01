@@ -38,6 +38,20 @@ pub fn resolve_source(
     }
 }
 
+/// Public, on-demand download to `dest` (temp file + rename). Used by the age-gated
+/// address-feed refresh, which downloads outside the normal cache-reuse path.
+pub fn download_to(
+    url: &str,
+    headers: &HashMap<String, String>,
+    dest: &str,
+) -> Result<(), String> {
+    if let Some(parent) = Path::new(dest).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create cache dir '{}': {e}", parent.display()))?;
+    }
+    download(url, headers, dest)
+}
+
 /// Download `url` (with interpolated headers) to `dest` via a temp file + rename.
 /// Neither the resolved URL nor header values are logged.
 fn download(url: &str, headers: &HashMap<String, String>, dest: &str) -> Result<(), String> {

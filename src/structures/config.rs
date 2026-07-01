@@ -34,6 +34,11 @@ pub struct RealtimeConfig {
     /// Per-request HTTP timeout for realtime polls.
     #[serde(default = "default_rt_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// A vehicle position is considered stale after this many seconds (unix time
+    /// comparison). Routing and the live UI fall back to schedule interpolation
+    /// when the position is absent or older than this window.
+    #[serde(default = "default_vehicle_position_max_age_secs")]
+    pub vehicle_position_max_age_secs: u64,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
@@ -46,6 +51,10 @@ fn default_poll_interval_secs() -> u64 {
 
 fn default_rt_timeout_secs() -> u64 {
     20
+}
+
+fn default_vehicle_position_max_age_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -89,6 +98,8 @@ pub enum RealtimeFeedConfig {
     Stib {
         name: String,
         waiting_time_url: String,
+        #[serde(default)]
+        vehicle_position_url: Option<String>,
         #[serde(default)]
         headers: HashMap<String, String>,
     },
@@ -204,6 +215,8 @@ pub enum Ingestor {
     GtfsStib(GtfsGenericIngestor),
     #[serde(rename = "gtfs/sncb")]
     GtfsSncb(GtfsSncbIngestor),
+    #[serde(rename = "best/add")]
+    BeStAdd(BeStAddIngestor),
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +246,24 @@ pub struct GtfsSncbIngestor {
     pub headers: HashMap<String, String>,
 }
 
+/// BeST-Add Belgian address feed (FULL XML zip from FPS BOSA). Ingested into a
+/// sibling [`crate::structures::AddressIndex`] (not the routing graph), so it runs
+/// on its own phase (default 2) outside the OSM/GTFS graph build. The download is
+/// age-gated and safely skippable — see `services::build::load_or_build_address_index`.
+#[derive(Debug, Deserialize)]
+pub struct BeStAddIngestor {
+    #[serde(default = "default_bestadd_name")]
+    pub name: String,
+    pub url: String,
+    pub phase: Option<u8>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_bestadd_name() -> String {
+    "bestadd".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoutingDefaultConfig {
     /// Minimum walk-radius (seconds) used for access/egress stop search.
@@ -242,6 +273,15 @@ pub struct RoutingDefaultConfig {
     /// Pedestrian walking speed in m/s. When absent, defaults to 1.2 m/s (4.32 km/h).
     #[serde(default)]
     pub walking_speed_mps: Option<f64>,
+    /// Radius (meters) within which a parent-less ("orphan") GTFS stop may be merged
+    /// into a physical station during ingestion when their normalized names match
+    /// EXACTLY and they belong to the SAME operator/feed. That exact-name + same-feed
+    /// match is a strong signal, so it tolerates a larger spread (big interchanges)
+    /// while genuinely distinct same-named stops (>250 m apart) stay separate. A
+    /// future fuzzy/cross-operator matcher should use its own, tighter value. When
+    /// absent, defaults to 250 m.
+    #[serde(default)]
+    pub station_merge_radius_m: Option<f64>,
     /// Cycling speed in m/s. When absent, defaults to 4.2 m/s (~15 km/h).
     #[serde(default)]
     pub cycling_speed_mps: Option<f64>,
@@ -336,6 +376,115 @@ pub struct RoutingDefaultConfig {
     /// Absent ⇒ compiled-in defaults. Touches presentation only, never the search.
     #[serde(default)]
     pub balance: Option<crate::structures::cost::BalanceWeights>,
+    /// Pedestrian vertical-connector (stairs/elevator/ramp) cost model, used by the
+    /// Stage B1 connector-coverage measurement to report the extra walk time a
+    /// vertical-access path adds. Absent ⇒ compiled-in defaults. (B1 does not charge
+    /// this in routing.)
+    #[serde(default)]
+    pub connector_cost: Option<ConnectorCostConfig>,
+    /// Address search: distance (km) within which a candidate keeps its full geo
+    /// score around the map focus point. Absent ⇒ 2.0.
+    #[serde(default)]
+    pub address_geo_offset_km: Option<f64>,
+    /// Address search: distance (km) at which the geo score has decayed to half;
+    /// the exponential scale is derived as `(half - offset)/ln(2)`. Absent ⇒ 5.0.
+    #[serde(default)]
+    pub address_geo_half_score_km: Option<f64>,
+    /// Address search: floor on the geo decay so a far but exact text match is
+    /// never fully buried. Absent ⇒ 0.1.
+    #[serde(default)]
+    pub address_geo_floor: Option<f64>,
+    /// Address search: text factor for a prefix-only token match relative to an
+    /// exact alias token (exact = 1.0). Absent ⇒ 0.6.
+    #[serde(default)]
+    pub address_prefix_token_weight: Option<f64>,
+    /// Address search: multiplicative boost when a number token exactly equals a
+    /// record's house number, ranking it above a prefix house-number match.
+    /// Absent ⇒ 1.5.
+    #[serde(default)]
+    pub address_house_number_boost: Option<f64>,
+    /// Address search: run the typo-tolerant fuzzy fallback only when the exact /
+    /// prefix pass covered fewer than this many streets. Absent ⇒ 5.
+    #[serde(default)]
+    pub address_fuzzy_trigger_k: Option<usize>,
+    /// Address search: minimum query-token length (chars) to allow 1 edit of fuzzy
+    /// tolerance; below it a token is never fuzzed. Absent ⇒ 3.
+    #[serde(default)]
+    pub address_fuzzy_min_len_1typo: Option<usize>,
+    /// Address search: minimum query-token length (chars) to allow 2 edits of fuzzy
+    /// tolerance. Absent ⇒ 8.
+    #[serde(default)]
+    pub address_fuzzy_min_len_2typos: Option<usize>,
+    /// Address search: text factor for a token matched only via the fuzzy fallback,
+    /// below the prefix weight so corrected matches rank under literal ones.
+    /// Absent ⇒ 0.4.
+    #[serde(default)]
+    pub address_fuzzy_token_weight: Option<f64>,
+    /// Address index build: divergence epsilon (meters) for a building's box
+    /// coordinates. BeST stores each apartment/box as its own address row at one
+    /// house number; when those rows sit within this radius they are one entrance,
+    /// so the box coordinates collapse to the building centroid. Beyond it (a rare
+    /// multi-entrance building) each box keeps its own coordinate so box-level
+    /// precision is not lost. Absent ⇒ 5.0.
+    #[serde(default)]
+    pub address_box_coord_epsilon_m: Option<f64>,
+}
+
+impl RoutingDefaultConfig {
+    /// Build the address-search tuning, starting from the researched compiled-in
+    /// defaults and overriding only the fields present in config.
+    pub fn to_address_search_params(&self) -> crate::structures::AddressSearchParams {
+        let mut p = crate::structures::AddressSearchParams::default();
+        if let Some(v) = self.address_geo_offset_km {
+            p.geo_offset_km = v;
+        }
+        if let Some(v) = self.address_geo_half_score_km {
+            p.geo_half_score_km = v;
+        }
+        if let Some(v) = self.address_geo_floor {
+            p.geo_floor = v;
+        }
+        if let Some(v) = self.address_prefix_token_weight {
+            p.prefix_token_weight = v;
+        }
+        if let Some(v) = self.address_house_number_boost {
+            p.house_number_boost = v;
+        }
+        if let Some(v) = self.address_fuzzy_trigger_k {
+            p.fuzzy_trigger_k = v;
+        }
+        if let Some(v) = self.address_fuzzy_min_len_1typo {
+            p.fuzzy_min_len_1typo = v;
+        }
+        if let Some(v) = self.address_fuzzy_min_len_2typos {
+            p.fuzzy_min_len_2typos = v;
+        }
+        if let Some(v) = self.address_fuzzy_token_weight {
+            p.fuzzy_token_weight = v;
+        }
+        p
+    }
+
+    /// Build-time representative-coordinate divergence epsilon (meters) for the
+    /// address index, from `address_box_coord_epsilon_m`. Absent ⇒ 5.0.
+    pub fn address_box_coord_epsilon_m(&self) -> f64 {
+        self.address_box_coord_epsilon_m
+            .unwrap_or(crate::structures::DEFAULT_BOX_COORD_EPSILON_M)
+    }
+}
+
+/// Config view of the pedestrian connector cost model. Absent fields fall back to
+/// the compiled-in `ConnectorCost::default()` values.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConnectorCostConfig {
+    #[serde(default)]
+    pub stairs_speed_mps: Option<f64>,
+    #[serde(default)]
+    pub ramp_speed_mps: Option<f64>,
+    #[serde(default)]
+    pub elevator_secs: Option<f64>,
+    #[serde(default)]
+    pub relocation_fallback_secs: Option<f64>,
 }
 
 /// Per-axis ε-dominance tuning: `ε_i = a_i + b_i·value`. Absent fields keep these
@@ -397,6 +546,7 @@ impl Ingestor {
             Ingestor::OsmPbf(_) => "osm/pbf",
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.name,
             Ingestor::GtfsSncb(c) => &c.name,
+            Ingestor::BeStAdd(c) => &c.name,
         }
     }
 
@@ -405,6 +555,7 @@ impl Ingestor {
             Ingestor::OsmPbf(c) => &c.url,
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.url,
             Ingestor::GtfsSncb(c) => &c.url,
+            Ingestor::BeStAdd(c) => &c.url,
         }
     }
 
@@ -413,6 +564,7 @@ impl Ingestor {
             Ingestor::OsmPbf(c) => &c.headers,
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.headers,
             Ingestor::GtfsSncb(c) => &c.headers,
+            Ingestor::BeStAdd(c) => &c.headers,
         }
     }
 
@@ -432,6 +584,7 @@ impl Ingestor {
             Ingestor::OsmPbf(i) => i.phase.unwrap_or(0),
             Ingestor::GtfsGeneric(i) | Ingestor::GtfsStib(i) => i.phase.unwrap_or(1),
             Ingestor::GtfsSncb(i) => i.phase.unwrap_or(1),
+            Ingestor::BeStAdd(i) => i.phase.unwrap_or(2),
         }
     }
 }
@@ -570,6 +723,16 @@ server:
         let yaml = "walking_speed_mps: 1.4";
         let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.walking_speed_mps, Some(1.4));
+    }
+
+    #[test]
+    fn routing_default_config_station_merge_radius_parses_and_defaults() {
+        let with = "station_merge_radius_m: 75.0";
+        let cfg: RoutingDefaultConfig = serde_yaml_ng::from_str(with).unwrap();
+        assert_eq!(cfg.station_merge_radius_m, Some(75.0));
+
+        let without: RoutingDefaultConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(without.station_merge_radius_m.is_none());
     }
 
     #[test]
@@ -726,6 +889,48 @@ feeds:
     }
 
     #[test]
+    fn stib_feed_vehicle_position_url_parses_and_defaults_to_none() {
+        let with_url = r#"
+enabled: true
+feeds:
+  - type: stib
+    name: stib
+    waiting_time_url: "https://example.com/WaitingTimes/"
+    vehicle_position_url: "https://example.com/VehiclePositions/"
+"#;
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(with_url).unwrap();
+        match &rt.feeds[0] {
+            RealtimeFeedConfig::Stib {
+                vehicle_position_url,
+                ..
+            } => assert_eq!(
+                vehicle_position_url.as_deref(),
+                Some("https://example.com/VehiclePositions/")
+            ),
+            _ => panic!("expected stib feed"),
+        }
+
+        let without_url = r#"
+enabled: true
+feeds:
+  - type: stib
+    name: stib
+    waiting_time_url: "https://example.com/WaitingTimes/"
+"#;
+        let rt2: RealtimeConfig = serde_yaml_ng::from_str(without_url).unwrap();
+        match &rt2.feeds[0] {
+            RealtimeFeedConfig::Stib {
+                vehicle_position_url,
+                ..
+            } => assert!(
+                vehicle_position_url.is_none(),
+                "vehicle_position_url should default to None"
+            ),
+            _ => panic!("expected stib feed"),
+        }
+    }
+
+    #[test]
     fn realtime_rate_limit_defaults() {
         let yaml = "enabled: true";
         let rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
@@ -733,6 +938,17 @@ feeds:
         assert_eq!(rt.rate_limit.throttled_min_interval_secs, 60);
         assert_eq!(rt.poll_interval_secs, 30);
         assert!(rt.feeds.is_empty());
+    }
+
+    #[test]
+    fn vehicle_position_max_age_secs_parses_and_defaults() {
+        let with_age = "enabled: true\nvehicle_position_max_age_secs: 60";
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(with_age).unwrap();
+        assert_eq!(rt.vehicle_position_max_age_secs, 60);
+
+        let without_age = "enabled: true";
+        let rt2: RealtimeConfig = serde_yaml_ng::from_str(without_age).unwrap();
+        assert_eq!(rt2.vehicle_position_max_age_secs, 120, "default should be 120");
     }
 
     #[test]
@@ -828,6 +1044,52 @@ feeds:
     fn balance_absent_is_none() {
         let r: RoutingDefaultConfig = serde_yaml_ng::from_str("{}").unwrap();
         assert!(r.balance.is_none());
+    }
+
+    #[test]
+    fn address_search_params_default_when_absent() {
+        let r: RoutingDefaultConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(r.address_geo_offset_km.is_none());
+        assert!(r.address_box_coord_epsilon_m.is_none());
+        assert_eq!(r.address_box_coord_epsilon_m(), 5.0);
+        let p = r.to_address_search_params();
+        assert_eq!(p.geo_offset_km, 2.0);
+        assert_eq!(p.geo_half_score_km, 5.0);
+        assert_eq!(p.geo_floor, 0.1);
+        assert_eq!(p.prefix_token_weight, 0.6);
+        assert_eq!(p.house_number_boost, 1.5);
+        assert_eq!(p.fuzzy_trigger_k, 5);
+        assert_eq!(p.fuzzy_min_len_1typo, 3);
+        assert_eq!(p.fuzzy_min_len_2typos, 8);
+        assert_eq!(p.fuzzy_token_weight, 0.4);
+    }
+
+    #[test]
+    fn address_search_params_override_from_config() {
+        let yaml = r#"
+address_geo_offset_km: 1.0
+address_geo_half_score_km: 8.0
+address_geo_floor: 0.05
+address_prefix_token_weight: 0.5
+address_house_number_boost: 2.0
+address_fuzzy_trigger_k: 3
+address_fuzzy_min_len_1typo: 4
+address_fuzzy_min_len_2typos: 9
+address_fuzzy_token_weight: 0.3
+address_box_coord_epsilon_m: 12.0
+"#;
+        let r: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(r.address_box_coord_epsilon_m(), 12.0);
+        let p = r.to_address_search_params();
+        assert_eq!(p.geo_offset_km, 1.0);
+        assert_eq!(p.geo_half_score_km, 8.0);
+        assert_eq!(p.geo_floor, 0.05);
+        assert_eq!(p.prefix_token_weight, 0.5);
+        assert_eq!(p.house_number_boost, 2.0);
+        assert_eq!(p.fuzzy_trigger_k, 3);
+        assert_eq!(p.fuzzy_min_len_1typo, 4);
+        assert_eq!(p.fuzzy_min_len_2typos, 9);
+        assert_eq!(p.fuzzy_token_weight, 0.3);
     }
 
     #[test]

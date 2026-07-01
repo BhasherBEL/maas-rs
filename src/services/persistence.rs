@@ -2,7 +2,7 @@ use std::fs;
 
 use postcard::{from_bytes, to_allocvec};
 
-use crate::structures::Graph;
+use crate::structures::{AddressIndex, Graph};
 
 /// Magic prefix identifying a maas-rs cache file.
 const MAGIC: &[u8; 4] = b"MAAS";
@@ -12,7 +12,35 @@ const MAGIC: &[u8; 4] = b"MAAS";
 /// v5: `elev_delta` is now DEM-denoised per-way at ingestion (RDP smoothing), so
 ///     stale caches carry raw (noisy) ascent and must be rebuilt.
 /// v6: `StreetEdgeData` gained a baked `surface_speed` bike speed factor.
-pub const OSM_SCHEMA_VERSION: u32 = 6;
+/// v7: OSM view gained a `PlatformIndex` (Stage A platform matching) serialized
+///     into `osm.bin` so the GTFS phase can match platform stops on `--update-gtfs`.
+/// v8: Stage B1 — OSM view gained `node_levels` + `connector_edges` (level/connector
+///     maps); `OsmPlatform` gained `node_ids`; platform ways are now imported as
+///     walkable foot edges (so node/edge counts changed). GRAPH_SCHEMA is NOT bumped:
+///     all of this is serde-skipped on `Graph` and lives only in the OSM view, mirroring
+///     `PlatformIndex`; routing never reads it in B1, so graph.bin's layout is unchanged.
+/// v9: `build_platform_index` now also indexes `public_transport=platform` /
+///     `railway=platform` OSM **nodes** (with `local_ref`/`ref`); `load_pbf_file`
+///     adds those nodes to the graph as unindexed entries. GRAPH stays 12 — these
+///     unindexed nodes are serde-skipped and invisible to the routing core.
+/// v10: `build_platform_index` now indexes `railway=platform` /
+///     `public_transport=platform` OSM **relations** (multipolygon platforms where
+///     member ways are untagged). `load_pbf_file` registers member-way nodes as
+///     unindexed entries so the resolver can find them. Old osm.bin is missing
+///     relation-derived platforms → rebuild needed. GRAPH stays 16: PlatformIndex
+///     is OSM-view-only and unindexed nodes remain serde-skipped.
+/// v11: `build_platform_index` now excludes bus/tram-only platforms from the index
+///     (`highway=bus_stop` or `bus=yes`/`tram=yes`/`trolleybus=yes` without a rail
+///     signal). Old osm.bin may contain bus-terminal nodes (e.g. Namur TECN Gare des
+///     Bus) that falsely match SNCB rail platform codes → rebuild to purge them.
+///     GRAPH stays 17: PlatformIndex is OSM-view-only.
+/// v12: `validate_way` now treats `virtual:highway=footway/steps/path/pedestrian`
+///     as a fallback when `highway` is absent, importing OSM platform-stair
+///     connector ways that were previously silently dropped (e.g. Bruges/Berchem
+///     stair-top-to-platform links tagged `virtual:highway=footway`). More ways
+///     are imported → node/edge counts in osm.bin change → rebuild required.
+///     GRAPH stays 17: no routing-core struct layout change.
+pub const OSM_SCHEMA_VERSION: u32 = 12;
 /// Bump when any `Graph`/`RaptorIndex` field changes layout (or, like v5, the baked
 /// `elev_delta` edge values change meaning).
 /// v7: `Graph` gained a serialized `contracted: Option<ContractedGraph>` (P3 node
@@ -23,7 +51,46 @@ pub const OSM_SCHEMA_VERSION: u32 = 6;
 ///     explain survey + plan nodes after the interior-node drop empties `g.nodes`).
 /// v10: P3f cutover — node_contraction default ON, the interior-node arrays are DROPPED
 ///      at build/restore, so graph.bin carries empty `nodes`/`edges` + the contracted graph.
-pub const GRAPH_SCHEMA_VERSION: u32 = 10;
+/// v11: overtaking-trips split — `build_raptor_index` now decomposes each pattern into
+///      non-overtaking sub-routes so every per-stop departure column is monotonic, so the
+///      built pattern set differs (old graph.bin holds unsplit, non-FIFO patterns).
+/// v12: Stage B2a snap-relocation — Stage-A platform-matched stops are relocated onto their
+///      matched OSM platform node and re-priced (boarding at the platform + a penalised
+///      fallback connector to the original street snap node), so the stop anchors and foot
+///      connector edges in graph.bin differ from v11. OSM_SCHEMA_VERSION stays 8: osm.bin is
+///      serialized at the end of the OSM phase, before relocation runs in the GTFS phase, so
+///      no relocated stop/edge/level ever enters it and its layout is unchanged.
+/// v13: (was 13, now 14) Connector-cost baking — OSM stairs/elevator/ramp edge lengths are
+///      rewritten at build time (before contraction) so `edge_secs` yields the correct
+///      slower time instead of charging at flat walking speed. Super-edge segments in the
+///      contracted graph now carry the baked lengths, so graph.bin content differs from v12.
+/// v15: RaptorIndex carries transit_stop_platform_codes (parallel to names) so the plan/live
+///      UI can show "Pl. N"; bump forces a rebuild to populate it (serde-default-compatible
+///      load, but the existing graph.bin's array is empty until rebuilt).
+/// v16: RaptorIndex carries transit_route_ids (raw GTFS route_id strings, parallel to
+///      transit_routes) required for route-level realtime alert matching. Bump forces a rebuild
+///      so the field is populated; old graphs silently skip route alerts until rebuilt.
+/// v17: B2a platform relocation uses bounded foot Dijkstra to pick the cheapest reachable
+///      platform node and suppresses the straight fallback connector when a real mapped path
+///      exists. Relocation targets and edge counts change → rebuild required.
+/// v18: RaptorIndex carries `transit_stations` (platforms grouped by GTFS `parent_station`
+///      into deduped physical stations) plus `TransitStopData.parent_station`. Bump forces a
+///      rebuild so the station index is populated; lookup maps are derived on load.
+/// v19: `StationInfo` gains `modes` (per-station transport-type set), and the GTFS phase now
+///      synthesizes `parent_station` for STIB/DeLijn orphan stops (radius-capped same-name
+///      absorption), so the grouped station set + content differ. Rebuild required.
+/// v20: `StationInfo` gains `lines` (distinct routes serving the station, each with mode +
+///      hex colours), populated at build time for the per-mode line badges in autocomplete.
+///      Rebuild required so the field is populated.
+pub const GRAPH_SCHEMA_VERSION: u32 = 20;
+
+/// Bump when the persisted (`#[serde]`-non-skipped) fields of [`AddressIndex`] change
+/// layout. Sibling cache `address.bin`, independent of the routing graph.
+/// v1: initial BeST-Add address index (interned streets/municipalities/postals + rows).
+/// v2: records are building-level (keyed by `(street, house_number)`); per-row box
+///     numbers collapsed into a `boxes: Vec<AddressBox>` metadata list. Rebuild
+///     required so apartment rows aggregate into one building candidate.
+pub const ADDRESS_SCHEMA_VERSION: u32 = 2;
 
 const HEADER_LEN: usize = 8;
 
@@ -61,6 +128,7 @@ pub fn save_graph(graph: &Graph, path: &str) -> Result<(), String> {
 }
 
 pub fn load_graph(path: &str) -> Result<Graph, String> {
+    tracing::info!("restoring graph from {path}…");
     let bytes = fs::read(path).map_err(|e| format!("Failed to read graph file: {e}"))?;
     let payload = split_header(&bytes, GRAPH_SCHEMA_VERSION, path)?;
     let mut graph: Graph =
@@ -93,11 +161,35 @@ pub fn save_osm_graph(graph: &Graph, path: &str) -> Result<(), String> {
 
 /// Load an OSM-only cache into a `Graph` with an empty `RaptorIndex`.
 pub fn load_osm_graph(path: &str) -> Result<Graph, String> {
+    tracing::info!("restoring OSM graph from {path}…");
     let bytes = fs::read(path).map_err(|e| format!("Failed to read OSM graph file: {e}"))?;
     let payload = split_header(&bytes, OSM_SCHEMA_VERSION, path)?;
     let graph = Graph::from_osm_postcard(payload)?;
     tracing::info!("OSM graph restored from {path}");
     Ok(graph)
+}
+
+/// Save the sibling [`AddressIndex`] to `path`, headered with `ADDRESS_SCHEMA_VERSION`.
+/// Only the interned tables and compact rows are serialized; the token/prefix lookup
+/// structures are `#[serde(skip)]` and rebuilt on load.
+pub fn save_address_index(index: &AddressIndex, path: &str) -> Result<(), String> {
+    let payload =
+        to_allocvec(index).map_err(|e| format!("Failed to serialize address index: {e}"))?;
+    let bytes = with_header(ADDRESS_SCHEMA_VERSION, &payload);
+    fs::write(path, &bytes).map_err(|e| format!("Failed to save address index: {e}"))?;
+    tracing::info!("address index saved to {path}");
+    Ok(())
+}
+
+/// Load an [`AddressIndex`] from `path`, then rebuild its `#[serde(skip)]` lookup
+/// structures so search works immediately after deserialization.
+pub fn load_address_index(path: &str) -> Result<AddressIndex, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read address index file: {e}"))?;
+    let payload = split_header(&bytes, ADDRESS_SCHEMA_VERSION, path)?;
+    let mut index: AddressIndex =
+        from_bytes(payload).map_err(|e| format!("Failed to deserialize address index: {e}"))?;
+    index.rebuild_indexes();
+    Ok(index)
 }
 
 /// Save `graph` to `path` while preserving the previous good copy.
@@ -304,6 +396,87 @@ mod tests {
         let restored = load_osm_graph(path_s).unwrap();
         assert_eq!(restored.node_count(), 0);
         assert_eq!(restored.raptor.transit_trips.len(), 0);
+    }
+
+    #[test]
+    fn osm_graph_round_trip_preserves_platform_index() {
+        use crate::ingestion::osm::{OsmPlatform, PlatformIndex};
+        use crate::structures::LatLng;
+
+        let dir = std::env::temp_dir().join("maas_persist_platform_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("osm.bin");
+        let path_s = path.to_str().unwrap();
+
+        let mut g = Graph::new();
+        g.set_platform_index(PlatformIndex::from_platforms(vec![OsmPlatform {
+            refs: vec!["9".into(), "10".into()],
+            level: Some(1.0),
+            centroid: LatLng {
+                latitude: 51.199,
+                longitude: 4.433,
+            },
+            node_ids: vec![crate::structures::NodeID(7)],
+        }]));
+        let mut nl = std::collections::HashMap::new();
+        nl.insert(crate::structures::NodeID(7), 1i16);
+        let mut ce = std::collections::HashMap::new();
+        ce.insert(
+            (crate::structures::NodeID(7), crate::structures::NodeID(8)),
+            crate::structures::Connector::Steps,
+        );
+        g.set_osm_level_data(nl, ce);
+
+        save_osm_graph(&g, path_s).unwrap();
+        let restored = load_osm_graph(path_s).unwrap();
+        let idx = restored.platform_index();
+        assert_eq!(idx.len(), 1);
+        let p = idx.platform(0).unwrap();
+        assert_eq!(p.refs, vec!["9".to_string(), "10".to_string()]);
+        assert_eq!(p.level, Some(1.0));
+        assert!((p.centroid.latitude - 51.199).abs() < 1e-9);
+        assert!((p.centroid.longitude - 4.433).abs() < 1e-9);
+        assert_eq!(p.node_ids, vec![crate::structures::NodeID(7)]);
+        // Stage B1 level/connector maps survive the osm.bin round-trip.
+        assert_eq!(restored.node_level(crate::structures::NodeID(7)), Some(1));
+        assert_eq!(
+            restored.connector_kind(crate::structures::NodeID(7), crate::structures::NodeID(8)),
+            Some(crate::structures::Connector::Steps)
+        );
+    }
+
+    #[test]
+    fn address_index_round_trip_rebuilds_search() {
+        use crate::structures::{AddressIndexBuilder, Named};
+
+        let dir = std::env::temp_dir().join("maas_persist_address_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("address.bin");
+        let path_s = path.to_str().unwrap();
+
+        let mut b = AddressIndexBuilder::new();
+        let s = b.intern_street(
+            "S1",
+            Named {
+                display: "Rue de la Loi".into(),
+                aliases: vec!["Rue de la Loi".into(), "Wetstraat".into()],
+            },
+        );
+        let m = b.intern_municipality(
+            "M1",
+            Named {
+                display: "Bruxelles".into(),
+                aliases: vec!["Bruxelles".into(), "Brussel".into()],
+            },
+        );
+        let p = b.intern_postal("P1", "1000".into());
+        b.push_record("A1".into(), s, m, p, "16".into(), String::new(), 50.846, 4.367);
+        let idx = b.finish();
+
+        save_address_index(&idx, path_s).unwrap();
+        let loaded = load_address_index(path_s).unwrap();
+        assert_eq!(loaded.search("rue de la loi 16", 5, None).len(), 1);
+        assert_eq!(loaded.search("wetstraat 16", 5, None)[0].id, "A1");
     }
 
     #[test]
