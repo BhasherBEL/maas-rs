@@ -120,8 +120,14 @@ fn run_update_cycle(graph: &SharedGraph, config: &Config, cache_dir: &str) -> Re
 
     let osm = load_osm_graph(&config.build.osm_output)?;
     // Feeds were just downloaded above (force=true); reuse the cache here.
-    let mut new_graph = build_gtfs_phase(osm, &config.build, cache_dir, false)
-        .ok_or_else(|| "GTFS rebuild failed".to_string())?;
+    let mut new_graph = build_gtfs_phase(
+        osm,
+        &config.build,
+        cache_dir,
+        false,
+        config.default_routing.station_merge_radius_m,
+    )
+    .ok_or_else(|| "GTFS rebuild failed".to_string())?;
     apply_routing_defaults(&mut new_graph, &config.default_routing);
     // P3f: drop the interior arrays before persisting + swapping in, else the background
     // refresh silently reverts the memory win and saves a bloated graph.bin.

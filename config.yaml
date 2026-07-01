@@ -25,6 +25,21 @@ build:
     - ingestor: osm/pbf
       url: path:data/belgium-latest.osm.pbf
 
+    # Belgian address search (FPS BOSA / BeST Address, CC BY 4.0). Ingested into a
+    # SIBLING address index (address.bin), NOT the routing graph — phase 2 keeps it
+    # out of the OSM/GTFS build. Like the other remote feeds, the zip is auto-
+    # downloaded once to cache/bestadd.zip and cached, then reused thereafter — no
+    # manual placement needed. First startup on a fresh machine downloads the large
+    # (~hundreds of MB) zip and blocks boot until the index is built. A present, fresh
+    # cache is reused without re-downloading; when the cached zip is older than ~7 days
+    # it is refreshed best-effort on the next start. If a download fails the index is
+    # skipped gracefully (routing/transit unaffected). Deliberately NOT wired into the
+    # hourly auto-update scheduler (which force-downloads every tick).
+    - ingestor: best/add
+      name: bestadd
+      phase: 2
+      url: https://opendata.bosa.be/download/best/best-full-latest.zip
+
   output: graph.bin
   osm_output: osm.bin
   elevation: path:data/belgium-DTM-20m.tif
@@ -84,8 +99,50 @@ default_routing:
   alt_max_share_factor: 0.6
   max_window_minutes: 1440
   max_snap_distance_m: 10000
+  # Merge radius (m) for the EXACT normalized-name + SAME-operator/feed case only
+  # (STIB surface tram/bus orphans, all DeLijn stops). That exact-name + same-feed
+  # match is a strong signal, so it tolerates the spread of big interchanges (Gare
+  # du Nord surface<->metro ~95-123 m, Merode ~111 m) while genuinely distinct
+  # same-named stops (>250 m apart) stay separate; also bounds the zero-cost station
+  # hub's free intra-station walk. A future fuzzy/cross-operator matcher would use
+  # its own, tighter value.
+  station_merge_radius_m: 250.0
+  # Address search (BeST-Add) proximity/relevance ranking. Results are biased
+  # toward the map the user is viewing (the UI sends the map centre as focus):
+  # final_score = text_score * geo_decay, sorted high-to-low. geo_decay is an
+  # exponential distance falloff: full score within the offset, halving at the
+  # half-score distance, floored so a far but exact text match is never buried.
+  address_geo_offset_km: 2.0        # full geo score within 2 km of the focus point
+  address_geo_half_score_km: 5.0    # geo score halves at 5 km (scale = (half-offset)/ln2)
+  address_geo_floor: 0.1            # a perfect text match far away still scores text*0.1
+  address_prefix_token_weight: 0.6  # a prefix-only token match scores 0.6 of an exact one
+  address_house_number_boost: 1.5   # exact house number outranks a prefix house-number match
+  # Stage-3 typo tolerance: the exact/prefix pass runs first; a fuzzy fallback only
+  # widens the WORD tokens (never house number/postcode) when too few streets
+  # resolved, so clean-query precision and latency are unchanged. Standard
+  # Levenshtein (a transposition counts as 2 edits).
+  address_fuzzy_trigger_k: 5        # run fuzzy only when fewer than 5 streets matched exactly/by prefix
+  address_fuzzy_min_len_1typo: 3    # query tokens ≥3 chars allow 1 edit (1–2 chars: no fuzzy, prefix intent)
+  address_fuzzy_min_len_2typos: 8   # query tokens ≥8 chars allow 2 edits (longer words absorb more error)
+  address_fuzzy_token_weight: 0.4   # a fuzzy-only token match scores 0.4 (< prefix 0.6 < exact 1.0)
+  # Address index build: BeST models each apartment/box ("bus"/"bte") as its own
+  # address row, so one house number can be many rows sharing a building entrance.
+  # The index collapses them into one building candidate keyed by (street, house
+  # number), keeping the box numbers as metadata. Boxes within this radius of the
+  # building centroid are one entrance (coordinates collapse to the centroid);
+  # beyond it (a rare multi-entrance building) each box keeps its own coordinate.
+  address_box_coord_epsilon_m: 5.0  # box-coordinate divergence epsilon (meters)
   cycling_speed_mps: 4.2
   driving_speed_mps: 11.0
+  # Pedestrian vertical-connector (stairs/elevator/ramp) cost model. Used by the
+  # Stage B1 connector-coverage measurement to report the extra walk time a
+  # vertical-access path adds to reach a matched platform. NOT charged in routing
+  # in B1 (additive metadata + measurement only). Absent fields use the defaults.
+  connector_cost:
+    stairs_speed_mps: 0.75  # effective pace on stairs (m/s) — realistic pedestrian stair pace
+    ramp_speed_mps: 0.9     # effective pace on a ramp (m/s)
+    elevator_secs: 45       # fixed call+ride+doors time (s), independent of run length
+    relocation_fallback_secs: 60  # B2a: extra penalty (s) on the synthetic platform→street fallback connector (baked at build; rebuild to re-apply)
   vehicle_access_secs: 1200       # bike/car access budget floor (s) — short trips keep ~5 km bike
   vehicle_access_fraction: 0.06   # budget grows to 6% of the crow-flies (walk-time) trip…
   vehicle_access_max_secs: 2700   # …capped at 45 min so a long trip can bike to a distant hub
@@ -208,6 +265,9 @@ auto_update:
 realtime:
   enabled: true
   poll_interval_secs: 30
+  # A vehicle position older than this many seconds is considered stale; the live
+  # UI falls back to schedule interpolation when the position is absent or stale.
+  vehicle_position_max_age_secs: 120
   feeds:
     - type: gtfs-rt
       name: sncb
@@ -215,9 +275,28 @@ realtime:
       headers:
         Cache-Control: "no-cache"
         bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: sncb-alerts
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/nmbssncb/rt/alert/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: delijn
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/rt/trip-update/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: delijn-alerts
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/rt/alert/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
     - type: stib
       name: stib
       waiting_time_url: "https://api-management-opendata-production.azure-api.net/api/datasets/stibmivb/rt/WaitingTimes/"
+      vehicle_position_url: "https://api-management-opendata-production.azure-api.net/api/datasets/stibmivb/rt/VehiclePositions/"
       headers:
         Cache-Control: "no-cache"
         bmc-partner-key: "${BMC_PARTNER_KEY}"

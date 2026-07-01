@@ -31,6 +31,26 @@ pub struct RouteQuery {
     /// When true, direct walk/bike plans are built with `LegRole::Deadline`
     /// (variance-proxy axis active) rather than `LegRole::Neutral`.
     pub terminal_deadline: bool,
+    /// When `Some`, route from a position ABOARD a transit trip (between stops)
+    /// instead of `from_lat`/`from_lng` (which are then ignored). The destination
+    /// stays the lat/lng `to_*`.
+    pub onboard_origin: Option<OnboardOrigin>,
+    /// When `Some` and resolvable, the origin is the chosen station: every member
+    /// platform is reachable with zero access walk (no 50 m line, no access leg),
+    /// overriding `from_lat`/`from_lng`. An unknown id falls back to the coordinate.
+    pub from_station_id: Option<String>,
+    /// As `from_station_id`, for the destination (zero-cost egress).
+    pub to_station_id: Option<String>,
+}
+
+/// A position aboard a transit trip: the boarded GTFS `trip_id`, plus an optional
+/// advisory current stop (id or stop sequence). When neither is given the current
+/// position is the last pattern stop whose realtime departure is `<= now` (`time`).
+#[derive(Clone, Debug)]
+pub struct OnboardOrigin {
+    pub trip_id: String,
+    pub from_stop_id: Option<String>,
+    pub from_stop_seq: Option<u32>,
 }
 
 /// Effective bike cost profile for a query: the per-request override if present,
@@ -106,6 +126,39 @@ fn arena_snap_node(
 
 use crate::structures::QueryEndpoints;
 
+/// Resolves one journey endpoint to its snap `NodeID`, geometry coordinate, and
+/// optional zero-cost station platform set. When `station_id` resolves to a known
+/// station with platforms, the station's representative coordinate is used for
+/// snapping/geometry (so no spurious access line is drawn) and its platforms are
+/// returned for zero-cost hub access/egress. An unknown id, or one that fails to
+/// snap, falls back to the supplied coordinate (no station).
+fn resolve_endpoint(
+    graph: &Graph,
+    lat: f64,
+    lng: f64,
+    station_id: Option<&str>,
+    endpoint: &str,
+) -> Result<
+    (
+        crate::structures::NodeID,
+        crate::structures::LatLng,
+        Option<Vec<usize>>,
+    ),
+    async_graphql::Error,
+> {
+    if let Some(id) = station_id
+        && let Some((coord, platforms)) = graph.station_endpoint(id)
+        && let Ok((node, _snapped)) = arena_snap_node(graph, coord.latitude, coord.longitude, endpoint)
+    {
+        // Use the station's own representative coordinate (not its street
+        // projection) for the endpoint marker/geometry, so no spurious access line
+        // is ever drawn to a chosen station.
+        return Ok((node, coord, Some(platforms)));
+    }
+    let (node, coord) = arena_snap_node(graph, lat, lng, endpoint)?;
+    Ok((node, coord, None))
+}
+
 fn resolve_query_params(
     graph: &Graph,
     query: &RouteQuery,
@@ -126,14 +179,28 @@ fn resolve_query_params(
     let weekday = 1u8 << query.date.weekday().num_days_from_monday();
 
     let (origin, destination, endpoints) = {
-        let (o, o_coord) = arena_snap_node(graph, query.from_lat, query.from_lng, "departure")?;
-        let (d, d_coord) = arena_snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
+        let (o, o_coord, o_station) = resolve_endpoint(
+            graph,
+            query.from_lat,
+            query.from_lng,
+            query.from_station_id.as_deref(),
+            "departure",
+        )?;
+        let (d, d_coord, d_station) = resolve_endpoint(
+            graph,
+            query.to_lat,
+            query.to_lng,
+            query.to_station_id.as_deref(),
+            "arrival",
+        )?;
         (
             o,
             d,
             Some(QueryEndpoints {
                 origin: o_coord,
                 destination: d_coord,
+                origin_station: o_station,
+                destination_station: d_station,
             }),
         )
     };
@@ -145,11 +212,81 @@ fn resolve_query_params(
     Ok((origin, destination, time, date, weekday, min_access, endpoints))
 }
 
+/// Routes from a position ABOARD a transit trip to the lat/lng destination.
+/// Seeds the boarded trip's downstream stops and re-plans onward, surfacing in
+/// one shot: stay-on, alight-and-transfer, and alight-and-walk.
+fn route_onboard(
+    graph: &Graph,
+    query: &RouteQuery,
+    onboard: &OnboardOrigin,
+    rt: &RealtimeIndex,
+) -> Result<Vec<Plan>, async_graphql::Error> {
+    let time = query.time.num_seconds_from_midnight();
+    let date = date_to_days(query.date);
+    let weekday = 1u8 << query.date.weekday().num_days_from_monday();
+
+    let (destination, d_coord) = arena_snap_node(graph, query.to_lat, query.to_lng, "arrival")?;
+    let ep = QueryEndpoints {
+        origin: d_coord,
+        destination: d_coord,
+        origin_station: None,
+        destination_station: None,
+    };
+
+    let trip = graph
+        .trip_index_of(&onboard.trip_id)
+        .ok_or_else(|| async_graphql::Error::new(format!("Unknown trip_id {}", onboard.trip_id)))?;
+    let from_stop = match &onboard.from_stop_id {
+        Some(sid) => Some(graph.stop_index_of(sid).ok_or_else(|| {
+            async_graphql::Error::new(format!("Unknown from_stop_id {sid}"))
+        })?),
+        None => None,
+    };
+
+    let (pattern, trip_within, current_pos) = graph
+        .locate_onboard_trip(trip, from_stop, onboard.from_stop_seq, time, rt)
+        .ok_or_else(|| {
+            async_graphql::Error::new("Could not locate the onboard position (no downstream stops)")
+        })?;
+
+    let ride = graph.build_onboard_ride(pattern, trip_within, current_pos, rt);
+
+    let (buckets, slack) = resolve_tuning(graph, query)?;
+    let egress_secs = query
+        .min_access_secs
+        .unwrap_or(graph.raptor.min_access_secs);
+    let am = ActiveModes::new(&[Mode::WalkTransit]);
+
+    let mut plans = graph.raptor_onboard_tuned_rt_modes_ep(
+        &ride,
+        destination,
+        date,
+        weekday,
+        egress_secs,
+        &buckets,
+        slack,
+        rt,
+        &am,
+        Some(&ep),
+    );
+
+    let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
+    graph.enrich_street_legs(&mut plans, destination, destination, &bike, query.terminal_deadline);
+
+    if plans.is_empty() {
+        return Err(async_graphql::Error::new("No plan found"));
+    }
+    Ok(plans)
+}
+
 pub fn route(
     graph: &Graph,
     query: &RouteQuery,
     rt: &RealtimeIndex,
 ) -> Result<Vec<Plan>, async_graphql::Error> {
+    if let Some(onboard) = &query.onboard_origin {
+        return route_onboard(graph, query, onboard, rt);
+    }
     let (origin, destination, time, date, weekday, min_access, endpoints) =
         resolve_query_params(graph, query)?;
     let ep = endpoints.as_ref();
@@ -329,6 +466,9 @@ mod tests {
             modes: None,
             bike_profile: None,
             terminal_deadline: false,
+            onboard_origin: None,
+            from_station_id: None,
+            to_station_id: None,
         }
     }
 
@@ -442,6 +582,9 @@ mod tests {
             modes: Some(vec![Mode::Walk]),
             bike_profile: None,
             terminal_deadline: false,
+            onboard_origin: None,
+            from_station_id: None,
+            to_station_id: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let walk = plans
@@ -527,6 +670,9 @@ mod tests {
             modes: Some(vec![Mode::Bike]),
             bike_profile: None,
             terminal_deadline: false,
+            onboard_origin: None,
+            from_station_id: None,
+            to_station_id: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let bike = plans

@@ -211,6 +211,13 @@ impl PlanTransitLeg {
         Ok(PlanTrip::from_trip_id(graph.as_ref(), self.trip_id))
     }
 
+    async fn trip_id(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let graph = ctx
+            .data::<crate::services::scheduler::SharedGraph>()?
+            .load_full();
+        Ok(graph.trip_id_str(self.trip_id).map(str::to_string))
+    }
+
     async fn previous_departures(
         &self,
         ctx: &Context<'_>,
@@ -786,12 +793,16 @@ mod tests {
             id: "A".into(),
             lat_lng: LatLng { latitude: 50.000, longitude: 4.003 },
             accessibility: Availability::Available,
+            platform_code: None,
+            parent_station: None,
         }));
         let stop_b = g.add_node(NodeData::TransitStop(TransitStopData {
             name: "Stop B".into(),
             id: "B".into(),
             lat_lng: LatLng { latitude: 50.000, longitude: 4.030 },
             accessibility: Availability::Available,
+            platform_code: None,
+            parent_station: None,
         }));
 
         let bidir = |g: &mut Graph, a: crate::structures::NodeID, b: crate::structures::NodeID, len: usize| {
@@ -854,11 +865,11 @@ mod tests {
             g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 2 });
             let sts = g.transit_pattern_stop_times_len();
             // Column-major: stop 0 (stop_a): trip 0 at 8:00, trip 1 at 9:00
-            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600, departure: 8 * 3600 });
-            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600 });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600, departure: 8 * 3600, ..Default::default() });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
             // Column-major: stop 1 (stop_b): trip 0 at 8:10, trip 1 at 9:10
-            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600 });
-            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600 });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600, ..Default::default() });
+            g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600, ..Default::default() });
             g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
             g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 2 });
         }

@@ -78,7 +78,13 @@ async fn main() {
             return;
         }
 
-        match build_gtfs_phase(osm_graph, &config.build, &cache_dir, false) {
+        match build_gtfs_phase(
+            osm_graph,
+            &config.build,
+            &cache_dir,
+            false,
+            config.default_routing.station_merge_radius_m,
+        ) {
             Some(g) => g,
             None => {
                 tracing::error!("GTFS phase failed");
@@ -98,7 +104,13 @@ async fn main() {
         };
 
         // Manual refresh: always pull fresh remote feeds.
-        match build_gtfs_phase(osm_graph, &config.build, &cache_dir, true) {
+        match build_gtfs_phase(
+            osm_graph,
+            &config.build,
+            &cache_dir,
+            true,
+            config.default_routing.station_merge_radius_m,
+        ) {
             Some(g) => g,
             None => {
                 tracing::error!("GTFS phase failed");
@@ -192,7 +204,13 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
         }
     };
 
-    let mut g = build_gtfs_phase(osm, &config.build, cache_dir, false)?;
+    let mut g = build_gtfs_phase(
+        osm,
+        &config.build,
+        cache_dir,
+        false,
+        config.default_routing.station_merge_radius_m,
+    )?;
     // Apply routing defaults before saving so persisted artifacts (e.g. the contracted
     // `g.contracted`) land in graph.bin. The caller re-applies defaults (idempotent)
     // after this returns.

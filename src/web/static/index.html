@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#1c64f2">
+<link rel="manifest" href="/manifest.webmanifest">
 <title>MaaS Trip Planner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -29,6 +31,33 @@
   --radius:    8px;
   --radius-s:  6px;
   --mono:      ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace;
+  /* ── Design system palette override (warm neutral) ── */
+  --ds-bg:        oklch(0.978 0.004 95);
+  --ds-surface:   #ffffff;
+  --ds-surface-2: oklch(0.967 0.005 95);
+  --ds-surface-3: oklch(0.945 0.006 95);
+  --ds-line:      oklch(0.905 0.006 95);
+  --ds-line-soft: oklch(0.935 0.005 95);
+  --ds-ink:       oklch(0.255 0.012 70);
+  --ds-ink-2:     oklch(0.46 0.012 70);
+  --ds-ink-3:     oklch(0.62 0.009 70);
+  --ds-ink-4:     oklch(0.74 0.007 70);
+  --ds-accent:      oklch(0.52 0.085 205);
+  --ds-accent-deep: oklch(0.43 0.09 207);
+  --ds-accent-soft: oklch(0.95 0.022 205);
+  --ds-rel-high: oklch(0.60 0.125 152);
+  --ds-rel-mid:  oklch(0.71 0.135 80);
+  --ds-rel-low:  oklch(0.60 0.165 33);
+  --ds-rel-high-soft: oklch(0.95 0.04 152);
+  --ds-rel-mid-soft:  oklch(0.955 0.05 88);
+  --ds-rel-low-soft:  oklch(0.955 0.045 33);
+  --ds-stone:      oklch(0.55 0.018 75);
+  --ds-stone-soft: oklch(0.915 0.012 80);
+  --ds-mode-mark:  #c01722;
+  --ds-radius:    11px;
+  --ds-radius-sm: 7px;
+  --ds-shadow-sm: 0 1px 2px oklch(0.4 0.02 70 / 0.06), 0 1px 1px oklch(0.4 0.02 70 / 0.04);
+  --ds-shadow-md: 0 2px 6px oklch(0.4 0.02 70 / 0.08), 0 8px 24px oklch(0.4 0.02 70 / 0.06);
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -78,32 +107,6 @@ header a.head-btn { text-decoration: none; }
   border-right: 1px solid var(--border); background: var(--panel);
   overflow-y: auto;
   transition: width 0.22s ease;
-  /* ── Design system palette override (warm neutral) ── */
-  --ds-bg:        oklch(0.978 0.004 95);
-  --ds-surface:   #ffffff;
-  --ds-surface-2: oklch(0.967 0.005 95);
-  --ds-surface-3: oklch(0.945 0.006 95);
-  --ds-line:      oklch(0.905 0.006 95);
-  --ds-line-soft: oklch(0.935 0.005 95);
-  --ds-ink:       oklch(0.255 0.012 70);
-  --ds-ink-2:     oklch(0.46 0.012 70);
-  --ds-ink-3:     oklch(0.62 0.009 70);
-  --ds-ink-4:     oklch(0.74 0.007 70);
-  --ds-accent:      oklch(0.52 0.085 205);
-  --ds-accent-deep: oklch(0.43 0.09 207);
-  --ds-accent-soft: oklch(0.95 0.022 205);
-  --ds-rel-high: oklch(0.60 0.125 152);
-  --ds-rel-mid:  oklch(0.71 0.135 80);
-  --ds-rel-low:  oklch(0.60 0.165 33);
-  --ds-rel-high-soft: oklch(0.95 0.04 152);
-  --ds-rel-mid-soft:  oklch(0.955 0.05 88);
-  --ds-rel-low-soft:  oklch(0.955 0.045 33);
-  --ds-stone:      oklch(0.55 0.018 75);
-  --ds-stone-soft: oklch(0.915 0.012 80);
-  --ds-radius:    11px;
-  --ds-radius-sm: 7px;
-  --ds-shadow-sm: 0 1px 2px oklch(0.4 0.02 70 / 0.06), 0 1px 1px oklch(0.4 0.02 70 / 0.04);
-  --ds-shadow-md: 0 2px 6px oklch(0.4 0.02 70 / 0.08), 0 8px 24px oklch(0.4 0.02 70 / 0.06);
 }
 
 #sidebar.collapsed { width: 0; border-right: none; overflow: hidden; }
@@ -137,16 +140,44 @@ header a.head-btn { text-decoration: none; }
   max-height: 240px; overflow-y: auto;
 }
 .maas-dropdown .row {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; flex-direction: column; gap: 4px;
   padding: 7px 10px; cursor: pointer; font-size: 13px; color: var(--fg);
 }
 .maas-dropdown .row.hl, .maas-dropdown .row:hover { background: var(--accent-2); }
-.maas-dropdown .row .badge {
+.maas-dropdown .row .st-head { display: flex; align-items: baseline; gap: 8px; }
+.maas-dropdown .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.maas-dropdown .row .op-tag {
   font-size: 10px; font-weight: 600; padding: 1px 6px;
-  border-radius: 8px; background: var(--accent-2); color: var(--accent);
+  border-radius: 8px; background: var(--ds-surface-3, var(--accent-2)); color: var(--ds-ink-3, var(--accent));
   flex-shrink: 0; white-space: nowrap;
 }
-.maas-dropdown .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.maas-dropdown .row .st-mode { display: flex; align-items: flex-start; gap: 8px; margin-top: 8px; }
+.maas-dropdown .row .mode-marker {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--ds-mode-mark); font-size: 11px; font-weight: 800; color: #fff; letter-spacing: 0;
+}
+.maas-dropdown .row .mode-lines { flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.maas-dropdown .row .line-badge {
+  font-size: 10px; font-weight: 700; padding: 1px 5px; min-width: 14px;
+  border-radius: 5px; text-align: center; white-space: nowrap; line-height: 1.4;
+  background: var(--ds-surface-3, var(--accent-2)); color: var(--ds-ink-2, var(--accent));
+  border: 1px solid var(--ds-line, var(--border));
+}
+.maas-dropdown .row .line-badge.colored { border-color: transparent; }
+.maas-dropdown .group-head {
+  padding: 5px 10px 3px; font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .04em;
+  color: var(--ds-ink-4, var(--accent)); border-top: 1px solid var(--ds-line, var(--border));
+}
+.maas-dropdown .row.addr-row { color: var(--ds-ink-3, var(--fg)); }
+.maas-dropdown .row.addr-row .name { font-weight: 500; }
+.maas-dropdown .row.addr-row .addr-marker { flex: 0 0 auto; font-size: 12px; line-height: 1.3; }
+.maas-dropdown .addr-attr {
+  padding: 4px 10px 7px; font-size: 9px; color: var(--ds-ink-4, var(--accent));
+  opacity: .7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ── Panel head: brand + OD ──────────────────────────────────── */
 .panel-head {
@@ -200,6 +231,22 @@ header a.head-btn { text-decoration: none; }
   display: flex; align-items: center; justify-content: center;
 }
 .od-swap:hover { background: var(--ds-accent-soft); border-color: var(--ds-accent); color: var(--ds-accent); }
+.od-gps {
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--ds-radius-sm); color: var(--ds-ink-4);
+  width: 24px; height: 24px; flex: none; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1; cursor: pointer;
+}
+.od-gps:hover:not([disabled]) { background: var(--ds-accent-soft); border-color: var(--ds-accent); color: var(--ds-accent); }
+.od-gps[disabled] { opacity: .45; cursor: not-allowed; }
+.od-gps.locating { animation: od-gps-spin 0.9s linear infinite; color: var(--ds-accent); }
+@keyframes od-gps-spin { to { transform: rotate(360deg); } }
+.gps-note {
+  margin: 7px 0 0; font-size: 11px; font-weight: 600;
+  color: var(--ds-rel-low);
+  font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
+}
 
 /* ── Date/time/go section ────────────────────────────────────── */
 .input-section { padding: 10px 12px 12px; border-bottom: 1px solid var(--border); }
@@ -495,7 +542,7 @@ header a.head-btn { text-decoration: none; }
 .mode-cell.disabled {
   cursor: default; border: none; pointer-events: none;
   background: repeating-linear-gradient(-45deg,
-    transparent 0 6px, color-mix(in srgb, var(--border) 60%, transparent) 6px 7px);
+    transparent 0 4px, color-mix(in srgb, var(--fg-3) 70%, transparent) 4px 6.5px);
   border: 1px solid var(--border);
 }
 .modes-caption { margin: 10px 0 0; font-size: 11px; color: var(--fg-2); line-height: 1.35; }
@@ -766,6 +813,8 @@ header a.head-btn { text-decoration: none; }
 .it-place.arrive { font-size: 15.5px; }
 .it-role { font-size: 9px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase; color: var(--ink-4); margin-left: 7px; }
 .it-role.arrive { color: var(--accent); }
+.it-platform { font-size: 9px; font-weight: 700; letter-spacing: .04em; color: var(--ink-3); background: var(--surface-2); border-radius: 4px; padding: 1px 5px; margin-left: 7px; }
+.it-platform--changed { color: var(--danger, #c0392b); background: color-mix(in oklab, var(--danger, #c0392b) 12%, var(--surface-2)); }
 .it-mid { padding: 4px 0; }
 .it-midstop { font-size: 12.5px; color: var(--ink-3); font-weight: 500; padding: 3px 0; }
 
@@ -865,6 +914,227 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   #plans-panel { overflow: visible; flex: 0 0 auto; }
   .plans-list-head { position: static; }
 }
+
+/* ── Start-journey CTA (in expanded plan detail) ─────────────── */
+.lv-start { display: flex; align-items: center; justify-content: center; gap: 8px;
+  width: 100%; margin-top: 10px; padding: 11px 14px; border: 0; cursor: pointer;
+  border-radius: var(--ds-radius-sm); background: var(--ds-accent); color: #fff;
+  font-size: 13.5px; font-weight: 700; letter-spacing: -.01em; }
+.lv-start:hover { background: var(--ds-accent-deep); }
+.lv-start:disabled { background: var(--ds-surface-3); color: var(--ds-ink-4); cursor: default; }
+.lv-start .lv-dot { width: 8px; height: 8px; border-radius: 50%; background: #fff;
+  box-shadow: 0 0 0 3px rgba(255,255,255,.3); }
+
+/* ── Resume-live-journey banner (planner, when an active journey persists) ── */
+.lv-resume { display: flex; align-items: center; gap: 8px; width: 100%;
+  margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--ds-accent);
+  border-radius: var(--ds-radius-sm); background: var(--ds-surface-2);
+  color: var(--ds-ink); font-size: 12.5px; font-weight: 600; cursor: pointer;
+  text-align: left; }
+.lv-resume[hidden] { display: none; }
+.lv-resume:hover { background: var(--ds-surface-3); }
+.lv-resume .lv-dot { flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ds-accent); box-shadow: 0 0 0 3px var(--ds-rel-mid-soft); }
+.lv-resume .lv-resume-od { flex: 1; min-width: 0; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.lv-resume .lv-resume-go { flex: none; color: var(--ds-accent); font-weight: 800; }
+
+/* ── Live (realtime) journey view ────────────────────────────── */
+.lv { position: fixed; inset: 0; z-index: 1200; background: var(--ds-bg);
+  display: flex; flex-direction: column; }
+.lv[hidden] { display: none; }
+.lv-bar { display: flex; align-items: center; gap: 12px; padding: 13px 16px 11px;
+  background: var(--ds-surface); border-bottom: 1px solid var(--ds-line);
+  box-shadow: var(--ds-shadow-sm); }
+.lv-close { flex: none; width: 30px; height: 30px; border: 1px solid var(--ds-line);
+  background: var(--ds-surface-2); border-radius: var(--ds-radius-sm); cursor: pointer;
+  font-size: 18px; line-height: 1; color: var(--ds-ink-3); }
+.lv-close:hover { color: var(--ds-ink); border-color: var(--ds-accent); }
+.lv-od { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.lv-route { display: flex; align-items: center; gap: 7px; font-size: 14px; min-width: 0; }
+.lv-route b { font-weight: 700; color: var(--ds-ink); letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42%; }
+.lv-arrow { color: var(--ds-ink-4); flex: none; font-size: 13px; }
+.lv-status { font-size: 11px; font-weight: 700; color: var(--ds-ink-3); min-height: 13px; }
+.lv-status.late { color: var(--danger); }
+.lv-status.canceled { color: var(--danger); }
+.lv-status.risk { color: var(--ds-rel-mid); }
+.lv-status.ontime { color: var(--ok); }
+.lv-fresh { font-size: 10px; font-weight: 600; color: var(--ds-ink-4);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lv-fresh.stale { color: var(--ds-rel-mid); opacity: .85; }
+.lv-eta { flex: none; text-align: right; display: flex; flex-direction: column; line-height: 1.1; }
+.lv-eta-k { font-size: 9px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--ds-ink-4); }
+.lv-eta-v { font-family: var(--mono); font-size: 21px; font-weight: 600; color: var(--ds-ink); letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+.lv-net { flex: none; font-size: 12px; color: var(--ok); }
+.lv-net.off { color: var(--ds-ink-4); }
+.lv-body { flex: 1; overflow: auto; padding: 14px; max-width: 720px; width: 100%; margin: 0 auto; }
+/* The live plan reuses the planner result card (.pd-root > .rc); it is the sole,
+   always-open plan, so suppress the collapse affordance and the inter-card gap. */
+.lv-body .lv-card { margin-bottom: 0; }
+.lv-body .lv-rc-head { cursor: default; }
+.lv-icon-btn { flex: none; width: 30px; height: 30px; border: 1px solid var(--ds-line);
+  background: var(--ds-surface-2); border-radius: var(--ds-radius-sm); cursor: pointer;
+  font-size: 15px; line-height: 1; color: var(--ds-ink-3); display: flex; align-items: center; justify-content: center; }
+.lv-icon-btn:hover { color: var(--ds-ink); border-color: var(--ds-accent); }
+.lv-map { flex: none; height: 50%; width: 100%; position: relative; overflow: hidden;
+  background: var(--ds-surface-2); border-bottom: 1px solid var(--ds-line);
+  transition: height .24s cubic-bezier(.22,.61,.36,1); }
+.lv-map.dragging { transition: none; }
+.lv-map > #map { display: block !important; position: relative !important; inset: auto !important;
+  width: 100%; height: 100%; z-index: auto !important; }
+/* Drag handle to resize the live map; snaps to anchors on release. */
+.lv-grab { flex: none; height: 18px; display: flex; align-items: center; justify-content: center;
+  cursor: ns-resize; background: var(--ds-surface); border-bottom: 1px solid var(--ds-line);
+  touch-action: none; user-select: none; -webkit-user-select: none; }
+.lv-grab::before { content: ''; width: 40px; height: 4px; border-radius: 2px;
+  background: var(--ds-surface-3); transition: background .15s ease; }
+.lv-grab:hover::before, .lv-grab:active::before { background: var(--ds-ink-4); }
+@media (prefers-reduced-motion: reduce) { .lv-map { transition: none; } }
+/* Estimated vehicle marker — a route-coloured dot ringed to read "approximate". */
+.lv-veh { position: relative; }
+.lv-veh-dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff;
+  box-shadow: 0 0 0 2px rgba(0,0,0,.18); }
+.lv-veh-ring { position: absolute; inset: -6px; border-radius: 50%;
+  border: 2px dashed currentColor; opacity: .55; animation: lvpulse 2s ease-in-out infinite; }
+.lv-veh-tilde { position: absolute; top: -13px; left: 50%; transform: translateX(-50%);
+  font-size: 11px; font-weight: 800; color: inherit; }
+@keyframes lvpulse { 0%,100% { transform: scale(1); opacity: .55; } 50% { transform: scale(1.25); opacity: .15; } }
+.lv-veh--real .lv-veh-ring { border-style: solid; animation: none; opacity: .7; }
+.lv-veh--real .lv-veh-tilde { display: none; }
+.lv-gps { width: 16px; height: 16px; border-radius: 50%; background: var(--ds-accent);
+  border: 3px solid #fff; box-shadow: 0 0 0 2px rgba(40,90,200,.35); }
+.lv-xfer-state { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px;
+  padding: 5px 9px; border-radius: 6px; font-size: 11px; font-weight: 700; }
+.lv-xfer-state[data-state="alarm"] { background: var(--ds-rel-low-soft); border: 1px solid var(--ds-rel-low); color: var(--ds-rel-low); }
+.lv-xfer-state[data-state="open"] { background: var(--ds-rel-mid-soft); border: 1px solid color-mix(in oklab, var(--ds-rel-mid) 50%, transparent); color: oklch(0.48 0.12 64); }
+.lv-xfer-state[data-state="calm"] { background: var(--ds-rel-high-soft); border: 1px solid color-mix(in oklab, var(--ds-rel-high) 35%, transparent); color: var(--ds-rel-high); }
+.lv-xfer-state .xsk { text-transform: uppercase; letter-spacing: .04em; }
+.lv-xfer-state .xod s { color: var(--ds-ink-4); font-weight: 600; text-decoration: line-through; }
+.lv-xfer-state[data-state="alarm"] .xod b { color: var(--ds-rel-low); }
+.lv-xfer-state[data-state="open"] .xod b { color: oklch(0.48 0.12 64); }
+.lv-xfer-state .xfind { margin-left: auto; font-weight: 600; font-size: 10px; letter-spacing: .04em;
+  text-transform: uppercase; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; background: none; border: none; color: inherit; padding: 0; }
+.it-alert { display: flex; align-items: flex-start; gap: 6px; margin-top: 6px;
+  padding: 5px 9px; border-radius: 6px; background: var(--ds-rel-mid-soft);
+  border: 1px solid color-mix(in oklab, var(--ds-rel-mid) 35%, transparent);
+  font-size: 11px; color: oklch(0.48 0.12 64); font-weight: 600; cursor: default; }
+.it-alert-ic { flex: none; }
+.it-alert-txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Bottom sheet for in-realtime edits (departure / route swap). */
+.lv-sheet { position: absolute; inset: 0; z-index: 5; background: rgba(0,0,0,.4);
+  display: flex; align-items: flex-end; justify-content: center; }
+.lv-sheet[hidden] { display: none; }
+.lv-sheet-card { background: var(--ds-surface); border-radius: 14px 14px 0 0; width: 100%;
+  max-width: 560px; max-height: 78%; overflow: auto; padding: 14px 14px 22px;
+  box-shadow: 0 -6px 24px rgba(0,0,0,.18); }
+.lv-sheet-h { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.lv-sheet-h b { font-size: 15px; color: var(--ds-ink); }
+.lv-sheet-sub { font-size: 11px; color: var(--ds-ink-3); margin-bottom: 10px; }
+.lv-opt { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 9px 11px; margin: 6px 0; border: 1px solid var(--ds-line); border-radius: 9px;
+  background: var(--ds-surface-2); cursor: pointer; }
+.lv-opt:hover { border-color: var(--ds-accent); }
+.lv-opt.cur { border-color: var(--ds-accent); background: var(--ds-accent-soft, var(--ds-surface-3)); }
+.lv-opt-t { font-weight: 800; font-variant-numeric: tabular-nums; color: var(--ds-ink); }
+.lv-opt-d { font-size: 11px; color: var(--ds-ink-3); flex: 1; }
+.lv-opt-r { font-size: 11px; font-weight: 700; color: var(--ds-ink-3); }
+
+/* Live alternatives affordance + Card 1 backup rail. */
+.lv-alt-btn { display: inline-flex; align-items: center; gap: 5px; margin-top: 7px;
+  padding: 5px 10px; border: 1px solid var(--ds-line); border-radius: 999px;
+  background: var(--ds-surface); color: var(--ds-ink-2); font-size: 11px; font-weight: 700;
+  cursor: pointer; }
+.lv-alt-btn:hover { border-color: var(--ds-accent); color: var(--ds-accent); }
+.lv-alt-btn svg { color: currentColor; }
+.lv-alt-btn.risk { background: var(--ds-rel-low-soft); border-color: var(--ds-rel-low);
+  color: var(--ds-rel-low); }
+.lv-bk-chip { display: inline-flex; align-items: center; gap: 6px; margin: 7px 0 0 8px;
+  padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  font-family: var(--mono); background: var(--ds-surface-3); color: var(--ds-ink-2); }
+.lv-bk-chip .bead { width: 7px; height: 7px; border-radius: 50%; background: var(--ds-ink-4); }
+.lv-bk-chip .pct { color: var(--ds-ink-3); }
+.lv-bk-chip[data-rel="high"] { background: var(--ds-rel-high-soft); color: oklch(0.42 0.13 152); }
+.lv-bk-chip[data-rel="high"] .bead { background: var(--ds-rel-high); }
+.lv-bk-chip[data-rel="mid"]  { background: var(--ds-rel-mid-soft);  color: oklch(0.48 0.12 64); }
+.lv-bk-chip[data-rel="mid"]  .bead { background: var(--ds-rel-mid); }
+.lv-bk-chip[data-rel="low"]  { background: var(--ds-rel-low-soft);  color: oklch(0.5 0.17 33); }
+.lv-bk-chip[data-rel="low"]  .bead { background: var(--ds-rel-low); }
+
+.lv-rail { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory;
+  padding: 2px 2px 8px; margin: 0 -2px; -webkit-overflow-scrolling: touch; }
+.lv-railcard { flex: 0 0 auto; scroll-snap-align: start; border: 1px solid var(--ds-line);
+  border-radius: 13px; background: var(--ds-surface); padding: 11px 12px; }
+.lv-railcard.keep { width: 272px; }
+.lv-soon-t { font-size: 13px; font-weight: 750; color: var(--ds-ink-2); }
+.lv-soon-s { font-size: 11px; line-height: 1.35; }
+.lv-railcard.switch { width: 224px; cursor: pointer; display: flex; flex-direction: column; gap: 9px; }
+.lv-railcard.switch:hover { border-color: var(--ds-accent); }
+.lv-railcard.switch.sel { border-color: var(--ds-accent); box-shadow: 0 0 0 1px var(--ds-accent) inset; }
+.lv-railcard.switch.quiet { background: var(--ds-surface-2); border-style: dashed; cursor: default;
+  justify-content: center; color: var(--ds-ink-3); gap: 4px; }
+.lv-railcard.switch.quiet:hover { border-color: var(--ds-line); }
+.lv-sw-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+.lv-sw-meta { display: flex; align-items: center; gap: 8px; margin-top: auto; }
+.lv-sw-arr { font-family: var(--mono); font-size: 13px; font-weight: 800; color: var(--ds-ink); }
+.lv-sw-arr .pre { font-family: var(--sans, inherit); font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: .06em; font-weight: 800; color: var(--ds-ink-3); margin-right: 4px; }
+.lv-sw-meta .rel { margin-left: auto; }
+.lv-sw-pick { font-size: 11px; font-weight: 800; color: var(--ds-accent); }
+.lv-railcard.switch.sel .lv-sw-pick { color: var(--ds-accent-deep, var(--ds-accent)); }
+.lv-preview { margin-top: 10px; opacity: .62; filter: saturate(.55); pointer-events: none;
+  border: 1px dashed var(--ds-line); border-radius: 12px; padding: 4px 12px 10px;
+  background: var(--ds-surface-2); max-height: 46vh; overflow-y: auto; }
+.lv-rc-hd { display: flex; align-items: center; gap: 6px; margin-bottom: 9px; }
+.lv-rc-hd .ic { display: inline-flex; color: var(--ds-accent); }
+.lv-rc-hd b { font-size: 13.5px; color: var(--ds-ink); }
+.lv-rc-hd .sub { font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+  font-weight: 800; color: var(--ds-ink-3); margin-left: auto; }
+.lv-keep-row { display: flex; align-items: center; gap: 7px; padding: 7px 8px;
+  border: 1px solid var(--ds-line); border-radius: 9px; background: var(--ds-surface-2); }
+.lv-band { font-size: 9.5px; text-transform: uppercase; letter-spacing: .08em; font-weight: 800;
+  color: var(--ds-ink-3); margin: 11px 0 6px; }
+.lv-bk-row { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+  padding: 8px; margin: 6px 0; border: 1px solid var(--ds-line); border-radius: 9px;
+  background: var(--ds-surface); cursor: pointer; }
+.lv-bk-row:hover { border-color: var(--ds-accent); }
+.lv-bk-row.sel { border-color: var(--ds-accent); background: var(--ds-accent-soft, var(--ds-surface-3));
+  box-shadow: 0 0 0 1px var(--ds-accent) inset; }
+.lv-bk-ar { color: var(--ds-ink-4); font-weight: 700; }
+.lv-bk-badge { padding: 1px 7px; border-radius: 6px; font-size: 11px; font-weight: 800;
+  font-family: var(--mono); }
+.lv-bk-dep { font-family: var(--mono); font-weight: 800; color: var(--ds-ink); font-size: 13px; }
+.lv-bk-dep s { color: var(--ds-ink-4); font-weight: 600; margin-right: 4px; font-size: 11px; }
+.lv-bk-hint { font-size: 10.5px; color: var(--ds-ink-3); flex: 1; }
+.lv-bk-arr { font-family: var(--mono); font-size: 11px; color: var(--ds-ink-3); }
+.lv-keep-tag { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; font-weight: 800;
+  color: var(--ds-ink-3); }
+.lv-od { margin-left: auto; font-family: var(--mono); font-size: 12px; font-weight: 700; }
+.lv-od s { color: var(--ds-ink-4); font-weight: 600; }
+.lv-od b { color: var(--ds-rel-low); }
+.lv-keep-row .rel, .lv-bk-row .rel { margin-left: auto; }
+.lv-bk-row .lv-bk-arr { margin-left: 0; }
+.rel.none { background: var(--ds-surface-3); color: var(--ds-ink-3); }
+.rel.none .bead { background: var(--ds-ink-4); }
+.lv-bk-confirm { display: block; width: 100%; margin-top: 12px; padding: 12px;
+  border: none; border-radius: 11px; background: var(--ds-accent); color: #fff;
+  font-size: 14px; font-weight: 800; cursor: pointer; }
+.lv-bk-confirm:disabled { background: var(--ds-surface-3); color: var(--ds-ink-4); cursor: default; }
+.lv-hist { position: absolute; inset: 0; z-index: 6; background: var(--ds-bg);
+  display: flex; flex-direction: column; }
+.lv-hist[hidden] { display: none; }
+.lv-hist-bar { display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+  background: var(--ds-surface); border-bottom: 1px solid var(--ds-line); }
+.lv-hist-bar b { flex: none; font-size: 15px; color: var(--ds-ink); }
+.lv-hist-note { flex: 1; font-size: 11px; color: var(--ds-ink-4); }
+.lv-hist-list { flex: 1; overflow: auto; padding: 10px 14px; max-width: 720px; width: 100%; margin: 0 auto; }
+.lv-hev { display: flex; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--ds-line); }
+.lv-hev-k { flex: none; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--ds-accent); padding-top: 2px; min-width: 84px; }
+.lv-hev-b { flex: 1; min-width: 0; }
+.lv-hev-s { font-size: 13px; color: var(--ds-ink); }
+.lv-hev-t { font-size: 11px; color: var(--ds-ink-4); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.lv-hist-empty { color: var(--ds-ink-4); font-size: 13px; padding: 20px 4px; text-align: center; }
 </style>
 </head>
 <body>
@@ -882,6 +1152,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
   <a href="/debug" class="head-btn" target="_blank">Debug ↗</a>
   <a href="/graphiql" class="head-btn" target="_blank">GraphQL ↗</a>
+  <button id="pwa-install-btn" class="head-btn" style="display:none" title="Install MaaS as an app">⊕ Install</button>
 </header>
 
 <div class="main">
@@ -898,15 +1169,18 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
             <span class="pin from"></span>
             <span class="od-lbl">From</span>
             <div class="od-input" id="from-search"></div>
+            <button id="gps-from" class="od-gps" data-target="from" type="button" title="Use my location" aria-label="Use my location">⌖</button>
           </div>
           <div class="od-row-wrap">
             <span class="pin to"></span>
             <span class="od-lbl">To</span>
             <div class="od-input" id="to-search"></div>
+            <button id="gps-to" class="od-gps" data-target="to" type="button" title="Use my location" aria-label="Use my location">⌖</button>
           </div>
         </div>
         <button id="swap-stops" class="od-swap" title="Swap (R)">⇅</button>
       </div>
+      <p class="gps-note" id="gps-note" role="status" aria-live="polite" hidden></p>
     </div>
 
     <div class="input-section">
@@ -992,6 +1266,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
     </div>
 
     <div id="plans-panel">
+      <button type="button" id="lv-resume" class="lv-resume" hidden></button>
       <div class="plans-list-head">
         <span class="eyebrow">Results</span>
         <span class="eyebrow" id="plans-count"></span>
@@ -1020,8 +1295,41 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   </div>
 </div>
 
+<!-- Live (realtime) journey view — additive overlay, hidden until SELECT -->
+<div id="live-view" class="lv" hidden>
+  <div class="lv-bar">
+    <button class="lv-close" id="lv-close" title="Exit live view" aria-label="Exit live view">×</button>
+    <div class="lv-od">
+      <span class="lv-route"><b id="lv-origin">Origin</b><span class="lv-arrow">→</span><b id="lv-dest">Destination</b></span>
+      <span class="lv-status" id="lv-status"></span>
+      <span class="lv-fresh" id="lv-fresh" title="Last successful live update"></span>
+    </div>
+    <button class="lv-icon-btn" id="lv-hist-btn" title="Journey history" aria-label="Journey history">🕘</button>
+    <div class="lv-eta">
+      <span class="lv-eta-k">Arrive</span>
+      <span class="lv-eta-v" id="lv-eta">—:—</span>
+    </div>
+    <span class="lv-net" id="lv-net" title="Connection">●</span>
+  </div>
+  <div class="lv-map" id="lv-map-host"></div>
+  <div class="lv-grab" id="lv-grab" title="Drag to resize map" aria-label="Resize map" role="separator"></div>
+  <div class="lv-body" id="lv-spine"></div>
+  <div class="lv-sheet" id="lv-sheet" hidden>
+    <div class="lv-sheet-card" id="lv-sheet-card"></div>
+  </div>
+  <div class="lv-hist" id="lv-hist" hidden>
+    <div class="lv-hist-bar">
+      <b>Journey history</b>
+      <span class="lv-hist-note" id="lv-hist-note"></span>
+      <button class="lv-icon-btn" id="lv-hist-close" aria-label="Close history">×</button>
+    </div>
+    <div class="lv-hist-list" id="lv-hist-list"></div>
+  </div>
+</div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/maas.js"></script>
+<script type="module" src="/static/js/live-view.mjs"></script>
 <script>
 'use strict';
 
@@ -1043,7 +1351,7 @@ const PLAN_FRAGMENT = `
       }
     }
     ... on PlanTransitLeg {
-      __typename start end duration
+      __typename start end duration tripId
       scheduledStart scheduledEnd realtime
       bikesAllowed
       transferRisk {
@@ -1053,8 +1361,8 @@ const PLAN_FRAGMENT = `
         headsign
         route { shortName longName mode color textColor agency { name } }
       }
-      from { departure node { name lat lon } }
-      to   { arrival   node { name lat lon } }
+      from { departure stopId platform node { name lat lon } }
+      to   { arrival   stopId platform node { name lat lon } }
       geometry { lat lon }
       steps {
         ... on PlanTransitLegStep {
@@ -1067,11 +1375,13 @@ const PLAN_FRAGMENT = `
 
 const QUERY = `query Plan(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
+  $fromStationId: String, $toStationId: String,
   $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int,
   $modes: [Mode!], $bikeProfile: BikeProfileInput
 ) {
   raptor(
     fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
+    fromStationId: $fromStationId, toStationId: $toStationId,
     date: $date, time: $time,
     windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs,
     modes: $modes, bikeProfile: $bikeProfile
@@ -1101,6 +1411,7 @@ const ALT_QUERY = `query Alts(
 
 // ── Map ───────────────────────────────────────────────────────
 const map = L.map('map').setView([50.85, 4.35], 12);
+window.map = map;
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   attribution: '© OpenStreetMap contributors', maxZoom: 19,
 }).addTo(map);
@@ -1135,11 +1446,11 @@ const state = {
 
 // ── Stop search inputs ────────────────────────────────────────
 const fromSearch = createStopSearch(
-  document.getElementById('from-search'), 'Search stop or right-click map',
+  document.getElementById('from-search'), 'Search station or address, or right-click map',
   s => { setOriginMarker(s.lat, s.lon); doSyncUrl(); },
 );
 const toSearch = createStopSearch(
-  document.getElementById('to-search'), 'Search stop or right-click map',
+  document.getElementById('to-search'), 'Search station or address, or right-click map',
   s => { setDestMarker(s.lat, s.lon); doSyncUrl(); },
 );
 
@@ -1167,6 +1478,67 @@ createContextMenu(map,
   },
 );
 
+// ── Geolocation ("use my location") ───────────────────────────
+let gpsNoteTimer = null;
+function showGpsNote(msg) {
+  const n = el('gps-note');
+  if (!n) return;
+  n.textContent = msg;
+  n.hidden = false;
+  if (gpsNoteTimer) clearTimeout(gpsNoteTimer);
+  gpsNoteTimer = setTimeout(() => { n.hidden = true; }, 6000);
+}
+
+function locateInto(target, btn) {
+  if (!('geolocation' in navigator) || !navigator.geolocation) {
+    showGpsNote('Location is not available on this device.');
+    return;
+  }
+  if (window.isSecureContext === false) {
+    showGpsNote('Location needs HTTPS or localhost.');
+    return;
+  }
+  if (btn.classList.contains('locating')) return;
+  btn.classList.add('locating');
+  btn.disabled = true;
+  const done = () => { btn.classList.remove('locating'); btn.disabled = false; };
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      done();
+      const lat = pos.coords.latitude, lng = pos.coords.longitude;
+      if (target === 'to') {
+        toSearch.setCoords(lat, lng);
+        setDestMarker(lat, lng);
+        doSyncUrl();
+        if (fromSearch.getLat() != null && toSearch.getLat() != null) runQuery();
+      } else {
+        fromSearch.setCoords(lat, lng);
+        setOriginMarker(lat, lng);
+        doSyncUrl();
+      }
+    },
+    err => {
+      done();
+      let msg = 'Could not get your location.';
+      if (err && err.code === err.PERMISSION_DENIED)        msg = 'Location permission denied.';
+      else if (err && err.code === err.POSITION_UNAVAILABLE) msg = 'Location unavailable right now.';
+      else if (err && err.code === err.TIMEOUT)              msg = 'Location request timed out.';
+      showGpsNote(msg);
+    },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
+  );
+}
+
+(function initGpsButtons() {
+  const supported = ('geolocation' in navigator) && !!navigator.geolocation;
+  ['gps-from', 'gps-to'].forEach(id => {
+    const btn = el(id);
+    if (!btn) return;
+    if (!supported) { btn.disabled = true; btn.title = 'Location not available'; return; }
+    btn.addEventListener('click', () => locateInto(btn.dataset.target, btn));
+  });
+})();
+
 // ── URL state ─────────────────────────────────────────────────
 function el(id) { return document.getElementById(id); }
 
@@ -1175,9 +1547,11 @@ function doSyncUrl() {
     fromLat:    fromSearch.getLat(),
     fromLng:    fromSearch.getLng(),
     fromName:   fromSearch.getLat() != null ? fromSearch.getName() : null,
+    fromStation: fromSearch.getStationId(),
     toLat:      toSearch.getLat(),
     toLng:      toSearch.getLng(),
     toName:     toSearch.getLat() != null ? toSearch.getName() : null,
+    toStation:  toSearch.getStationId(),
     date:       el('date').value || null,
     time:       el('time').value || null,
     window:     parseInt(el('adv-window').value, 10) || null,
@@ -1186,7 +1560,17 @@ function doSyncUrl() {
     modes:      selectedModes().join(',') || null,
     group:      state.grouping !== 'departure' ? state.grouping : null,
     sel:        state.selectedIdx >= 0 ? state.selectedIdx : null,
+    live:       readUrl().get('live') || null,   // preserve active live-journey marker
   });
+}
+
+// Set/clear the `live=<journeyId>` URL marker without dropping any planner params
+// and without navigating (replaceState). A reload on this URL auto-resumes the view.
+function setLiveUrlParam(id) {
+  const p = readUrl();
+  if (id) p.set('live', id); else p.delete('live');
+  const qs = p.toString();
+  history.replaceState(null, '', qs ? '?' + qs : location.pathname);
 }
 
 function loadFromUrl() {
@@ -1218,11 +1602,11 @@ function loadFromUrl() {
   const fLat = parseFloat(p.get('fromLat')), fLng = parseFloat(p.get('fromLng'));
   const tLat = parseFloat(p.get('toLat')),   tLng = parseFloat(p.get('toLng'));
   if (!isNaN(fLat) && !isNaN(fLng)) {
-    fromSearch.setValue(p.get('fromName') || `${fLat.toFixed(5)}, ${fLng.toFixed(5)}`, fLat, fLng);
+    fromSearch.setValue(p.get('fromName') || `${fLat.toFixed(5)}, ${fLng.toFixed(5)}`, fLat, fLng, p.get('fromStation'));
     setOriginMarker(fLat, fLng);
   }
   if (!isNaN(tLat) && !isNaN(tLng)) {
-    toSearch.setValue(p.get('toName') || `${tLat.toFixed(5)}, ${tLng.toFixed(5)}`, tLat, tLng);
+    toSearch.setValue(p.get('toName') || `${tLat.toFixed(5)}, ${tLng.toFixed(5)}`, tLat, tLng, p.get('toStation'));
     setDestMarker(tLat, tLng);
   }
   if (p.has('sel')) state.selectedIdx = parseInt(p.get('sel'), 10);
@@ -1240,7 +1624,7 @@ const MODE_COLS = [
   { col: 'SOLO', label: 'Solo' },
   { col: 'ON',   label: 'On transit' },
   { col: 'PARK', label: 'Park & ride' },
-  { col: 'BOTH', label: 'Both ends' },
+  { col: 'BOTH', label: 'Pickup' },
 ];
 const MODE_ROWS = [
   { row: 'WALK', label: '🚶 Walk' },
@@ -1249,13 +1633,13 @@ const MODE_ROWS = [
 ];
 const MODE_GRID = {
   WALK: { SOLO: 'WALK', ON: 'WALK_TRANSIT',    PARK: null,              BOTH: null },
-  BIKE: { SOLO: 'BIKE', ON: 'BIKE_ON_TRANSIT', PARK: 'BIKE_TO_TRANSIT', BOTH: 'BIKE_TRANSIT' },
+  BIKE: { SOLO: 'BIKE', ON: 'BIKE_ON_TRANSIT', PARK: 'BIKE_TO_TRANSIT', BOTH: 'BIKE_PICKUP' },
   CAR:  { SOLO: 'CAR',  ON: null,              PARK: 'CAR_DROP_OFF',    BOTH: 'CAR_PICKUP' },
 };
 const MODE_GLYPH = {
-  WALK: '🚶', WALK_TRANSIT: '🚶+🚌', BIKE: '🚲', BIKE_TRANSIT: '🚲+🚌',
+  WALK: '🚶', WALK_TRANSIT: '🚶+🚌', BIKE: '🚲',
   BIKE_TO_TRANSIT: '🚲🅿+🚌', BIKE_ON_TRANSIT: '🚲⇄🚌',
-  CAR: '🚗', CAR_DROP_OFF: '🚗🅿+🚌', CAR_PICKUP: '🚌+🚗',
+  CAR: '🚗', CAR_DROP_OFF: '🚗🅿+🚌', CAR_PICKUP: '🚌+🚗', BIKE_PICKUP: '🚌+🚲',
 };
 const MODE_TITLES = {
   WALK: 'Walk — On foot the whole way',
@@ -1263,12 +1647,12 @@ const MODE_TITLES = {
   BIKE: 'Bike — Cycle door to door',
   BIKE_ON_TRANSIT: 'Bike on board — Bring your bike on the train',
   BIKE_TO_TRANSIT: 'Bike & Ride — Park your bike at the station',
-  BIKE_TRANSIT: 'Bike both ends — A bike at the start and the finish',
+  BIKE_PICKUP: 'Pickup — Walk to transit, your bike waiting at the destination station for the final leg',
   CAR: 'Car — Drive the whole way',
   CAR_DROP_OFF: 'Park & Ride — Drive to a station, park, take transit',
-  CAR_PICKUP: 'Car at arrival — Transit, then a car for the last leg',
+  CAR_PICKUP: 'Pickup — Walk to transit, a car waiting at the destination station for the final leg',
 };
-const DEFAULT_MODES = new Set(['WALK', 'WALK_TRANSIT', 'BIKE_ON_TRANSIT', 'BIKE_TO_TRANSIT', 'BIKE_TRANSIT', 'CAR', 'CAR_PICKUP']);
+const DEFAULT_MODES = new Set(['WALK_TRANSIT']);
 
 function selectedModes() {
   return [...document.querySelectorAll('#modes-grid .mode-cell.active')].map(b => b.dataset.mode);
@@ -1355,11 +1739,13 @@ el('modes-head').addEventListener('click', () => {
 });
 const MODE_LABEL = {
   WALK: '🚶 Walk', BIKE: '🚲 Bike', WALK_TRANSIT: '🚶+🚌',
-  BIKE_TRANSIT: '🚲+🚌 Bike + transit', BIKE_TO_TRANSIT: '🚲🅿+🚌 Bike to transit',
+  BIKE_TO_TRANSIT: '🚲🅿+🚌 Bike to transit',
   BIKE_ON_TRANSIT: '🚲⇄🚌 Bike on board',
-  CAR: '🚗 Car', CAR_DROP_OFF: '🚗🅿+🚌 Park & ride', CAR_PICKUP: '🚌+🚗 Kiss & ride',
+  BIKE_PICKUP: '🚌+🚲 Bike pickup',
+  CAR: '🚗 Car', CAR_DROP_OFF: '🚗🅿+🚌 Park & ride', CAR_PICKUP: '🚌+🚗 Car pickup',
 };
-const BIKE_MODES = new Set(['BIKE', 'BIKE_TRANSIT', 'BIKE_TO_TRANSIT', 'BIKE_ON_TRANSIT']);
+const BIKE_MODES = new Set(['BIKE', 'BIKE_TO_TRANSIT', 'BIKE_ON_TRANSIT', 'BIKE_PICKUP']);
+const CAR_MODES = new Set(['CAR', 'CAR_DROP_OFF', 'CAR_PICKUP']);
 el('adv-window').addEventListener('input', e => {
   el('adv-window-val').textContent = e.target.value + 'm';
 });
@@ -1373,10 +1759,10 @@ el('advanced-btn').addEventListener('click', () => {
 });
 
 function reverseEndpoints() {
-  const fLat = fromSearch.getLat(), fLng = fromSearch.getLng(), fN = fromSearch.getName();
-  const tLat = toSearch.getLat(),   tLng = toSearch.getLng(),   tN = toSearch.getName();
-  if (tLat != null) fromSearch.setValue(tN, tLat, tLng); else fromSearch.clear();
-  if (fLat != null) toSearch.setValue(fN, fLat, fLng);   else toSearch.clear();
+  const fLat = fromSearch.getLat(), fLng = fromSearch.getLng(), fN = fromSearch.getName(), fS = fromSearch.getStationId();
+  const tLat = toSearch.getLat(),   tLng = toSearch.getLng(),   tN = toSearch.getName(),   tS = toSearch.getStationId();
+  if (tLat != null) fromSearch.setValue(tN, tLat, tLng, tS); else fromSearch.clear();
+  if (fLat != null) toSearch.setValue(fN, fLat, fLng, fS);   else toSearch.clear();
   if (tLat != null) setOriginMarker(tLat, tLng); else if (originMarker) { map.removeLayer(originMarker); originMarker = null; }
   if (fLat != null) setDestMarker(fLat, fLng);   else if (destMarker)   { map.removeLayer(destMarker);   destMarker   = null; }
   doSyncUrl();
@@ -1392,10 +1778,23 @@ el('sidebar-fold').addEventListener('click', () => {
 el('reverse-btn').addEventListener('click', reverseEndpoints);
 el('swap-stops').addEventListener('click', reverseEndpoints);
 
-el('now-btn').addEventListener('click', () => {
+function nowLocal() {
   const d = new Date();
-  el('date').value = d.toISOString().slice(0, 10);
-  el('time').value = d.toTimeString().slice(0, 5);
+  const pad = n => String(n).padStart(2, '0');
+  return {
+    date: d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()),
+    time: pad(d.getHours()) + ':' + pad(d.getMinutes()),
+  };
+}
+function fillDateTimeIfEmpty() {
+  const n = nowLocal();
+  if (!el('date').value) el('date').value = n.date;
+  if (!el('time').value) el('time').value = n.time;
+}
+el('now-btn').addEventListener('click', () => {
+  const n = nowLocal();
+  el('date').value = n.date;
+  el('time').value = n.time;
   doSyncUrl();
 });
 
@@ -1428,8 +1827,20 @@ async function runQuery() {
   const vars = { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs,
                  modes: modes.length ? modes : null, bikeProfile: null };
 
+  // Zero-cost station hub: when a dropdown station was selected, pass its id so
+  // routing treats all its platforms as zero-walk access/egress. The station ids
+  // stay OUT of `vars`/`state.queryVars` so per-leg alt fetches keep using only
+  // coordinates (ALT_QUERY does not declare these variables).
+  const fromStationId = fromSearch.getStationId();
+  const toStationId   = toSearch.getStationId();
+  const sendVars = {
+    ...vars,
+    ...(fromStationId ? { fromStationId } : {}),
+    ...(toStationId ? { toStationId } : {}),
+  };
+
   // Manual mode: send the user-edited query + variables verbatim.
-  let queryToSend = QUERY, varsToSend = vars;
+  let queryToSend = QUERY, varsToSend = sendVars;
   if (queryManual()) {
     try {
       varsToSend = JSON.parse(el('query-vars').value || '{}');
@@ -1673,6 +2084,12 @@ function mkModeIc(mode, size, color) {
 function mkSwapIcon(s) {
   return mkSvgIcon([['path', { d: 'M4 8h13l-3-3M20 16H7l3 3' }]], s || 12);
 }
+function mkShieldIcon(s) {
+  return mkSvgIcon([
+    ['path', { d: 'M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6z' }],
+    ['path', { d: 'M9 12l2 2 4-4' }],
+  ], s || 12);
+}
 function mkChev() { return mkEl('span', 'chev', '▾'); }
 
 // Realtime-aware time descriptor → {s, real?, rt}. rt: 'ontime' | 'late' | 'plain' | 'dim'.
@@ -1811,7 +2228,7 @@ function renderRibbon(plan, openLeg, onLeg) {
 
 // ── Itinerary (boxed-spine timeline) ──────────────────────────
 // The median-walk + safety-buffer split shown under the first foot leg.
-function mkWalkSplit(leaveT, walkMed, buffer) {
+function mkWalkSplit(leaveT, walkMed, buffer, bufLabel, modeWord = 'walk') {
   const w   = mkEl('div', 'wsplit');
   const bar = mkEl('div', 'wsbar');
   const wp  = mkEl('span', 'walkp'); wp.style.flex = String(Math.max(walkMed, 1));
@@ -1823,10 +2240,10 @@ function mkWalkSplit(leaveT, walkMed, buffer) {
   w.appendChild(bar);
   const cap = mkEl('div', 'wscap');
   cap.appendChild(mkEl('b', null, 'Leave ' + leaveT));
-  cap.appendChild(document.createTextNode(' · ' + walkMed + ' min walk'));
+  cap.appendChild(document.createTextNode(' · ' + walkMed + ' min ' + modeWord));
   if (buffer > 0) {
     cap.appendChild(document.createTextNode(' '));
-    cap.appendChild(mkEl('span', 'mg', '+ ' + buffer + ' min buffer'));
+    cap.appendChild(mkEl('span', 'mg', bufLabel ?? ('+ ' + buffer + ' min buffer')));
   }
   w.appendChild(cap);
   return w;
@@ -1840,9 +2257,10 @@ function firstTransitOf(plan) {
   return { route, line: route?.shortName || route?.mode || '?', stop: leg.from?.node?.name || '—', time: leg.start };
 }
 
-function buildItinerary(plan, idx, onLeg) {
+function buildItinerary(plan, idx, onLeg, opts = {}) {
   const it   = mkEl('div', 'it');
   const legs = plan.legs;
+  const liveMode = !!opts.live;
 
   // Live banner — only when some transit leg carries realtime.
   const rtTransit = legs.filter(l => l.__typename === 'PlanTransitLeg' && l.realtime);
@@ -1914,10 +2332,13 @@ function buildItinerary(plan, idx, onLeg) {
       label.appendChild(isBike || isCar ? mkModeIc(isBike ? 'BUS' : 'RAIL', 14) : mkWalkIcon(14));
       label.appendChild(mkEl('span', 'm', (isBike ? 'Bike ' : isCar ? 'Drive ' : 'Walk ') + mins + ' min'));
       wc.appendChild(label);
-      if (isFirst && !isBike && !isCar && next?.__typename === 'PlanTransitLeg') {
-        const total  = Math.max(mins, Math.round((next.start - leg.start) / 60));
-        const buffer = Math.max(0, total - mins);
-        wc.appendChild(mkWalkSplit(fmtTime(leg.start), mins, buffer));
+      if (!isCar) {
+        const selAlt    = leg.alternatives?.[leg._selAlt ?? 0];
+        const uncertMin = (selAlt?.p95 != null && selAlt?.p50 != null)
+          ? Math.max(0, Math.round((selAlt.p95 - selAlt.p50) / 60))
+          : 0;
+        wc.appendChild(mkWalkSplit(fmtTime(leg.start), mins, uncertMin,
+          uncertMin > 0 ? '± ' + uncertMin + ' min' : null, isBike ? 'bike' : 'walk'));
       }
       if (isBike) wc.appendChild(mkBikeStats(leg));
       w.appendChild(wc);
@@ -1943,7 +2364,7 @@ function buildItinerary(plan, idx, onLeg) {
         wc.appendChild(mkEl('span', 'leg-routes-link', leg.alternatives.length + ' routes ›'));
         w.classList.add('leg-row-pick');
         w.title = 'Compare ' + leg.alternatives.length + ' route options';
-        w.addEventListener('click', e => { e.stopPropagation(); openPicker(idx, i); });
+        w.addEventListener('click', e => { e.stopPropagation(); if (onLeg) onLeg(e, leg); else openPicker(idx, i); });
       }
       return;
     }
@@ -1977,6 +2398,30 @@ function buildItinerary(plan, idx, onLeg) {
           card.appendChild(rel);
         }
         xc.appendChild(card);
+        if (leg._liveRisk) {
+          const rs = window.MaaSLive?.logic?.transferRiskState?.(leg._liveRisk);
+          if (rs) {
+            const block = mkEl('div', 'lv-xfer-state');
+            block.dataset.state = rs.state;
+            const labels = { alarm: '⚠ Connection at risk', open: '~ Tight connection', calm: '✓ Connection fine' };
+            block.appendChild(mkEl('span', 'xsk', labels[rs.state]));
+            if (rs.marginSecs != null && rs.state !== 'calm') {
+              const m = Math.round(rs.marginSecs / 60);
+              block.appendChild(mkEl('span', null, (m > 0 ? m : 0) + ' min'));
+            }
+            if (rs.delta && rs.state === 'alarm') {
+              const od = mkEl('span', 'xod');
+              od.appendChild(mkEl('s', null, relPct(rs.delta.oldP)));
+              od.appendChild(document.createTextNode(' → '));
+              od.appendChild(mkEl('b', null, relPct(rs.delta.newP)));
+              block.appendChild(od);
+            }
+            const findBtn = mkEl('button', 'xfind', 'Alternatives');
+            findBtn.addEventListener('click', e => { e.stopPropagation(); openAlternativesRail(leg); });
+            block.appendChild(findBtn);
+            xc.appendChild(block);
+          }
+        }
         x.appendChild(xc);
         it.appendChild(x);
       }
@@ -1998,6 +2443,14 @@ function buildItinerary(plan, idx, onLeg) {
       const bc = mkEl('div', 'it-c');
       bc.appendChild(mkEl('span', 'it-place', board));
       bc.appendChild(mkEl('span', 'it-role', 'Board'));
+      const boardPlatform = leg.from?.platform;
+      const boardPlatformChange = leg.platformChangeBoard;
+      if (boardPlatformChange) {
+        const sp = mkEl('span', 'it-platform it-platform--changed', 'Pl. ' + boardPlatformChange.from + ' → ' + boardPlatformChange.to);
+        bc.appendChild(sp);
+      } else if (boardPlatform) {
+        bc.appendChild(mkEl('span', 'it-platform', 'Pl. ' + boardPlatform));
+      }
 
       const veh = mkEl('div', 'it-veh');
       veh.style.setProperty('--bd', `color-mix(in oklab, ${bg} 26%, var(--line))`);
@@ -2034,10 +2487,35 @@ function buildItinerary(plan, idx, onLeg) {
       pill.addEventListener('click', e => {
         e.stopPropagation();
         if (state.openStops.has(key)) state.openStops.delete(key); else state.openStops.add(key);
-        renderList();
+        (opts.rerender || renderList)();
       });
       veh.appendChild(pill);
       bc.appendChild(veh);
+
+      // Live "Find alternatives" affordance — same-station backups for this
+      // boarding (Card 1). More prominent when the connection INTO this leg is
+      // at risk. Planner never sets liveMode, so this stays invisible there.
+      if (liveMode) {
+        const _rs = window.MaaSLive?.logic?.transferRiskState?.(leg._liveRisk ?? null);
+        const atRisk = _rs?.state === 'alarm';
+        const altBtn = mkEl('button', 'lv-alt-btn' + (atRisk ? ' risk' : ''));
+        altBtn.appendChild(mkSwapIcon(13));
+        altBtn.appendChild(mkEl('span', null, atRisk ? 'Find alternatives' : 'Backups'));
+        altBtn.addEventListener('click', e => { e.stopPropagation(); openAlternativesRail(leg); });
+        bc.appendChild(altBtn);
+        if (leg._backup) bc.appendChild(mkBackupChip(leg._backup));
+        if (leg.alerts?.length) {
+          const summary = window.MaaSLive?.logic?.alertSummary?.(leg.alerts) ?? (leg.alerts[0]?.header || null);
+          if (summary) {
+            const chip = mkEl('div', 'it-alert');
+            chip.appendChild(mkEl('span', 'it-alert-ic', '⚠'));
+            chip.appendChild(mkEl('span', 'it-alert-txt', summary));
+            chip.title = leg.alerts.map(a => [a.header, a.description].filter(Boolean).join(': ')).join('\n');
+            bc.appendChild(chip);
+          }
+        }
+      }
+
       b.appendChild(bc);
       it.appendChild(b);
 
@@ -2064,6 +2542,14 @@ function buildItinerary(plan, idx, onLeg) {
       const ac = mkEl('div', 'it-c');
       ac.appendChild(mkEl('span', 'it-place', alight));
       ac.appendChild(mkEl('span', 'it-role', 'Get off'));
+      const alightPlatform = leg.to?.platform;
+      const alightPlatformChange = leg.platformChangeAlight;
+      if (alightPlatformChange) {
+        const sp = mkEl('span', 'it-platform it-platform--changed', 'Pl. ' + alightPlatformChange.from + ' → ' + alightPlatformChange.to);
+        ac.appendChild(sp);
+      } else if (alightPlatform) {
+        ac.appendChild(mkEl('span', 'it-platform', 'Pl. ' + alightPlatform));
+      }
       a.appendChild(ac);
       it.appendChild(a);
     }
@@ -2231,6 +2717,22 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
     const connEl = renderConnection(openLeg, idx, openLegIdx);
     if (connEl) detail.appendChild(connEl);
   }
+  // Start-journey CTA — only for plans that actually board transit (a live
+  // refresh has nothing to do for walk/bike/car-only plans). Gated on the live
+  // bridge being ready (deferred module); maaslive:ready re-renders the list.
+  if (transitLegsOf(plan).length) {
+    const btn = mkEl('button', 'lv-start');
+    btn.type = 'button';
+    if (liveReady) {
+      btn.appendChild(mkEl('span', 'lv-dot'));
+      btn.appendChild(mkEl('span', null, 'Start journey'));
+      btn.addEventListener('click', e => { e.stopPropagation(); startJourney(plan); });
+    } else {
+      btn.disabled = true;
+      btn.appendChild(mkEl('span', null, 'Preparing live view…'));
+    }
+    detail.appendChild(btn);
+  }
   return detail;
 }
 
@@ -2242,13 +2744,13 @@ function renderTripCard(plan, idx, isOpen) {
   // header — departure → arrival, tag, reliability chip
   const head  = mkEl('div', 'rc-head');
   const times = mkEl('div', 'rc-times');
-  times.appendChild(mkEl('span', 'big', fmtTime(plan.start)));
+  times.appendChild(mkEl('span', 'big', fmtTime(plan.legs[0]?.start ?? plan.start)));
   times.appendChild(mkEl('span', 'ar', '→'));
   times.appendChild(mkEl('span', 'big', fmtTime(plan.end)));
   head.appendChild(times);
   const tag = planTag(state.plans, plan);
   if (tag) head.appendChild(mkEl('span', 'rc-tag', tag));
-  else if (BIKE_MODES.has(plan.mode)) head.appendChild(mkEl('span', 'rc-tag', MODE_LABEL[plan.mode] || plan.mode));
+  else if (BIKE_MODES.has(plan.mode) || CAR_MODES.has(plan.mode)) head.appendChild(mkEl('span', 'rc-tag', MODE_LABEL[plan.mode] || plan.mode));
   if (rel < 1) {
     const relEl = mkEl('span', 'rc-rel'); relEl.dataset.rel = relClass(rel);
     relEl.appendChild(mkEl('span', 'bead'));
@@ -2470,6 +2972,1104 @@ function closeCard() {
   renderAllPlansOnMap();
   doSyncUrl();
 }
+
+// ── Live (realtime) journey view ──────────────────────────────
+// Thin classic-side controller. Storage + pure ETA/shift logic live in the
+// deferred module bridge (window.MaaSLive); this owns DOM + the poll lifecycle.
+const LIVE_POLL_MS = 20000;
+const LIVE_QUERY = `query Live($legs: [LiveLegInput!]!) {
+  liveRefresh(legs: $legs) {
+    generatedAt eta scheduledEta
+    legs { tripId found status delaySecs scheduledStart scheduledEnd realtimeStart realtimeEnd vehicle { lat lng bearing observedAt stale } alerts { header description cause effect } platformChangeBoard { from to } platformChangeAlight { from to } }
+    transfers { fromLegIndex marginSecs reliability }
+  }
+}`;
+
+// Full transit-leg shape used by the in-realtime departure picker: enough to
+// splice the chosen trip into the live plan (geometry, stops) AND rebuild the
+// poll descriptor (tripId + stop ids). Fetched lazily, once, at select time.
+const DEP_LEG_FIELDS = `
+  __typename tripId start end duration scheduledStart scheduledEnd realtime bikesAllowed
+  transferRisk { reliability scheduledDeparture nextDeparture nextReliability marginSecs }
+  trip { headsign route { shortName longName mode color textColor agency { name } } }
+  from { departure stopId platform node { name lat lon } }
+  to   { arrival   stopId platform node { name lat lon } }
+  geometry { lat lon }
+  steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
+`;
+const LIVE_DEP_QUERY = `query LiveDep(
+  $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
+  $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int, $modes: [Mode!]
+) {
+  raptor(fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
+         date: $date, time: $time, windowMinutes: $windowMinutes,
+         walkRadiusSecs: $walkRadiusSecs, modes: $modes) {
+    legs {
+      __typename
+      ... on PlanTransitLeg {
+        tripId
+        previousDepartures(count: 4) { ${DEP_LEG_FIELDS} }
+        nextDepartures(count: 4)     { ${DEP_LEG_FIELDS} }
+      }
+    }
+  }
+}`;
+// Same-station backups for ONE boarded leg (Card 1 of the live alternatives rail):
+// other trips leaving the same stop and reaching the same downstream stop. Keyed
+// purely by GTFS handle, so it's stable across polls; fetched on demand per leg.
+const STATION_BACKUPS_QUERY = `query Backups(
+  $tripId: String!, $boardStopId: String!, $alightStopId: String!,
+  $beforeCount: Int, $afterCount: Int, $date: String
+) {
+  stationBackups(tripId: $tripId, boardStopId: $boardStopId, alightStopId: $alightStopId,
+                 beforeCount: $beforeCount, afterCount: $afterCount, date: $date) {
+    tripId boardStopId alightStopId routeShortName routeLongName mode routeColor sameLine
+    scheduledDeparture scheduledArrival realtimeDeparture realtimeArrival reliability
+  }
+}`;
+// Onboard requery for the live alternatives rail (Card 2+ — SWITCH cards): route
+// FROM the rider's CURRENT vehicle (tripId + last-passed/board stop) to the same
+// destination, returning COMPLETE alternative plans (stay-on, alight-and-transfer,
+// alight-and-walk). Reuses PLAN_FRAGMENT so a chosen plan can fully replace the
+// live journey and re-render its spine. Fired lazily, once per boarded leg.
+const LIVE_ONBOARD_QUERY = `query Onboard(
+  $tripId: String!, $fromStopId: String,
+  $toLat: Float!, $toLng: Float!,
+  $date: String, $time: String, $walkRadiusSecs: Int
+) {
+  onboardRaptor(onboardOrigin: { tripId: $tripId, fromStopId: $fromStopId },
+         toLat: $toLat, toLng: $toLng, date: $date, time: $time,
+         walkRadiusSecs: $walkRadiusSecs) {
+    ${PLAN_FRAGMENT}
+  }
+}`;
+const LIVE_VEH_ANIM_MS = 1000;
+
+let liveReady = !!(window.MaaSLive && window.MaaSLive.ready);  // module may have raced ahead
+// `live` owns the whole realtime lifecycle. Every entry MUST be torn down on exit
+// (see exitLiveView): timer (poll), animTimer (vehicle), watchId (GPS), the two
+// map markers, and the reparented #map node.
+const live = {
+  plan: null, descriptor: null, journeyId: null, queryVars: null,
+  timer: null, animTimer: null, watchId: null,
+  vehMarker: null, gpsMarker: null, viewLegs: null, riskRows: [],
+  mapParent: null, mapNext: null, depsReady: false,
+  lastRefreshSec: null, pollFails: 0, mapAnchor: null,
+};
+
+// Live-map height anchors (fraction of the live-view content height, i.e. below
+// the .lv-bar): 0 = collapsed, 0.5 = half, 0.9 = near-full. Drag snaps to these.
+const LIVE_MAP_ANCHORS = [0, 0.5, 0.9];
+const LIVE_MAP_ANCHOR_KEY = 'maas.live.mapAnchor';
+function loadMapAnchor() {
+  let a = 0.5;
+  try { const s = localStorage.getItem(LIVE_MAP_ANCHOR_KEY); if (s != null) a = parseFloat(s); } catch (_) {}
+  return LIVE_MAP_ANCHORS.includes(a) ? a : 0.5;
+}
+// Available content height = live-view minus the top bar.
+function liveContentHeight() {
+  const lv = el('live-view'), bar = lv?.querySelector('.lv-bar');
+  if (!lv) return 0;
+  return Math.max(0, lv.clientHeight - (bar ? bar.offsetHeight : 0));
+}
+let mapSizeRaf = 0;
+function scheduleInvalidate() {
+  if (mapSizeRaf) return;
+  mapSizeRaf = requestAnimationFrame(() => { mapSizeRaf = 0; try { map.invalidateSize(); } catch (_) {} });
+}
+// Apply an anchor (fraction). `animate` lets the CSS height transition run, then
+// invalidates the map once it settles. Persists the chosen anchor.
+function applyMapAnchor(frac, animate) {
+  const host = el('lv-map-host');
+  if (!host) return;
+  live.mapAnchor = frac;
+  try { localStorage.setItem(LIVE_MAP_ANCHOR_KEY, String(frac)); } catch (_) {}
+  const px = Math.round(liveContentHeight() * frac);
+  host.classList.toggle('dragging', !animate);
+  host.style.height = px + 'px';
+  if (animate) {
+    let done = false;
+    const fin = () => { if (done) return; done = true; host.removeEventListener('transitionend', fin); scheduleInvalidate(); };
+    host.addEventListener('transitionend', fin);
+    setTimeout(fin, 320);   // fallback when height is unchanged (no transitionend)
+  } else {
+    scheduleInvalidate();
+  }
+}
+// Pointer-driven resize: drag the grabber, snap to the nearest anchor on release.
+function setupMapDrag() {
+  const grab = el('lv-grab'), host = el('lv-map-host');
+  if (!grab || !host) return;
+  let startY = 0, startH = 0, avail = 0, dragging = false;
+  grab.addEventListener('pointerdown', e => {
+    avail = liveContentHeight();
+    if (avail <= 0) return;
+    dragging = true;
+    startY = e.clientY;
+    startH = host.getBoundingClientRect().height;
+    host.classList.add('dragging');
+    try { grab.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  grab.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const h = Math.max(0, Math.min(avail, startH + (e.clientY - startY)));
+    host.style.height = h + 'px';
+    scheduleInvalidate();
+  });
+  const end = e => {
+    if (!dragging) return;
+    dragging = false;
+    try { grab.releasePointerCapture(e.pointerId); } catch (_) {}
+    const frac = avail > 0 ? host.getBoundingClientRect().height / avail : 0.5;
+    let best = LIVE_MAP_ANCHORS[0];
+    for (const a of LIVE_MAP_ANCHORS) if (Math.abs(a - frac) < Math.abs(best - frac)) best = a;
+    applyMapAnchor(best, true);
+  };
+  grab.addEventListener('pointerup', end);
+  grab.addEventListener('pointercancel', end);
+}
+
+let liveAutoResumeTried = false;
+window.addEventListener('maaslive:ready', () => {
+  liveReady = true;
+  if (state.selectedIdx >= 0 && !state.picker) renderList();  // enable Start buttons
+  // A reload of a `?live=<id>` URL auto-resumes the stored journey; otherwise just
+  // surface the resume banner for a persisted active journey from a previous load.
+  if (!tryAutoResumeLive()) maybeShowResume();
+});
+
+// If the URL carries `live=<journeyId>` and the bridge still has that exact stored
+// journey (persistent OPFS store), re-enter the live view automatically — same path
+// as the resume banner. Degrades to false (banner/planner) when the store is the
+// in-memory fallback (getJourney null after reload) or the id no longer matches.
+function tryAutoResumeLive() {
+  if (liveAutoResumeTried) return false;   // guard against re-entry loops
+  liveAutoResumeTried = true;
+  if (!el('live-view').hidden) return false;
+  const wantId = readUrl().get('live');
+  if (!wantId) return false;
+  let j = null;
+  try { j = window.MaaSLive?.getJourney?.(); } catch (err) { console.warn('getJourney failed', err); return false; }
+  if (!j || j.status !== 'active' || !j.payload || !j.payload.plan || j.id !== wantId) return false;
+  resumeLiveJourney(j);
+  return !el('live-view').hidden;
+}
+
+function planToDescriptor(plan) {
+  const legs = transitLegsOf(plan).map(l => ({
+    tripId: l.tripId, boardStopId: l.from?.stopId, alightStopId: l.to?.stopId,
+  }));
+  return { legs };
+}
+
+function startJourney(plan) {
+  if (!liveReady || !window.MaaSLive) return;
+  const descriptor = planToDescriptor(plan);
+  if (!descriptor.legs.length) return;
+  const origin = (fromSearch.getName && fromSearch.getName()) || plan.legs[0]?.from?.node?.name || 'Start';
+  const dest   = (toSearch.getName && toSearch.getName()) || plan.legs[plan.legs.length - 1]?.to?.node?.name || 'Destination';
+  const id = 'j:' + descriptor.legs.map(l => l.tripId).join('|') + ':' + plan.start;
+  live.journeyId = id;
+  live.queryVars = state.queryVars;     // for the lazy departure-alternatives fetch
+  try {
+    window.MaaSLive.saveJourney({
+      id, payload: { plan, descriptor, queryVars: live.queryVars },
+      originLabel: origin, destinationLabel: dest,
+      status: 'active', summary: `Started ${origin} → ${dest}`,
+    });
+  } catch (err) { console.warn('saveJourney failed', err); }
+  enterLiveView(plan, descriptor, origin, dest);
+}
+
+function enterLiveView(plan, descriptor, origin, dest) {
+  stopLivePoll();                       // kill any prior journey's interval first
+  teardownLiveOverlays();               // markers/watch/anim from a prior journey
+  live.plan = plan;
+  live.descriptor = descriptor;
+  live.viewLegs = plan.legs;
+  live.riskRows = [];
+  live.depsReady = false;
+  live.lastRefreshSec = null;
+  live.pollFails = 0;
+  el('lv-fresh').textContent = '';
+  el('lv-fresh').classList.remove('stale');
+  el('lv-resume').hidden = true;   // hide the planner banner while the journey is live
+  el('lv-origin').textContent = origin;
+  el('lv-dest').textContent   = dest;
+  el('lv-status').className = 'lv-status';
+  el('lv-status').textContent = '';
+  el('lv-eta').textContent = window.MaaSLive?.logic?.secOfDayToHHMM
+    ? window.MaaSLive.logic.secOfDayToHHMM(plan.end) : fmtTime(plan.end);
+  el('lv-sheet').hidden = true;
+  el('lv-hist').hidden = true;
+  renderLiveSpine(plan.legs);
+  el('live-view').hidden = false;
+  setLiveUrlParam(live.journeyId);   // F5 on this URL auto-resumes the live view
+  attachLiveMap();
+  applyMapAnchor(live.mapAnchor != null ? live.mapAnchor : loadMapAnchor(), false);
+  startGpsWatch();
+  updateNetBadge();
+  enrichDepartures();                   // background: fetch swap-able departures
+  pollLive();                           // immediate first paint
+  if (navigator.onLine) live.timer = setInterval(pollLive, LIVE_POLL_MS);
+  live.animTimer = setInterval(animateVehicle, LIVE_VEH_ANIM_MS);
+}
+
+function exitLiveView() {
+  stopLivePoll();
+  teardownLiveOverlays();
+  detachLiveMap();
+  // Drop the persisted active journey so no orphaned status:'active' row lingers
+  // (history is untouched — clearJourney only removes the active row).
+  try { window.MaaSLive?.clearJourney(); } catch (err) { console.warn('clearJourney failed', err); }
+  live.plan = null;
+  live.descriptor = null;
+  live.journeyId = null;
+  live.queryVars = null;
+  live.viewLegs = null;
+  live.riskRows = [];
+  live.lastRefreshSec = null;
+  live.pollFails = 0;
+  el('lv-sheet').hidden = true;
+  el('lv-hist').hidden = true;
+  el('live-view').hidden = true;
+  setLiveUrlParam(null);   // so a later reload doesn't re-enter the live view
+  maybeShowResume();
+}
+
+function stopLivePoll() {
+  if (live.timer) { clearInterval(live.timer); live.timer = null; }
+}
+
+// Clear every non-poll realtime overlay: vehicle marker, GPS marker+watch, and
+// the per-second animation timer. Idempotent — safe to call on plan-change too.
+function teardownLiveOverlays() {
+  if (live.animTimer) { clearInterval(live.animTimer); live.animTimer = null; }
+  if (live.watchId != null && navigator.geolocation) {
+    try { navigator.geolocation.clearWatch(live.watchId); } catch (_) {}
+  }
+  live.watchId = null;
+  if (live.vehMarker) { map.removeLayer(live.vehMarker); live.vehMarker = null; }
+  if (live.gpsMarker) { map.removeLayer(live.gpsMarker); live.gpsMarker = null; }
+}
+
+// Reuse the SINGLE planner Leaflet map by reparenting its #map node into the
+// live overlay (the selected plan's polylines are already drawn on it). The
+// original parent/sibling are stashed so detach restores the planner layout.
+function attachLiveMap() {
+  const m = el('map'), host = el('lv-map-host');
+  if (!m || !host || m.parentNode === host) return;
+  live.mapParent = m.parentNode;
+  live.mapNext = m.nextSibling;
+  host.appendChild(m);
+  setTimeout(() => { map.invalidateSize(); }, 0);
+}
+
+function detachLiveMap() {
+  const m = el('map');
+  if (!m || !live.mapParent) return;
+  if (live.mapNext && live.mapNext.parentNode === live.mapParent) {
+    live.mapParent.insertBefore(m, live.mapNext);
+  } else {
+    live.mapParent.appendChild(m);
+  }
+  live.mapParent = null; live.mapNext = null;
+  setTimeout(() => { map.invalidateSize(); }, 0);
+}
+
+function startGpsWatch() {
+  if (!navigator.geolocation || live.watchId != null) return;
+  try {
+    live.watchId = navigator.geolocation.watchPosition(
+      pos => {
+        if (el('live-view').hidden) return;
+        const { latitude, longitude } = pos.coords;
+        if (live.gpsMarker) { live.gpsMarker.setLatLng([latitude, longitude]); return; }
+        live.gpsMarker = L.marker([latitude, longitude], {
+          icon: L.divIcon({ className: '', html: '<div class="lv-gps"></div>', iconSize: [16, 16], iconAnchor: [8, 8] }),
+          zIndexOffset: 1000,
+        }).addTo(map).bindTooltip('You');
+      },
+      () => {},   // permission denied / unavailable — silently omit the dot
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
+    );
+  } catch (_) { /* geolocation unavailable */ }
+}
+
+// Place / move the ESTIMATED vehicle marker on the currently-boarded leg. Phase 1
+// has no VehiclePosition feed, so this is interpolated from the realtime window —
+// styled with a dashed ring + "~" so it never reads as a true GPS fix.
+function animateVehicle() {
+  const L = window.MaaSLive?.logic;
+  if (!L || !live.plan || el('live-view').hidden) return;
+  const isT = l => l.__typename === 'PlanTransitLeg';
+  const active = L.activeLegAt(live.viewLegs || live.plan.legs, nowSecOfDay(), isT);
+  if (!active || !(active.leg.geometry?.length >= 2)) {
+    if (live.vehMarker) { map.removeLayer(live.vehMarker); live.vehMarker = null; }
+    return;
+  }
+  const leg = active.leg;
+  const seg = {
+    points: leg.geometry.map(p => ({ lat: p.lat, lng: p.lon })),
+    tPrev: leg.start, tNext: leg.end,
+  };
+  const interpolated = L.interpolatePosition(seg, nowSecOfDay());
+  const chosen = L.chooseVehiclePosition(leg.vehicle ?? null, interpolated);
+  if (!chosen) return;
+  const color = routeColors(leg.trip?.route).bg || '#1565c0';
+  const isReal = chosen.source === 'real';
+  if (!live.vehMarker) {
+    live.vehMarker = window.L.marker([chosen.lat, chosen.lng], {
+      icon: makeVehicleIcon(color, isReal), zIndexOffset: 1100,
+    }).addTo(map).bindTooltip(isReal ? 'Vehicle position' : 'Estimated position');
+  } else {
+    live.vehMarker.setLatLng([chosen.lat, chosen.lng]);
+    live.vehMarker.setIcon(makeVehicleIcon(color, isReal));
+  }
+}
+
+function makeVehicleIcon(color, real) {
+  return window.L.divIcon({
+    className: '',
+    html: `<div class="lv-veh${real ? ' lv-veh--real' : ''}" style="color:${color}">`
+      + `<span class="lv-veh-ring"></span>`
+      + `<span class="lv-veh-tilde">~</span>`
+      + `<span class="lv-veh-dot" style="background:${color}"></span></div>`,
+    iconSize: [14, 14], iconAnchor: [7, 7],
+  });
+}
+
+// Render the active journey as an EXPANDED planner plan card so the live view
+// shares the Plans UI chrome: `.pd-root` (remaps --ds-* → --bg/--surface/--ink,
+// which the ribbon + itinerary need), a `.rc` header (departure → realtime
+// arrival + reliability), the line-badge ribbon, and the boxed `.card-detail`
+// itinerary. No "Start journey" CTA (already en route) and no collapse toggle
+// (one plan, always open). `liveOnLeg` keeps the in-trip edit picker working.
+function renderLiveSpine(legs, endSec) {
+  const spine = el('lv-spine');
+  spine.replaceChildren();
+  const end  = endSec != null ? endSec : (legs[legs.length - 1]?.end ?? live.plan.end);
+  const view = { ...live.plan, legs, end };
+
+  const root = mkEl('div', 'pd-root');
+  const card = mkEl('div', 'rc best lv-card');
+
+  // header — departure → realtime arrival, LIVE eyebrow, reliability bead
+  const head  = mkEl('div', 'rc-head lv-rc-head');
+  const times = mkEl('div', 'rc-times');
+  times.appendChild(mkEl('span', 'big', fmtTime(legs[0]?.start ?? view.start)));
+  times.appendChild(mkEl('span', 'ar', '→'));
+  times.appendChild(mkEl('span', 'big', fmtTime(view.end)));
+  head.appendChild(times);
+  head.appendChild(mkEl('span', 'rc-tag', 'Live'));
+  const rel = planReliability(view);
+  if (rel < 1) {
+    const relEl = mkEl('span', 'rc-rel'); relEl.dataset.rel = relClass(rel);
+    relEl.appendChild(mkEl('span', 'bead'));
+    relEl.appendChild(document.createTextNode(relPct(rel)));
+    head.appendChild(relEl);
+  }
+  card.appendChild(head);
+
+  // folded: where + when the first transit departs (matches planner card)
+  const ft = firstTransitOf(view);
+  if (ft) {
+    const { bg, fg } = routeColors(ft.route);
+    const row = mkEl('div', 'rc-first'); row.style.setProperty('--fc', bg);
+    const ic  = mkEl('span', 'ic'); ic.appendChild(mkModeIc(ft.route?.mode, 16, bg)); row.appendChild(ic);
+    const badge = mkEl('span', 'rc-fbadge', ft.line); badge.style.background = bg; badge.style.color = fg;
+    row.appendChild(badge);
+    const txt = mkEl('span', 'rc-ftxt');
+    txt.appendChild(document.createTextNode('from '));
+    txt.appendChild(mkEl('b', null, ft.stop));
+    row.appendChild(txt);
+    const time = mkEl('span', 'rc-ftime');
+    time.appendChild(mkEl('span', 'pre', 'dep'));
+    time.appendChild(document.createTextNode(fmtTime(ft.time)));
+    row.appendChild(time);
+    card.appendChild(row);
+  }
+
+  // ribbon (line badges + summary), identical to the planner card
+  const ribWrap = mkEl('div', 'rc-ribbon');
+  ribWrap.appendChild(renderRibbon(view, null, liveOnLeg));
+  card.appendChild(ribWrap);
+
+  // boxed itinerary spine — sentinel idx avoids openStops collision with plan cards
+  const detail = mkEl('div', 'card-detail');
+  detail.appendChild(buildItinerary(view, 999000, liveOnLeg, { live: true, rerender: () => renderLiveSpine(legs, end) }));
+  card.appendChild(detail);
+
+  root.appendChild(card);
+  spine.appendChild(root);
+}
+
+// In-realtime edit entry point, shared with buildItinerary's onLeg hook. Walk/bike
+// legs with stored alternatives, or any transit leg, open the live edit sheet.
+function liveOnLeg(e, clickedLeg) {
+  e.stopPropagation();
+  if (!live.plan) return;
+  // The spine renders view-leg COPIES (applyRealtime output); map the click back
+  // to the pristine plan leg by position (1:1 with the view legs).
+  const idx = (live.viewLegs || live.plan.legs).indexOf(clickedLeg);
+  if (idx < 0) return;
+  const pristine = live.plan.legs[idx];
+  if (pristine.__typename === 'PlanWalkLeg') {
+    if (pristine.alternatives?.length >= 2) openLiveWalkEdit(idx);
+  } else if (pristine.__typename === 'PlanTransitLeg') {
+    openLiveDepartureEdit(pristine);
+  }
+}
+
+async function pollLive() {
+  if (!live.plan || !navigator.onLine) return;
+  const L = window.MaaSLive?.logic;
+  if (!L) return;
+  let data;
+  try {
+    data = await gql(LIVE_QUERY, { legs: live.descriptor.legs });
+  } catch (err) {
+    console.warn('liveRefresh failed', err);
+    if (live.plan) { live.pollFails++; updateFreshness(); }
+    return;
+  }
+  const lr = data?.liveRefresh;
+  if (!lr) {                            // parsed but empty — a silent failure
+    if (live.plan) { live.pollFails++; updateFreshness(); }
+    return;
+  }
+  if (!live.plan) return;              // exited mid-flight
+  live.pollFails = 0;
+  live.lastRefreshSec = nowSecOfDay(); // freshness stamp: successful refresh only
+  const isT = l => l.__typename === 'PlanTransitLeg';
+  const { legs, arrival } = L.applyRealtime(live.plan.legs, lr, isT);
+  // Baseline (select-time) vs live reliability, per interior transfer. Attach the
+  // at-risk row to the arriving transit leg so the spine renders it inline.
+  live.riskRows = L.transferRiskRows(transitLegsOf(live.plan), lr.transfers);
+  const transitView = legs.filter(isT);
+  legs.forEach(l => { if (isT(l)) l._liveRisk = null; });
+  transitView.forEach((l, k) => { l.vehicle = lr.legs[k]?.vehicle ?? null; l.alerts = lr.legs[k]?.alerts ?? []; l.platformChangeBoard = lr.legs[k]?.platformChangeBoard ?? null; l.platformChangeAlight = lr.legs[k]?.platformChangeAlight ?? null; });
+  live.riskRows.forEach(r => {
+    const boarded = transitView[r.boardedIndex];
+    if (boarded) boarded._liveRisk = r;
+  });
+  live.viewLegs = legs;
+  const headEta = arrival != null ? arrival : (L.etaFromLegs(lr.legs) ?? live.plan.end);
+  renderLiveSpine(legs, headEta);   // card header + bar ETA share one number
+  el('lv-eta').textContent = L.secOfDayToHHMM(headEta);
+  updateLiveStatus(legs, lr);
+  updateFreshness();
+  animateVehicle();
+  maybeComplete(arrival);
+}
+
+// "Updated HH:MM" freshness cue in the live bar, fed by the last SUCCESSFUL poll.
+// Dims + appends "reconnecting" once polls have failed N times while still online,
+// so a silent refresh failure can't keep masquerading as fresh.
+function updateFreshness() {
+  const f = el('lv-fresh');
+  if (!f) return;
+  const L = window.MaaSLive?.logic;
+  if (live.lastRefreshSec == null || !L) { f.textContent = ''; f.classList.remove('stale'); return; }
+  const stale = L.isLiveStale(live.pollFails || 0, navigator.onLine);
+  const base = 'Updated ' + L.secOfDayToHHMM(live.lastRefreshSec);
+  f.textContent = stale ? base + ' — reconnecting' : base;
+  f.classList.toggle('stale', stale);
+}
+
+function updateLiveStatus(legs, lr) {
+  const statusEl = el('lv-status');
+  statusEl.className = 'lv-status';
+  if (legs.some(l => l.liveStatus === 'CANCELED')) {
+    statusEl.classList.add('canceled');
+    statusEl.textContent = '⚠ Service canceled';
+    return;
+  }
+  if (riskyTransfer()) {
+    statusEl.classList.add('risk');
+    statusEl.textContent = '⚠ Connection at risk';
+    return;
+  }
+  let lateSecs = 0;
+  legs.forEach(l => { if (l.realtime && l.scheduledEnd != null) lateSecs = Math.max(lateSecs, l.end - l.scheduledEnd); });
+  if (lateSecs >= 60) {
+    statusEl.classList.add('late');
+    statusEl.textContent = 'Running ' + Math.round(lateSecs / 60) + ' min late';
+    return;
+  }
+  if (legs.some(l => l.realtime)) {
+    statusEl.classList.add('ontime');
+    statusEl.textContent = 'Live · on schedule';
+  } else {
+    statusEl.textContent = 'Scheduled · no live data';
+  }
+}
+
+// Connection-risk signal: any interior transfer whose live reliability fell ≥50%
+// below its select-time baseline (computed once in pollLive via transferRiskRows).
+function riskyTransfer() {
+  return (live.riskRows || []).some(r => r.atRisk);
+}
+
+function nowSecOfDay() {
+  const d = new Date();
+  return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+}
+
+function maybeComplete(arrival) {
+  if (arrival == null) return;
+  if (nowSecOfDay() > arrival + 60) {
+    el('lv-status').className = 'lv-status ontime';
+    el('lv-status').textContent = 'Journey complete';
+    stopLivePoll();
+    teardownLiveOverlays();   // stop the vehicle animation + GPS watch; map stays
+    // The journey is done — drop the active row (history survives) so it can't
+    // resume later or pile up as an orphan.
+    try { window.MaaSLive?.clearJourney(); } catch (err) { console.warn('clearJourney failed', err); }
+  }
+}
+
+function updateNetBadge() {
+  const n = el('lv-net');
+  if (navigator.onLine) { n.classList.remove('off'); n.textContent = '●'; n.title = 'Online'; }
+  else { n.classList.add('off'); n.textContent = '○'; n.title = 'Offline — polling paused'; }
+}
+
+// Record a user-initiated change as a durable (or in-session) change_event.
+// NEVER called on poll ticks — only on real edits.
+function recordLiveEvent(kind, summary, payload) {
+  try { window.MaaSLive?.appendEvent({ journeyId: live.journeyId, kind, summary, payload: payload ?? null }); }
+  catch (err) { console.warn('appendEvent failed', err); }
+}
+
+// ── In-realtime edits ─────────────────────────────────────────
+// Lazy, one-shot fetch of earlier/later departures for each boarded leg, keyed
+// by tripId so a leg can be matched regardless of plan order. Uses the journey's
+// ORIGINAL queryVars so the result is consistent with the selected plan.
+async function enrichDepartures() {
+  if (!live.queryVars || live.depsReady) return;
+  const v = live.queryVars;
+  let data;
+  try {
+    data = await gql(LIVE_DEP_QUERY, {
+      fromLat: v.fromLat, fromLng: v.fromLng, toLat: v.toLat, toLng: v.toLng,
+      date: v.date, time: v.time, windowMinutes: v.windowMinutes,
+      walkRadiusSecs: v.walkRadiusSecs, modes: v.modes,
+    });
+  } catch (err) { console.warn('departure enrichment failed', err); live.depsReady = true; return; }
+  if (!live.plan) return;               // exited mid-flight
+  const byTrip = new Map();
+  (data?.raptor || []).forEach(p => (p.legs || []).forEach(l => {
+    if (l && l.tripId && !byTrip.has(l.tripId)) {
+      byTrip.set(l.tripId, { prev: l.previousDepartures || [], next: l.nextDepartures || [] });
+    }
+  }));
+  live.plan.legs.forEach(l => {
+    if (!l || l.__typename !== 'PlanTransitLeg') return;
+    const hit = byTrip.get(l.tripId);
+    if (hit) { l._prevDeps = hit.prev; l._nextDeps = hit.next; }
+  });
+  live.depsReady = true;
+}
+
+function closeLiveSheet() { live._switchSel = null; el('lv-sheet').hidden = true; el('lv-sheet-card').replaceChildren(); }
+
+function liveSheetShell(title, sub) {
+  const card = el('lv-sheet-card');
+  card.replaceChildren();
+  const h = mkEl('div', 'lv-sheet-h');
+  h.appendChild(mkEl('b', null, title));
+  const x = mkEl('button', 'lv-icon-btn', '×'); x.setAttribute('aria-label', 'Close');
+  x.addEventListener('click', closeLiveSheet);
+  h.appendChild(x);
+  card.appendChild(h);
+  if (sub) card.appendChild(mkEl('div', 'lv-sheet-sub', sub));
+  el('lv-sheet').hidden = false;
+  return card;
+}
+
+// Swap a transit leg to an earlier/later departure. On confirm: splice the chosen
+// trip into the live plan, rebuild the poll descriptor (applyDepartureChange),
+// record a change_event, and re-poll with the UPDATED descriptor.
+function openLiveDepartureEdit(leg) {
+  const transit = transitLegsOf(live.plan);
+  const ti = transit.indexOf(leg);
+  if (ti < 0) return;
+  const card = liveSheetShell('Change departure', 'Switch this vehicle to an earlier or later trip. Polling continues with your new choice.');
+  if (!live.depsReady) {
+    card.appendChild(mkEl('div', 'lv-sheet-sub', 'Loading alternative departures…'));
+    enrichDepartures().then(() => { if (!el('lv-sheet').hidden) openLiveDepartureEdit(leg); });
+    return;
+  }
+  const prev = leg._prevDeps || [], next = leg._nextDeps || [];
+  if (!prev.length && !next.length) {
+    card.appendChild(mkEl('div', 'lv-sheet-sub', 'No alternative departures found for this trip.'));
+    return;
+  }
+  const mkRow = (dep, planned) => {
+    const row = mkEl('button', 'lv-opt' + (planned ? ' cur' : ''));
+    row.appendChild(mkEl('span', 'lv-opt-t', fmtTime(dep.start)));
+    const dmin = Math.round((dep.start - leg.start) / 60);
+    row.appendChild(mkEl('span', 'lv-opt-d',
+      planned ? 'current' : (dmin <= 0 ? Math.abs(dmin) + ' min earlier' : dmin + ' min later')));
+    if (dep.transferRisk?.reliability != null) row.appendChild(mkEl('span', 'lv-opt-r', relPct(dep.transferRisk.reliability)));
+    if (!planned) row.addEventListener('click', () => confirmDepartureChange(ti, dep, leg));
+    return row;
+  };
+  [...prev].reverse().forEach(d => card.appendChild(mkRow(d, false)));
+  card.appendChild(mkRow(leg, true));
+  next.forEach(d => card.appendChild(mkRow(d, false)));
+}
+
+function confirmDepartureChange(transitIndex, chosen, oldLeg) {
+  const L = window.MaaSLive?.logic;
+  if (!L || !live.plan) return;
+  const legPos = live.plan.legs.indexOf(oldLeg);
+  if (legPos >= 0) {
+    const merged = { ...oldLeg, ...chosen, __typename: 'PlanTransitLeg' };
+    live.plan.legs[legPos] = merged;
+  }
+  live.descriptor = L.applyDepartureChange(live.descriptor, transitIndex, chosen);
+  const summary = `Departure changed to ${fmtTime(chosen.start)}`
+    + (chosen.trip?.route?.shortName ? ` (${chosen.trip.route.shortName})` : '');
+  recordLiveEvent('departure_change', summary, { transitIndex, tripId: chosen.tripId, start: chosen.start });
+  persistLiveJourney();
+  closeLiveSheet();
+  renderLiveSpine(live.plan.legs);
+  if (state.selectedIdx >= 0) renderAllPlansOnMap();
+  pollLive();                           // re-poll with the new descriptor
+}
+
+// ── Live alternatives rail (Card 1 — same-station backups) ────
+// Card 1 keeps the main plan and only sets a NET: selecting a backup row never
+// replaces the boarded leg, it records a fallback you can lean on if you miss it.
+// Switch cards (Card 2+) instead REPLACE the whole plan with a reroute on confirm.
+function mkBackupChip(model) {
+  const chip = mkEl('span', 'lv-bk-chip');
+  chip.dataset.rel = model.relClass || 'none';
+  chip.appendChild(mkEl('span', 'bead'));
+  chip.appendChild(document.createTextNode('Backup ' + fmtTime(model.depSec) + ' ' + model.line));
+  if (model.reliability != null) chip.appendChild(mkEl('span', 'pct', model.relPct));
+  return chip;
+}
+
+// Lazy, per-leg fetch of same-station backups (cached on the pristine leg).
+async function fetchBackups(leg) {
+  if (leg._backups) return;
+  const L = window.MaaSLive?.logic;
+  if (!L) { leg._backups = []; return; }
+  try {
+    const data = await gql(STATION_BACKUPS_QUERY, {
+      tripId: leg.tripId,
+      boardStopId: leg.from?.stopId,
+      alightStopId: leg.to?.stopId,
+      beforeCount: 0, afterCount: 5,
+      date: live.queryVars?.date || null,
+    });
+    leg._backups = (data?.stationBackups || []).map(b => L.backupRowModel(b)).filter(Boolean);
+  } catch (err) {
+    console.warn('stationBackups failed', err);
+    leg._backups = [];
+  }
+}
+
+// Open the rail for a boarded leg. Maps the clicked VIEW leg back to its pristine
+// plan leg (so the chosen backup persists across re-renders/polls).
+function openAlternativesRail(viewLeg) {
+  if (!live.plan) return;
+  const L = window.MaaSLive?.logic;
+  if (!L) return;
+  const idx = (live.viewLegs || live.plan.legs).indexOf(viewLeg);
+  const leg = idx >= 0 ? live.plan.legs[idx] : viewLeg;
+  if (!leg) return;
+  const boardName = leg.from?.node?.name || '—';
+  const mainLine  = leg.trip?.route?.shortName || leg.trip?.route?.mode || '?';
+  live._railSel = null;
+  live._switchSel = null;
+  if (leg._backups) { renderAlternativesRail(leg, boardName, mainLine); return; }
+  liveSheetShell('Alternatives', 'Set a backup at ' + boardName + ' if you miss it, or reroute onto a different route. Your call.');
+  el('lv-sheet-card').appendChild(mkEl('div', 'lv-sheet-sub', 'Loading backups…'));
+  fetchBackups(leg).then(() => {
+    if (el('lv-sheet').hidden || !live.plan) return;       // closed / exited mid-flight
+    if (live.plan.legs.indexOf(leg) < 0) return;
+    renderAlternativesRail(leg, boardName, mainLine);
+  });
+}
+
+function renderAlternativesRail(leg, boardName, mainLine) {
+  const L = window.MaaSLive?.logic;
+  const card = liveSheetShell('Alternatives', 'Set a backup at ' + boardName + ' if you miss it, or reroute onto a different route. Your call.');
+  const rail = mkEl('div', 'lv-rail');
+
+  // Card 1 — your plan + backup rows.
+  const c1 = mkEl('div', 'lv-railcard keep');
+  const hd = mkEl('div', 'lv-rc-hd');
+  const sh = mkEl('span', 'ic'); sh.appendChild(mkShieldIcon(14)); hd.appendChild(sh);
+  hd.appendChild(mkEl('b', null, boardName));
+  hd.appendChild(mkEl('span', 'sub', 'your plan'));
+  c1.appendChild(hd);
+
+  // Kept main row (the leg you're boarding) — never replaced by a backup pick.
+  const route = leg.trip?.route; const { bg, fg } = routeColors(route);
+  const keep = mkEl('div', 'lv-keep-row');
+  const kb = mkEl('span', 'lv-bk-badge', mainLine); kb.style.background = bg; kb.style.color = fg; keep.appendChild(kb);
+  keep.appendChild(mkEl('span', 'lv-bk-dep', fmtTime(leg.start)));
+  keep.appendChild(mkEl('span', 'lv-keep-tag', 'keep'));
+  const rk = leg._liveRisk, mainRel = leg.transferRisk?.reliability;
+  if (rk && rk.delta) {
+    const od = mkEl('span', 'lv-od');
+    od.appendChild(mkEl('s', null, relPct(rk.delta.oldP)));
+    od.appendChild(document.createTextNode(' → '));
+    od.appendChild(mkEl('b', null, relPct(rk.delta.newP)));
+    keep.appendChild(od);
+  } else if (mainRel != null) {
+    const r = mkEl('span', 'rel ' + relClass(mainRel));
+    r.appendChild(mkEl('span', 'bead'));
+    r.appendChild(document.createTextNode(relPct(mainRel)));
+    keep.appendChild(r);
+  }
+  c1.appendChild(keep);
+
+  const backups = leg._backups || [];
+  c1.appendChild(mkEl('div', 'lv-band', backups.length ? 'Backup if you miss it · pick one' : 'No same-station backups'));
+
+  backups.forEach((m, i) => {
+    const sel = live._railSel === i;
+    const row = mkEl('button', 'lv-bk-row' + (sel ? ' sel' : ''));
+    row.appendChild(mkEl('span', 'lv-bk-ar', '↳'));
+    const bd = mkEl('span', 'lv-bk-badge', m.line);
+    const col = routeColors({ color: m.routeColor, mode: m.mode });
+    bd.style.background = col.bg; bd.style.color = col.fg; row.appendChild(bd);
+    const dep = mkEl('span', 'lv-bk-dep');
+    if (m.depShifted) dep.appendChild(mkEl('s', null, fmtTime(m.schedDepSec)));
+    dep.appendChild(mkEl('b', null, fmtTime(m.depSec)));
+    row.appendChild(dep);
+    row.appendChild(mkEl('span', 'lv-bk-hint', m.hint));
+    const rel = mkEl('span', 'rel ' + (m.relClass || 'none'));
+    rel.appendChild(mkEl('span', 'bead'));
+    rel.appendChild(document.createTextNode(m.relPct));
+    row.appendChild(rel);
+    if (m.arrSec != null) row.appendChild(mkEl('span', 'lv-bk-arr', 'arr ' + fmtTime(m.arrSec)));
+    row.addEventListener('click', () => {
+      live._railSel = sel ? null : i;
+      renderAlternativesRail(leg, boardName, mainLine);
+    });
+    c1.appendChild(row);
+  });
+  rail.appendChild(c1);
+
+  // Card 2+ — SWITCH alternatives, powered by the onboard requery. Fetched lazily
+  // on first open; selecting one is the ONLY action that replaces the live plan.
+  appendSwitchCards(rail, leg, boardName, mainLine);
+  card.appendChild(rail);
+
+  // Lock action — reflects keep + chosen net.
+  const sel = live._railSel != null ? backups[live._railSel] : null;
+  const confirm = mkEl('button', 'lv-bk-confirm');
+  confirm.textContent = L.backupConfirmLabel(mainLine, sel);
+  if (sel) confirm.addEventListener('click', () => confirmBackup(leg, sel, boardName, mainLine));
+  else confirm.disabled = true;
+  card.appendChild(confirm);
+}
+
+function confirmBackup(leg, model, boardName, mainLine) {
+  const L = window.MaaSLive?.logic;
+  if (!L || !live.plan) return;
+  leg._backup = model;                    // pristine leg → survives re-render/poll
+  recordLiveEvent('backup_set', L.backupSummary(boardName, mainLine, model),
+    { tripId: leg.tripId, boardStopId: model.boardStopId, backupTripId: model.tripId, dep: model.depSec });
+  persistLiveJourney();
+  closeLiveSheet();
+  renderLiveSpine(live.plan.legs);
+}
+
+// ── Live alternatives rail (Card 2+ — switch alternatives) ────
+// Lazy onboard requery: from the boarded leg's trip + board stop to the journey
+// destination. Deduped against the journey's transit suffix from this leg onward
+// (so the stay-on plan is excluded). Cached on the pristine leg.
+async function fetchSwitchAlternatives(leg) {
+  if (leg._switches !== undefined) return;
+  const L = window.MaaSLive?.logic;
+  if (!L || !live.queryVars) { leg._switches = []; return; }
+  const v = live.queryVars;
+  try {
+    const data = await gql(LIVE_ONBOARD_QUERY, {
+      tripId: leg.tripId, fromStopId: leg.from?.stopId || null,
+      toLat: v.toLat, toLng: v.toLng, date: v.date || null, time: v.time || null,
+      walkRadiusSecs: v.walkRadiusSecs,
+    });
+    if (!live.plan) return;               // exited mid-flight
+    const onward = transitLegsOf(live.plan).slice(transitLegsOf(live.plan).indexOf(leg)).map(l => l.tripId);
+    leg._switches = L.dedupeSwitchPlans(data?.onboardRaptor || [], onward);
+  } catch (err) {
+    console.warn('onboard alternatives failed', err);
+    leg._switches = [];
+  }
+}
+
+// Append the switch area to the rail: a loading peek (and kick off the fetch), a
+// quiet empty state, or one card per distinct alternative plan.
+function appendSwitchCards(rail, leg, boardName, mainLine) {
+  const L = window.MaaSLive?.logic;
+  if (!L) return;
+  if (leg._switches === undefined) {
+    const load = mkEl('div', 'lv-railcard switch quiet loading');
+    load.appendChild(mkEl('div', 'lv-soon-t', 'Other routes'));
+    load.appendChild(mkEl('div', 'lv-soon-s', 'Finding routes from here…'));
+    rail.appendChild(load);
+    if (!leg._switchLoading) {
+      leg._switchLoading = true;
+      fetchSwitchAlternatives(leg).then(() => {
+        leg._switchLoading = false;
+        if (el('lv-sheet').hidden || !live.plan) return;
+        if (live.plan.legs.indexOf(leg) < 0) return;
+        renderAlternativesRail(leg, boardName, mainLine);
+      });
+    }
+    return;
+  }
+  const switches = leg._switches || [];
+  if (!switches.length) {
+    const empty = mkEl('div', 'lv-railcard switch quiet empty');
+    empty.appendChild(mkEl('div', 'lv-soon-t', 'Other routes'));
+    empty.appendChild(mkEl('div', 'lv-soon-s', 'No other routes right now'));
+    rail.appendChild(empty);
+    return;
+  }
+  switches.forEach((plan, i) => {
+    const m = L.switchCardModel(plan);
+    if (!m) return;
+    const c = mkEl('div', 'lv-railcard switch' + (live._switchSel === i ? ' sel' : ''));
+    const hd = mkEl('div', 'lv-rc-hd');
+    const ic = mkEl('span', 'ic'); ic.appendChild(mkSwapIcon(14)); hd.appendChild(ic);
+    hd.appendChild(mkEl('b', null, m.title));
+    hd.appendChild(mkEl('span', 'sub', 'switch'));
+    c.appendChild(hd);
+
+    const badges = mkEl('div', 'lv-sw-badges');
+    m.badges.forEach(b => {
+      const col = routeColors({ color: b.routeColor, textColor: b.textColor, mode: b.mode });
+      const bd = mkEl('span', 'lv-bk-badge', b.line);
+      bd.style.background = col.bg; bd.style.color = col.fg;
+      badges.appendChild(bd);
+    });
+    c.appendChild(badges);
+
+    const meta = mkEl('div', 'lv-sw-meta');
+    const arr = mkEl('span', 'lv-sw-arr');
+    arr.appendChild(mkEl('span', 'pre', 'arr'));
+    arr.appendChild(document.createTextNode(fmtTime(m.arrSec)));
+    meta.appendChild(arr);
+    const rel = mkEl('span', 'rel ' + (m.relClass || 'none'));
+    rel.appendChild(mkEl('span', 'bead'));
+    rel.appendChild(document.createTextNode(m.relPct));
+    meta.appendChild(rel);
+    c.appendChild(meta);
+
+    c.appendChild(mkEl('div', 'lv-sw-pick', live._switchSel === i ? 'Selected' : 'Preview this route →'));
+    c.addEventListener('click', () => selectSwitch(leg, i, boardName, mainLine));
+    rail.appendChild(c);
+  });
+}
+
+// Selecting a switch card → a DIMMED preview of the alternative's full spine plus a
+// primary confirm. Replaces the rail view in the sheet; "Back" returns to the rail.
+function selectSwitch(leg, idx, boardName, mainLine) {
+  const L = window.MaaSLive?.logic;
+  const plan = (leg._switches || [])[idx];
+  if (!plan || !L) return;
+  live._switchSel = idx;
+  const m = L.switchCardModel(plan);
+  const card = liveSheetShell(m.title, 'Preview of the switch from ' + boardName + '. Confirm to make it your live journey.');
+
+  const back = mkEl('button', 'lv-alt-btn');
+  back.appendChild(document.createTextNode('← Back to alternatives'));
+  back.addEventListener('click', () => { live._switchSel = null; openAlternativesRail(leg); });
+  card.appendChild(back);
+
+  const preview = mkEl('div', 'lv-preview');
+  const root = mkEl('div', 'pd-root');
+  const detail = mkEl('div', 'card-detail');
+  detail.appendChild(buildItinerary({ ...plan }, 998000, e => e.stopPropagation(), {}));
+  root.appendChild(detail);
+  preview.appendChild(root);
+  card.appendChild(preview);
+
+  const confirm = mkEl('button', 'lv-bk-confirm');
+  confirm.textContent = 'Confirm the change →';
+  confirm.addEventListener('click', () => confirmSwitch(plan, m, boardName));
+  card.appendChild(confirm);
+}
+
+// Confirm a switch → REPLACE the live journey with the chosen alternative: swap the
+// plan + descriptor, refresh the app-bar ETA + spine, restart polling against the
+// new descriptor, and record a 'switch' change_event. Destination is unchanged.
+function confirmSwitch(plan, model, boardName) {
+  const L = window.MaaSLive?.logic;
+  if (!L || !live.plan) return;
+  live.plan = plan;
+  live.descriptor = planToDescriptor(plan);
+  live.viewLegs = plan.legs;
+  live.riskRows = [];
+  live._switchSel = null;
+  live.depsReady = false;
+  live.lastRefreshSec = null;
+  live.pollFails = 0;
+  el('lv-fresh').textContent = '';
+  el('lv-fresh').classList.remove('stale');
+  el('lv-status').className = 'lv-status';
+  el('lv-status').textContent = '';
+  el('lv-eta').textContent = L.secOfDayToHHMM ? L.secOfDayToHHMM(plan.end) : fmtTime(plan.end);
+  recordLiveEvent('switch', L.switchEventSummary(model, boardName), { tripSeq: model.tripSeq, arr: model.arrSec });
+  persistLiveJourney();
+  closeLiveSheet();
+  renderLiveSpine(plan.legs);
+  if (state.selectedIdx >= 0) renderAllPlansOnMap();
+  enrichDepartures();
+  pollLive();                             // re-poll with the new descriptor
+}
+
+// Swap a walk/bike leg to one of its stored Pareto alternatives. Geometry+timing
+// recompute mirrors the planner's commitPicker; descriptor is unchanged (walk legs
+// aren't polled), so this records an event and re-renders without touching the poll.
+function openLiveWalkEdit(legPos) {
+  const leg = live.plan.legs[legPos];
+  if (!leg || !(leg.alternatives?.length >= 2)) return;
+  const isEgress = legPos === live.plan.legs.length - 1;
+  const mode = leg.streetMode === 'BIKE' ? 'Bike' : leg.streetMode === 'CAR' ? 'Drive' : 'Walk';
+  const card = liveSheetShell('Change route', `Pick a different ${mode.toLowerCase()} option for this leg.`);
+  leg.alternatives.forEach((o, i) => {
+    const row = mkEl('button', 'lv-opt' + (leg._selAlt === i ? ' cur' : ''));
+    row.appendChild(mkEl('span', 'lv-opt-t', Math.round(o.p50 / 60) + ' min'));
+    const bits = [fmtDist(o.length)];
+    if (o.elevationGain) bits.push('+' + o.elevationGain + ' m');
+    if (o.unpavedLength) bits.push(Math.round(o.unpavedLength / o.length * 100) + '% unpaved');
+    row.appendChild(mkEl('span', 'lv-opt-d', bits.join(' · ')));
+    row.addEventListener('click', () => confirmWalkChange(legPos, i, isEgress));
+    card.appendChild(row);
+  });
+}
+
+function confirmWalkChange(legPos, altIdx, isEgress) {
+  const leg = live.plan.legs[legPos], o = leg.alternatives[altIdx];
+  if (!o) return;
+  const origStart = leg.start, origEnd = leg.end, origDur = leg.end - leg.start;
+  leg.geometry = o.geometry; leg.duration = o.p50; leg.length = o.length;
+  leg.cyclerouteLength = o.cyclerouteLength; leg.elevationGain = o.elevationGain;
+  leg._selAlt = altIdx; leg._dismountRuns = o.dismountRuns || [];
+  if (isEgress) {
+    leg.start = origStart; leg.end = origStart + o.p50;
+    live.plan.end = (live.plan.end || origEnd) + (o.p50 - origDur);
+  } else {
+    leg.end = origEnd; leg.start = origEnd - o.p50;
+    if (legPos === 0) live.plan.start = leg.start;
+  }
+  const mode = leg.streetMode === 'BIKE' ? 'bike' : leg.streetMode === 'CAR' ? 'drive' : 'walk';
+  recordLiveEvent('walk_bike_change', `Changed ${mode} route (${Math.round(o.p50 / 60)} min, ${fmtDist(o.length)})`,
+    { legPos, p50: o.p50, length: o.length });
+  persistLiveJourney();
+  closeLiveSheet();
+  renderLiveSpine(live.plan.legs);
+  if (state.selectedIdx >= 0) renderAllPlansOnMap();
+}
+
+// Persist the (edited) journey so a reload resumes the new plan. Passed
+// { logSelect: false } so it does NOT append a generic 'select' history row —
+// the edit (departure_change / walk_bike_change) already logged its own event.
+function persistLiveJourney() {
+  if (!window.MaaSLive || !live.plan) return;
+  try {
+    window.MaaSLive.saveJourney({
+      id: live.journeyId,
+      payload: { plan: live.plan, descriptor: live.descriptor, queryVars: live.queryVars },
+      originLabel: el('lv-origin').textContent, destinationLabel: el('lv-dest').textContent,
+      status: 'active', summary: 'Journey updated',
+    }, { logSelect: false });
+  } catch (err) { console.warn('persistLiveJourney failed', err); }
+}
+
+// ── Resume a persisted active journey ─────────────────────────
+// On load (after the bridge is ready) a non-intrusive planner banner offers to
+// re-enter the Live view reconstructed from the stored payload — never auto-enters.
+function maybeShowResume() {
+  const banner = el('lv-resume');
+  if (!banner) return;
+  let j = null;
+  try { j = window.MaaSLive?.getJourney?.(); } catch (err) { console.warn('getJourney failed', err); }
+  const inLive = !el('live-view').hidden;
+  const ok = !inLive && j && j.status === 'active' && j.payload && j.payload.plan;
+  if (!ok) { banner.hidden = true; return; }
+  banner.replaceChildren();
+  banner.appendChild(mkEl('span', 'lv-dot'));
+  banner.appendChild(mkEl('span', 'lv-resume-od',
+    `Resume ${j.originLabel || 'journey'} → ${j.destinationLabel || ''}`));
+  banner.appendChild(mkEl('span', 'lv-resume-go', '→'));
+  banner.onclick = () => resumeLiveJourney(j);
+  banner.hidden = false;
+}
+
+function resumeLiveJourney(j) {
+  if (!window.MaaSLive || !j || !j.payload || !j.payload.plan) return;
+  const { plan, descriptor, queryVars } = j.payload;
+  live.journeyId = j.id;
+  live.queryVars = queryVars || null;
+  enterLiveView(
+    plan,
+    descriptor || planToDescriptor(plan),
+    j.originLabel || (plan.legs?.[0]?.from?.node?.name) || 'Start',
+    j.destinationLabel || (plan.legs?.[plan.legs.length - 1]?.to?.node?.name) || 'Destination',
+  );
+}
+
+// ── Journey history ───────────────────────────────────────────
+function openLiveHistory() {
+  const listEl = el('lv-hist-list');
+  listEl.replaceChildren();
+  const persistent = !!(window.MaaSLive && window.MaaSLive.persistent);
+  el('lv-hist-note').textContent = persistent ? '' : 'Session only — not saved on this device';
+  let events = [];
+  try { events = window.MaaSLive?.listEvents({ limit: 100 }) || []; }
+  catch (err) { console.warn('listEvents failed', err); }
+  if (!events.length) {
+    listEl.appendChild(mkEl('div', 'lv-hist-empty', 'No changes recorded yet.'));
+  } else {
+    const labels = { select: 'Started', departure_change: 'Departure', walk_bike_change: 'Route', backup_set: 'Backup', switch: 'Reroute' };
+    events.forEach(ev => {
+      const row = mkEl('div', 'lv-hev');
+      row.appendChild(mkEl('div', 'lv-hev-k', labels[ev.kind] || ev.kind));
+      const b = mkEl('div', 'lv-hev-b');
+      b.appendChild(mkEl('div', 'lv-hev-s', ev.summary || '—'));
+      b.appendChild(mkEl('div', 'lv-hev-t', fmtEventTime(ev.ts)));
+      row.appendChild(b);
+      listEl.appendChild(row);
+    });
+  }
+  el('lv-hist').hidden = false;
+}
+
+function fmtEventTime(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts || '';
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+el('lv-close').addEventListener('click', exitLiveView);
+setupMapDrag();
+el('lv-hist-btn').addEventListener('click', openLiveHistory);
+el('lv-hist-close').addEventListener('click', () => { el('lv-hist').hidden = true; });
+el('lv-sheet').addEventListener('click', e => { if (e.target === el('lv-sheet')) closeLiveSheet(); });
+window.addEventListener('resize', () => {
+  if (!el('live-view').hidden && live.mapAnchor != null) applyMapAnchor(live.mapAnchor, false);
+});
+window.addEventListener('offline', () => { stopLivePoll(); updateNetBadge(); });
+window.addEventListener('online', () => {
+  updateNetBadge();
+  if (!el('live-view').hidden && live.plan) {
+    pollLive();
+    if (!live.timer) live.timer = setInterval(pollLive, LIVE_POLL_MS);
+  }
+});
 
 // ── Trip drill-down modal ─────────────────────────────────────
 function openTripModal(leg) {
@@ -2874,7 +4474,10 @@ document.addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') { reverseEndpoints(); return; }
   if (e.key === 'n' || e.key === 'N') { el('now-btn').click(); return; }
   if (e.key === 'Enter' || e.key === 'g' || e.key === 'G') { runQuery(); return; }
-  if (e.key === 'Escape') { el('trip-modal').classList.remove('open'); return; }
+  if (e.key === 'Escape') {
+    if (!el('live-view').hidden) { exitLiveView(); return; }
+    el('trip-modal').classList.remove('open'); return;
+  }
   if ((e.key === 'ArrowDown' || e.key === 'j') && state.plans.length) {
     e.preventDefault();
     const ord = state.displayOrder.length ? state.displayOrder : state.plans.map((_, i) => i);
@@ -2893,8 +4496,42 @@ document.addEventListener('keydown', e => {
 
 // ── Bootstrap ─────────────────────────────────────────────────
 loadFromUrl();
+fillDateTimeIfEmpty();
+doSyncUrl();
 const _p = readUrl();
 if (_p.has('fromLat') && _p.has('toLat')) runQuery();
+
+// ── PWA: service worker + install affordance ───────────────────
+(function () {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+
+  navigator.serviceWorker.register('/sw.js').catch(function () {});
+
+  let _deferredPrompt = null;
+  const installBtn = document.getElementById('pwa-install-btn');
+
+  window.addEventListener('beforeinstallprompt', function (e) {
+    e.preventDefault();
+    _deferredPrompt = e;
+    if (installBtn) installBtn.style.display = '';
+  });
+
+  if (installBtn) {
+    installBtn.addEventListener('click', function () {
+      if (!_deferredPrompt) return;
+      _deferredPrompt.prompt();
+      _deferredPrompt.userChoice.then(function () {
+        _deferredPrompt = null;
+        installBtn.style.display = 'none';
+      });
+    });
+  }
+
+  window.addEventListener('appinstalled', function () {
+    _deferredPrompt = null;
+    if (installBtn) installBtn.style.display = 'none';
+  });
+}());
 </script>
 </body>
 </html>

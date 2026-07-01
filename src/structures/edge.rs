@@ -11,6 +11,20 @@ pub enum EdgeData {
     Transit(TransitEdgeData),
 }
 
+/// A pedestrian vertical connector that bridges OSM `level`s — the
+/// infrastructure that makes a platform (`level=1`) reachable from a `level=0`
+/// concourse. Classified from the OSM way tag (NOT derived from node levels: a
+/// flat concourse footway can share a node with a platform yet is *not* a
+/// connector). Stored in `Graph::connector_edges` (auxiliary OSM data, osm.bin
+/// only). Used by the Stage B1 connector-coverage measurement; B1 does not yet
+/// charge it in routing (see `ConnectorCost`).
+#[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Connector {
+    Steps,
+    Elevator,
+    Ramp,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StreetEdgeData {
     pub origin: NodeID,

@@ -44,4 +44,10 @@ pub struct TransitStopData {
     /// stop_id, STIB pointid) to internal stops.
     #[serde(default)]
     pub id: String,
+    #[serde(default)]
+    pub platform_code: Option<String>,
+    /// GTFS `parent_station` value (empty/absent normalized to `None`). Platforms
+    /// sharing a non-empty value collapse into one station in the station index.
+    #[serde(default)]
+    pub parent_station: Option<String>,
 }

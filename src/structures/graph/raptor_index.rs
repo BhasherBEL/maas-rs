@@ -15,6 +15,42 @@ use crate::{
     },
 };
 
+/// One transit line (GTFS route) serving a station, with its display mode and
+/// colours. `color`/`text_color` are 6-character hex strings (no leading `#`),
+/// or `None` when the feed omits them. Distinct per `(mode, short_name, color)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationLine {
+    pub mode: String,
+    pub short_name: String,
+    pub color: Option<String>,
+    pub text_color: Option<String>,
+}
+
+/// One physical transit station: a group of GTFS platforms collapsed by their
+/// shared (non-empty) `parent_station`. Stops lacking a parent each form their
+/// own standalone station.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationInfo {
+    /// Station id: the shared `parent_station` value, or the lone stop's `stop_id`.
+    pub id: String,
+    pub name: String,
+    pub lat_lng: LatLng,
+    /// Distinct operator (agency) names serving any member platform, sorted.
+    pub operators: Vec<String>,
+    /// Distinct transport-mode labels (e.g. "Bus", "Tramway", "Subway") served by
+    /// any member platform, sorted. Derived after grouping from each member's
+    /// stop→pattern→route route_type via `display_route_type`.
+    #[serde(default)]
+    pub modes: Vec<String>,
+    /// Distinct lines (routes) serving any member platform, deduped by
+    /// `(mode, short_name, color)`. Grouped by mode (Rail, Subway, Tramway, Bus,
+    /// then others alphabetically) and naturally sorted by `short_name` within a mode.
+    #[serde(default)]
+    pub lines: Vec<StationLine>,
+    /// Compact stop indices of the member platforms, ascending.
+    pub platform_stop_indices: Vec<usize>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RaptorIndex {
     pub transit_departures: Vec<TripSegment>,
@@ -42,6 +78,12 @@ pub struct RaptorIndex {
     pub transit_stop_to_node: Vec<NodeID>,
     pub transit_stops_tree: KdTree<f64, usize, [f64; 2]>,
 
+    /// Original GTFS `route_id` string per internal `RouteId` (index = `RouteId.0`).
+    /// Serialized — required to match realtime alert `route_id` fields, which carry
+    /// the raw GTFS string id. Parallel to `transit_routes`.
+    #[serde(default)]
+    pub transit_route_ids: Vec<String>,
+
     /// Original GTFS `trip_id` string per internal `TripId` (index = `TripId.0`).
     /// Serialized — required to match realtime feeds, which key by string id.
     #[serde(default)]
@@ -63,6 +105,21 @@ pub struct RaptorIndex {
     /// explain reconstruction read after the interior-node drop empties `g.nodes`.
     #[serde(default)]
     pub transit_stop_names: Vec<String>,
+
+    /// GTFS `platform_code` per compact stop index (parallel to `transit_stop_ids`).
+    #[serde(default)]
+    pub transit_stop_platform_codes: Vec<Option<String>>,
+
+    /// Deduped physical stations (grouped by `parent_station`). Source of truth;
+    /// the lookup maps below are derived in `build_runtime_indices`.
+    #[serde(default)]
+    pub transit_stations: Vec<StationInfo>,
+    /// compact stop index → station index, derived from `transit_stations`.
+    #[serde(skip)]
+    pub transit_stop_to_station: Vec<u32>,
+    /// station id → station index, derived from `transit_stations`.
+    #[serde(skip)]
+    pub station_id_to_index: HashMap<String, usize>,
 
     #[serde(default)]
     pub transit_stop_reverse_transfers: Vec<(usize, u32)>,
@@ -92,6 +149,13 @@ pub struct RaptorIndex {
 
     #[serde(default = "RaptorIndex::default_walking_speed_mps")]
     pub walking_speed_mps: f64,
+
+    /// Build-time radius (meters) for merging parent-less GTFS stops into a
+    /// same-named physical station. Read during the GTFS ingestion phase by the
+    /// per-provider orphan-absorption preprocessor. Tuning param — not serialized,
+    /// set before the GTFS phase from config.yaml.
+    #[serde(skip, default = "RaptorIndex::default_station_merge_radius_m")]
+    pub station_merge_radius_m: f64,
 
     #[serde(skip, default = "RaptorIndex::default_cycling_speed_mps")]
     pub cycling_speed_mps: f64,
@@ -261,11 +325,17 @@ impl RaptorIndex {
             transit_stop_to_node: Vec::new(),
             transit_stops_tree: KdTree::new(2),
 
+            transit_route_ids: Vec::new(),
             transit_trip_ids: Vec::new(),
             trip_id_to_index: HashMap::new(),
             transit_stop_ids: Vec::new(),
             stop_id_to_index: HashMap::new(),
             transit_stop_names: Vec::new(),
+            transit_stop_platform_codes: Vec::new(),
+
+            transit_stations: Vec::new(),
+            transit_stop_to_station: Vec::new(),
+            station_id_to_index: HashMap::new(),
 
             transit_stop_reverse_transfers: Vec::new(),
             transit_idx_stop_reverse_transfers: Vec::new(),
@@ -279,6 +349,7 @@ impl RaptorIndex {
 
             min_access_secs: Self::default_min_access_secs(),
             walking_speed_mps: Self::default_walking_speed_mps(),
+            station_merge_radius_m: Self::default_station_merge_radius_m(),
             cycling_speed_mps: Self::default_cycling_speed_mps(),
             driving_speed_mps: Self::default_driving_speed_mps(),
             vehicle_access_secs: Self::default_vehicle_access_secs(),
@@ -315,6 +386,15 @@ impl RaptorIndex {
 
     pub fn default_walking_speed_mps() -> f64 {
         1.2
+    }
+
+    /// Merge radius (m) for the EXACT normalized-name + SAME-operator/feed case
+    /// only. That match is a strong signal, so it tolerates the spread of big
+    /// interchanges (Gare du Nord surface↔metro ~95-123 m, Merode ~111 m) while
+    /// keeping genuinely distinct same-named STIB stops (>250 m apart) separate. A
+    /// future fuzzy or cross-operator matcher should use its own, tighter value.
+    pub fn default_station_merge_radius_m() -> f64 {
+        250.0
     }
 
     pub fn default_cycling_speed_mps() -> f64 {
@@ -446,11 +526,46 @@ impl RaptorIndex {
             .filter(|(_, s)| !s.is_empty())
             .map(|(i, s)| (s.clone(), i))
             .collect();
+        self.rebuild_station_lookups();
+    }
+
+    /// Derive the station lookup maps from the serialized `transit_stations`.
+    /// Called on both build and load, mirroring the other runtime-index rebuilds.
+    pub fn rebuild_station_lookups(&mut self) {
+        self.station_id_to_index = self
+            .transit_stations
+            .iter()
+            .enumerate()
+            .map(|(i, st)| (st.id.clone(), i))
+            .collect();
+
+        self.transit_stop_to_station = vec![u32::MAX; self.transit_stop_to_node.len()];
+        for (station_idx, st) in self.transit_stations.iter().enumerate() {
+            for &compact in &st.platform_stop_indices {
+                if compact < self.transit_stop_to_station.len() {
+                    self.transit_stop_to_station[compact] = station_idx as u32;
+                }
+            }
+        }
+    }
+
+    /// Compact platform stop indices for a GTFS station id, if known.
+    pub fn station_platforms(&self, station_id: &str) -> Option<Vec<usize>> {
+        let idx = *self.station_id_to_index.get(station_id)?;
+        Some(self.transit_stations[idx].platform_stop_indices.clone())
     }
 
     /// Compact stop index for a GTFS `stop_id` string, if known.
     pub fn stop_index_of(&self, stop_id: &str) -> Option<usize> {
         self.stop_id_to_index.get(stop_id).copied()
+    }
+
+    /// Original GTFS `route_id` string for the route of an internal `TripId`, if known.
+    /// Returns `None` when either the trip or the route-id mapping is absent (e.g. on
+    /// old `graph.bin` files loaded before `transit_route_ids` was added).
+    pub fn route_id_of_trip(&self, trip: TripId) -> Option<&str> {
+        let route_idx = self.transit_trips.get(trip.0 as usize)?.route_id.0 as usize;
+        self.transit_route_ids.get(route_idx).map(|s| s.as_str())
     }
 
     /// Original GTFS `trip_id` string for an internal `TripId`, if known.
@@ -637,6 +752,110 @@ mod tests {
         );
         assert_eq!(idx.trip_index_of("nope"), None);
         assert_eq!(idx.trip_id_str(crate::ingestion::gtfs::TripId(99)), None);
+    }
+
+    #[test]
+    fn route_id_of_trip_resolves_via_trip_info() {
+        use crate::ingestion::gtfs::{RouteId, ServiceId, TripId, TripInfo};
+        let mut idx = RaptorIndex::new();
+        idx.transit_route_ids = vec!["gtfs-route-A".into(), "gtfs-route-B".into()];
+        idx.transit_routes.push(crate::ingestion::gtfs::RouteInfo {
+            route_short_name: "A".into(),
+            route_long_name: "Route A".into(),
+            route_type: gtfs_structures::RouteType::Bus,
+            agency_id: crate::ingestion::gtfs::AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        });
+        idx.transit_routes.push(crate::ingestion::gtfs::RouteInfo {
+            route_short_name: "B".into(),
+            route_long_name: "Route B".into(),
+            route_type: gtfs_structures::RouteType::Bus,
+            agency_id: crate::ingestion::gtfs::AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        });
+        idx.transit_services
+            .push(crate::ingestion::gtfs::ServicePattern {
+                days_of_week: 0x7F,
+                start_date: 0,
+                end_date: 9999,
+                added_dates: vec![],
+                removed_dates: vec![],
+            });
+        idx.transit_trips.push(TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        });
+        idx.transit_trips.push(TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(1),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        });
+
+        assert_eq!(idx.route_id_of_trip(TripId(0)), Some("gtfs-route-A"));
+        assert_eq!(idx.route_id_of_trip(TripId(1)), Some("gtfs-route-B"));
+        assert_eq!(idx.route_id_of_trip(TripId(99)), None, "out-of-bounds trip → None");
+    }
+
+    #[test]
+    fn route_id_of_trip_none_when_transit_route_ids_empty() {
+        use crate::ingestion::gtfs::{RouteId, ServiceId, TripId, TripInfo};
+        let mut idx = RaptorIndex::new();
+        idx.transit_trips.push(TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        });
+        assert_eq!(
+            idx.route_id_of_trip(TripId(0)),
+            None,
+            "empty transit_route_ids → None (old graph.bin graceful degradation)"
+        );
+    }
+
+    #[test]
+    fn station_lookups_rebuild_from_serialized_stations() {
+        let mut idx = RaptorIndex::new();
+        idx.transit_stop_to_node = vec![NodeID(0), NodeID(1), NodeID(2)];
+        idx.transit_stations = vec![
+            StationInfo {
+                id: "HUB".into(),
+                name: "Hub".into(),
+                lat_lng: LatLng {
+                    latitude: 51.0,
+                    longitude: 3.7,
+                },
+                operators: vec!["Op".into()],
+                modes: vec!["Bus".into()],
+                lines: Vec::new(),
+                platform_stop_indices: vec![0, 1],
+            },
+            StationInfo {
+                id: "SOLO".into(),
+                name: "Solo".into(),
+                lat_lng: LatLng {
+                    latitude: 50.0,
+                    longitude: 4.0,
+                },
+                operators: vec![],
+                modes: vec![],
+                lines: Vec::new(),
+                platform_stop_indices: vec![2],
+            },
+        ];
+
+        idx.rebuild_station_lookups();
+
+        assert_eq!(idx.station_id_to_index["HUB"], 0);
+        assert_eq!(idx.station_id_to_index["SOLO"], 1);
+        assert_eq!(idx.transit_stop_to_station, vec![0, 0, 1]);
+        assert_eq!(idx.station_platforms("HUB"), Some(vec![0, 1]));
+        assert_eq!(idx.station_platforms("nope"), None);
     }
 
     #[test]

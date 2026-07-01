@@ -244,7 +244,9 @@ pub(super) fn access_timing(
 ) -> (u32, u32, usize) {
     let window = board.saturating_sub(earliest);
     let cur = highlight_index(options, Some(window), balance);
-    let leg_start = board.saturating_sub(options[cur].p50).max(earliest);
+    // `.min(board)`: an access leg can never start after it ends (the boarding
+    // time), even if `earliest` is somehow later than `board`.
+    let leg_start = board.saturating_sub(options[cur].p50).max(earliest).min(board);
     let leave_by = board.saturating_sub(options[cur].p95);
     (leg_start, leave_by, cur)
 }

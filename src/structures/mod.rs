@@ -1,3 +1,4 @@
+mod address;
 mod bike_attrs;
 mod bike_profile;
 mod config;
@@ -14,6 +15,10 @@ mod realtime;
 mod street_time;
 mod surface_speed;
 
+pub use address::{
+    ADDRESS_ATTRIBUTION, AddressBox, AddressHit, AddressIndex, AddressIndexBuilder, AddressRecord,
+    AddressSearchParams, DEFAULT_BOX_COORD_EPSILON_M, Named, normalize as normalize_address,
+};
 pub use bike_attrs::{BikeAttrs, HighwayClass, Surface};
 pub use bike_profile::{BikeProfile, HighwayFactors};
 pub use config::*;

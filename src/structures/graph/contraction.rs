@@ -2096,6 +2096,8 @@ mod tests {
                 longitude: 4.002,
             },
             accessibility: Availability::Available,
+            platform_code: None,
+            parent_station: None,
         }));
         g.build_raptor_index();
         assert_ne!(

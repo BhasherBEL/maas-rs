@@ -272,6 +272,7 @@ impl Graph {
         mut debug_sink: Option<&mut Vec<PlanCandidate>>,
         departure_stamp: u32,
         arena: &[Label],
+        onboard: bool,
     ) -> Vec<Plan> {
         use super::MAX_ROUNDS;
 
@@ -281,7 +282,7 @@ impl Graph {
         let class_of = |vs: VehicleState| -> usize {
             match vs {
                 VehicleState::Walked => 0,
-                VehicleState::BikeInHand | VehicleState::BikeDropped => 1,
+                VehicleState::BikeInHand | VehicleState::BikeDropped | VehicleState::BikeEgress => 1,
                 VehicleState::CarParked | VehicleState::CarEgress => 2,
             }
         };
@@ -301,7 +302,7 @@ impl Graph {
         for k in 0..=MAX_ROUNDS {
             // For this round, the earliest arrival (incl. egress walk/ride) per
             // (class, bucket), and which (stop, walk, state) achieves it.
-            let mut per_key: Vec<Option<(u32, usize, u32, usize)>> = vec![None; n_keys];
+            let mut per_key: Vec<Option<(u32, bool, usize, u32, usize)>> = vec![None; n_keys];
             for (sidx, vs) in mc.am.states() {
                 let class = class_of(vs);
                 for &(s, w) in &mc.egress[sidx] {
@@ -312,9 +313,15 @@ impl Graph {
                         let b = buckets.bucket(l.reliability) as usize;
                         let key = class * n_buckets + b;
                         let arr = l.bag.earliest().saturating_add(w);
+                        let intra_member_transfer = l.trace.is_transfer()
+                            && mc
+                                .dest_station
+                                .as_ref()
+                                .is_some_and(|m| m.contains(&(l.trace.from_stop as usize)));
                         match per_key[key] {
-                            Some((cur, ..)) if cur <= arr => {}
-                            _ => per_key[key] = Some((arr, s, w, sidx)),
+                            Some((cur_arr, cur_intra, ..))
+                                if (cur_arr, cur_intra) <= (arr, intra_member_transfer) => {}
+                            _ => per_key[key] = Some((arr, intra_member_transfer, s, w, sidx)),
                         }
                     }
                 }
@@ -322,7 +329,7 @@ impl Graph {
 
             for key in 0..n_keys {
                 let b = key % n_buckets;
-                let (best_arr, best_stop, best_walk, dest_sidx) = match per_key[key] {
+                let (best_arr, _best_intra, best_stop, best_walk, dest_sidx) = match per_key[key] {
                     Some(t) => t,
                     None => continue,
                 };
@@ -361,6 +368,10 @@ impl Graph {
                     // up by car at the destination station (kiss & ride).
                     VehicleState::CarParked => Mode::CarDropOff,
                     VehicleState::CarEgress => Mode::CarPickup,
+                    // BikeEgress = walked to the access stop, took transit, then a
+                    // bike waiting at the destination station for the final leg
+                    // (the bike mirror of CarPickup / kiss & ride).
+                    VehicleState::BikeEgress => Mode::BikePickup,
                     // Bike-rooted: the egress state tells park-and-ride apart from
                     // carry-on-board. BikeInHand egress = bike ridden to the
                     // destination; BikeDropped egress = parked at the station and
@@ -419,7 +430,7 @@ impl Graph {
                         date,
                         weekday,
                     );
-                    self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday);
+                    self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday, onboard);
                 }
 
                 // Realtime post-pass: shift leg times by live delays, re-chain the
@@ -432,7 +443,7 @@ impl Graph {
                 Self::link_following_connections(&mut legs);
 
                 let (access_profile, access_mode) = match root_vs {
-                    VehicleState::Walked | VehicleState::CarEgress => {
+                    VehicleState::Walked | VehicleState::CarEgress | VehicleState::BikeEgress => {
                         (StreetProfile::Foot, Mode::Walk)
                     }
                     VehicleState::BikeInHand | VehicleState::BikeDropped => {
@@ -494,7 +505,9 @@ impl Graph {
 
                 if best_walk > 0 {
                     let (egress_profile, egress_mode) = match dest_vs {
-                        VehicleState::BikeInHand => (StreetProfile::Bike, Mode::Bike),
+                        VehicleState::BikeInHand | VehicleState::BikeEgress => {
+                            (StreetProfile::Bike, Mode::Bike)
+                        }
                         VehicleState::CarEgress => (StreetProfile::Car, Mode::Car),
                         _ => (StreetProfile::Foot, Mode::Walk),
                     };
@@ -1138,6 +1151,7 @@ impl Graph {
         lambda: &[Vec<u32>],
         date: u32,
         weekday: u8,
+        onboard: bool,
     ) {
         let transit_indices: Vec<usize> = legs
             .iter()
@@ -1209,7 +1223,10 @@ impl Graph {
                 max_alighting
             };
 
-            if max_alighting > 0 {
+            // Onboard plans must never re-time leg[0]: the user is already aboard
+            // that specific vehicle, so swapping it to a later same-pattern
+            // departure would put them on a trip they are not riding.
+            if max_alighting > 0 && !(onboard && i == 0) {
                 let min_dep = if i == 0 { leg_start } else { current_time };
 
                 if let Some((dep_idx, new_dep, _)) = self.latest_departure_before_arrival(
@@ -2127,6 +2144,9 @@ mod tests {
             modes: Some(vec![Mode::Walk, Mode::WalkTransit]),
             bike_profile: None,
             terminal_deadline: false,
+            onboard_origin: None,
+            from_station_id: None,
+            to_station_id: None,
         };
 
         eprintln!("SMOKE stop_count={}", g.raptor.transit_stop_to_node.len());

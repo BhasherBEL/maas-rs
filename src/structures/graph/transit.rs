@@ -15,6 +15,19 @@ use crate::{
 
 use super::Graph;
 
+/// One same-station backup departure: a trip leaving the same boarding stop and
+/// reaching the same alighting stop as a reference leg, possibly on a different
+/// route. Scheduled times only — realtime is layered on by the resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationBackup {
+    pub trip: TripId,
+    pub route: crate::ingestion::gtfs::RouteId,
+    pub scheduled_departure: u32,
+    pub scheduled_arrival: u32,
+    /// True when this backup runs on the same route as the reference trip.
+    pub same_route: bool,
+}
+
 impl Graph {
     pub fn get_transit_departures_size(&self) -> usize {
         self.raptor.transit_departures.len()
@@ -66,12 +79,42 @@ impl Graph {
         self.raptor.transit_stop_ids.get(stop).map(|s| s.as_str())
     }
 
+    /// GTFS `stop_id` string for a `NodeID`, if it is a transit stop.
+    pub fn stop_id_of_node(&self, id: NodeID) -> Option<&str> {
+        let compact = *self.raptor.transit_node_to_stop.get(id.0)?;
+        if compact == u32::MAX {
+            return None;
+        }
+        self.stop_id_str(compact as usize)
+    }
+
+    /// GTFS `platform_code` for a `NodeID`, if it is a transit stop with a platform.
+    pub fn platform_code_of_node(&self, id: NodeID) -> Option<&str> {
+        let compact = *self.raptor.transit_node_to_stop.get(id.0)?;
+        if compact == u32::MAX {
+            return None;
+        }
+        self.raptor.transit_stop_platform_codes.get(compact as usize)?.as_deref()
+    }
+
+    /// GTFS `platform_code` for a compact stop index.
+    pub fn platform_code_of_stop(&self, stop: usize) -> Option<&str> {
+        self.raptor.transit_stop_platform_codes.get(stop)?.as_deref()
+    }
+
     pub fn get_transit_routes_size(&self) -> usize {
         self.raptor.transit_routes.len()
     }
 
     pub fn add_transit_routes(&mut self, routes: Vec<RouteInfo>) {
         self.raptor.transit_routes.extend(routes);
+    }
+
+    /// Append raw GTFS `route_id` strings, aligned 1:1 with `add_transit_routes` so
+    /// index `i` corresponds to the ith appended `RouteInfo`. Required by route-level
+    /// alert matching; old graphs without this field silently skip route alerts.
+    pub fn add_transit_route_ids(&mut self, ids: Vec<String>) {
+        self.raptor.transit_route_ids.extend(ids);
     }
 
     pub fn get_transit_agencies_size(&self) -> usize {
@@ -116,6 +159,60 @@ impl Graph {
                 )
             })
             .collect()
+    }
+
+    /// Deduped physical stations as (id, name, lat, lon, operators, modes, lines,
+    /// platform_count). Platforms are grouped by GTFS `parent_station`; standalone
+    /// stops each form one station. Operators are the distinct agency names serving
+    /// any member; modes are the distinct transport-type labels served by any member;
+    /// lines are the distinct routes (with mode + colours) serving any member.
+    #[allow(clippy::type_complexity)]
+    pub fn gtfs_stations(
+        &self,
+    ) -> Vec<(
+        String,
+        String,
+        f64,
+        f64,
+        Vec<String>,
+        Vec<String>,
+        Vec<crate::structures::graph::StationLine>,
+        usize,
+    )> {
+        self.raptor
+            .transit_stations
+            .iter()
+            .map(|st| {
+                (
+                    st.id.clone(),
+                    st.name.clone(),
+                    st.lat_lng.latitude,
+                    st.lat_lng.longitude,
+                    st.operators.clone(),
+                    st.modes.clone(),
+                    st.lines.clone(),
+                    st.platform_stop_indices.len(),
+                )
+            })
+            .collect()
+    }
+
+    /// Compact platform stop indices for a station id, for future zero-cost-hub
+    /// access/egress routing to any platform of a chosen station.
+    pub fn station_platforms(&self, station_id: &str) -> Option<Vec<usize>> {
+        self.raptor.station_platforms(station_id)
+    }
+
+    /// A chosen station's representative coordinate and its member platform
+    /// compact indices, for zero-cost station-hub access/egress. `None` when the
+    /// id is unknown or the station has no platforms.
+    pub fn station_endpoint(&self, station_id: &str) -> Option<(crate::structures::LatLng, Vec<usize>)> {
+        let idx = *self.raptor.station_id_to_index.get(station_id)?;
+        let st = &self.raptor.transit_stations[idx];
+        if st.platform_stop_indices.is_empty() {
+            return None;
+        }
+        Some((st.lat_lng, st.platform_stop_indices.clone()))
     }
 
     /// G-free plan-node resolution for a `NodeID`: its coordinate (via `node_loc`,
@@ -386,6 +483,107 @@ impl Graph {
         candidates
     }
 
+    /// Same-station backups for a reference transit leg identified by GTFS handles
+    /// (`original_trip` boarding compact stop `board`, alighting compact stop
+    /// `alight`): every OTHER trip leaving `board` and reaching `alight` — including
+    /// trips on different routes — active on `(date, weekday)`. The reference trip
+    /// itself is excluded; same-route sibling trips are kept (they are the obvious
+    /// "next one from this platform"). Trips that serve `board` but never reach
+    /// `alight` are excluded.
+    ///
+    /// `before` latest departures strictly before, and `after` earliest departures
+    /// at or after, the reference trip's scheduled departure are returned, merged
+    /// and sorted chronologically by scheduled departure. Returns an empty vector
+    /// when a handle is unknown or `original_trip` does not serve `board → alight`.
+    pub fn station_backups(
+        &self,
+        original_trip: TripId,
+        board: usize,
+        alight: usize,
+        before: usize,
+        after: usize,
+        date: u32,
+        weekday: u8,
+    ) -> Vec<StationBackup> {
+        use std::collections::HashSet;
+
+        let Some((reference_departure, _)) =
+            self.scheduled_trip_leg_times(original_trip, board, alight)
+        else {
+            return vec![];
+        };
+        let Some(&alight_node) = self.raptor.transit_stop_to_node.get(alight) else {
+            return vec![];
+        };
+        let original_route = self.get_trip(original_trip).map(|t| t.route_id);
+
+        let pats = match self.raptor.transit_idx_stop_patterns.get(board) {
+            Some(l) => l.of(&self.raptor.transit_stop_patterns),
+            None => return vec![],
+        };
+
+        let mut seen_trips: HashSet<TripId> = HashSet::new();
+        let mut candidates: Vec<StationBackup> = Vec::new();
+
+        for &(pattern_id, boarding_pos) in pats {
+            let p = pattern_id.0 as usize;
+            let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
+            if n_trips == 0 {
+                continue;
+            }
+            let route = self.raptor.transit_patterns[p].route;
+            let pat_stops =
+                self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
+            let Some(off) = pat_stops[boarding_pos as usize + 1..]
+                .iter()
+                .position(|&n| n == alight_node)
+            else {
+                continue;
+            };
+            let alighting_pos = boarding_pos as usize + 1 + off;
+
+            let all_times = self.raptor.transit_idx_pattern_stop_times[p]
+                .of(&self.raptor.transit_pattern_stop_times);
+            let trip_ids =
+                self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
+            let boarding_col =
+                &all_times[boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
+            let alighting_col = &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
+
+            for t in 0..n_trips {
+                let trip_id = trip_ids[t];
+                if trip_id == original_trip || seen_trips.contains(&trip_id) {
+                    continue;
+                }
+                let service_id = self.raptor.transit_trips[trip_id.0 as usize].service_id;
+                if !self.raptor.transit_services[service_id.0 as usize].is_active(date, weekday) {
+                    continue;
+                }
+                seen_trips.insert(trip_id);
+                candidates.push(StationBackup {
+                    trip: trip_id,
+                    route,
+                    scheduled_departure: boarding_col[t].departure,
+                    scheduled_arrival: alighting_col[t].arrival,
+                    same_route: Some(route) == original_route,
+                });
+            }
+        }
+
+        let (mut earlier, mut later): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|c| c.scheduled_departure < reference_departure);
+        earlier.sort_by_key(|c| std::cmp::Reverse(c.scheduled_departure));
+        earlier.truncate(before);
+        later.sort_by_key(|c| c.scheduled_departure);
+        later.truncate(after);
+
+        let mut out = earlier;
+        out.extend(later);
+        out.sort_by_key(|c| c.scheduled_departure);
+        out
+    }
+
     // RAPTOR pattern management
 
     pub fn push_transit_pattern(&mut self, p: PatternInfo) {
@@ -469,6 +667,54 @@ impl Graph {
     pub fn route_type_of_trip(&self, trip_id: TripId) -> Option<RouteType> {
         let route_id = self.get_trip(trip_id)?.route_id;
         self.get_route(route_id).map(|r| r.route_type)
+    }
+
+    /// Scheduled `(board departure, alight arrival)` in seconds since the service
+    /// midnight for `trip` travelling from compact stop `board` to compact stop
+    /// `alight`, read straight from the static column-major pattern stop-time
+    /// arrays (the same source RAPTOR plan reconstruction uses). `None` when no
+    /// pattern carries `trip` with `board` preceding `alight` — i.e. the leg
+    /// descriptor does not match the static schedule.
+    pub fn scheduled_trip_leg_times(
+        &self,
+        trip: TripId,
+        board: usize,
+        alight: usize,
+    ) -> Option<(u32, u32)> {
+        let alight_node = *self.raptor.transit_stop_to_node.get(alight)?;
+        let pats = self
+            .raptor
+            .transit_idx_stop_patterns
+            .get(board)?
+            .of(&self.raptor.transit_stop_patterns);
+
+        for &(pattern_id, board_pos) in pats {
+            let p = pattern_id.0 as usize;
+            let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
+            if n_trips == 0 {
+                continue;
+            }
+            let trip_ids =
+                self.raptor.transit_idx_pattern_trips[p].of(&self.raptor.transit_pattern_trips);
+            let Some(t) = trip_ids.iter().position(|&tid| tid == trip) else {
+                continue;
+            };
+            let pat_stops =
+                self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops);
+            let Some(off) = pat_stops[board_pos as usize + 1..]
+                .iter()
+                .position(|&n| n == alight_node)
+            else {
+                continue;
+            };
+            let alight_pos = board_pos as usize + 1 + off;
+            let times = self.raptor.transit_idx_pattern_stop_times[p]
+                .of(&self.raptor.transit_pattern_stop_times);
+            let dep = times[board_pos as usize * n_trips + t].departure;
+            let arr = times[alight_pos * n_trips + t].arrival;
+            return Some((dep, arr));
+        }
+        None
     }
 
     /// Returns the latest trip across all RAPTOR patterns serving both
@@ -616,6 +862,148 @@ impl Graph {
             self.raptor.transit_pattern_shapes[p] = pts;
             self.raptor.transit_pattern_shape_stop_idx[p] = stop_idx;
         }
+    }
+
+    /// WGS84 coordinate of compact stop `stop`, or `None` when out of range.
+    pub fn stop_lat_lng(&self, stop: usize) -> Option<LatLng> {
+        let node_id = *self.raptor.transit_stop_to_node.get(stop)?;
+        Some(self.node_loc(node_id))
+    }
+
+    /// Interpolated vehicle position: `distance_m` metres ahead of compact stop
+    /// `stop_compact` along the stored shape polyline for the pattern that owns
+    /// `trip`. Returns `None` when the trip has no stored shape, the stop is not
+    /// found in any serving pattern, or the shape data is inconsistent — callers
+    /// should fall back to the stop coordinate in that case.
+    pub fn interpolate_along_trip_shape(
+        &self,
+        trip: TripId,
+        stop_compact: usize,
+        distance_m: f64,
+    ) -> Option<LatLng> {
+        let pats = self.raptor
+            .transit_idx_stop_patterns
+            .get(stop_compact)?
+            .of(&self.raptor.transit_stop_patterns);
+
+        for &(pattern_id, stop_pos) in pats {
+            let p = pattern_id.0 as usize;
+            let trip_ids = self.raptor
+                .transit_idx_pattern_trips
+                .get(p)?
+                .of(&self.raptor.transit_pattern_trips);
+
+            if !trip_ids.contains(&trip) {
+                continue;
+            }
+
+            let (shape, stop_idx_in_shape) = self.get_pattern_shape(p)?;
+            let shape_vertex = *stop_idx_in_shape.get(stop_pos as usize)? as usize;
+            return Some(advance_along_shape(shape, shape_vertex, distance_m));
+        }
+        None
+    }
+}
+
+/// Advances `distance_m` metres forward along `shape` starting from
+/// `start_vertex`, walking segment by segment with haversine lengths. Returns
+/// the interpolated point when the distance is consumed, or the last shape
+/// vertex if the polyline runs out. Returns `(0, 0)` when the shape is empty
+/// or `start_vertex` is out of range.
+pub(crate) fn advance_along_shape(
+    shape: &[LatLng],
+    start_vertex: usize,
+    distance_m: f64,
+) -> LatLng {
+    if shape.is_empty() || start_vertex >= shape.len() {
+        return LatLng { latitude: 0.0, longitude: 0.0 };
+    }
+    if distance_m <= 0.0 || start_vertex + 1 >= shape.len() {
+        return shape[start_vertex];
+    }
+    let mut remaining = distance_m;
+    for i in start_vertex..shape.len() - 1 {
+        let seg_len = shape[i].dist(shape[i + 1]);
+        if remaining <= seg_len {
+            let t = if seg_len > 0.0 { remaining / seg_len } else { 0.0 };
+            return LatLng {
+                latitude: shape[i].latitude + t * (shape[i + 1].latitude - shape[i].latitude),
+                longitude: shape[i].longitude + t * (shape[i + 1].longitude - shape[i].longitude),
+            };
+        }
+        remaining -= seg_len;
+    }
+    *shape.last().unwrap()
+}
+
+#[cfg(test)]
+mod advance_along_shape_tests {
+    use super::*;
+
+    fn pt(lat: f64, lng: f64) -> LatLng {
+        LatLng { latitude: lat, longitude: lng }
+    }
+
+    #[test]
+    fn empty_shape_returns_zero() {
+        let r = advance_along_shape(&[], 0, 100.0);
+        assert_eq!(r.latitude, 0.0);
+        assert_eq!(r.longitude, 0.0);
+    }
+
+    #[test]
+    fn out_of_range_start_vertex_returns_zero() {
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0)];
+        let r = advance_along_shape(&shape, 5, 50.0);
+        assert_eq!(r.latitude, 0.0);
+    }
+
+    #[test]
+    fn zero_distance_returns_start_vertex() {
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0)];
+        let r = advance_along_shape(&shape, 0, 0.0);
+        assert!((r.latitude - 50.0).abs() < 1e-9);
+        assert!((r.longitude - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn negative_distance_returns_start_vertex() {
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0)];
+        let r = advance_along_shape(&shape, 0, -10.0);
+        assert!((r.latitude - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn advances_past_first_vertex_into_second_segment() {
+        // Three vertices going north: A(50.0) → B(50.001) → C(50.002)
+        // Segment A→B ≈ 111 m, total 222 m.
+        // Advance 150 m: consumes A→B then 39 m into B→C.
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0), pt(50.002, 4.0)];
+        let r = advance_along_shape(&shape, 0, 150.0);
+        // Must be past B (lat > 50.001) and before C (lat < 50.002).
+        assert!(r.latitude > 50.001, "should be past B: lat={}", r.latitude);
+        assert!(r.latitude < 50.002, "should be before C: lat={}", r.latitude);
+        assert!((r.longitude - 4.0).abs() < 1e-9);
+        // Total haversine distance from A should be ≈ 150 m (within 5 m).
+        let a = pt(50.0, 4.0);
+        let dist = a.dist(r);
+        assert!((dist - 150.0).abs() < 5.0, "expected ~150 m, got {dist}");
+    }
+
+    #[test]
+    fn excess_distance_clamps_to_last_vertex() {
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0)];
+        let r = advance_along_shape(&shape, 0, 99_999.0);
+        assert!((r.latitude - 50.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn start_from_middle_vertex() {
+        let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0), pt(50.002, 4.0)];
+        // Start from B, advance 50 m into B→C.
+        let r = advance_along_shape(&shape, 1, 50.0);
+        assert!(r.latitude > 50.001);
+        assert!(r.latitude < 50.002);
     }
 }
 

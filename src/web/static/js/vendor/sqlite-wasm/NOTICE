@@ -1,0 +1,14 @@
+These files (sqlite3.mjs, sqlite3.wasm) are vendored from the npm package
+`@sqlite.org/sqlite-wasm` version 3.53.0-build1.
+
+The SQLite C library core (compiled into sqlite3.wasm) is in the public domain
+under the SQLite "blessing": "May you do good and not evil. May you find
+forgiveness for yourself and forgive others. May you share freely, never taking
+more than you give."
+
+The JavaScript/WASM wrapper (sqlite3.mjs and the surrounding glue code) is
+licensed under the Apache License, Version 2.0, by the SQLite developers:
+https://www.apache.org/licenses/LICENSE-2.0
+
+The npm package itself ships no separate license file; the full upstream license
+terms are documented in that package's metadata and at the URL above.
