@@ -1,10 +1,12 @@
 use crate::ingestion::gtfs::{StopTime, TripId};
+use crate::structures::RealtimeIndex;
 
 use super::Graph;
 
 impl Graph {
     /// Find the latest trip (by index) in `col` whose arrival is ≤ `max_arrival`
     /// and that is active on the given date/weekday.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn latest_trip_arriving_at_stop_before(
         &self,
         col: &[StopTime],
@@ -12,13 +14,24 @@ impl Graph {
         max_arrival: u32,
         date: u32,
         weekday: u8,
+        rt: &RealtimeIndex,
     ) -> Option<usize> {
         // Scan backward: trips are sorted by departure but arrival ordering is
         // not strictly guaranteed across all GTFS feeds, so avoid partition_point.
         for t in (0..col.len()).rev() {
-            if col[t].arrival <= max_arrival {
+            // This stop is the ALIGHTING point for the trip the backward pass rides,
+            // so it must permit alighting (drop_off_type != 1) — the alight half of
+            // the forward chain oracle's board/alight predicate. Inert on an empty
+            // index (alight_allowed defaults true) → byte-identical with no feed.
+            if col[t].arrival <= max_arrival && col[t].alight_allowed {
+                // Same schedule-activity AND cancellation predicate the forward
+                // chain oracle (`latest_departure_before_arrival`) uses, so the
+                // lambda backward bounds and the chain bounds agree under the DIFF
+                // gate. Inert on an empty index → byte-identical with no feed.
                 let svc = self.raptor.transit_trips[trip_ids[t].0 as usize].service_id;
-                if self.raptor.transit_services[svc.0 as usize].is_active(date, weekday) {
+                if self.raptor.transit_services[svc.0 as usize].is_active(date, weekday)
+                    && !rt.is_canceled(trip_ids[t])
+                {
                     return Some(t);
                 }
             }
@@ -34,6 +47,7 @@ impl Graph {
     ///
     /// `num_transit_legs` is the number of transit legs K reconstructed from
     /// the forward pass.  `lambda` has dimensions `[0..=K][0..n_stops]`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn raptor_backward(
         &self,
         target_compact_stop: usize,
@@ -41,6 +55,7 @@ impl Graph {
         num_transit_legs: usize,
         date: u32,
         weekday: u8,
+        rt: &RealtimeIndex,
     ) -> Vec<Vec<u32>> {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let n_patterns = self.raptor.transit_patterns.len();
@@ -109,8 +124,15 @@ impl Graph {
                     let stop = compact as usize;
                     let col = &all_times[pos * n_trips..(pos + 1) * n_trips];
 
-                    // Step A: propagate t_star — label this (earlier) stop.
-                    if let Some(t) = t_star {
+                    // Step A: propagate t_star — label this (earlier) stop as a
+                    // BOARDING point, so it must permit boarding (pickup_type != 1):
+                    // the board half of the forward chain oracle's predicate. When
+                    // boarding is forbidden here the label is skipped but t_star keeps
+                    // riding backward to an earlier stop that does allow boarding.
+                    // Inert on an empty index (board_allowed defaults true).
+                    if let Some(t) = t_star
+                        && col[t].board_allowed
+                    {
                         let dep = col[t].departure;
                         if dep > 0 && dep > lambda[round][stop] {
                             lambda[round][stop] = dep;
@@ -126,6 +148,7 @@ impl Graph {
                             lambda[round - 1][stop],
                             date,
                             weekday,
+                            rt,
                         )
                     {
                         let update = match t_star {
@@ -151,6 +174,14 @@ impl Graph {
     /// For each currently-marked stop `s`, propagates its backward label to
     /// every stop `src` that can walk TO `s`: `lambda[src] = lambda[s] - walk`.
     /// Only iterates the stops present in `marked` at call time (one hop).
+    ///
+    /// NOTE (unrestricted_transfers / MCR): this reverse pass still uses the capped
+    /// ≤`MAX_TRANSFER_DISTANCE_M` table, so with the forward MCR flag ON a plan whose
+    /// forward transfer is a >1 km walk has no matching backward label. That is SOUND —
+    /// `tighten_with_backward_labels` simply no-ops (never a drop, never a
+    /// fastest-arrival error) — but such long-transfer plans keep looser
+    /// margins/expectedEnd. A reverse multi-source bounded Dijkstra under the same flag
+    /// is the documented companion (design §7); forward-only ships first.
     pub(super) fn apply_reverse_footpaths(
         &self,
         lambda_k: &mut [u32],

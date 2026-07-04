@@ -131,7 +131,7 @@ async fn main() {
     // Apply config.yaml routing defaults (works for all modes). Must run BEFORE the save
     // below so any persisted artifact it builds (e.g. the contracted `g.contracted`)
     // is written into graph.bin rather than rebuilt in RAM on every restore.
-    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing, &config.build.output);
 
     // Drop the interior-node arrays so the served graph (and any graph.bin saved below)
     // carries only the contracted structure. Errors if the loaded graph.bin has no
@@ -173,7 +173,7 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
                 // Apply defaults + finalize here so a cached graph.bin with no contracted
                 // graph self-heals (rebuild) instead of serving broken; the caller
                 // re-applies/finalizes idempotently.
-                maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+                maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing, &config.build.output);
                 match maas_rs::services::build::finalize_contraction(&mut g) {
                     Ok(()) => return Some(g),
                     Err(e) => tracing::info!("cached graph unusable ({e}); rebuilding"),
@@ -214,7 +214,7 @@ fn acquire_auto(config: &Config, cache_dir: &str) -> Option<maas_rs::structures:
     // Apply routing defaults before saving so persisted artifacts (e.g. the contracted
     // `g.contracted`) land in graph.bin. The caller re-applies defaults (idempotent)
     // after this returns.
-    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing, &config.build.output);
     // Drop interior arrays so the saved graph.bin is the contracted form.
     if let Err(e) = maas_rs::services::build::finalize_contraction(&mut g) {
         tracing::error!("{e}");

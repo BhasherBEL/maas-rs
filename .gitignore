@@ -12,3 +12,8 @@ scripts/p3_ab_out/
 
 # Superpowers workflow scratch (briefs, ledgers, reports)
 .superpowers/
+
+# Transient server logs and scratch profiling artifacts
+serve*.log
+serve*.log.*
+scratchpad_*.json

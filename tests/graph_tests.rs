@@ -17,8 +17,8 @@ use maas_rs::{
     structures::{
         ActiveModes, BikeAttrs, BikeCost, BikeProfile, DelayCDF, EdgeData, Endpoint, Graph,
         HighwayClass, LatLng, Mode, NodeData, NodeID, OnboardRide, OsmNodeData, QueryEndpoints,
-        RealtimeIndex, ReliabilityBuckets, StreetEdgeData, StreetProfile, Surface, TransitEdgeData,
-        TransitStopData,
+        RealtimeIndex, ReliabilityBuckets, StreetEdgeData, StreetProfile, StreetTimeModel, Surface,
+        TransitEdgeData, TransitStopData,
         cost::VarGen,
         plan::PlanLeg,
         raptor::{Lookup, PatternInfo},
@@ -153,10 +153,11 @@ fn raptor_modes_ep(
         min_access_secs,
         &buckets,
         g.raptor.arrival_slack_secs,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
         &RealtimeIndex::new(),
         am,
         &BikeCost::new(BikeProfile::default()),
-        false,
         Some(&ep),
     )
 }
@@ -1200,6 +1201,8 @@ fn station_query(from_station: Option<&str>, to_station: Option<&str>) -> RouteQ
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: None,
         bike_profile: None,
@@ -1207,6 +1210,7 @@ fn station_query(from_station: Option<&str>, to_station: Option<&str>) -> RouteQ
         onboard_origin: None,
         from_station_id: from_station.map(|s| s.to_string()),
         to_station_id: to_station.map(|s| s.to_string()),
+        profile_latency: None,
     }
 }
 
@@ -1236,28 +1240,21 @@ fn from_station_id_boards_with_zero_access_walk() {
     let q = station_query(Some(HUB_ORIG), None);
     let plans = route(&g, &q, &RealtimeIndex::new()).expect("a plan from the station");
 
+    // The property under test: a station ORIGIN boards directly with NO leading
+    // access-walk leg. Assert it on the fastest transit-bearing plan. (With
+    // provably-complete egress search the fastest plan here is a single ride plus
+    // a long egress walk, which Pareto-dominates the fixture's 2-leg journey; the
+    // mid-journey transfer-walk-survival property is covered separately by the
+    // both-station tests below, which skip the wide egress pass.)
     let transit = plans
         .iter()
-        .find(|p| transit_leg_count(p) >= 1)
+        .filter(|p| transit_leg_count(p) >= 1)
+        .min_by_key(|p| p.end)
         .expect("a transit-bearing plan");
 
-    // The "no 50 m walk" property, asserted directly on plan output: the journey
-    // boards at the station with NO leading access walk leg.
     assert!(
         matches!(transit.legs.first(), Some(PlanLeg::Transit(_))),
         "station origin must board directly (first leg Transit); got {:?}",
-        leg_kinds(transit)
-    );
-    assert_eq!(
-        transit_leg_count(transit),
-        2,
-        "fixture journey is two transit legs; got {:?}",
-        leg_kinds(transit)
-    );
-    // The zero-cost endpoint change must NOT eliminate the mid-journey transfer walk.
-    assert!(
-        has_mid_transfer_walk(transit),
-        "mid-journey transfer walk leg must survive; got {:?}",
         leg_kinds(transit)
     );
 }
@@ -1467,6 +1464,8 @@ fn offset_station_query() -> RouteQuery {
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: None,
         bike_profile: None,
@@ -1474,6 +1473,7 @@ fn offset_station_query() -> RouteQuery {
         onboard_origin: None,
         from_station_id: Some(HUB_ORIG.to_string()),
         to_station_id: Some(HUB_DEST.to_string()),
+        profile_latency: None,
     }
 }
 
@@ -1586,6 +1586,8 @@ fn intra_member_terminal_query() -> RouteQuery {
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: None,
         bike_profile: None,
@@ -1593,6 +1595,7 @@ fn intra_member_terminal_query() -> RouteQuery {
         onboard_origin: None,
         from_station_id: None,
         to_station_id: Some(HUB_DEST.to_string()),
+        profile_latency: None,
     }
 }
 
@@ -1706,6 +1709,8 @@ fn intra_member_origin_query() -> RouteQuery {
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: None,
         bike_profile: None,
@@ -1713,6 +1718,7 @@ fn intra_member_origin_query() -> RouteQuery {
         onboard_origin: None,
         from_station_id: Some(HUB_ORIG.to_string()),
         to_station_id: None,
+        profile_latency: None,
     }
 }
 
@@ -2270,6 +2276,274 @@ fn two_route_raptor_graph_with_bikes(
     (g, osm_origin, osm_dest)
 }
 
+// ── Unrestricted (MCR) inter-stop transfers ───────────────────────────────────
+
+/// A graph whose only good itinerary requires a >1 km FOOT transfer between two
+/// stops that the capped table (`MAX_TRANSFER_DISTANCE_M` = 1000 m) cannot link.
+///
+/// Three foot-ISOLATED islands, bridged only by transit, so the >1 km hop can only ever
+/// be a MID-JOURNEY transfer — never an access or egress walk (which Stage-1
+/// completeness would otherwise widen to reach any nearby stop, and which would let a
+/// bus+long-egress shortcut dominate the two-leg plan):
+///   Island A (origin):  osm_o(4.000) — stop_A(4.001)↦osm_o(50m)
+///   Island B (mid):      osm_b(4.100) ─1434m─ osm_c(4.120);  stop_B↦osm_b(50m), stop_C↦osm_c(50m)
+///   Island C (dest):     osm_d(4.140) ─50m─ osm_dest(4.1407); stop_D↦osm_d(50m)
+///
+///   Bus  (route 0): stop_A → stop_B   dep 09:10 arr 09:15  (bridges A→B)
+///   Tram (route 1): stop_C → stop_D   dep 09:53 arr 10:03  (bridges B→C island)
+///
+/// stop_B ↔ stop_C is ~1434 m straight-line and ~1534 m over the street network —
+/// OUTSIDE the 1000 m cap on both the KD-tree neighbour radius and the walk-Dijkstra
+/// budget, so the precomputed table has no B↔C entry. The tram (hence the destination)
+/// is reachable ONLY by walking B→C, which requires the live MCR transfer search.
+fn long_walk_transfer_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_o = g.add_node(osm_node("o", 50.000, 4.000));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.100));
+    let osm_c = g.add_node(osm_node("c", 50.000, 4.120));
+    let osm_d = g.add_node(osm_node("d", 50.000, 4.140));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.1407));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.100));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.120));
+    let stop_d = g.add_node(transit_stop("Stop D", 50.000, 4.140));
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, street_edge(a, b, m));
+        g.add_edge(b, street_edge(b, a, m));
+    };
+    // Only the mid island's B→C span and the dest island's short link are walkable;
+    // the three islands are otherwise foot-disconnected (transit is the only bridge).
+    add_street(&mut g, osm_b, osm_c, 1434); // the >1 km B→C span
+    add_street(&mut g, osm_d, osm_dest, 50);
+
+    // Stop→OSM snap edges (partial, foot-only), mirroring GTFS ingestion.
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        let mk = |o: NodeID, d: NodeID| {
+            EdgeData::Street(StreetEdgeData {
+                origin: o,
+                destination: d,
+                length: m,
+                partial: true,
+                foot: true,
+                bike: false,
+                car: false,
+                attrs: BikeAttrs::road_default(),
+                elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        g.add_edge(stop, mk(stop, osm));
+        g.add_edge(osm, mk(osm, stop));
+    };
+    add_snap(&mut g, stop_a, osm_o, 50);
+    add_snap(&mut g, stop_b, osm_b, 50);
+    add_snap(&mut g, stop_c, osm_c, 50);
+    add_snap(&mut g, stop_d, osm_d, 50);
+
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 1 },
+            length: 1434,
+        }),
+    );
+    g.add_edge(
+        stop_c,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_c,
+            destination: stop_d,
+            route_id: RouteId(1),
+            timetable_segment: TimetableSegment { start: 1, len: 1 },
+            length: 1434,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "1".into(),
+            route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "T".into(),
+            route_long_name: "Tram T".into(),
+            route_type: RouteType::Tramway,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        },
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(1),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        },
+    ]);
+
+    // Bus dep 09:10 arr 09:15; tram dep 09:53 arr 10:03. After the bus reaches
+    // stop_B at 33300 the ~1534 m walk (~1278 s) lands at stop_C ~34578 < 35580 dep.
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600 + 600,
+            arrival: 9 * 3600 + 900,
+            service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(1),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600 + 3180,
+            arrival: 9 * 3600 + 3780,
+            service_id: ServiceId(0),
+        },
+    ]);
+
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 600,
+            departure: 9 * 3600 + 600,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 900,
+            departure: 9 * 3600 + 900,
+            ..Default::default()
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: 1,
+        });
+    }
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_c, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 3180,
+            departure: 9 * 3600 + 3180,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 3780,
+            departure: 9 * 3600 + 3780,
+            ..Default::default()
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(1),
+            num_trips: 1,
+        });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, osm_o, osm_dest)
+}
+
+/// The capped transfer table drops any B↔C link beyond 1 km, so a journey that must
+/// walk >1 km between two stops is invisible with the flag OFF but discovered by the
+/// live MCR multi-source Dijkstra with it ON. Proves the feature does something:
+/// ON yields a bus+walk+tram plan whose middle transfer leg is >1000 m; OFF yields no
+/// such two-transit plan.
+#[test]
+fn unrestricted_transfers_find_long_inter_stop_walk() {
+    let (mut g, origin, dest) = long_walk_transfer_graph();
+    let start = 9 * 3600; // 09:00
+
+    // Flag OFF (default): the capped table cannot link stop_B → stop_C.
+    let plans_off = g.raptor(origin, dest, start, 0, 0x7F, 10 * 60);
+    assert!(
+        plans_off.iter().all(|p| transit_leg_count(p) < 2),
+        "with capped transfers no two-transit (bus+tram) plan should exist; got legs {:?}",
+        plans_off.iter().map(leg_kinds).collect::<Vec<_>>()
+    );
+
+    // Flag ON: MCR resolves the >1 km B→C foot transfer live.
+    g.set_unrestricted_transfers(true);
+    let plans_on = g.raptor(origin, dest, start, 0, 0x7F, 10 * 60);
+
+    let long_transfer_plan = plans_on.iter().find(|p| {
+        transit_leg_count(p) == 2
+            && p.legs.iter().any(|l| match l {
+                PlanLeg::Walk(w) => w.length > 1000,
+                _ => false,
+            })
+    });
+    assert!(
+        long_transfer_plan.is_some(),
+        "MCR should surface a bus+walk+tram plan with a >1000 m transfer leg; got {:?}",
+        plans_on.iter().map(leg_kinds).collect::<Vec<_>>()
+    );
+
+    // And that transfer walk really is the >1 km hop between the two transit legs.
+    let plan = long_transfer_plan.unwrap();
+    let transfer = plan
+        .legs
+        .iter()
+        .filter_map(|l| match l {
+            PlanLeg::Walk(w) => Some(w),
+            _ => None,
+        })
+        .max_by_key(|w| w.length)
+        .expect("a walk leg");
+    assert!(
+        transfer.length > 1000,
+        "longest walk leg should be the >1 km transfer; got {} m",
+        transfer.length
+    );
+    // Reconstruction must materialize the real street polyline for the transfer leg
+    // (from `trace.from_stop`, via `street_path_geom`) — not just a duration×speed
+    // length. A non-empty geometry proves the leg is drawable end-to-end.
+    assert!(
+        !transfer.geometry.is_empty(),
+        "the >1 km transfer leg must carry a reconstructed street geometry"
+    );
+    // The ON plan must also reach the destination strictly no later than any OFF plan.
+    let best_off = plans_off.iter().map(|p| p.end).min();
+    if let Some(best_off) = best_off {
+        assert!(
+            plan.end <= best_off,
+            "the transit plan (end {}) should not be slower than the best flag-off plan (end {})",
+            plan.end,
+            best_off
+        );
+    }
+}
+
 // ── Multi-state RAPTOR (bike modes) ───────────────────────────────────────────
 
 /// Two express legs spanning ~10 km each, so transit genuinely beats direct
@@ -2816,7 +3090,6 @@ fn transit_modes_never_emit_zero_transit_plans() {
         &RealtimeIndex::new(),
         &am,
         &BikeCost::new(BikeProfile::default()),
-        false,
     );
     // Direct modes (Walk/Bike/Car) are legitimately 0-transit; transit-labelled
     // modes must use transit.
@@ -3752,6 +4025,46 @@ fn raptor_second_transit_leg_has_transfer_risk() {
 }
 
 #[test]
+fn raptor_transit_leg_carries_scheduled_step_times_and_endpoint_fills() {
+    use maas_rs::structures::plan::PlanLegStep;
+
+    let (g, origin, dest) = two_route_raptor_graph();
+    let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "expected at least one plan");
+
+    let mut checked_transit = 0usize;
+    for p in &plans {
+        for leg in &p.legs {
+            let PlanLeg::Transit(t) = leg else { continue };
+            checked_transit += 1;
+
+            // B2: both endpoint dwell fields are now populated (were None).
+            assert!(t.from.arrival.is_some(), "from.arrival must be filled");
+            assert!(t.to.departure.is_some(), "to.departure must be filled");
+
+            for step in &t.steps {
+                let PlanLegStep::Transit(s) = step else { continue };
+                // B1: every step carries its scheduled arrival.
+                assert!(
+                    s.scheduled_arrival.is_some(),
+                    "each transit step must carry scheduled_arrival"
+                );
+                // Without realtime, scheduled == effective (place) exactly.
+                assert_eq!(
+                    s.scheduled_arrival, s.place.arrival,
+                    "scheduled_arrival must mirror place.arrival with no realtime"
+                );
+                assert_eq!(
+                    s.scheduled_departure, s.place.departure,
+                    "scheduled_departure must mirror place.departure with no realtime"
+                );
+            }
+        }
+    }
+    assert!(checked_transit > 0, "expected at least one transit leg to check");
+}
+
+#[test]
 fn raptor_transfer_risk_reliability_is_one_without_delay_model() {
     let (g, origin, dest) = two_route_raptor_graph();
     let plans = g.raptor(origin, dest, 8 * 3600, 0, 0x7F, 10 * 60);
@@ -4238,6 +4551,54 @@ fn raptor_realtime_delay_is_per_trip() {
     assert_eq!(same.iter().map(|p| p.end).min().unwrap(), base_end);
 }
 
+/// Realtime SKIPPED stop (bug 6 routing consumption): the tram (TripId 2) is the
+/// only transit that reaches the destination (it alights at stop_D = compact 3).
+/// Marking the tram as SKIPPING stop_D means the router may not alight it there,
+/// so no transit plan survives — only a walk-only plan remains. The schedule-only
+/// baseline (empty, inert index) does produce the transit plan, proving the skip
+/// guard is what removed it.
+#[test]
+fn raptor_skipped_stop_is_not_used_for_alighting() {
+    let (g, origin, dest) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+    fn has_transit(plans: &[maas_rs::structures::plan::Plan]) -> bool {
+        plans
+            .iter()
+            .any(|p| p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_))))
+    }
+
+    // Baseline via the SAME entry point with an empty (inert) index, isolating the
+    // skip as the only difference. It reaches the destination by tram.
+    let empty = RealtimeIndex::new();
+    let base = g.raptor_tuned_rt(origin, dest, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &empty);
+    assert!(
+        has_transit(&base),
+        "baseline must reach the destination by transit (the tram)"
+    );
+
+    // SKIP the tram at its alighting stop: the trip no longer serves stop_D, so the
+    // router cannot alight there and no transit plan can reach the destination.
+    let mut skip = std::collections::HashSet::new();
+    skip.insert((TripId(2), 3u32));
+    let rt = RealtimeIndex::new().with_skipped(skip);
+    let skipped = g.raptor_tuned_rt(
+        origin,
+        dest,
+        7 * 3600,
+        0,
+        0x7F,
+        10 * 60,
+        &buckets,
+        900,
+        &rt,
+    );
+    assert!(
+        !has_transit(&skipped),
+        "skipping the tram's alighting stop must leave no transit plan (the tram was \
+         the only transit reaching the destination)"
+    );
+}
+
 /// Realtime reaches the reconstructed leg: delaying the tram at its alighting
 /// stop shifts that leg's `end` (effective) while `scheduled_end` keeps the
 /// timetable value and `realtime` is flagged true; the un-delayed bus leg stays
@@ -4406,6 +4767,495 @@ fn raptor_backward_tightening_preserves_valid_connection() {
         transit_legs[1].start,
         9 * 3600 + 1800,
         "Tram should still depart at 09:30"
+    );
+}
+
+// ── S1 chain-sweep tightening: over-credit safety ─────────────────────────────
+
+/// Bus (A→B, three trips) + tram (C→D, one trip) with a short B→C transfer, where
+/// the third bus trip arrives too late to make the tram. The forward pass boards
+/// the first bus; tightening should shift it to the LATEST bus that still connects
+/// (09:00), never the connection-breaking 09:20 bus.
+fn over_tighten_break_graph() -> (Graph, NodeID, NodeID) {
+    over_tighten_break_graph_perm(true)
+}
+
+/// Like `over_tighten_break_graph`, but the 09:00 bus (T1 — the latest bus that
+/// still connects, hence the trip tightening would swap leg-0 onto) can be made
+/// un-boardable at stop A (`t1_board = false`, GTFS pickup_type == 1). That is the
+/// Bug #5 trap: the schedule-only oracle would re-time leg-0 onto this un-boardable
+/// trip; the permission-aware oracle must instead keep the boardable 08:00 bus.
+fn over_tighten_break_graph_perm(t1_board: bool) -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_ab = g.add_node(osm_node("ab", 50.000, 4.010));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.019));
+    let osm_cd = g.add_node(osm_node("cd", 50.000, 4.030));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.041));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.020));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.022));
+    let stop_d = g.add_node(transit_stop("Stop D", 50.000, 4.040));
+
+    let street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial: false,
+                    foot: true,
+                    bike: true,
+                    car: true,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    street(&mut g, osm_origin, osm_ab, 718);
+    street(&mut g, osm_ab, osm_b, 645);
+    street(&mut g, osm_b, osm_cd, 789);
+    street(&mut g, osm_cd, osm_dest, 789);
+
+    let snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (o, d) in [(stop, osm), (osm, stop)] {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial: true,
+                    foot: true,
+                    bike: false,
+                    car: false,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    snap(&mut g, stop_a, osm_origin, 72);
+    snap(&mut g, stop_b, osm_b, 72);
+    snap(&mut g, stop_c, osm_b, 215);
+    snap(&mut g, stop_d, osm_dest, 72);
+
+    // Bus: 3 trips (timetable segment len=3).
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 3 },
+            length: 1362,
+        }),
+    );
+    // Tram: 1 trip.
+    g.add_edge(
+        stop_c,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_c,
+            destination: stop_d,
+            route_id: RouteId(1),
+            timetable_segment: TimetableSegment { start: 3, len: 1 },
+            length: 1290,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "1".into(),
+            route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "T".into(),
+            route_long_name: "Tram T".into(),
+            route_type: RouteType::Tramway,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // 0: bus 08:00
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // 1: bus 09:00 (latest that still connects)
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // 2: bus 09:20 (arrives 09:35 — too late for the 09:30 tram)
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(1),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // 3: tram 09:30
+    ]);
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 8 * 3600,
+            arrival: 8 * 3600 + 900,
+            service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(1),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600,
+            arrival: 9 * 3600 + 900,
+            service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(2),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600 + 1200,
+            arrival: 9 * 3600 + 2100,
+            service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(3),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600 + 1800,
+            arrival: 9 * 3600 + 2700,
+            service_id: ServiceId(0),
+        },
+    ]);
+
+    // Pattern 0: Bus [A,B], 3 trips (column-major).
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_pattern_trip(TripId(2));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 3 });
+        let sts = g.transit_pattern_stop_times_len();
+        // stop_A column (departures). The middle trip (T1, 09:00) is the swap
+        // candidate; suppress its boarding permission when `t1_board` is false.
+        for (idx, dep) in [8 * 3600, 9 * 3600, 9 * 3600 + 1200].into_iter().enumerate() {
+            g.push_transit_pattern_stop_time(StopTime {
+                arrival: dep,
+                departure: dep,
+                board_allowed: idx != 1 || t1_board,
+                ..Default::default()
+            });
+        }
+        // stop_B column (arrivals)
+        for arr in [8 * 3600 + 900, 9 * 3600 + 900, 9 * 3600 + 2100] {
+            g.push_transit_pattern_stop_time(StopTime {
+                arrival: arr,
+                departure: arr,
+                ..Default::default()
+            });
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 6 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: 3,
+        });
+    }
+    // Pattern 1: Tram [C,D], 1 trip.
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_c, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(3));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 1800,
+            departure: 9 * 3600 + 1800,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 2700,
+            departure: 9 * 3600 + 2700,
+            ..Default::default()
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(1),
+            num_trips: 1,
+        });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, osm_origin, osm_dest)
+}
+
+/// Smallest transfer margin (seconds) between consecutive transit legs of a plan:
+/// `next.start - (prev.end + intervening walk)`. Negative ⇒ time-inconsistent.
+fn min_transfer_margin(legs: &[PlanLeg]) -> i32 {
+    let mut worst = i32::MAX;
+    let mut prev_end: Option<u32> = None;
+    let mut walk = 0u32;
+    for l in legs {
+        match l {
+            PlanLeg::Transit(t) => {
+                if let Some(e) = prev_end {
+                    worst = worst.min(t.start as i32 - (e + walk) as i32);
+                }
+                prev_end = Some(t.end);
+                walk = 0;
+            }
+            PlanLeg::Walk(w) => {
+                if prev_end.is_some() {
+                    walk += w.duration;
+                }
+            }
+        }
+    }
+    worst
+}
+
+/// S1 correctness gate: an over-generous alighting bound (the shape the legacy
+/// backward pass can produce when its network-wide view over-credits a leg via a
+/// parallel line it does not actually ride) re-times the first bus onto the 09:20
+/// trip that CANNOT make the tram — a negative transfer margin. `chain_bounds`,
+/// derived from the plan's own fixed legs, produces a bound that keeps the plan
+/// time-consistent, and the debug-build assertion catches the bad bound.
+#[test]
+fn chain_bounds_reject_over_credit_that_lambda_would_accept() {
+    let (g, origin, dest) = over_tighten_break_graph();
+    let date = 0;
+    let weekday = 0x7F;
+
+    let plans = g.raptor(origin, dest, 7 * 3600, date, weekday, 10 * 60);
+    let plan = plans
+        .iter()
+        .find(|p| {
+            p.legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count()
+                == 2
+        })
+        .expect("a bus+tram plan");
+    let legs = plan.legs.clone();
+
+    // Baseline: the delivered (chain-tightened) plan is time-consistent.
+    assert!(
+        min_transfer_margin(&legs) >= 0,
+        "baseline plan must be consistent"
+    );
+
+    // Target = arrival at the last transit leg's alighting stop.
+    let (target_stop, target) = plan
+        .legs
+        .iter()
+        .rev()
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => {
+                Some((g.compact_stop_of_node(t.to.node_id).unwrap(), t.end))
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let chain = g.chain_bounds_pub(&legs, target_stop, target, date, weekday, &RealtimeIndex::new());
+    assert_eq!(chain.len(), 2, "two transit legs");
+
+    // On this single-line graph the chain reproduces the backward pass exactly.
+    let lambda =
+        g.bounds_from_lambda_pub(&legs, target_stop, target, 2, date, weekday, &RealtimeIndex::new());
+    assert_eq!(
+        chain, lambda,
+        "chain must reproduce the backward pass on a single-line plan"
+    );
+
+    // Simulate the legacy over-credit: inflate leg-0's bound past the connection
+    // (to the 09:20 bus arrival, 09:35). Tighten the LAMBDA-style bound → the
+    // first leg jumps to the 09:20 bus and the tram is missed (negative margin).
+    let mut over = chain.clone();
+    over[0] = 9 * 3600 + 2100; // 09:35 — the connection-breaking bus arrival
+    let mut broken = legs.clone();
+    g.tighten_with_bounds_pub(&mut broken, &over, date, weekday, &RealtimeIndex::new(), false, false);
+    assert!(
+        min_transfer_margin(&broken) < 0,
+        "an over-credited bound must break the tram connection (got margin {})",
+        min_transfer_margin(&broken)
+    );
+
+    // The chain bound keeps the plan consistent (debug_check on ⇒ also exercises
+    // the negative-margin debug assertion, which must NOT fire).
+    let mut kept = legs.clone();
+    g.tighten_with_bounds_pub(&mut kept, &chain, date, weekday, &RealtimeIndex::new(), false, true);
+    assert!(
+        min_transfer_margin(&kept) >= 0,
+        "chain_bounds must keep the plan consistent (got margin {})",
+        min_transfer_margin(&kept)
+    );
+
+    // The debug assertion actively rejects the bad bound in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        let g2 = &g;
+        let legs2 = legs.clone();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = legs2;
+            g2.tighten_with_bounds_pub(&mut b, &over, date, weekday, &RealtimeIndex::new(), false, true);
+        }));
+        assert!(
+            caught.is_err(),
+            "debug_check must panic on an over-credited (negative-margin) bound"
+        );
+    }
+}
+
+/// Bug #5 S1 invariant (end-to-end): when the latest-connecting bus (09:00, T1)
+/// forbids boarding at stop A, the live chain-sweep tightening path (which runs
+/// `tighten_with_bounds` with `debug_check = true`) must NOT re-time leg-0 onto
+/// that un-boardable trip. The delivered bus+tram plan must keep the boardable
+/// 08:00 bus, stay time-consistent (margin ≥ 0), and never fire the S1 debug
+/// assertion. Pre-fix the schedule-only oracle selects the un-boardable 09:00 bus
+/// (start re-timed to 09:00 → an itinerary the passenger cannot board).
+#[test]
+fn tightening_never_retimes_onto_unboardable_trip() {
+    let (g, origin, dest) = over_tighten_break_graph_perm(false); // T1 (09:00) un-boardable at A
+    let date = 0;
+    let weekday = 0x7F;
+
+    // Live path: default (chain) tighten mode, debug_check = true. A pre-fix run
+    // would either emit the un-boardable plan or (with a downstream break) trip
+    // the S1 assert; post-fix it must return a valid, consistent plan.
+    let plans = g.raptor(origin, dest, 7 * 3600, date, weekday, 10 * 60);
+    let plan = plans
+        .iter()
+        .find(|p| {
+            p.legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count()
+                == 2
+        })
+        .expect("a bus+tram plan");
+    let legs = plan.legs.clone();
+
+    assert!(
+        min_transfer_margin(&legs) >= 0,
+        "delivered plan must stay time-consistent (got margin {})",
+        min_transfer_margin(&legs)
+    );
+
+    let bus = legs
+        .iter()
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => Some(t),
+            _ => None,
+        })
+        .expect("a first transit (bus) leg");
+    assert_eq!(
+        bus.start,
+        8 * 3600,
+        "tightening must keep the boardable 08:00 bus, never re-time onto the \
+         un-boardable 09:00 bus (start={})",
+        bus.start
+    );
+}
+
+/// The `tighten_long_transfers` flag: by default the chain sweep leaves an
+/// off-table (> MAX_TRANSFER_DISTANCE_M) transfer untightened — bound 0, exactly
+/// as lambda's capped reverse footpath does — so the two are byte-identical. With
+/// the flag on, the chain tightens that leg using the plan's own reconstructed
+/// walk (the opt-in accuracy improvement).
+#[test]
+fn tighten_long_transfers_flag_gates_off_table_bound() {
+    let (mut g, origin, dest) = long_walk_transfer_graph();
+    g.set_unrestricted_transfers(true); // surface the >1 km B→C transfer plan
+    let date = 0;
+    let weekday = 0x7F;
+
+    let plans = g.raptor(origin, dest, 9 * 3600, date, weekday, 10 * 60);
+    let plan = plans
+        .iter()
+        .find(|p| {
+            p.legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count()
+                == 2
+                && p.legs
+                    .iter()
+                    .any(|l| matches!(l, PlanLeg::Walk(w) if w.length > 1000))
+        })
+        .expect("a bus + >1km walk + tram plan");
+    let legs = plan.legs.clone();
+
+    let (target_stop, target) = plan
+        .legs
+        .iter()
+        .rev()
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => Some((g.compact_stop_of_node(t.to.node_id).unwrap(), t.end)),
+            _ => None,
+        })
+        .unwrap();
+
+    // Default (flag off): chain no-ops the long transfer ⇒ identical to lambda.
+    let chain_off =
+        g.chain_bounds_pub(&legs, target_stop, target, date, weekday, &RealtimeIndex::new());
+    let lambda =
+        g.bounds_from_lambda_pub(&legs, target_stop, target, 2, date, weekday, &RealtimeIndex::new());
+    assert_eq!(
+        chain_off, lambda,
+        "default chain must reproduce lambda on a long-transfer plan"
+    );
+    assert_eq!(
+        chain_off[0], 0,
+        "the feeder leg before a >1km transfer is left untightened by default"
+    );
+
+    // Flag on: the same leg now gets a real (non-zero) tightened bound.
+    g.set_tighten_long_transfers(true);
+    let chain_on =
+        g.chain_bounds_pub(&legs, target_stop, target, date, weekday, &RealtimeIndex::new());
+    assert!(
+        chain_on[0] > 0,
+        "flag on must tighten the long-transfer feeder leg (got {})",
+        chain_on[0]
+    );
+
+    // Tightening with the flag-on bound stays time-consistent.
+    let mut tightened = legs.clone();
+    g.tighten_with_bounds_pub(&mut tightened, &chain_on, date, weekday, &RealtimeIndex::new(), false, true);
+    assert!(
+        min_transfer_margin(&tightened) >= 0,
+        "flag-on long-transfer tightening must stay consistent"
     );
 }
 
@@ -5533,6 +6383,175 @@ fn raptor_range_connecting_pattern_not_starved_by_dead_end_pattern() {
             p.end
         );
     }
+}
+
+/// Regression test for the range-query PROBE-GATE bug.
+///
+/// The range driver used to run a full single-departure probe at `start_time`
+/// and bail with `vec![]` when it was empty — treating "no plan at start_time"
+/// as "no plan at any window departure". That is unsound: extract's per-bucket
+/// suppression anchors to the round-0 walk-chain label (access + footpath
+/// transfer to the destination stop), whose arrival shifts with departure time,
+/// while the transit arrival is a step function. So the probe at `start_time`
+/// can be empty (the far-future bus is dominated by the walk-chain at that
+/// departure) even though a later window departure boards the bus successfully.
+///
+/// Layout (all foot speeds 1.2 m/s):
+///   osm_origin (50.000, 4.000) ─60s─ stop_A (50.000, 4.001)
+///   osm_dest   (50.000, 4.005) ─60s─ stop_B (50.000, 4.004)
+///   direct street osm_origin↔osm_dest = 360 m (300 s walk)
+///   ⇒ auto footpath transfer A→B ≈ 360 s (300 s street + 60 s snap), < 1000 m.
+/// One bus stop_A→stop_B, single trip departing stop_A at 09:10 (D=33000),
+/// 120 s ride (r < transfer, so it survives at its own departure).
+///
+/// At start_time 09:00 (S=32400, access a=60, transfer T=360): the round-0
+/// walk-chain reaches stop_B at S+a+T=32820; the bus arrives 33120 ≥ that, so
+/// it is suppressed → probe empty → the OLD gate fired → walk-only fallback.
+/// At the windowed departure t*=D−a=32940 the walk-chain reaches stop_B at
+/// 33360 while the bus arrives 33120 < that, so the bus is a valid transit plan.
+///
+/// Expected AFTER the fix: `raptor_range` returns a plan containing a Transit
+/// leg (the bus). BEFORE the fix it returns only the walk-only fallback.
+#[test]
+fn raptor_range_probe_gate_does_not_drop_windowed_transit_plan() {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.005));
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001)); // 72 m / 60 s from origin
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.004)); // 72 m / 60 s from dest
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial: false,
+                    foot: true,
+                    bike: true,
+                    car: true,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    // 360 m direct walk (300 s) — short enough that the A→B footpath transfer
+    // (≈360 s) stays under the 1000 m transfer radius.
+    add_street(&mut g, osm_origin, osm_dest, 360);
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (o, d) in [(stop, osm), (osm, stop)] {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial: true,
+                    foot: true,
+                    bike: false,
+                    car: false,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72); // 60 s walk
+    add_snap(&mut g, stop_b, osm_dest, 72); // 60 s walk
+
+    // Single bus stop_A → stop_B.
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 1 },
+            length: 300,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "1".into(),
+        route_long_name: "Bus".into(),
+        route_type: RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None,
+        route_id: RouteId(0),
+        service_id: ServiceId(0),
+        bikes_allowed: None,
+    }]);
+
+    let d_dep = 33000u32; // 09:10 departure from stop_A
+    let d_arr = d_dep + 120; // 120 s ride → arrive stop_B 33120
+    g.add_transit_departures(vec![TripSegment {
+        trip_id: TripId(0),
+        origin_stop_sequence: 0,
+        destination_stop_sequence: 1,
+        departure: d_dep,
+        arrival: d_arr,
+        service_id: ServiceId(0),
+    }]);
+
+    // Pattern 0: stop_A × stop_B, 1 trip, column-major.
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: d_dep,
+            departure: d_dep,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: d_arr,
+            departure: d_arr,
+            ..Default::default()
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: 1,
+        });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+
+    // 60-min window from 09:00, min_access 10 min.
+    let plans = g.raptor_range(osm_origin, osm_dest, 32400, 60 * 60, 0, 0x7F, 600);
+
+    let has_transit = plans
+        .iter()
+        .any(|p| p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_))));
+    assert!(
+        has_transit,
+        "raptor_range must return the windowed bus plan (a Transit leg), not just \
+         the walk-only fallback. The start_time probe is empty (the bus is dominated \
+         by the walk-chain at 09:00), but the 09:10 bus is valid at its own departure. \
+         Got {} plan(s), none with a Transit leg.",
+        plans.len(),
+    );
 }
 
 /// Verifies that `with_access_search` doubles `access_secs` until it locates
@@ -6810,7 +7829,6 @@ fn raptor_range_modes_matches_independent_oracle() {
         &rt,
         &am,
         &BikeCost::new(BikeProfile::default()),
-        false,
     );
     let indep = g.raptor_range_independent_rt_modes(
         origin,
@@ -6822,6 +7840,8 @@ fn raptor_range_modes_matches_independent_oracle() {
         10 * 60,
         &buckets,
         900,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
         &rt,
         &am,
     );
@@ -6853,6 +7873,8 @@ fn raptor_explain_supports_bike_modes() {
         10 * 60,
         &buckets,
         900,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
         &RealtimeIndex::new(),
         &am,
         &BikeCost::new(BikeProfile::default()),
@@ -7265,7 +8287,6 @@ fn multiobj_transit_graph() -> (Graph, NodeID, NodeID) {
 
     g.set_distance_budget(f64::INFINITY);
     g.build_raptor_index();
-    g.set_multiobj_street(true);
     enable_contraction(&mut g);
 
     (g, origin, destination)
@@ -7286,6 +8307,8 @@ fn transit_access_egress_multiobj_alternatives_and_leave_by() {
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: Some(vec![Mode::WalkTransit]),
         bike_profile: None,
@@ -7293,6 +8316,7 @@ fn transit_access_egress_multiobj_alternatives_and_leave_by() {
         onboard_origin: None,
         from_station_id: None,
         to_station_id: None,
+        profile_latency: None,
     };
     let plans = route(&g, &q, &RealtimeIndex::new()).expect("route should succeed");
 
@@ -7594,6 +8618,8 @@ fn t4_explain_drop_gate_identical() {
         window_minutes: None,
         min_access_secs: Some(600),
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: Some(vec![Mode::Walk, Mode::WalkTransit]),
         bike_profile: None,
@@ -7601,6 +8627,7 @@ fn t4_explain_drop_gate_identical() {
         onboard_origin: None,
         from_station_id: None,
         to_station_id: None,
+        profile_latency: None,
     };
 
     let before = route_explain(&g, &q, &RealtimeIndex::new()).expect("pre-drop explain");
@@ -7748,7 +8775,11 @@ fn transit_enrich_drop_gate() {
 
     let mut g = load_graph("graph_on.bin").expect("graph_on.bin");
     let config = Config::load("config.yaml").expect("config.yaml");
-    maas_rs::services::build::apply_routing_defaults(&mut g, &config.default_routing);
+    maas_rs::services::build::apply_routing_defaults(
+        &mut g,
+        &config.default_routing,
+        &config.build.output,
+    );
 
     let rt = RealtimeIndex::new();
     let date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
@@ -7763,12 +8794,13 @@ fn transit_enrich_drop_gate() {
     let q = |fl, fg, tl, tg, modes: Option<Vec<Mode>>| RouteQuery {
         from_lat: fl, from_lng: fg, to_lat: tl, to_lng: tg,
         date, time,
-        window_minutes: None, min_access_secs: None, arrival_slack_secs: None,
+        window_minutes: None, min_access_secs: None, arrival_slack_secs: None, unrestricted_transfers: None, use_cch_access: None,
         reliability_bucket_edges: None, modes, bike_profile: None,
         terminal_deadline: false,
         onboard_origin: None,
         from_station_id: None,
         to_station_id: None,
+        profile_latency: None,
     };
 
     let before: Vec<_> = ods
@@ -7839,6 +8871,8 @@ fn all_modes_drop_gate_identical() {
         window_minutes: None,
         min_access_secs: Some(600),
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes,
         bike_profile: None,
@@ -7846,6 +8880,7 @@ fn all_modes_drop_gate_identical() {
         onboard_origin: None,
         from_station_id: None,
         to_station_id: None,
+        profile_latency: None,
     };
 
     let all_modes = [
@@ -8478,6 +9513,8 @@ fn onboard_plans(
         g.raptor.arrival_slack_secs,
         rt,
         &am,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
         Some(&ep),
     )
 }
@@ -8666,6 +9703,57 @@ fn onboard_leg0_not_swapped_keeps_realtime_departure() {
     );
 }
 
+/// D1: when the boarded (onboard, first) trip is reported CANCELED, cancellation
+/// outranks any stale per-stop delay — the leg keeps its SCHEDULED times and is
+/// NOT flagged realtime (mirroring live_refresh). The boarded trip itself is not
+/// excluded (it is the user's reality). Injecting a +180s delay AND a
+/// cancellation together proves the cancellation wins over the delay.
+#[test]
+fn onboard_canceled_boarded_trip_keeps_scheduled_times() {
+    let (g, osm_dest, dest_ll) = onboard_graph();
+
+    let s1 = g.stop_index_of("S1").unwrap() as u32;
+    let s2 = g.stop_index_of("S2").unwrap() as u32;
+    let s3 = g.stop_index_of("S3").unwrap() as u32;
+    let rt = RealtimeIndex::from_updates(
+        0,
+        [
+            ((TripId(0), s1), 180),
+            ((TripId(0), s2), 180),
+            ((TripId(0), s3), 180),
+        ],
+        [TripId(0)],
+    );
+    let plans = onboard_plans(&g, osm_dest, dest_ll, 1, &rt, 600);
+
+    let stay_on = plans
+        .iter()
+        .find(|p| {
+            p.legs
+                .iter()
+                .filter(|l| matches!(l, PlanLeg::Transit(_)))
+                .count()
+                == 1
+        })
+        .expect("a stay-on plan survives even when the boarded trip is canceled");
+    let PlanLeg::Transit(leg0) = &stay_on.legs[0] else {
+        panic!("leg[0] must be the onboard transit ride");
+    };
+    assert_eq!(leg0.trip_id, TripId(0), "leg[0] is still the boarded trip");
+    assert_eq!(
+        leg0.start, 32700,
+        "canceled boarded leg keeps its SCHEDULED departure (delay ignored)"
+    );
+    assert_eq!(
+        leg0.start, leg0.scheduled_start,
+        "effective == scheduled for a canceled onboard leg"
+    );
+    assert!(
+        !leg0.realtime,
+        "a canceled boarded leg must not be flagged realtime"
+    );
+}
+
 /// Test 3 (regression): the onboard path does not perturb the normal lat/lng
 /// route. `route()` with `onboard_origin = None` over a fixed OD returns plans
 /// byte-identical run-to-run (and the existing raptor suite is the wider net).
@@ -8682,6 +9770,8 @@ fn lat_lng_route_unchanged_by_onboard_path() {
         window_minutes: None,
         min_access_secs: None,
         arrival_slack_secs: None,
+        unrestricted_transfers: None,
+        use_cch_access: None,
         reliability_bucket_edges: None,
         modes: None,
         bike_profile: None,
@@ -8689,6 +9779,7 @@ fn lat_lng_route_unchanged_by_onboard_path() {
         onboard_origin: None,
         from_station_id: None,
         to_station_id: None,
+        profile_latency: None,
     };
     let dbg =
         |ps: &[maas_rs::structures::plan::Plan]| ps.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>();
@@ -8702,8 +9793,10 @@ fn lat_lng_route_unchanged_by_onboard_path() {
     );
 
     // Concrete signature for this fixed OD: a single 5-leg plan riding trips 0 then
-    // 1, departing 32300 and arriving 35168. A systematic shift in the normal path
-    // (which the run-to-run check alone cannot catch) would break this.
+    // 1, departing 32300 and arriving 35100 (multi-objective street routing is now
+    // unconditional, so the egress leg is always rebuilt from its Pareto front). A
+    // systematic shift in the normal path (which the run-to-run check alone cannot
+    // catch) would break this.
     let sig: Vec<(usize, Vec<u32>, u32, u32)> = a
         .iter()
         .map(|p| {
@@ -8718,7 +9811,7 @@ fn lat_lng_route_unchanged_by_onboard_path() {
             (p.legs.len(), trips, p.start, p.end)
         })
         .collect();
-    assert_eq!(sig, vec![(5, vec![0, 1], 32300, 35168)]);
+    assert_eq!(sig, vec![(5, vec![0, 1], 32300, 35100)]);
 }
 
 // ── Stage B1: platform connector-coverage measurement ──────────────────────────
@@ -9544,3 +10637,2223 @@ fn raptor_all_allowed_stops_unchanged() {
     assert!(has_transit, "All-allowed stops: plan must use transit");
 }
 
+
+// ── Stage 1: provably-complete FOOT access/egress (fastest-arrival guarantee) ──
+//
+// These tests build tiny synthetic graphs whose FASTEST journey requires an
+// access or egress foot walk LONGER than the default 600 s discovery radius —
+// exactly the case the legacy `with_access_search` (return on first non-empty
+// result) silently misses. An independent brute-force oracle computes the true
+// fastest arrival; the engine must match it.
+
+/// One boardable transit segment: board `board` at `dep`, alight `alight` at `arr`.
+#[derive(Clone, Copy)]
+struct Hop {
+    board: NodeID,
+    alight: NodeID,
+    dep: u32,
+    arr: u32,
+}
+
+/// Street-time model that is the identity on both access and egress seconds
+/// (percentile 0.5 ⇒ z = 0, σ = 0), so arrival = label + raw walk seconds and
+/// the oracle can predict arrivals exactly.
+fn identity_street_time() -> StreetTimeModel {
+    StreetTimeModel {
+        access_percentile: 0.5,
+        sigma_alpha: 0.0,
+        sigma_floor: 0.0,
+        sigma_cap: 0.5,
+    }
+}
+
+fn add_street_bidir(g: &mut Graph, a: NodeID, b: NodeID, m: usize) {
+    g.add_edge(a, street_edge(a, b, m));
+    g.add_edge(b, street_edge(b, a, m));
+}
+
+/// Foot-only snap edge (like a GTFS stop→street partial edge), both directions.
+fn add_snap_bidir(g: &mut Graph, stop: NodeID, osm: NodeID, m: usize) {
+    let mk = |o: NodeID, d: NodeID| {
+        EdgeData::Street(StreetEdgeData {
+            origin: o,
+            destination: d,
+            length: m,
+            partial: true,
+            foot: true,
+            bike: false,
+            car: false,
+            attrs: BikeAttrs::road_default(),
+            elev_delta: 0,
+            surface_speed: 100,
+            var_gen: VarGen::NONE,
+        })
+    };
+    g.add_edge(stop, mk(stop, osm));
+    g.add_edge(osm, mk(osm, stop));
+}
+
+/// Push one 2-stop pattern with N trips (column-major stop times) plus its
+/// transit edge + trip segments. `deps`/`arrs` are per-trip board/alight times.
+#[allow(clippy::too_many_arguments)]
+fn add_two_stop_line(
+    g: &mut Graph,
+    board: NodeID,
+    alight: NodeID,
+    route: RouteId,
+    trips: &[TripId],
+    deps: &[u32],
+    arrs: &[u32],
+    length_m: usize,
+) {
+    let n = trips.len();
+    // Transit edge (reconstruct / timetable lookup), covering all N segments.
+    let seg_start = g.get_transit_departures_size();
+    let segs: Vec<TripSegment> = (0..n)
+        .map(|i| TripSegment {
+            trip_id: trips[i],
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: deps[i],
+            arrival: arrs[i],
+            service_id: ServiceId(0),
+        })
+        .collect();
+    g.add_transit_departures(segs);
+    g.add_edge(
+        board,
+        EdgeData::Transit(TransitEdgeData {
+            origin: board,
+            destination: alight,
+            route_id: route,
+            timetable_segment: TimetableSegment { start: seg_start, len: n },
+            length: length_m,
+        }),
+    );
+
+    // Pattern arrays.
+    let ss = g.transit_pattern_stops_len();
+    g.extend_transit_pattern_stops(&[board, alight]);
+    g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+    let ts = g.transit_pattern_trips_len();
+    for &t in trips {
+        g.push_transit_pattern_trip(t);
+    }
+    g.push_transit_idx_pattern_trips(Lookup { start: ts, len: n });
+
+    let sts = g.transit_pattern_stop_times_len();
+    // Column-major: all board times, then all alight times.
+    for &d in deps {
+        g.push_transit_pattern_stop_time(StopTime { arrival: d, departure: d, ..Default::default() });
+    }
+    for &a in arrs {
+        g.push_transit_pattern_stop_time(StopTime { arrival: a, departure: a, ..Default::default() });
+    }
+    g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 * n });
+
+    g.push_transit_pattern(PatternInfo { route, num_trips: n as u32 });
+}
+
+/// Corridor whose FASTEST journey egresses at a stop ~905 s from the destination
+/// (well beyond the 600 s radius). Fast bus A→Z (Z is 905 s from D); slow bus
+/// A→Y (Y is 305 s from D) arrives later. Returns (graph, origin, dest, hops).
+fn stage1_far_egress_graph() -> (Graph, NodeID, NodeID, Vec<Hop>) {
+    let mut g = Graph::new();
+    g.set_street_time(identity_street_time());
+
+    // osm corridor (lon = 4.0 + meters/71695).
+    let o = g.add_node(osm_node("O", 50.000, 4.000000));
+    let jz = g.add_node(osm_node("jZ", 50.000, 4.0350652));
+    let jy = g.add_node(osm_node("jY", 50.000, 4.0451078));
+    let d = g.add_node(osm_node("D", 50.000, 4.0501291));
+
+    let stop_a = g.add_node(transit_stop("A", 50.000, 4.0010043));
+    let stop_z = g.add_node(transit_stop("Z", 50.000, 4.0350652));
+    let stop_y = g.add_node(transit_stop("Y", 50.000, 4.0451078));
+
+    add_street_bidir(&mut g, o, jz, 2514); // 2095 s
+    add_street_bidir(&mut g, jz, jy, 720); //  600 s
+    add_street_bidir(&mut g, jy, d, 360); //  300 s
+    add_snap_bidir(&mut g, stop_a, o, 72); //   60 s
+    add_snap_bidir(&mut g, stop_z, jz, 6); //    5 s
+    add_snap_bidir(&mut g, stop_y, jy, 6); //    5 s
+    // egress D→Z = 300+600+5 = 905 s; D→Y = 300+5 = 305 s.
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "F".into(),
+            route_long_name: "Fast".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "S".into(),
+            route_long_name: "Slow".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    let mk_trip = |route: RouteId| TripInfo {
+        trip_headsign: None,
+        route_id: route,
+        service_id: ServiceId(0),
+        bikes_allowed: None,
+    };
+    g.add_transit_trips(vec![
+        mk_trip(RouteId(0)),
+        mk_trip(RouteId(0)),
+        mk_trip(RouteId(0)),
+        mk_trip(RouteId(1)),
+        mk_trip(RouteId(1)),
+        mk_trip(RouteId(1)),
+    ]);
+
+    // Fast A→Z: 3 trips, 10-min ride.
+    let f_dep = [33000u32, 34200, 35400];
+    let f_arr = [33600u32, 34800, 36000];
+    add_two_stop_line(
+        &mut g, stop_a, stop_z, RouteId(0),
+        &[TripId(0), TripId(1), TripId(2)], &f_dep, &f_arr, 2438,
+    );
+    // Slow A→Y: 3 trips, 25-min ride.
+    let s_dep = [33000u32, 34200, 35400];
+    let s_arr = [34500u32, 35700, 36900];
+    add_two_stop_line(
+        &mut g, stop_a, stop_y, RouteId(1),
+        &[TripId(3), TripId(4), TripId(5)], &s_dep, &s_arr, 3160,
+    );
+
+    let mut hops = Vec::new();
+    for i in 0..3 {
+        hops.push(Hop { board: stop_a, alight: stop_z, dep: f_dep[i], arr: f_arr[i] });
+        hops.push(Hop { board: stop_a, alight: stop_y, dep: s_dep[i], arr: s_arr[i] });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, o, d, hops)
+}
+
+/// Corridor whose FASTEST journey boards at a stop ~905 s from the origin (well
+/// beyond the 600 s radius). Fast bus from the far stop reaches the destination
+/// stop earlier than the slow bus from the near stop.
+fn stage1_far_access_graph() -> (Graph, NodeID, NodeID, Vec<Hop>) {
+    let mut g = Graph::new();
+    g.set_street_time(identity_street_time());
+
+    let o = g.add_node(osm_node("O", 50.000, 4.000000));
+    let jfast = g.add_node(osm_node("jFast", 50.000, 4.0151486));
+    let d = g.add_node(osm_node("D", 50.000, 4.0501291));
+
+    let stop_slow = g.add_node(transit_stop("SLOW", 50.000, 4.0010043));
+    let stop_fast = g.add_node(transit_stop("FAST", 50.000, 4.0151486));
+    let stop_near_d = g.add_node(transit_stop("NEARD", 50.000, 4.0501291));
+
+    add_street_bidir(&mut g, o, jfast, 1086); //  905 s
+    add_street_bidir(&mut g, jfast, d, 2508); // 2090 s
+    add_snap_bidir(&mut g, stop_slow, o, 72); //   60 s access
+    add_snap_bidir(&mut g, stop_fast, jfast, 6); //  5 s (→ 905 s from O)
+    add_snap_bidir(&mut g, stop_near_d, d, 6); //    5 s egress
+    // access O→FAST = 905 s; O→SLOW = 60 s; walk O→D = 2995 s.
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "F".into(),
+            route_long_name: "Fast".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "S".into(),
+            route_long_name: "Slow".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+    ]);
+
+    // Fast FAST→NEARD dep 33600 arr 34200; Slow SLOW→NEARD dep 33000 arr 34500.
+    add_two_stop_line(
+        &mut g, stop_fast, stop_near_d, RouteId(0),
+        &[TripId(0)], &[33600], &[34200], 2508,
+    );
+    add_two_stop_line(
+        &mut g, stop_slow, stop_near_d, RouteId(1),
+        &[TripId(1)], &[33000], &[34500], 3594,
+    );
+
+    let hops = vec![
+        Hop { board: stop_fast, alight: stop_near_d, dep: 33600, arr: 34200 },
+        Hop { board: stop_slow, alight: stop_near_d, dep: 33000, arr: 34500 },
+    ];
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, o, d, hops)
+}
+
+/// Independent brute-force fastest arrival for `origin → dest` departing at
+/// `dep`: the min over the direct walk and every single-transit-leg journey
+/// (walk to a boardable stop, ride, walk to dest), using the engine's own
+/// unbounded foot Dijkstra for ground-truth walk seconds. Unrestricted access/
+/// egress radius, so it is oblivious to the 600 s heuristic.
+fn oracle_fastest_arrival(g: &Graph, origin: NodeID, dest: NodeID, dep: u32, hops: &[Hop]) -> u32 {
+    let from_o = g.walk_dijkstra(origin, u32::MAX);
+    let to_d = g.walk_dijkstra(dest, u32::MAX);
+    let mut best = u32::MAX;
+    // Direct walk.
+    if let Some(&w) = from_o.get(&dest) {
+        best = best.min(dep.saturating_add(w));
+    }
+    // Single transit leg.
+    for h in hops {
+        let Some(&wa) = from_o.get(&h.board) else { continue };
+        if dep.saturating_add(wa) > h.dep {
+            continue; // cannot make this departure
+        }
+        let Some(&we) = to_d.get(&h.alight) else { continue };
+        best = best.min(h.arr.saturating_add(we));
+    }
+    best
+}
+
+fn min_end(plans: &[maas_rs::structures::plan::Plan]) -> u32 {
+    plans.iter().map(|p| p.end).min().unwrap_or(u32::MAX)
+}
+
+#[test]
+fn stage1_egress_beyond_radius_fastest_arrival() {
+    // Fastest journey egresses at Z (905 s > 600 s from D). Legacy code returns
+    // the slower Y journey (34805); Stage 1 must return the Z journey (34505).
+    let (g, o, d, hops) = stage1_far_egress_graph();
+    let dep = 32400;
+    let oracle = oracle_fastest_arrival(&g, o, d, dep, &hops);
+    // Sanity: the oracle's optimum is the far-egress Z journey (34505), strictly
+    // better than the best journey reachable within the 600 s radius (Y = 34805).
+    assert_eq!(oracle, 34505, "oracle fastest arrival (via far egress Z)");
+
+    let plans = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "must return a plan");
+    assert_eq!(
+        min_end(&plans),
+        oracle,
+        "engine must find the far-egress fastest journey (got {}, oracle {})",
+        min_end(&plans),
+        oracle
+    );
+}
+
+#[test]
+fn stage1_access_beyond_radius_fastest_arrival() {
+    // Fastest journey boards FAST (905 s > 600 s from O). Legacy returns the
+    // slower SLOW journey (34505); Stage 1 must return the FAST journey (34205).
+    let (g, o, d, hops) = stage1_far_access_graph();
+    let dep = 32400;
+    let oracle = oracle_fastest_arrival(&g, o, d, dep, &hops);
+    assert_eq!(oracle, 34205, "oracle fastest arrival (via far access FAST)");
+
+    let plans = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "must return a plan");
+    assert_eq!(
+        min_end(&plans),
+        oracle,
+        "engine must find the far-access fastest journey (got {}, oracle {})",
+        min_end(&plans),
+        oracle
+    );
+}
+
+#[test]
+fn stage1_oracle_equivalence_single_departures() {
+    // Across several departures, the single-departure engine must match the
+    // brute-force fastest arrival exactly (completeness + soundness).
+    // Departures chosen so a transit journey is always the fastest option (the
+    // walk-only-dominates regime is a separate walk-vs-transit concern, not an
+    // access/egress-completeness one).
+    let (g, o, d, hops) = stage1_far_egress_graph();
+    for dep in [32400u32, 33000, 33001, 34000] {
+        let oracle = oracle_fastest_arrival(&g, o, d, dep, &hops);
+        let plans = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+        assert!(!plans.is_empty(), "dep {dep}: must return a plan");
+        assert_eq!(
+            min_end(&plans),
+            oracle,
+            "dep {dep}: engine {} != oracle {}",
+            min_end(&plans),
+            oracle
+        );
+    }
+}
+
+#[test]
+fn stage1_oracle_equivalence_range() {
+    // The range driver must also find the window's globally fastest arrival,
+    // which is the earliest fast-bus far-egress journey.
+    let (g, o, d, hops) = stage1_far_egress_graph();
+    let start = 32400;
+    let window = 3 * 3600;
+    // Global fastest over any boardable departure in the window.
+    let mut oracle_global = u32::MAX;
+    for dep in start..=(start + window) {
+        oracle_global = oracle_global.min(oracle_fastest_arrival(&g, o, d, dep, &hops));
+    }
+    let plans = g.raptor_range(o, d, start, window, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "range must return plans");
+    assert_eq!(
+        min_end(&plans),
+        oracle_global,
+        "range engine fastest {} != oracle {}",
+        min_end(&plans),
+        oracle_global
+    );
+}
+
+/// The query-latency profiler is purely additive observability: arming it must
+/// not change routing behavior. Runs the same far-egress range query with the
+/// profiler off then on and asserts byte-identical plans (via `Debug`), plus
+/// sanity-checks that turning it on actually produced a non-trivial
+/// decomposition (so this isn't accidentally testing a no-op).
+#[test]
+fn profile_latency_flag_off_vs_on_yields_identical_plans() {
+    use maas_rs::structures::latency_profile;
+
+    let (g, o, d, _hops) = stage1_far_egress_graph();
+    let start = 32400;
+    let window = 3 * 3600;
+    let dbg = |ps: &[maas_rs::structures::plan::Plan]| {
+        ps.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>()
+    };
+
+    let t0 = latency_profile::begin_query(false);
+    let plans_off = g.raptor_range(o, d, start, window, 0, 0x7F, 10 * 60);
+    assert!(
+        latency_profile::end_query(t0).is_none(),
+        "profiler must not report anything when off"
+    );
+
+    let t1 = latency_profile::begin_query(true);
+    let plans_on = g.raptor_range(o, d, start, window, 0, 0x7F, 10 * 60);
+    let profile = latency_profile::end_query(t1).expect("profiling was enabled");
+
+    assert_eq!(
+        dbg(&plans_off),
+        dbg(&plans_on),
+        "profiling must not change routing behavior or results"
+    );
+
+    // The profiler actually measured something real: at least one pass ran the
+    // per-departure range loop, and backward never exceeds extract.
+    let total_departures: u32 = profile.passes.iter().map(|p| p.departures).sum();
+    assert!(total_departures > 0, "expected at least one range departure");
+    assert!(
+        profile.backward <= profile.extract,
+        "backward ({:?}) must nest under extract ({:?})",
+        profile.backward,
+        profile.extract
+    );
+    let report = profile.report();
+    assert!(report.contains("discovery"));
+    assert!(report.contains("Pass A"));
+}
+
+// ── Near-slow + far-fast retention (accumulate-and-merge soundness) ──
+//
+// The completeness fix runs two access/egress passes (near-stop radius, then the
+// walk-only radius W) and MERGES their plans. These graphs place BOTH a near stop
+// (inside the 600 s radius, non-empty Pass A) AND a far stop (beyond it, only
+// found by Pass B). They assert two things at once:
+//   • soundness — the engine's fastest arrival equals the brute-force oracle, and
+//     the oracle's optimum is the FAR journey, so Pass B is doing real work; and
+//   • retention — a later-departing NEAR-stop journey, Pareto-non-dominated on the
+//     departure axis, must survive the merge (bug #3: the old budget-cap dropped
+//     such diverse plans). Both distinct arrivals must appear in the range result.
+
+/// Near+far ACCESS corridor with a later NEAR departure. NEAR boards 60 s from O
+/// (inside the radius); FAR boards ~1010 s from O (beyond it). One fast FAR→NEARD
+/// trip arrives earliest; the NEAR→NEARD line has an early trip (dominated by FAR)
+/// and a late trip no FAR ride can dominate on departure. Fastest = far-access.
+fn stage1_near_far_access_graph() -> (Graph, NodeID, NodeID, Vec<Hop>) {
+    let mut g = Graph::new();
+    g.set_street_time(identity_street_time());
+
+    let o = g.add_node(osm_node("O", 50.000, 4.000000));
+    let jfar = g.add_node(osm_node("jFar", 50.000, 4.0168283));
+    let d = g.add_node(osm_node("D", 50.000, 4.0518168));
+
+    let stop_near = g.add_node(transit_stop("NEAR", 50.000, 4.0010043));
+    let stop_far = g.add_node(transit_stop("FAR", 50.000, 4.0168283));
+    let stop_neard = g.add_node(transit_stop("NEARD", 50.000, 4.0518168));
+
+    add_street_bidir(&mut g, o, jfar, 1206); // 1005 s
+    add_street_bidir(&mut g, jfar, d, 2508); // 2090 s
+    add_snap_bidir(&mut g, stop_near, o, 72); //   60 s access
+    add_snap_bidir(&mut g, stop_far, jfar, 6); //   5 s (→ 1010 s from O)
+    add_snap_bidir(&mut g, stop_neard, d, 6); //    5 s egress
+    // access O→FAR = 1010 s (> 600 s); O→NEAR = 60 s; walk O→D = 3095 s.
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "F".into(),
+            route_long_name: "Fast".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "S".into(),
+            route_long_name: "Slow".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+    ]);
+
+    // Fast FAR→NEARD: single trip dep 33600 arr 34200 (→ dest 34205).
+    add_two_stop_line(
+        &mut g, stop_far, stop_neard, RouteId(0),
+        &[TripId(0)], &[33600], &[34200], 2508,
+    );
+    // Slow NEAR→NEARD: early trip (dominated) + late trip (retained in a window).
+    add_two_stop_line(
+        &mut g, stop_near, stop_neard, RouteId(1),
+        &[TripId(1), TripId(2)], &[33000, 36000], &[34500, 37500], 3714,
+    );
+
+    let hops = vec![
+        Hop { board: stop_far, alight: stop_neard, dep: 33600, arr: 34200 },
+        Hop { board: stop_near, alight: stop_neard, dep: 33000, arr: 34500 },
+        Hop { board: stop_near, alight: stop_neard, dep: 36000, arr: 37500 },
+    ];
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, o, d, hops)
+}
+
+/// Near+far EGRESS corridor with a later NEAR-egress departure. A fast bus alights
+/// at Z (~905 s egress, beyond the radius) yet arrives earliest overall; a slow
+/// bus alights at Y (305 s egress, inside the radius) with an early trip (dominated)
+/// and a late trip (retained). Fastest = far-egress Z.
+fn stage1_near_far_egress_graph() -> (Graph, NodeID, NodeID, Vec<Hop>) {
+    let mut g = Graph::new();
+    g.set_street_time(identity_street_time());
+
+    let o = g.add_node(osm_node("O", 50.000, 4.000000));
+    let jz = g.add_node(osm_node("jZ", 50.000, 4.0350652));
+    let jy = g.add_node(osm_node("jY", 50.000, 4.0451078));
+    let d = g.add_node(osm_node("D", 50.000, 4.0501291));
+
+    let stop_a = g.add_node(transit_stop("A", 50.000, 4.0010043));
+    let stop_z = g.add_node(transit_stop("Z", 50.000, 4.0350652));
+    let stop_y = g.add_node(transit_stop("Y", 50.000, 4.0451078));
+
+    add_street_bidir(&mut g, o, jz, 2514); // 2095 s
+    add_street_bidir(&mut g, jz, jy, 720); //  600 s
+    add_street_bidir(&mut g, jy, d, 360); //  300 s
+    add_snap_bidir(&mut g, stop_a, o, 72); //   60 s access
+    add_snap_bidir(&mut g, stop_z, jz, 6); //    5 s
+    add_snap_bidir(&mut g, stop_y, jy, 6); //    5 s
+    // egress D→Z = 300+600+5 = 905 s (> 600 s); D→Y = 305 s; walk O→D = 2995 s.
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "F".into(),
+            route_long_name: "Fast".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "S".into(),
+            route_long_name: "Slow".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+    ]);
+
+    // Fast A→Z: single trip dep 33000 arr 33600 (→ dest 34505 via 905 s egress).
+    add_two_stop_line(
+        &mut g, stop_a, stop_z, RouteId(0),
+        &[TripId(0)], &[33000], &[33600], 2438,
+    );
+    // Slow A→Y: early trip (dominated) + late trip (retained), 305 s egress.
+    add_two_stop_line(
+        &mut g, stop_a, stop_y, RouteId(1),
+        &[TripId(1), TripId(2)], &[33000, 36000], &[34500, 37500], 3160,
+    );
+
+    let hops = vec![
+        Hop { board: stop_a, alight: stop_z, dep: 33000, arr: 33600 },
+        Hop { board: stop_a, alight: stop_y, dep: 33000, arr: 34500 },
+        Hop { board: stop_a, alight: stop_y, dep: 36000, arr: 37500 },
+    ];
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, o, d, hops)
+}
+
+#[test]
+fn stage1_near_far_access_finds_far_and_retains_near() {
+    let (g, o, d, hops) = stage1_near_far_access_graph();
+
+    // Single departure: fastest is the far-access FAST journey (34205), beyond the
+    // 600 s radius, so only the merged Pass B can find it.
+    let dep = 32400;
+    let oracle = oracle_fastest_arrival(&g, o, d, dep, &hops);
+    assert_eq!(oracle, 34205, "oracle fastest = far-access FAST (via FAR)");
+    let plans = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "single: must return a plan");
+    assert_eq!(min_end(&plans), oracle, "single: engine {} != oracle {}", min_end(&plans), oracle);
+
+    // Range: the globally fastest is still the far-access journey, AND the later
+    // NEAR-departure journey (37505) must be retained alongside it, not dropped.
+    let start = 32400;
+    let window = 4 * 3600;
+    let mut oracle_global = u32::MAX;
+    for t in start..=(start + window) {
+        oracle_global = oracle_global.min(oracle_fastest_arrival(&g, o, d, t, &hops));
+    }
+    assert_eq!(oracle_global, 34205, "range oracle fastest = far-access FAST");
+    let plans = g.raptor_range(o, d, start, window, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "range: must return plans");
+    assert_eq!(min_end(&plans), oracle_global, "range: engine {} != oracle {}", min_end(&plans), oracle_global);
+    let ends: std::collections::HashSet<u32> = plans.iter().map(|p| p.end).collect();
+    assert!(ends.contains(&34205), "range: fast far-access arrival retained; ends={ends:?}");
+    assert!(
+        ends.contains(&37505),
+        "range: later NEAR-departure arrival must be retained (bug #3 regression); ends={ends:?}"
+    );
+}
+
+#[test]
+fn stage1_near_far_egress_finds_far_and_retains_near() {
+    let (g, o, d, hops) = stage1_near_far_egress_graph();
+
+    // Single departure: fastest is the far-egress Z journey (34505), whose egress
+    // walk (905 s) lies beyond the radius — only merged Pass B reaches it.
+    let dep = 32400;
+    let oracle = oracle_fastest_arrival(&g, o, d, dep, &hops);
+    assert_eq!(oracle, 34505, "oracle fastest = far-egress (via Z)");
+    let plans = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "single: must return a plan");
+    assert_eq!(min_end(&plans), oracle, "single: engine {} != oracle {}", min_end(&plans), oracle);
+
+    // Range: fastest still far-egress; the later NEAR-egress journey (37805) must
+    // be retained.
+    let start = 32400;
+    let window = 4 * 3600;
+    let mut oracle_global = u32::MAX;
+    for t in start..=(start + window) {
+        oracle_global = oracle_global.min(oracle_fastest_arrival(&g, o, d, t, &hops));
+    }
+    assert_eq!(oracle_global, 34505, "range oracle fastest = far-egress");
+    let plans = g.raptor_range(o, d, start, window, 0, 0x7F, 10 * 60);
+    assert!(!plans.is_empty(), "range: must return plans");
+    assert_eq!(min_end(&plans), oracle_global, "range: engine {} != oracle {}", min_end(&plans), oracle_global);
+    let ends: std::collections::HashSet<u32> = plans.iter().map(|p| p.end).collect();
+    assert!(ends.contains(&34505), "range: fast far-egress arrival retained; ends={ends:?}");
+    assert!(
+        ends.contains(&37805),
+        "range: later NEAR-egress arrival must be retained (bug #3 regression); ends={ends:?}"
+    );
+}
+
+/// Item 12: raptorExplain uses the SAME two-pass A/B access/egress search as
+/// production `raptor`. On the far-egress graph the fastest journey (34505) needs
+/// an egress walk (905 s) beyond the initial 600 s near radius — only merged Pass B
+/// reaches it. The OLD growing-radius doubling loop in `with_access_search_debug`
+/// returned on the first non-empty radius and MISSED it; the ported two-pass finds
+/// it, so the explain plan set now equals prod's.
+#[test]
+fn explain_two_pass_matches_prod_on_far_egress() {
+    let (g, o, d, _hops) = stage1_near_far_egress_graph();
+    let dep = 32400;
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let am = ActiveModes::default();
+    let rt = RealtimeIndex::new();
+    let bike = BikeCost::new(BikeProfile::default());
+
+    let prod = g.raptor(o, d, dep, 0, 0x7F, 10 * 60);
+    let res = g.raptor_explain_tuned_rt_modes(
+        o,
+        d,
+        dep,
+        0,
+        0x7F,
+        10 * 60,
+        &buckets,
+        900,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
+        &rt,
+        &am,
+        &bike,
+        None,
+    );
+
+    // The far-egress fastest arrival is discovered by the explain (debug) path.
+    assert!(
+        res.plans.iter().any(|p| p.end == 34505),
+        "explain must reach the far-egress arrival 34505 via Pass B; ends={:?}",
+        res.plans.iter().map(|p| p.end).collect::<Vec<_>>()
+    );
+    // Explain plan SET now equals prod's (access is identical; single departure has
+    // no finalization-only divergence here).
+    let key = |p: &maas_rs::structures::plan::Plan| (p.mode, p.start, p.end, transit_leg_count(p));
+    let mut a: Vec<_> = prod.iter().map(key).collect();
+    let mut b: Vec<_> = res.plans.iter().map(key).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    assert_eq!(a, b, "raptorExplain plan set diverged from prod raptor on far egress");
+    // Two-pass ran: Pass B beyond Pass A is recorded as one extra pass.
+    assert_eq!(res.access.access_attempts, 1, "Pass B must have run for the far egress");
+    assert!(!res.access.fell_back_to_walk_only);
+}
+
+// ── CCH foot access/egress (chunk 1 smoke test) ─────────────────────────────────
+
+/// A star of foot edges around a central non-stop hub `h`, so the CCH one-to-many
+/// traverses real super-edge arcs (not just seed stubs):
+///
+/// ```text
+///   a --60m-- h --120m-- s1(stop)
+///             |
+///           240m
+///             |
+///            s2(stop)
+/// ```
+///
+/// Edge LENGTHS are explicit, so at the default 1.2 m/s (speed_mms = 1200) the exact
+/// foot seconds are `len * 1000 / 1200`: 60→50, 120→100, 240→200. From `a`, access to
+/// `s1` = 50+100 = 150, to `s2` = 50+200 = 250 — a hand-computed anchor independent of
+/// any graph routine. Returns `(g, a, h)` with contraction + raptor index built.
+fn cch_star_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+    let h = g.add_node(osm_node("h", 50.000, 4.000));
+    let a = g.add_node(osm_node("a", 50.000, 4.001));
+    let s1 = g.add_node(transit_stop("S1", 50.001, 4.000));
+    let s2 = g.add_node(transit_stop("S2", 50.000, 3.999));
+    // Bidirectional foot edges (foot cost is direction-symmetric).
+    g.add_edge(h, street_edge(h, a, 60));
+    g.add_edge(a, street_edge(a, h, 60));
+    g.add_edge(h, street_edge(h, s1, 120));
+    g.add_edge(s1, street_edge(s1, h, 120));
+    g.add_edge(h, street_edge(h, s2, 240));
+    g.add_edge(s2, street_edge(s2, h, 240));
+    g.build_raptor_index(); // MUST precede contraction (build_cch_access reads transit_node_to_stop)
+    enable_contraction(&mut g);
+    (g, a, h)
+}
+
+/// `build_cch_access` + `cch_access` reproduce the exact node-level `nearby_stops`
+/// Dijkstra and the contracted `nearby_stops_arena`, and match a hand-computed anchor.
+#[test]
+fn cch_access_matches_exact_walk() {
+    let (g, a, _h) = cch_star_graph();
+    let cch = g.build_cch_access();
+    let a_ll = g.get_node(a).unwrap().loc();
+    let radius = g.raptor.edge_snap_radius_m;
+
+    let got = g.cch_access(&cch, a_ll);
+
+    // Independent reference #1: node-level walk Dijkstra (uses g.nodes/edges, no foot_snap,
+    // no contracted graph — a genuinely independent oracle).
+    let node_ref = g.nearby_stops(a, u32::MAX);
+    assert_eq!(got, node_ref, "cch_access must equal node-level nearby_stops");
+
+    // Independent reference #2: contracted coord-based twin, exact (unbounded) set.
+    let cg = g.contracted.as_ref().unwrap();
+    let arena_ref = cg.nearby_stops_arena(&g, a_ll.latitude, a_ll.longitude, radius, u32::MAX);
+    assert_eq!(got, arena_ref, "cch_access must equal nearby_stops_arena");
+
+    // Independent hand-computed anchor: from a, {s1: 150s, s2: 250s} by geometry.
+    let mut secs: Vec<u32> = got.iter().map(|&(_, s)| s).collect();
+    secs.sort_unstable();
+    assert_eq!(secs, vec![150, 250], "hand-computed foot seconds from a");
+    assert_eq!(got.len(), 2, "both stops reached");
+}
+
+/// `cch_egress` is the symmetric one-to-many: from the hub `h` it must give the exact
+/// hub→stop foot seconds ({s1:100, s2:200}) and equal node-level `nearby_stops(h)`.
+#[test]
+fn cch_egress_matches_exact_walk() {
+    let (g, _a, h) = cch_star_graph();
+    let cch = g.build_cch_access();
+    let h_ll = g.get_node(h).unwrap().loc();
+
+    let got = g.cch_egress(&cch, h_ll);
+
+    let node_ref = g.nearby_stops(h, u32::MAX);
+    assert_eq!(got, node_ref, "cch_egress must equal node-level nearby_stops(h)");
+
+    let mut secs: Vec<u32> = got.iter().map(|&(_, s)| s).collect();
+    secs.sort_unstable();
+    assert_eq!(secs, vec![100, 200], "hand-computed foot seconds from hub h");
+}
+
+/// CHUNK 3 split: the cacheable ORDER path (`compute_cch_order` →
+/// `build_cch_access_with_order`) must produce a CCH that answers identically to the
+/// all-in-one `build_cch_access`. The order is `n` long (a permutation of the junction
+/// ranks), independent of the walk-second weights, and is the only thing cached to
+/// `cch.bin`.
+#[test]
+fn cch_split_order_matches_all_in_one() {
+    let (g, a, h) = cch_star_graph();
+
+    let order = g.compute_cch_order();
+    assert_eq!(order.len(), g.cch_vertex_count(), "order permutes every junction");
+    // A valid rank permutation: every rank in 0..n appears exactly once.
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, (0..order.len() as u32).collect::<Vec<_>>());
+
+    let cch_split = g.build_cch_access_with_order(&order);
+    let cch_all = g.build_cch_access();
+    let a_ll = g.get_node(a).unwrap().loc();
+    let h_ll = g.get_node(h).unwrap().loc();
+
+    assert_eq!(
+        g.cch_access(&cch_split, a_ll),
+        g.cch_access(&cch_all, a_ll),
+        "split order reproduces all-in-one access"
+    );
+    assert_eq!(
+        g.cch_egress(&cch_split, h_ll),
+        g.cch_egress(&cch_all, h_ll),
+        "split order reproduces all-in-one egress"
+    );
+}
+
+/// CHUNK 3 restore path: `graph.bin` is persisted AFTER `finalize_contraction` drops the
+/// interior node/edge arrays, so on `--restore --serve` the CCH is (re)built with empty
+/// `g.nodes`/`g.edges`. `extract_foot_graph`/`walk_secs` must read only the contracted
+/// arena + `raptor` params (never the dropped arrays), exactly like `nearby_stops_arena`.
+/// Assert the CCH answers identically before and after the drop, on the same cached order.
+#[test]
+fn cch_build_survives_interior_array_drop() {
+    let (mut g, a, h) = cch_star_graph();
+    let a_ll = g.get_node(a).unwrap().loc();
+    let h_ll = g.get_node(h).unwrap().loc();
+
+    let order = g.compute_cch_order();
+    let before_access = g.cch_access(&g.build_cch_access_with_order(&order), a_ll);
+    let before_egress = g.cch_egress(&g.build_cch_access_with_order(&order), h_ll);
+
+    // Drop the interior arrays exactly as production does before persisting graph.bin.
+    maas_rs::services::build::finalize_contraction(&mut g).expect("drop interior arrays");
+
+    // Same order (contracted graph + junction count are untouched by the drop), rebuilt
+    // CCH — must answer identically. (`nearby_stops` can't be the oracle here: it needs
+    // g.nodes, now empty; pre-drop vs post-drop CCH output is the invariant.)
+    let after_access = g.cch_access(&g.build_cch_access_with_order(&order), a_ll);
+    let after_egress = g.cch_egress(&g.build_cch_access_with_order(&order), h_ll);
+    assert_eq!(before_access, after_access, "access invariant to interior-array drop");
+    assert_eq!(before_egress, after_egress, "egress invariant to interior-array drop");
+}
+
+// ── CHUNK 2: CCH exactness (superset agreement + end-to-end A/B) ─────────────────
+
+/// (4a) Superset / agreement. On the star graph one stop (S1, 150 s) lies inside a
+/// radius `R = 200 s` and one (S2, 250 s) lies beyond it. The exact CCH one-to-many
+/// (which never bounds by radius) must, when RESTRICTED to `<= R`, agree stop-for-stop
+/// and second-for-second with the radius-bounded two-pass reference
+/// (`nearby_stops_union(origin, R, cg)`), AND additionally surface the far S2 that the
+/// bounded reference cannot see. `a` sits exactly on a junction node, so the CCH's
+/// coord edge-snap and the reference's node seeding collapse to the same seed — the
+/// comparison isolates the radius behaviour, not a snap offset.
+#[test]
+fn cch_access_is_superset_of_bounded_two_pass() {
+    let (g, a, _h) = cch_star_graph();
+    let cch = g.build_cch_access();
+    let a_ll = g.get_node(a).unwrap().loc();
+    let cg = g.contracted.as_ref().unwrap();
+
+    // Exact, unbounded CCH access: both stops, {S1:150, S2:250}.
+    let exact = g.cch_access(&cch, a_ll);
+    assert_eq!(exact.len(), 2, "CCH reaches both stops; got {exact:?}");
+
+    // Bounded two-pass reference at R = 200 s: only S1 (150 s) is within radius.
+    let r: u32 = 200;
+    let bounded = g.nearby_stops_union(a, r, cg);
+
+    // CCH restricted to <= R must equal the bounded reference stop-for-stop, EQUAL secs.
+    let cch_within: Vec<(usize, u32)> =
+        exact.iter().copied().filter(|&(_, s)| s <= r).collect();
+    assert_eq!(
+        cch_within, bounded,
+        "CCH restricted to <= {r}s must equal nearby_stops_union(origin, {r}s); \
+         cch_within={cch_within:?} bounded={bounded:?}"
+    );
+    assert_eq!(cch_within.len(), 1, "exactly S1 within {r}s");
+
+    // And the CCH surfaces the far stop the bounded reference misses.
+    let far: Vec<(usize, u32)> = exact.iter().copied().filter(|&(_, s)| s > r).collect();
+    assert_eq!(far.len(), 1, "exactly S2 beyond {r}s; got {far:?}");
+    assert_eq!(far[0].1, 250, "far stop is S2 at 250 s");
+    let bounded_stops: std::collections::HashSet<usize> =
+        bounded.iter().map(|&(s, _)| s).collect();
+    assert!(
+        !bounded_stops.contains(&far[0].0),
+        "bounded two-pass must NOT contain the far stop"
+    );
+}
+
+/// (4b) End-to-end A/B through `raptor()`. The OD's fastest journey boards FAR, whose
+/// access walk (1010 s) lies beyond the 600 s near radius. With `use_cch_access` OFF
+/// the router uses the radius-bounded two-pass foot search; with it ON the CCH exact
+/// one-to-many feeds foot access. Toggling the flag on the SAME graph (build + install
+/// the CCH once) must leave the fastest arrival no worse and still surface the
+/// far-boarding plan.
+///
+/// NOTE: the two-pass path already widens (Pass B → `min(W, A - start)`) far enough to
+/// discover the fastest far-boarding stop, so CCH-off is NOT expected to miss it — the
+/// A/B asserts arrival PARITY (`on <= off`) plus far-boarding presence, which is what
+/// provably holds; it does not assert CCH-off fails.
+#[test]
+fn cch_ab_far_boarding_end_to_end() {
+    let (mut g, o, d, hops) = stage1_near_far_access_graph();
+    let far_board = hops[0].board; // stop FAR: 1010 s access, beyond the 600 s radius.
+    let cch = g.build_cch_access();
+    g.set_cch(cch);
+
+    let dep = 32400;
+    let radius = 10 * 60; // 600 s near radius.
+
+    // CCH OFF — radius-bounded two-pass foot access.
+    g.set_use_cch_access(false);
+    let off = g.raptor(o, d, dep, 0, 0x7F, radius);
+    assert!(!off.is_empty(), "CCH-off must return a plan");
+    let off_fastest = min_end(&off);
+
+    // CCH ON — exact one-to-many foot access.
+    g.set_use_cch_access(true);
+    let on = g.raptor(o, d, dep, 0, 0x7F, radius);
+    assert!(!on.is_empty(), "CCH-on must return a plan");
+    let on_fastest = min_end(&on);
+
+    assert!(
+        on_fastest <= off_fastest,
+        "CCH-on fastest {on_fastest} must be <= CCH-off {off_fastest}"
+    );
+    assert_eq!(
+        on_fastest, 34205,
+        "CCH-on fastest arrival = far-boarding FAST journey (via FAR)"
+    );
+
+    // Specifically finds the far-boarding plan: some plan's first transit leg boards FAR.
+    let boards_far = |plans: &[maas_rs::structures::plan::Plan]| {
+        plans.iter().any(|p| {
+            p.legs.iter().find_map(|l| match l {
+                PlanLeg::Transit(t) => Some(t.from.node_id == far_board),
+                _ => None,
+            }) == Some(true)
+        })
+    };
+    assert!(
+        boards_far(&on),
+        "CCH-on must surface the far-boarding (FAR) plan"
+    );
+}
+
+/// (4b-discriminator) Proves `use_cch_access` SPECIFICALLY flips the foot-access seam.
+/// `raptor()` output can't discriminate (the two-pass is complete for fastest arrival,
+/// so on/off land on the same Pareto set), so a dropped/swapped flag would be invisible
+/// there. The pre-Pareto access metadata does discriminate: at the initial 600 s radius
+/// the bounded two-pass reports only the NEAR stop (1), while the unbounded CCH
+/// one-to-many reports all three (NEAR 60 s, FAR 1010 s, NEARD ~3095 s). A plumbing bug
+/// that fed `false` (or the `unrestricted` value) into the `use_cch` slot would leave
+/// flag-ON reading the bounded set and this assertion would fail.
+#[test]
+fn cch_flag_flips_access_set_via_explain() {
+    let (mut g, o, d, _hops) = stage1_near_far_access_graph();
+    let cch = g.build_cch_access();
+    g.set_cch(cch);
+
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let am = ActiveModes::default();
+    let rt = RealtimeIndex::new();
+    let bike = BikeCost::new(BikeProfile::default());
+    let run = |g: &Graph| {
+        g.raptor_explain_tuned_rt_modes(
+            o, d, 32400, 0, 0x7F, 10 * 60, &buckets, 900,
+            g.raptor.unrestricted_transfers, g.raptor.use_cch_access,
+            &rt, &am, &bike, None,
+        )
+    };
+
+    g.set_use_cch_access(false);
+    let off = run(&g);
+    g.set_use_cch_access(true);
+    let on = run(&g);
+
+    assert_eq!(
+        off.access.origin_stops_found, 1,
+        "flag OFF: bounded two-pass finds only NEAR within 600 s"
+    );
+    assert_eq!(
+        on.access.origin_stops_found, 3,
+        "flag ON: unbounded CCH finds NEAR + FAR + NEARD"
+    );
+    assert!(
+        on.access.origin_stops_found > off.access.origin_stops_found,
+        "toggling use_cch_access must widen the discovered access set"
+    );
+}
+
+// ── Realtime CANCELED-trip correctness ────────────────────────────────────────
+//
+// These validate the canceled-trips fix (sites A1/A2/A2b/B1/B2/C1/D1). Every
+// guard is `&& !rt.is_canceled(trip)` beside the schedule-activity check, so an
+// empty index is byte-identical (proven by the rest of the suite); here we assert
+// the *with-feed* behaviour: a canceled trip is never boarded, never used as a
+// miss-fallback, and never selected by the tightening oracle.
+
+/// Direct single-route graph: origin → [Stop P] → Bus(P,Q) → [Stop Q] → dest.
+/// Bus has TWO trips: T0 dep 08:00 arr 08:30, T1 dep 09:00 arr 09:30. Returns the
+/// two street endpoints and both stop nodes (needed to call the oracle directly).
+fn direct_bus_two_trip_graph() -> (Graph, NodeID, NodeID, NodeID, NodeID) {
+    direct_bus_two_trip_graph_perm(true, true)
+}
+
+/// Like `direct_bus_two_trip_graph`, but the later bus (T1, 09:00) can have its
+/// boarding permission at P (`t1_board`) or alighting permission at Q (`t1_alight`)
+/// suppressed — modelling GTFS `pickup_type == 1` / `drop_off_type == 1` at a
+/// terminal on a same-pattern later trip (the shape that traps the tightening
+/// oracle into re-timing a leg onto an un-boardable/un-alightable trip).
+fn direct_bus_two_trip_graph_perm(
+    t1_board: bool,
+    t1_alight: bool,
+) -> (Graph, NodeID, NodeID, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.041));
+    let stop_p = g.add_node(transit_stop("Stop P", 50.000, 4.001));
+    let stop_q = g.add_node(transit_stop("Stop Q", 50.000, 4.040));
+
+    // A long walkable street spine so origin/dest are connected for access/egress.
+    g.add_edge(osm_origin, street_edge(osm_origin, osm_dest, 3000));
+    g.add_edge(osm_dest, street_edge(osm_dest, osm_origin, 3000));
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (a, b) in [(stop, osm), (osm, stop)] {
+            g.add_edge(
+                a,
+                EdgeData::Street(StreetEdgeData {
+                    origin: a,
+                    destination: b,
+                    length: m,
+                    partial: true,
+                    foot: true,
+                    bike: false,
+                    car: false,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    add_snap(&mut g, stop_p, osm_origin, 72);
+    add_snap(&mut g, stop_q, osm_dest, 72);
+
+    g.add_edge(
+        stop_p,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_p,
+            destination: stop_q,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 2 },
+            length: 3000,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "1".into(),
+        route_long_name: "Bus 1".into(),
+        route_type: RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // TripId(0) = 08:00
+        TripInfo {
+            trip_headsign: None,
+            route_id: RouteId(0),
+            service_id: ServiceId(0),
+            bikes_allowed: None,
+        }, // TripId(1) = 09:00
+    ]);
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 8 * 3600,
+            arrival: 8 * 3600 + 1800,
+            service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(1),
+            origin_stop_sequence: 0,
+            destination_stop_sequence: 1,
+            departure: 9 * 3600,
+            arrival: 9 * 3600 + 1800,
+            service_id: ServiceId(0),
+        },
+    ]);
+
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_p, stop_q]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 2 });
+
+        let sts = g.transit_pattern_stop_times_len();
+        // Stop P column (departures), then Stop Q column (arrivals).
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 8 * 3600,
+            departure: 8 * 3600,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600,
+            departure: 9 * 3600,
+            board_allowed: t1_board,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 8 * 3600 + 1800,
+            departure: 8 * 3600 + 1800,
+            ..Default::default()
+        });
+        g.push_transit_pattern_stop_time(StopTime {
+            arrival: 9 * 3600 + 1800,
+            departure: 9 * 3600 + 1800,
+            alight_allowed: t1_alight,
+            ..Default::default()
+        });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
+
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: 2,
+        });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, osm_origin, osm_dest, stop_p, stop_q)
+}
+
+fn first_transit_leg(plan: &maas_rs::structures::plan::Plan) -> &maas_rs::structures::plan::PlanTransitLeg {
+    plan.legs
+        .iter()
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => Some(t),
+            _ => None,
+        })
+        .expect("plan should have a transit leg")
+}
+
+/// A1: the forward search must not board a CANCELED trip — it boards the next
+/// running trip instead. Cancelling the 08:00 bus (T0) shifts boarding to the
+/// 09:00 bus (T1); the arrival moves back by exactly one hour.
+#[test]
+fn canceled_trip_is_not_boarded_next_runner_used() {
+    let (g, o, d, _, _) = direct_bus_two_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let base = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &RealtimeIndex::new());
+    let base_plan = base.iter().min_by_key(|p| p.end).expect("a baseline plan");
+    assert_eq!(
+        first_transit_leg(base_plan).trip_id,
+        TripId(0),
+        "baseline should board the earliest bus (T0, 08:00)"
+    );
+    let base_end = base_plan.end;
+
+    let rt = RealtimeIndex::from_updates(1, [], [TripId(0)]);
+    let canc = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    let canc_plan = canc.iter().min_by_key(|p| p.end).expect("a plan on the next bus");
+    assert_eq!(
+        first_transit_leg(canc_plan).trip_id,
+        TripId(1),
+        "with T0 canceled the search must board T1 (09:00), never the dead T0"
+    );
+    assert_eq!(
+        canc_plan.end,
+        base_end + 3600,
+        "boarding the next runner (09:00 vs 08:00) pushes arrival back one hour"
+    );
+}
+
+/// A2: the tightening oracle (`latest_departure_before_arrival`, shared by
+/// chain_bounds and tighten_with_bounds) must never select a CANCELED trip.
+/// With both bus trips feasible it returns the latest (T1); cancelling T1 makes
+/// it fall back to T0.
+#[test]
+fn tightening_oracle_skips_canceled_trip() {
+    let (g, _, _, p, q) = direct_bus_two_trip_graph();
+
+    let empty = RealtimeIndex::new();
+    let (_, dep_latest, _) = g
+        .latest_departure_before_arrival(p, q, 0, 10 * 3600, 0, 0x7F, &empty)
+        .expect("some feasible bus with no feed");
+    assert_eq!(dep_latest, 9 * 3600, "latest feasible bus is T1 (09:00)");
+
+    let rt = RealtimeIndex::from_updates(1, [], [TripId(1)]);
+    let (_, dep_after, _) = g
+        .latest_departure_before_arrival(p, q, 0, 10 * 3600, 0, 0x7F, &rt)
+        .expect("T0 still feasible when T1 is canceled");
+    assert_eq!(
+        dep_after,
+        8 * 3600,
+        "with T1 canceled the oracle must fall back to T0 (08:00), never the dead T1"
+    );
+}
+
+/// Bug #5 (permission-blind tightening): the shared oracle must never select a
+/// same-pattern later trip that forbids BOARDING at the boarding stop
+/// (GTFS pickup_type == 1). With T1 (09:00) un-boardable at P the oracle must
+/// fall back to the boardable T0 (08:00), just as it does for a canceled trip.
+#[test]
+fn tightening_oracle_skips_unboardable_trip() {
+    let (g, _, _, p, q) = direct_bus_two_trip_graph_perm(false, true);
+    let empty = RealtimeIndex::new();
+
+    let (_, dep_latest, _) = g
+        .latest_departure_before_arrival(p, q, 0, 10 * 3600, 0, 0x7F, &empty)
+        .expect("T0 remains feasible when the later T1 forbids boarding");
+    assert_eq!(
+        dep_latest,
+        8 * 3600,
+        "oracle must skip the un-boardable T1 (pickup_type=1 at P) and keep T0 (08:00)"
+    );
+}
+
+/// Bug #5, alight half: the oracle must never select a same-pattern later trip
+/// that forbids ALIGHTING at the alighting stop (GTFS drop_off_type == 1). With
+/// T1 (09:00) un-alightable at Q the oracle must fall back to T0 (08:00).
+#[test]
+fn tightening_oracle_skips_unalightable_trip() {
+    let (g, _, _, p, q) = direct_bus_two_trip_graph_perm(true, false);
+    let empty = RealtimeIndex::new();
+
+    let (_, dep_latest, _) = g
+        .latest_departure_before_arrival(p, q, 0, 10 * 3600, 0, 0x7F, &empty)
+        .expect("T0 remains feasible when the later T1 forbids alighting");
+    assert_eq!(
+        dep_latest,
+        8 * 3600,
+        "oracle must skip the un-alightable T1 (drop_off_type=1 at Q) and keep T0 (08:00)"
+    );
+
+    // Both permissions allowed ⇒ the oracle picks the latest (T1), proving the
+    // guard is the only thing suppressing it above (not some other exclusion).
+    let (g_ok, _, _, p2, q2) = direct_bus_two_trip_graph_perm(true, true);
+    let (_, dep_ok, _) = g_ok
+        .latest_departure_before_arrival(p2, q2, 0, 10 * 3600, 0, 0x7F, &empty)
+        .expect("a feasible bus");
+    assert_eq!(
+        dep_ok, 9 * 3600,
+        "with both permissions the oracle picks the latest feasible trip (T1, 09:00)"
+    );
+}
+
+/// A2 (end-to-end) + S1: three-pass tightening normally shifts the bus leg to the
+/// later 09:00 trip (T1). Cancelling T1 forces the oracle to keep T0, and the
+/// re-chained plan must still hold a non-negative transfer margin (S1 invariant;
+/// the debug_assert in `tighten_with_bounds` also arms here in test/debug builds).
+#[test]
+fn tightening_falls_back_when_preferred_trip_canceled() {
+    let (g, o, d) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let base = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &RealtimeIndex::new());
+    let base_plan = base
+        .iter()
+        .find(|p| p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2)
+        .expect("a bus+tram plan");
+    assert_eq!(
+        first_transit_leg(base_plan).start,
+        9 * 3600,
+        "baseline tightening shifts the bus to the 09:00 trip (T1)"
+    );
+
+    let rt = RealtimeIndex::from_updates(1, [], [TripId(1)]);
+    let canc = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    let canc_plan = canc
+        .iter()
+        .find(|p| p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2)
+        .expect("a bus+tram plan with T1 canceled");
+    let bus = first_transit_leg(canc_plan);
+    assert_eq!(
+        bus.trip_id,
+        TripId(0),
+        "with T1 canceled the tightening oracle must keep T0 (08:00), never the dead T1"
+    );
+    assert_eq!(bus.start, 8 * 3600, "kept-T0 bus departs at 08:00");
+
+    // S1: every reconstructed transfer margin stays non-negative.
+    for leg in &canc_plan.legs {
+        if let PlanLeg::Transit(t) = leg {
+            if let Some(prev_arr) = t.preceding_arrival {
+                assert!(
+                    t.start >= prev_arr,
+                    "negative transfer margin after canceled-trip fallback: start={} prev_arr={}",
+                    t.start,
+                    prev_arr
+                );
+            }
+        }
+    }
+}
+
+/// A1 (egress side): cancelling the ONLY trip of the final leg must remove the
+/// journey entirely — the search cannot board the dead vehicle, and there is no
+/// alternative, so no through plan survives.
+#[test]
+fn canceling_sole_final_leg_trip_removes_plan() {
+    let (g, o, d) = two_route_multi_trip_graph();
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let base = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &RealtimeIndex::new());
+    assert!(
+        base.iter().any(|p| p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2),
+        "baseline has a bus+tram plan"
+    );
+
+    // TripId(2) is the sole tram; cancel it.
+    let rt = RealtimeIndex::from_updates(1, [], [TripId(2)]);
+    let canc = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    assert!(
+        !canc.iter().any(|p| p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2),
+        "with the only tram canceled, no bus+tram plan may be produced"
+    );
+}
+
+/// Two-leg graph with a feeder Bus (delay model) and a Tram with THREE trips, so
+/// a missed connection has a real next-running fallback. Origin→Bus(A,B)→walk→
+/// Tram(C,D)→dest.
+fn bus_tram_three_trip_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_ab = g.add_node(osm_node("ab", 50.000, 4.010));
+    let osm_b = g.add_node(osm_node("b", 50.000, 4.019));
+    let osm_cd = g.add_node(osm_node("cd", 50.000, 4.030));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.041));
+
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.020));
+    let stop_c = g.add_node(transit_stop("Stop C", 50.000, 4.022));
+    let stop_d = g.add_node(transit_stop("Stop D", 50.000, 4.040));
+
+    let add_street = |g: &mut Graph, a: NodeID, b: NodeID, m: usize| {
+        g.add_edge(a, street_edge(a, b, m));
+        g.add_edge(b, street_edge(b, a, m));
+    };
+    add_street(&mut g, osm_origin, osm_ab, 718);
+    add_street(&mut g, osm_ab, osm_b, 645);
+    add_street(&mut g, osm_b, osm_cd, 789);
+    add_street(&mut g, osm_cd, osm_dest, 789);
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        for (a, b) in [(stop, osm), (osm, stop)] {
+            g.add_edge(
+                a,
+                EdgeData::Street(StreetEdgeData {
+                    origin: a,
+                    destination: b,
+                    length: m,
+                    partial: true,
+                    foot: true,
+                    bike: false,
+                    car: false,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_b, osm_b, 72);
+    add_snap(&mut g, stop_c, osm_b, 215);
+    add_snap(&mut g, stop_d, osm_dest, 72);
+
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: 1 },
+            length: 1362,
+        }),
+    );
+    g.add_edge(
+        stop_c,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_c,
+            destination: stop_d,
+            route_id: RouteId(1),
+            timetable_segment: TimetableSegment { start: 1, len: 3 },
+            length: 1290,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![
+        RouteInfo {
+            route_short_name: "1".into(),
+            route_long_name: "Bus 1".into(),
+            route_type: RouteType::Bus,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+        RouteInfo {
+            route_short_name: "T".into(),
+            route_long_name: "Tram T".into(),
+            route_type: RouteType::Tramway,
+            agency_id: AgencyId(0),
+            route_color: None,
+            route_text_color: None,
+        },
+    ]);
+    // T0 = bus; T1/T2/T3 = trams (10 min apart).
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+    ]);
+    g.add_transit_departures(vec![
+        TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 28800, arrival: 29100, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 30000, arrival: 30600, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(2), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 30600, arrival: 31200, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(3), origin_stop_sequence: 0, destination_stop_sequence: 1, departure: 31200, arrival: 31800, service_id: ServiceId(0) },
+    ]);
+
+    // Pattern 0: Bus [A,B], 1 trip.
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 28800, departure: 28800, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 29100, departure: 29100, ..Default::default() });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    // Pattern 1: Tram [C,D], 3 trips. Column-major: C col (3 deps), D col (3 arrs).
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_c, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_pattern_trip(TripId(2));
+        g.push_transit_pattern_trip(TripId(3));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 3 });
+        let sts = g.transit_pattern_stop_times_len();
+        // Stop C departures.
+        g.push_transit_pattern_stop_time(StopTime { arrival: 30000, departure: 30000, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 30600, departure: 30600, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 31200, departure: 31200, ..Default::default() });
+        // Stop D arrivals.
+        g.push_transit_pattern_stop_time(StopTime { arrival: 30600, departure: 30600, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 31200, departure: 31200, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 31800, departure: 31800, ..Default::default() });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 6 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 3 });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, osm_origin, osm_dest)
+}
+
+/// A2b: the lambda backward pass (`raptor_backward` /
+/// `latest_trip_arriving_at_stop_before`) must exclude CANCELED trips with the
+/// SAME predicate the chain sweep uses, so the two never diverge under the DIFF
+/// gate. With a loose target the backward pass would otherwise credit the latest
+/// tram (T3); cancelling it must drop the bound to T2's connection, then T1's —
+/// and `chain_bounds` must agree at every step.
+#[test]
+fn lambda_backward_pass_excludes_canceled_and_matches_chain() {
+    let (g, origin, dest) = bus_tram_three_trip_graph();
+    let date = 0;
+    let weekday = 0x7F;
+    let plans = g.raptor(origin, dest, 7 * 3600, date, weekday, 10 * 60);
+    let plan = plans
+        .iter()
+        .find(|p| p.legs.iter().filter(|l| matches!(l, PlanLeg::Transit(_))).count() == 2)
+        .expect("a bus+tram plan");
+    let legs = plan.legs.clone();
+    let target_stop = plan
+        .legs
+        .iter()
+        .rev()
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => Some(g.compact_stop_of_node(t.to.node_id).unwrap()),
+            _ => None,
+        })
+        .unwrap();
+    // Loose target at stop D: any of T1/T2/T3 (arr 30600/31200/31800) qualifies,
+    // so the backward pass credits the LATEST running tram.
+    let target = 31800;
+
+    let lam = |rt: &RealtimeIndex| g.bounds_from_lambda_pub(&legs, target_stop, target, 2, date, weekday, rt);
+    let chn = |rt: &RealtimeIndex| g.chain_bounds_pub(&legs, target_stop, target, date, weekday, rt);
+
+    let empty = RealtimeIndex::new();
+    let cancel_t3 = RealtimeIndex::from_updates(1, [], [TripId(3)]);
+    let cancel_t23 = RealtimeIndex::from_updates(1, [], [TripId(2), TripId(3)]);
+
+    // The feeder-leg bound tightens by exactly one 600s tram interval as each
+    // later tram is removed — proving the guard actually excludes them.
+    assert_eq!(lam(&empty)[0], 31021, "empty: bound credits T3");
+    assert_eq!(lam(&cancel_t3)[0], 30421, "T3 canceled: bound falls back to T2");
+    assert_eq!(lam(&cancel_t23)[0], 29821, "T2+T3 canceled: bound falls back to T1");
+
+    // Lambda == chain under every cancellation (the A2b parity the DIFF gate needs).
+    for rt in [&empty, &cancel_t3, &cancel_t23] {
+        assert_eq!(lam(rt), chn(rt), "lambda backward bounds must equal chain bounds under cancellation");
+    }
+}
+
+/// B1: the miss-scenario in a plan's arrival distribution must use the next
+/// RUNNING trip, not a canceled one. With a flat Bus delay model the connection
+/// onto the first tram (T1) is uncertain, so the arrival bag carries a second
+/// (miss) scenario at the next tram's arrival. Baseline: miss = T2 (gap 600s).
+/// Cancel T2: the miss must skip it and land on T3 (gap 1200s) — never the dead
+/// T2 (which would corrupt the reliability bag).
+#[test]
+fn miss_scenario_uses_next_running_trip_not_canceled() {
+    let (mut g, o, d) = bus_tram_three_trip_graph();
+    let mut models = HashMap::new();
+    // Flat 0.6 on-time probability for any positive margin < 2h, so the tram
+    // connection is uncertain (hit_prob 0.6) yet every tram shares one bucket
+    // (only T1 is boarded) — isolating the miss-fallback under test.
+    models.insert(RouteType::Bus, DelayCDF { bins: vec![(0, 0.6), (7200, 1.0)] });
+    g.set_transit_delay_models(models);
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let two_scenario_gap = |plans: &[maas_rs::structures::plan::Plan]| -> u32 {
+        let plan = plans
+            .iter()
+            .filter(|p| p.arrival_distribution.len() >= 2)
+            .min_by_key(|p| p.end)
+            .expect("a plan with a two-scenario arrival distribution");
+        let mut times: Vec<u32> = plan.arrival_distribution.iter().map(|s| s.time).collect();
+        times.sort_unstable();
+        times[1] - times[0]
+    };
+
+    let base = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &RealtimeIndex::new());
+    assert_eq!(
+        two_scenario_gap(&base),
+        600,
+        "baseline miss-scenario is the next tram T2 (arr +600s after T1)"
+    );
+
+    let rt = RealtimeIndex::from_updates(1, [], [TripId(2)]);
+    let canc = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    assert_eq!(
+        two_scenario_gap(&canc),
+        1200,
+        "with T2 canceled the miss-scenario must skip it and use T3 (arr +1200s)"
+    );
+}
+
+/// B1 (delay term): the miss arrival returned by `next_trip_arrival` must be
+/// shifted by the live delay on that running trip — parity with the hit branch,
+/// which already delays. Delaying the next running tram (T2) at its alighting
+/// stop by 300s must widen the two-scenario gap by exactly 300s over the
+/// no-delay baseline; the empty-delay-map cancellation test leaves this
+/// `apply_delay(col[t].arrival, rt.delay(..))` term as a no-op, so this arms it.
+#[test]
+fn miss_scenario_applies_realtime_delay_to_fallback_arrival() {
+    let (mut g, o, d) = bus_tram_three_trip_graph();
+    let mut models = HashMap::new();
+    models.insert(RouteType::Bus, DelayCDF { bins: vec![(0, 0.6), (7200, 1.0)] });
+    g.set_transit_delay_models(models);
+    let buckets = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
+
+    let two_scenario_gap = |plans: &[maas_rs::structures::plan::Plan]| -> u32 {
+        let plan = plans
+            .iter()
+            .filter(|p| p.arrival_distribution.len() >= 2)
+            .min_by_key(|p| p.end)
+            .expect("a plan with a two-scenario arrival distribution");
+        let mut times: Vec<u32> = plan.arrival_distribution.iter().map(|s| s.time).collect();
+        times.sort_unstable();
+        times[1] - times[0]
+    };
+
+    // Baseline (no realtime): miss-scenario is T2's scheduled arrival (gap 600s).
+    let base = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &RealtimeIndex::new());
+    let base_gap = two_scenario_gap(&base);
+    assert_eq!(base_gap, 600, "baseline miss = T2 (arr +600s after T1)");
+
+    // Delay the running fallback tram (T2) by 300s at its alighting stop (D). The
+    // hit (T1) is untouched, so the miss arrival — and only it — shifts by +300s.
+    let stop_d = g.stop_index_of("Stop D").expect("Stop D compact index") as u32;
+    let rt = RealtimeIndex::from_delays(1, [((TripId(2), stop_d), 300)]);
+    let delayed = g.raptor_tuned_rt(o, d, 7 * 3600, 0, 0x7F, 10 * 60, &buckets, 900, &rt);
+    assert_eq!(
+        two_scenario_gap(&delayed),
+        base_gap + 300,
+        "a +300s live delay on the running fallback tram must push the miss \
+         scenario back by exactly 300s (B1 apply_delay term)"
+    );
+}
+
+
+// ── date+1 forward midnight-rollover extension ──────────────────────────────────
+
+/// Single bus route whose only departures are the given next-service-day times
+/// (each trip is a 10-min A→B hop). A late-night query on the previous day whose
+/// window crosses midnight can only reach them via the date+1 forward extension.
+///
+///   osm_origin (50.000, 4.000) ─72 m─ stop_A (50.000, 4.001)
+///                                        │ (bus at `deps`)
+///   osm_dest   (50.000, 4.100) ─72 m─ stop_B (50.000, 4.099)
+fn next_day_route_graph(deps: &[u32]) -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+    let n = deps.len() as u32;
+
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.100));
+    let stop_a = g.add_node(transit_stop("Stop A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Stop B", 50.000, 4.099));
+
+    let add_edge_pair = |g: &mut Graph, a: NodeID, b: NodeID, m: usize, partial: bool| {
+        for (o, d) in [(a, b), (b, a)] {
+            g.add_edge(
+                o,
+                EdgeData::Street(StreetEdgeData {
+                    origin: o,
+                    destination: d,
+                    length: m,
+                    partial,
+                    foot: true,
+                    bike: !partial,
+                    car: !partial,
+                    attrs: BikeAttrs::road_default(),
+                    elev_delta: 0,
+                    surface_speed: 100,
+                    var_gen: VarGen::NONE,
+                }),
+            );
+        }
+    };
+    add_edge_pair(&mut g, osm_origin, osm_dest, 7200, false);
+    add_edge_pair(&mut g, stop_a, osm_origin, 72, true);
+    add_edge_pair(&mut g, stop_b, osm_dest, 72, true);
+
+    g.add_edge(
+        stop_a,
+        EdgeData::Transit(TransitEdgeData {
+            origin: stop_a,
+            destination: stop_b,
+            route_id: RouteId(0),
+            timetable_segment: TimetableSegment { start: 0, len: n as usize },
+            length: 7000,
+        }),
+    );
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "N1".into(),
+        route_long_name: "Night 1".into(),
+        route_type: RouteType::Bus,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    g.add_transit_trips(
+        (0..n)
+            .map(|_| TripInfo {
+                trip_headsign: None,
+                route_id: RouteId(0),
+                service_id: ServiceId(0),
+                bikes_allowed: None,
+            })
+            .collect(),
+    );
+
+    g.add_transit_departures(
+        (0..n)
+            .map(|i| TripSegment {
+                trip_id: TripId(i),
+                origin_stop_sequence: 0,
+                destination_stop_sequence: 1,
+                departure: deps[i as usize],
+                arrival: deps[i as usize] + 600,
+                service_id: ServiceId(0),
+            })
+            .collect(),
+    );
+
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_b]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+
+        let ts = g.transit_pattern_trips_len();
+        for i in 0..n {
+            g.push_transit_pattern_trip(TripId(i));
+        }
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: n as usize });
+
+        let sts = g.transit_pattern_stop_times_len();
+        for &t in deps {
+            g.push_transit_pattern_stop_time(StopTime {
+                arrival: t,
+                departure: t,
+                ..Default::default()
+            });
+        }
+        for &t in deps {
+            g.push_transit_pattern_stop_time(StopTime {
+                arrival: t + 600,
+                departure: t + 600,
+                ..Default::default()
+            });
+        }
+        g.push_transit_idx_pattern_stop_times(Lookup {
+            start: sts,
+            len: 2 * n as usize,
+        });
+        g.push_transit_pattern(PatternInfo {
+            route: RouteId(0),
+            num_trips: n,
+        });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    (g, osm_origin, osm_dest)
+}
+
+/// Next-day service at 00:15 and 00:45 — both land inside a 23:30 w120 crossing
+/// window's midnight tail, so they are legitimate forward gains.
+fn after_midnight_route_graph() -> (Graph, NodeID, NodeID) {
+    next_day_route_graph(&[900, 2700])
+}
+
+fn has_transit_leg(plans: &[maas_rs::structures::plan::Plan]) -> bool {
+    plans
+        .iter()
+        .any(|p| p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_))))
+}
+
+fn origin_dest_ep() -> QueryEndpoints {
+    QueryEndpoints {
+        origin: LatLng {
+            latitude: 50.000,
+            longitude: 4.000,
+        },
+        destination: LatLng {
+            latitude: 50.000,
+            longitude: 4.100,
+        },
+        origin_station: None,
+        destination_station: None,
+    }
+}
+
+/// Repro + fix: a late-night window query that crosses midnight must surface the
+/// next service day's early-morning trip. The plain (non-overnight) window driver
+/// misses it — reproducing the reported "no plan / walk-only" bug — while the
+/// overnight driver's forward extension finds it, boarding the 00:15 trip displayed
+/// in the query day's frame as 24:15 (87300).
+#[test]
+fn forward_extension_finds_next_day_early_trip() {
+    let (g, origin, dest) = after_midnight_route_graph();
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let ep = origin_dest_ep();
+    let am = ActiveModes::default();
+    let bike = BikeCost::new(BikeProfile::default());
+    let rt = RealtimeIndex::new();
+
+    let start = 84600u32; // 23:30
+    let window = 120 * 60u32; // 120 min → [23:30, Sat 01:30] crosses midnight
+    let date = 100u32;
+    let weekday = 0x10u8; // Friday (all-days service, so any weekday works)
+    let min_access = 10 * 60u32;
+
+    // Master behaviour: the plain driver only explores the query day, whose only
+    // departures (00:15/00:45) are BEFORE the 23:30 start → no transit plan.
+    let base = g.raptor_range_tuned_rt_modes_ep(
+        origin,
+        dest,
+        start,
+        window,
+        date,
+        weekday,
+        min_access,
+        &buckets,
+        g.raptor.arrival_slack_secs,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
+        &rt,
+        &am,
+        &bike,
+        Some(&ep),
+    );
+    assert!(
+        !has_transit_leg(&base),
+        "plain window driver must miss the next-day trip (bug repro)"
+    );
+
+    // The forward extension surfaces the Saturday 00:15 trip.
+    let fixed = g.raptor_range_tuned_rt_overnight_modes(
+        origin,
+        dest,
+        start,
+        window,
+        date,
+        weekday,
+        min_access,
+        &buckets,
+        g.raptor.arrival_slack_secs,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
+        &rt,
+        &am,
+        &bike,
+        Some(&ep),
+    );
+    assert!(
+        has_transit_leg(&fixed),
+        "forward extension must surface the next-day trip"
+    );
+
+    let leg = fixed
+        .iter()
+        .flat_map(|p| &p.legs)
+        .find_map(|l| match l {
+            PlanLeg::Transit(t) => Some(t),
+            _ => None,
+        })
+        .expect("a transit leg");
+    // Sign check: 00:15 (raw 900) is shifted UP by a day to 24:15 (87300).
+    assert_eq!(
+        leg.start, 87300,
+        "boarding must be shifted +1 day (00:15 → 24:15)"
+    );
+    // The date+1 leg records a NEGATIVE shift so raw recovery works.
+    assert_eq!(leg.time_shift, -86400, "date+1 leg records a negative time_shift");
+    // Raw recovery (used by prev/nextDepartures) lands on the Saturday-listed 900.
+    assert_eq!(
+        leg.start as i64 + leg.time_shift,
+        900,
+        "raw = displayed + time_shift must recover the next-day-listed departure"
+    );
+    // Boarding/alighting STOP times must move with the leg (the UI reads
+    // from.departure). raw dep 900 → 87300, raw arr 1500 → 87900.
+    assert_eq!(
+        leg.from.departure,
+        Some(87300),
+        "boarding-stop departure must be shifted consistently with leg.start"
+    );
+    assert_eq!(
+        leg.to.arrival,
+        Some(87900),
+        "alighting-stop arrival must be shifted consistently with leg.end"
+    );
+    // No boarding leaks past the requested window end (Sat 01:30 = 91800).
+    for p in &fixed {
+        for l in &p.legs {
+            if let PlanLeg::Transit(t) = l {
+                assert!(
+                    t.start <= start + window,
+                    "forward plan boards at {} — past the window end {}",
+                    t.start,
+                    start + window
+                );
+            }
+        }
+    }
+}
+
+/// Window-leak guard for the date+1 forward (crossing) extension, alongside the
+/// degenerate next-day fallback. When the midnight-crossing TAIL of the window
+/// contains NO service departure, the range driver's unbounded earliest-arrival
+/// probe boards an arbitrarily-late next-day trip; after the +86400 shift its `start`
+/// lands past the window end yet a later start is Pareto-favorable, so the CROSSING
+/// block must drop any gained plan whose DEPARTURE exceeds the window end — no plan
+/// may leak into the in-day gap `(window_end, 86400)`.
+///
+/// Here the only next-day trip is at 05:30 (raw 19800) — far outside the 23:30 w120
+/// tail `[0, 5400]` — so the crossing block contributes nothing. But at these
+/// near-midnight starts the same-day walk arrives after midnight, so the DEGENERATE
+/// fallback fires and surfaces the 05:30 trip as a properly-shifted next-day plan
+/// (`start`/`end >= 86400`). The invariants: (a) no plan departs in the leak gap
+/// `(window_end, 86400)`; (b) any transit plan surfaced is a next-day fallback
+/// (`>= 86400`), never an in-window crossing-tail gain of the out-of-tail 05:30 trip.
+#[test]
+fn forward_extension_does_not_leak_past_window_on_empty_tail() {
+    // Only next-day service is at 05:30, outside any reasonable crossing-window tail.
+    let (g, origin, dest) = next_day_route_graph(&[5 * 3600 + 1800]); // 19800
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let ep = origin_dest_ep();
+    let am = ActiveModes::default();
+    let bike = BikeCost::new(BikeProfile::default());
+    let rt = RealtimeIndex::new();
+    let date = 100u32;
+    let weekday = 0x10u8;
+    let min_access = 10 * 60u32;
+
+    for (start, window) in [(84600u32, 120 * 60u32), (86100u32, 90 * 60u32)] {
+        let window_end = start + window;
+        let plans = g.raptor_range_tuned_rt_overnight_modes(
+            origin,
+            dest,
+            start,
+            window,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        // (a) No plan may leak into the in-day gap (window_end, 86400): the crossing
+        // filter still blocks a same-day-clock departure past the window. A next-day
+        // fallback plan departs tomorrow (start >= 86400) and is allowed.
+        for p in &plans {
+            assert!(
+                p.start <= window_end || p.start >= 86400,
+                "leak: plan departs at {} in the gap ({window_end}, 86400) (start={start}, w={window})",
+                p.start
+            );
+        }
+        // (b) The out-of-tail 05:30 trip may ONLY surface as a properly-shifted
+        // next-day fallback (start/end >= 86400), never as an in-window crossing gain.
+        for p in &plans {
+            if p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_))) {
+                assert!(
+                    p.start >= 86400 && p.end >= 86400,
+                    "05:30 trip surfaced as an in-window gain (leak): start={} end={} (start={start}, w={window})",
+                    p.start,
+                    p.end
+                );
+            }
+        }
+    }
+
+    // Control: a SERVED tail (00:15/00:45) still yields its legitimate forward gain,
+    // and it departs within the window — proving the filter drops only leaks.
+    let (gs, o2, d2) = after_midnight_route_graph();
+    let served = gs.raptor_range_tuned_rt_overnight_modes(
+        o2,
+        d2,
+        84600,
+        120 * 60,
+        date,
+        weekday,
+        min_access,
+        &buckets,
+        gs.raptor.arrival_slack_secs,
+        gs.raptor.unrestricted_transfers,
+        gs.raptor.use_cch_access,
+        &rt,
+        &am,
+        &bike,
+        Some(&ep),
+    );
+    assert!(
+        has_transit_leg(&served),
+        "served-tail OD must still gain its in-window next-day trip"
+    );
+    for p in &served {
+        assert!(
+            p.start <= 84600 + 120 * 60,
+            "served-tail gain departs past the window end: {}",
+            p.start
+        );
+    }
+}
+
+/// The single-departure (earliest-arrival) wrapper must never POLLUTE the same-day
+/// result and must only APPEND next-day plans under the degenerate gate. Two regimes
+/// across the evening:
+///   * A same-day plan still reaches the destination before midnight (some
+///     `end < 86400`): the wrapper is a strict byte-identical no-op versus the plain
+///     driver — no spurious tomorrow-morning departures (the original anti-pollution
+///     guarantee, still enforced at 19:00–22:00 here where the ~1 h walk arrives
+///     before midnight).
+///   * No same-day plan reaches the destination before midnight (every `end >= 86400`
+///     — near-midnight starts whose only option, a walk, spills past midnight): the
+///     wrapper KEEPS every same-day plan byte-identical and APPENDS the genuine
+///     next-day trip. Each appended plan carries next-day-clock times (`start`/`end`
+///     `>= 86400`, so the UI marks it "+1 day") and is transit-bearing. This is the
+///     intended, gated behaviour of the next-day fallback — a query that truly cannot
+///     reach the dest today gains tomorrow's train rather than only a huge walk.
+#[test]
+fn single_departure_wrapper_pollutes_nothing_appends_next_day_at_evening() {
+    let (g, origin, dest) = single_route_many_trips_graph();
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let ep = origin_dest_ep();
+    let am = ActiveModes::default();
+    let bike = BikeCost::new(BikeProfile::default());
+    let rt = RealtimeIndex::new();
+    let date = 100u32;
+    let weekday = 0x7Fu8;
+    let min_access = 10 * 60u32;
+
+    for &start in &[
+        19 * 3600u32,
+        20 * 3600,
+        21 * 3600,
+        22 * 3600,
+        23 * 3600,
+        86340, // 23:59
+    ] {
+        let base = g.raptor_tuned_rt_modes_ep(
+            origin,
+            dest,
+            start,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        let wrapped = g.raptor_tuned_rt_overnight_modes(
+            origin,
+            dest,
+            start,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+
+        // Every same-day plan is preserved byte-identical (no pollution / reorder-drop).
+        let wrapped_dbg: Vec<String> = wrapped.iter().map(|p| format!("{p:?}")).collect();
+        for b in &base {
+            assert!(
+                wrapped_dbg.contains(&format!("{b:?}")),
+                "same-day plan dropped/mutated at start={start}"
+            );
+        }
+        let extras: Vec<&maas_rs::structures::plan::Plan> = wrapped
+            .iter()
+            .filter(|p| !base.iter().any(|b| format!("{b:?}") == format!("{p:?}")))
+            .collect();
+
+        let same_day_ok = base.iter().any(|p| p.end < 86400);
+        if same_day_ok {
+            assert!(
+                extras.is_empty(),
+                "strict no-op expected when a same-day plan reaches before midnight (start={start}); got extras {:?}",
+                extras.iter().map(|p| (p.start, p.end)).collect::<Vec<_>>()
+            );
+        } else {
+            assert!(
+                !extras.is_empty(),
+                "degenerate start={start}: expected an appended next-day plan"
+            );
+            for e in &extras {
+                assert!(
+                    e.start >= 86400 && e.end >= 86400,
+                    "appended plan must carry next-day-clock times (start/end >= 86400); got start={} end={}",
+                    e.start,
+                    e.end
+                );
+                assert!(
+                    e.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_))),
+                    "appended next-day plan must be transit-bearing at start={start}"
+                );
+            }
+        }
+    }
+}
+
+/// Byte-identity: for daytime queries whose window never crosses midnight (and
+/// whose start is past the date-1 threshold), both overnight wrappers are provable
+/// no-ops — their output is literally identical to the underlying non-overnight
+/// driver. Proven over a spread of daytime start times.
+#[test]
+fn overnight_wrappers_are_byte_identical_for_daytime_queries() {
+    let (g, origin, dest) = single_route_many_trips_graph();
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let ep = origin_dest_ep();
+    let am = ActiveModes::default();
+    let bike = BikeCost::new(BikeProfile::default());
+    let rt = RealtimeIndex::new();
+    let date = 100u32;
+    let weekday = 0x7Fu8;
+    let min_access = 10 * 60u32;
+
+    // Daytime starts (all >= OVERNIGHT_THRESHOLD 18000 so date-1 never fires),
+    // with a 60-min window that never reaches 86400 so date+1 never fires either.
+    let starts = [
+        7 * 3600u32,
+        8 * 3600,
+        9 * 3600,
+        10 * 3600,
+        11 * 3600,
+        12 * 3600,
+        14 * 3600,
+        16 * 3600,
+        18 * 3600,
+        20 * 3600,
+    ];
+    let window = 60 * 60u32;
+    for &start in &starts {
+        let base = g.raptor_range_tuned_rt_modes_ep(
+            origin,
+            dest,
+            start,
+            window,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        let wrapped = g.raptor_range_tuned_rt_overnight_modes(
+            origin,
+            dest,
+            start,
+            window,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        assert_eq!(
+            format!("{base:?}"),
+            format!("{wrapped:?}"),
+            "range overnight wrapper must be byte-identical at start={start}"
+        );
+
+        // Single-departure driver: byte-identical at ALL these starts — it has no
+        // date+1 forward extension (see single_departure_wrapper_byte_identical_at_evening),
+        // and the date-1 backward extension does not fire past the 5 h threshold.
+        let sbase = g.raptor_tuned_rt_modes_ep(
+            origin,
+            dest,
+            start,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        let swrapped = g.raptor_tuned_rt_overnight_modes(
+            origin,
+            dest,
+            start,
+            date,
+            weekday,
+            min_access,
+            &buckets,
+            g.raptor.arrival_slack_secs,
+            g.raptor.unrestricted_transfers,
+            g.raptor.use_cch_access,
+            &rt,
+            &am,
+            &bike,
+            Some(&ep),
+        );
+        assert_eq!(
+            format!("{sbase:?}"),
+            format!("{swrapped:?}"),
+            "single overnight wrapper must be byte-identical at start={start}"
+        );
+    }
+}

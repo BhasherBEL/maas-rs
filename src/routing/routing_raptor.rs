@@ -21,6 +21,14 @@ pub struct RouteQuery {
     pub min_access_secs: Option<u32>,
     /// Per-query override for the arrival-slack (seconds). `None` → graph default.
     pub arrival_slack_secs: Option<u32>,
+    /// Per-query override for MCR unrestricted (uncapped) inter-stop transfers.
+    /// `None` → graph default (`graph.raptor.unrestricted_transfers`). Lets MCR on/off
+    /// be A/B'd on the same binary + `graph.bin` without a rebuild.
+    pub unrestricted_transfers: Option<bool>,
+    /// Per-query override for exact CCH foot access/egress.
+    /// `None` → graph default (`graph.raptor.use_cch_access`). Lets the CCH seam be
+    /// A/B'd on the same binary + `graph.bin` without a rebuild.
+    pub use_cch_access: Option<bool>,
     /// Per-query override for reliability bucket edges. `None`/invalid → graph default.
     pub reliability_bucket_edges: Option<Vec<f32>>,
     /// Travel modes the router may use. `None` → `[WALK, WALK_TRANSIT]`
@@ -41,6 +49,12 @@ pub struct RouteQuery {
     pub from_station_id: Option<String>,
     /// As `from_station_id`, for the destination (zero-cost egress).
     pub to_station_id: Option<String>,
+    /// When `Some(true)`, emit a per-phase wall-clock decomposition of this query
+    /// (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/range/
+    /// departure counts) as one structured log line. Purely additive observability
+    /// — never changes routing behavior or results. `None` → graph default
+    /// (`graph.raptor.profile_latency`, itself defaulting to off).
+    pub profile_latency: Option<bool>,
 }
 
 /// A position aboard a transit trip: the boarded GTFS `trip_id`, plus an optional
@@ -252,6 +266,12 @@ fn route_onboard(
     let ride = graph.build_onboard_ride(pattern, trip_within, current_pos, rt);
 
     let (buckets, slack) = resolve_tuning(graph, query)?;
+    let unrestricted = query
+        .unrestricted_transfers
+        .unwrap_or(graph.raptor.unrestricted_transfers);
+    let use_cch = query
+        .use_cch_access
+        .unwrap_or(graph.raptor.use_cch_access);
     let egress_secs = query
         .min_access_secs
         .unwrap_or(graph.raptor.min_access_secs);
@@ -267,6 +287,8 @@ fn route_onboard(
         slack,
         rt,
         &am,
+        unrestricted,
+        use_cch,
         Some(&ep),
     );
 
@@ -279,11 +301,76 @@ fn route_onboard(
     Ok(plans)
 }
 
+/// Wall-clock unix seconds; `0` if the clock is somehow before the epoch.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Brussels-local calendar date of `now_unix`, as days since 2000-01-01 — the same
+/// convention `date_to_days(query.date)` uses. GTFS service dates are Brussels-local,
+/// so this is the service date the live snapshot is currently relevant to.
+fn brussels_service_days(now_unix: i64) -> u32 {
+    use chrono::TimeZone;
+    match chrono_tz::Europe::Brussels.timestamp_opt(now_unix, 0).single() {
+        Some(dt) => date_to_days(dt.date_naive()),
+        None => 0,
+    }
+}
+
+/// Consumer-boundary realtime gate. Returns the index routing should actually apply:
+/// either the live snapshot or an inert empty index (`RealtimeIndex::new()`), so a
+/// stale or wrong-date snapshot is never applied. The poller is never modified.
+///
+/// - **Already inert** (`rt.is_empty()`): returned as-is. The no-feed path is thus
+///   byte-identical to schedule-only and never consults the clock.
+/// - **Staleness (#2):** `now - generated_at > max_age_secs` → empty. A cycle where
+///   every feed fails keeps the last good index in the poller with no TTL of its
+///   own; this boundary supplies the config TTL (`realtime.index_max_age_secs`,
+///   stamped on the snapshot) so hours-old delays/cancellations stop being applied.
+/// - **Service date (#3):** realtime carries no service-date dimension (keyed
+///   `(TripId, compact_stop)` only), so it may only be applied when the query's
+///   calendar service date equals the Brussels service date of `now`. A query for
+///   another day (tomorrow / last week) must not inherit today's delays or today's
+///   cancellations.
+///
+/// Overnight nuance: `raptor_tuned_rt_overnight_modes` runs the after-midnight
+/// (`date - 1`) sub-pass with the SAME index handed to the main pass. Because a
+/// same-day query legitimately covers "now" — including just-after-midnight runs of
+/// the previous service day — handing the live index to a same-day query is exactly
+/// what serves that overnight sub-pass; we deliberately do NOT also accept
+/// `date == now + 1` (that would leak realtime into tomorrow's MAIN pass, re-opening
+/// #3). Keying the date on `now` (not on `generated_at`) keeps the immediate
+/// post-midnight window live: a query dated D+1 at 00:05, against a still-fresh
+/// snapshot generated at 23:58 on day D, matches `now`'s date D+1 and keeps its
+/// realtime.
+fn gate_realtime<'a>(
+    rt: &'a RealtimeIndex,
+    empty: &'a RealtimeIndex,
+    query_date_days: u32,
+    now_unix: i64,
+) -> &'a RealtimeIndex {
+    if rt.is_empty() {
+        return rt;
+    }
+    if now_unix.saturating_sub(rt.generated_at) > rt.max_age_secs() {
+        return empty;
+    }
+    if query_date_days != brussels_service_days(now_unix) {
+        return empty;
+    }
+    rt
+}
+
 pub fn route(
     graph: &Graph,
     query: &RouteQuery,
     rt: &RealtimeIndex,
 ) -> Result<Vec<Plan>, async_graphql::Error> {
+    let empty = RealtimeIndex::new();
+    let rt = gate_realtime(rt, &empty, date_to_days(query.date), now_unix_secs());
     if let Some(onboard) = &query.onboard_origin {
         return route_onboard(graph, query, onboard, rt);
     }
@@ -291,7 +378,21 @@ pub fn route(
         resolve_query_params(graph, query)?;
     let ep = endpoints.as_ref();
     let (buckets, slack) = resolve_tuning(graph, query)?;
+    let unrestricted = query
+        .unrestricted_transfers
+        .unwrap_or(graph.raptor.unrestricted_transfers);
+    let use_cch = query
+        .use_cch_access
+        .unwrap_or(graph.raptor.use_cch_access);
     let am = resolve_modes(query)?;
+
+    // Flag read ONCE per query (never per-call/per-departure): resolves the
+    // per-query override or the graph default, then arms the thread-local
+    // profiler for the duration of this query only.
+    let profiling = query
+        .profile_latency
+        .unwrap_or(graph.raptor.profile_latency);
+    let profile_start = crate::structures::latency_profile::begin_query(profiling);
 
     let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let mut plans = match query.window_minutes {
@@ -307,10 +408,11 @@ pub fn route(
                 min_access,
                 &buckets,
                 slack,
+                unrestricted,
+                use_cch,
                 rt,
                 &am,
                 &bike,
-                query.terminal_deadline,
                 ep,
             )
         }
@@ -323,10 +425,11 @@ pub fn route(
             min_access,
             &buckets,
             slack,
+            unrestricted,
+            use_cch,
             rt,
             &am,
             &bike,
-            query.terminal_deadline,
             ep,
         ),
     };
@@ -338,6 +441,10 @@ pub fn route(
         &bike,
         query.terminal_deadline,
     );
+
+    if let Some(profile) = crate::structures::latency_profile::end_query(profile_start) {
+        tracing::info!(target: "latency_profile", "{}", profile.report());
+    }
 
     if plans.is_empty() {
         return Err(async_graphql::Error::new("No plan found"));
@@ -353,10 +460,18 @@ pub fn route_explain(
     query: &RouteQuery,
     rt: &RealtimeIndex,
 ) -> Result<ExplainResult, async_graphql::Error> {
+    let empty = RealtimeIndex::new();
+    let rt = gate_realtime(rt, &empty, date_to_days(query.date), now_unix_secs());
     let (origin, destination, time, date, weekday, min_access, endpoints) =
         resolve_query_params(graph, query)?;
     let ep = endpoints.as_ref();
     let (buckets, slack) = resolve_tuning(graph, query)?;
+    let unrestricted = query
+        .unrestricted_transfers
+        .unwrap_or(graph.raptor.unrestricted_transfers);
+    let use_cch = query
+        .use_cch_access
+        .unwrap_or(graph.raptor.use_cch_access);
     let am = resolve_modes(query)?;
 
     // Note: the explain path does not apply the overnight pass — it's a debug view
@@ -375,6 +490,8 @@ pub fn route_explain(
                 min_access,
                 &buckets,
                 slack,
+                unrestricted,
+                use_cch,
                 rt,
                 &am,
                 &bike,
@@ -390,6 +507,8 @@ pub fn route_explain(
             min_access,
             &buckets,
             slack,
+            unrestricted,
+            use_cch,
             rt,
             &am,
             &bike,
@@ -462,6 +581,8 @@ mod tests {
             window_minutes: None,
             min_access_secs: None,
             arrival_slack_secs: None,
+            unrestricted_transfers: None,
+            use_cch_access: None,
             reliability_bucket_edges: None,
             modes: None,
             bike_profile: None,
@@ -469,7 +590,130 @@ mod tests {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         }
+    }
+
+    // --- Realtime consumer-boundary gate (bugs #2 stale-index, #3 wrong-date) ---
+
+    use crate::ingestion::gtfs::TripId;
+
+    /// A non-empty synthetic snapshot (one delay) generated at `gen_unix` with TTL
+    /// `ttl`. Non-empty so it does NOT hit the `is_empty()` short-circuit — the
+    /// staleness/date checks are actually exercised.
+    fn rt_snapshot(gen_unix: i64, ttl: i64) -> RealtimeIndex {
+        RealtimeIndex::from_updates(gen_unix, [((TripId(1), 0), 60)], [])
+            .with_max_age_secs(ttl)
+    }
+
+    fn brussels_unix(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono_tz::Europe::Brussels
+            .with_ymd_and_hms(y, m, d, hh, mm, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn gate_fresh_today_applies_realtime() {
+        // (a) FRESH snapshot + query for TODAY → the real index is applied
+        // (returned handle is the snapshot itself). This is the common live case
+        // and the byte-identity requirement: routing sees exactly the passed rt.
+        let now = now_unix_secs();
+        let today = brussels_service_days(now);
+        let rt = rt_snapshot(now - 10, 600);
+        let empty = RealtimeIndex::new();
+        let got = gate_realtime(&rt, &empty, today, now);
+        assert!(std::ptr::eq(got, &rt), "fresh+today must apply the live index");
+    }
+
+    #[test]
+    fn gate_sticky_only_index_is_inert_for_routing() {
+        // A snapshot carrying ONLY sticky (tracked-journey) delays must look empty to
+        // the routing gate: is_empty() short-circuits (returns the snapshot, which is
+        // itself empty), so apply_realtime no-ops and planning is byte-identical to
+        // no-feed. Retention lives solely for the live-refresh overlay.
+        let now = now_unix_secs();
+        let today = brussels_service_days(now);
+        let mut sticky = std::collections::HashMap::new();
+        sticky.insert((TripId(1), 0), (120, now));
+        // Fresh generated_at + today, so the ONLY thing that could make it apply is a
+        // non-empty index — which sticky must NOT provide.
+        let rt = RealtimeIndex::new()
+            .with_max_age_secs(600)
+            .with_sticky_delays(sticky);
+        let empty = RealtimeIndex::new();
+        let got = gate_realtime(&rt, &empty, today, now);
+        assert!(got.is_empty(), "sticky-only snapshot is empty for routing");
+        assert_eq!(got.delay(TripId(1), 0), 0, "routing accessor never sees sticky");
+        // Sticky is still reachable via the live-refresh accessor on the same handle.
+        assert_eq!(rt.delay_with_sticky(TripId(1), 0), 120);
+    }
+
+    #[test]
+    fn gate_stale_index_is_ignored() {
+        // (b) snapshot older than its TTL → ignored (empty substituted), even for a
+        // today query. A feed outage must not serve hours-old delays/cancellations.
+        let now = now_unix_secs();
+        let today = brussels_service_days(now);
+        let rt = rt_snapshot(now - 1000, 600); // 1000s old, TTL 600s
+        let empty = RealtimeIndex::new();
+        let got = gate_realtime(&rt, &empty, today, now);
+        assert!(std::ptr::eq(got, &empty), "stale index must be ignored");
+    }
+
+    #[test]
+    fn gate_future_date_query_is_ignored() {
+        // (c) query for TOMORROW against a fresh snapshot → ignored: realtime has no
+        // service-date dimension, so today's delays/cancellations must not apply to
+        // a future day.
+        let now = now_unix_secs();
+        let tomorrow = brussels_service_days(now) + 1;
+        let rt = rt_snapshot(now - 10, 600);
+        let empty = RealtimeIndex::new();
+        let got = gate_realtime(&rt, &empty, tomorrow, now);
+        assert!(std::ptr::eq(got, &empty), "future-date query must ignore realtime");
+    }
+
+    #[test]
+    fn gate_after_midnight_window_keeps_realtime() {
+        // (d) The legitimate after-midnight window. `now` = 00:05 on day D+1,
+        // snapshot generated at 23:58 on day D (7 min old, still fresh). The query
+        // is dated D+1 (the current calendar day). Keying the date on `now` keeps
+        // realtime live across the midnight boundary — a `generated_at`-based date
+        // would (wrongly) drop it, since gen's date is D. The single applied index
+        // also feeds RAPTOR's internal `date-1` overnight sub-pass.
+        let now = brussels_unix(2026, 1, 15, 0, 5); // winter → no DST ambiguity
+        let gen_unix = brussels_unix(2026, 1, 14, 23, 58);
+        let now_days = brussels_service_days(now);
+        let gen_days = brussels_service_days(gen_unix);
+        assert_eq!(now_days, gen_days + 1, "the instants must straddle midnight");
+        assert!(now - gen_unix < 600, "snapshot must still be within TTL");
+
+        let rt = rt_snapshot(gen_unix, 600);
+        let empty = RealtimeIndex::new();
+        // Query dated D+1 (current calendar day) at/after midnight still gets rt.
+        let got = gate_realtime(&rt, &empty, now_days, now);
+        assert!(
+            std::ptr::eq(got, &rt),
+            "post-midnight same-day query must keep realtime"
+        );
+    }
+
+    #[test]
+    fn gate_empty_index_short_circuits_regardless_of_clock() {
+        // Byte-identity guarantee for the no-feed path: an empty index is returned
+        // as-is (never the substitute), and the clock/date are never consulted —
+        // even a nominally "stale" or wrong-date call returns the same empty handle.
+        let empty_in = RealtimeIndex::new(); // gen=0, ttl=0
+        let empty_sub = RealtimeIndex::new();
+        let now = now_unix_secs();
+        let wrong_date = brussels_service_days(now) + 5;
+        let got = gate_realtime(&empty_in, &empty_sub, wrong_date, now);
+        assert!(
+            std::ptr::eq(got, &empty_in),
+            "empty index short-circuits to itself (schedule-only, byte-identical)"
+        );
     }
 
     #[test]
@@ -541,7 +785,6 @@ mod tests {
         g.build_raptor_index();
         g.raptor.set_bike_select_dplus(true);
         g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
         let e = |o, d, len, s| {
             let mut at = BikeAttrs::road_default();
             at.highway = HighwayClass::Residential;
@@ -578,6 +821,8 @@ mod tests {
             window_minutes: None,
             min_access_secs: None,
             arrival_slack_secs: None,
+            unrestricted_transfers: None,
+            use_cch_access: None,
             reliability_bucket_edges: None,
             modes: Some(vec![Mode::Walk]),
             bike_profile: None,
@@ -585,6 +830,7 @@ mod tests {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let walk = plans
@@ -626,7 +872,6 @@ mod tests {
         g.build_raptor_index();
         g.raptor.set_bike_select_dplus(true);
         g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
         let e = |o, d, len, elev: i16| {
             let mut at = BikeAttrs::road_default();
             at.highway = HighwayClass::Residential;
@@ -666,6 +911,8 @@ mod tests {
             window_minutes: None,
             min_access_secs: None,
             arrival_slack_secs: None,
+            unrestricted_transfers: None,
+            use_cch_access: None,
             reliability_bucket_edges: None,
             modes: Some(vec![Mode::Bike]),
             bike_profile: None,
@@ -673,6 +920,7 @@ mod tests {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let bike = plans
@@ -744,7 +992,6 @@ mod tests {
         g.build_raptor_index();
         g.raptor.set_bike_select_dplus(true);
         g.set_distance_budget(f64::INFINITY);
-        g.set_multiobj_street(true);
         let edge = |o: crate::structures::NodeID, d: crate::structures::NodeID| {
             let mut at = BikeAttrs::road_default();
             at.highway = HighwayClass::Residential;

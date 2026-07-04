@@ -126,6 +126,17 @@ pub struct RaptorIndex {
     #[serde(default)]
     pub transit_idx_stop_reverse_transfers: Vec<Lookup>,
 
+    /// Opt-in accuracy improvement for the S1 chain-sweep tightening: when `true`,
+    /// a long inter-leg transfer (> `MAX_TRANSFER_DISTANCE_M`, off the capped
+    /// reverse-footpath table) is tightened using the plan's own reconstructed
+    /// walk instead of being left untightened. This surfaces valid plans that the
+    /// legacy backward pass hides (its capped table produces no reverse label, so
+    /// the leg's bound is 0 and it is never re-timed). Default `false` keeps the
+    /// chain sweep byte-identical to the backward pass on every transfer; opt-in
+    /// pending product review. Runtime-only (not persisted).
+    #[serde(skip)]
+    pub tighten_long_transfers: bool,
+
     #[serde(default)]
     pub transit_pattern_shapes: Vec<Vec<LatLng>>,
     #[serde(default)]
@@ -185,6 +196,34 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_arrival_slack_secs")]
     pub arrival_slack_secs: u32,
 
+    /// When true, inter-stop transfers are found by a live, per-round, multi-source,
+    /// cutoff-bounded foot-Dijkstra over the contracted graph (MCR) instead of the
+    /// precomputed ≤`MAX_TRANSFER_DISTANCE_M` table — so journeys needing a >1 km walk
+    /// between stops are discovered. Runtime tuning (like `arrival_slack_secs`): NOT
+    /// serialized, so toggling it needs no schema bump. Default false.
+    #[serde(skip, default = "RaptorIndex::default_unrestricted_transfers")]
+    pub unrestricted_transfers: bool,
+
+    /// When true, foot access/egress stop discovery uses the exact Customizable
+    /// Contraction Hierarchy (`Graph::cch_access`/`cch_egress`) instead of the
+    /// radius-bounded two-pass foot Dijkstra — so every stop reachable on foot is
+    /// found regardless of the access radius. Requires a built `cch` (runtime-only,
+    /// `#[serde(skip)]`); when absent the flag silently falls back to the two-pass
+    /// path. Runtime tuning like `unrestricted_transfers`: NOT serialized, so
+    /// toggling it needs no schema bump. Default false.
+    #[serde(skip, default = "RaptorIndex::default_use_cch_access")]
+    pub use_cch_access: bool,
+
+    /// When true, a range/window query emits a per-phase wall-clock decomposition
+    /// (discovery / grid_alloc / forward / extract / backward, plus per-pass
+    /// probe/range/departure counts) as one structured log line. Purely additive
+    /// observability — never changes routing behavior or results. Per-query
+    /// `profileLatency` overrides this graph default. Runtime tuning like
+    /// `unrestricted_transfers`: NOT serialized, so toggling it needs no schema
+    /// bump. Default false.
+    #[serde(skip, default = "RaptorIndex::default_profile_latency")]
+    pub profile_latency: bool,
+
     #[serde(skip, default = "RaptorIndex::default_max_window_secs")]
     pub max_window_secs: u32,
 
@@ -195,9 +234,6 @@ pub struct RaptorIndex {
     // (within `edge_snap_radius_m`) instead of the nearest node, so a point mid-way
     // along a long straight edge isn't forced onto a distant end node. Runtime
     // tuning — not serialized.
-    #[serde(skip, default = "RaptorIndex::default_edge_snap")]
-    pub edge_snap: bool,
-
     #[serde(skip, default = "RaptorIndex::default_edge_snap_radius_m")]
     pub edge_snap_radius_m: f64,
 
@@ -232,6 +268,26 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_bike_bucket_dpl_k")]
     pub bike_bucket_dpl_k: f64,
 
+    /// Drive grid-bucketing cell-size coefficient per metre of origin→dest
+    /// straight-line distance, on the Variance selection axis. Cell size = k·D;
+    /// `0.0` disables bucketing (strict no-op). Variance is Time-decorrelated and
+    /// accumulates per-edge (signals/crossings), so on long direct drive legs it
+    /// lets a combinatorial number of near-duplicate routes survive the per-node
+    /// Pareto frontier; bucketing bounds the frontier while still preserving the
+    /// low↔high-variance span the user routes on. Tuning param — not serialized,
+    /// applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_drive_bucket_var_k")]
+    pub drive_bucket_var_k: f64,
+
+    /// Walk grid-bucketing cell-size coefficient per metre of origin→dest
+    /// straight-line distance, on the Surface selection axis. Cell size = k·D;
+    /// `0.0` disables bucketing (strict no-op). Surface accumulates per-edge like
+    /// Variance and combines combinatorially with it on long direct walk legs;
+    /// bucketing bounds the per-node frontier while preserving the paved↔unpaved
+    /// span. Tuning param — not serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_walk_bucket_surf_k")]
+    pub walk_bucket_surf_k: f64,
+
     /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false: with the
     /// gradient-aware power model climbing is already priced in Time, so a separate
     /// "minimize D+ at any cost" axis only manufactures absurd extremes (a long walk to
@@ -253,26 +309,6 @@ pub struct RaptorIndex {
     /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_representatives_k")]
     pub representatives_k: usize,
-
-    /// Whether multi-objective street routing is enabled (opt-in; see config).
-    /// Tuning param — not serialized, applied from config at startup.
-    #[serde(skip, default = "RaptorIndex::default_multiobj_street")]
-    pub multiobj_street: bool,
-
-    /// Max scalar leg length (metres) to enrich with multi-objective alternatives
-    /// for non-walk street modes (bike/car). Bike/car alternatives come from
-    /// `multiobj_leg_options` (Pareto front, corridor-budgeted), so this is a high
-    /// safety net against pathological cross-country legs rather than a hard perf cliff.
-    /// Walk legs are never gated. Tuning param — applied at startup.
-    #[serde(skip, default = "RaptorIndex::default_multiobj_street_max_len_m")]
-    pub multiobj_street_max_len_m: usize,
-
-    /// Secondary weight on Time in a single-axis "champion" scalarization (the
-    /// fastest champion is pure Time). Breaks ties toward shorter routes when an
-    /// objective (e.g. D+) is otherwise near-degenerate. Tuning param — applied at
-    /// startup, not serialized.
-    #[serde(skip, default = "RaptorIndex::default_champion_time_tiebreak")]
-    pub champion_time_tiebreak: f64,
 
     /// ADGW limited-sharing threshold: an alternative bike/car leg is dropped if it
     /// shares more than this fraction of its length with a higher-ranked one. Tuning
@@ -339,6 +375,7 @@ impl RaptorIndex {
 
             transit_stop_reverse_transfers: Vec::new(),
             transit_idx_stop_reverse_transfers: Vec::new(),
+            tighten_long_transfers: false,
 
             transit_pattern_shapes: Vec::new(),
             transit_pattern_shape_stop_idx: Vec::new(),
@@ -357,9 +394,11 @@ impl RaptorIndex {
             vehicle_access_max_secs: Self::default_vehicle_access_max_secs(),
             reliability_bucket_edges: Self::default_reliability_bucket_edges(),
             arrival_slack_secs: Self::default_arrival_slack_secs(),
+            unrestricted_transfers: Self::default_unrestricted_transfers(),
+            use_cch_access: Self::default_use_cch_access(),
+            profile_latency: Self::default_profile_latency(),
             max_window_secs: Self::default_max_window_secs(),
             max_snap_distance_m: Self::default_max_snap_distance_m(),
-            edge_snap: Self::default_edge_snap(),
             edge_snap_radius_m: Self::default_edge_snap_radius_m(),
             bike_profile: crate::structures::BikeProfile::default(),
             street_time: Self::default_street_time(),
@@ -367,13 +406,12 @@ impl RaptorIndex {
             epsilon: Self::default_epsilon(),
             bike_bucket_cyc_k: Self::default_bike_bucket_cyc_k(),
             bike_bucket_dpl_k: Self::default_bike_bucket_dpl_k(),
+            drive_bucket_var_k: Self::default_drive_bucket_var_k(),
+            walk_bucket_surf_k: Self::default_walk_bucket_surf_k(),
             bike_select_dplus: Self::default_bike_select_dplus(),
             variance_model: Self::default_variance_model(),
             cost_weights: Self::default_cost_weights(),
             representatives_k: Self::default_representatives_k(),
-            multiobj_street: Self::default_multiobj_street(),
-            multiobj_street_max_len_m: Self::default_multiobj_street_max_len_m(),
-            champion_time_tiebreak: Self::default_champion_time_tiebreak(),
             alt_max_share_factor: Self::default_alt_max_share_factor(),
             systematic_cv: Self::default_systematic_cv(),
             balance: Self::default_balance(),
@@ -425,16 +463,24 @@ impl RaptorIndex {
         900
     }
 
+    pub fn default_unrestricted_transfers() -> bool {
+        false
+    }
+
+    pub fn default_use_cch_access() -> bool {
+        false
+    }
+
+    pub fn default_profile_latency() -> bool {
+        false
+    }
+
     pub fn default_max_window_secs() -> u32 {
         24 * 3600
     }
 
     pub fn default_max_snap_distance_m() -> u32 {
         10_000
-    }
-
-    pub fn default_edge_snap() -> bool {
-        true
     }
 
     pub fn default_edge_snap_radius_m() -> f64 {
@@ -461,6 +507,22 @@ impl RaptorIndex {
         0.013
     }
 
+    pub fn default_drive_bucket_var_k() -> f64 {
+        // Variance is seconds², not metres, but the same "cell ∝ trip distance"
+        // shape keeps a roughly constant bucket count as distance (and therefore
+        // the accumulated signal/crossing count) grows. Calibrated on a synthetic
+        // repeated-diamond diagnostic (multiobj.rs tests) to bound the per-node
+        // frontier to a handful of representatives regardless of route length.
+        0.05
+    }
+
+    pub fn default_walk_bucket_surf_k() -> f64 {
+        // Same rationale as `bike_bucket_cyc_k`: Surface is a length-scaled cost
+        // (metres × roughness factor), so cell size ∝ distance keeps the paved↔
+        // unpaved span while bounding the frontier on long direct walk legs.
+        0.025
+    }
+
     pub fn default_bike_select_dplus() -> bool {
         // Off: A/B showed demoting D+ removes the long-walk-for-flatness extreme
         // (push 1114→44 m) and makes the search 3–4× faster, with comparable diversity.
@@ -481,20 +543,6 @@ impl RaptorIndex {
 
     pub fn default_representatives_k() -> usize {
         6
-    }
-
-    pub fn default_multiobj_street() -> bool {
-        false
-    }
-
-    pub fn default_multiobj_street_max_len_m() -> usize {
-        // 25 km comfortably covers urban bike legs and the ~5 km vehicle access radius;
-        // the scalar search is corridor-bounded so this is a guard, not a perf cliff.
-        25_000
-    }
-
-    pub fn default_champion_time_tiebreak() -> f64 {
-        0.1
     }
 
     pub fn default_alt_max_share_factor() -> f64 {

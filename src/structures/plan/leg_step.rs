@@ -48,6 +48,9 @@ pub struct PlanTransitLegStep {
     pub time: u32,
     pub place: PlanPlace,
 
+    pub scheduled_arrival: Option<u32>,
+    pub scheduled_departure: Option<u32>,
+
     #[graphql(skip)]
     pub timetable_segment: TimetableSegment,
     #[graphql(skip)]

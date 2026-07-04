@@ -1,4 +1,4 @@
-use super::raptor_route::{Label, LabelSet, ModeContext};
+use super::raptor_route::{Label, LabelCell, LabelRow, ModeContext, apply_delay};
 
 use crate::{
     ingestion::gtfs::TimetableSegment,
@@ -15,10 +15,116 @@ use crate::{
 
 use super::{Graph, raptor_access::StreetProfile};
 
-/// Apply a signed realtime delay (seconds) to a time, clamped at 0.
-#[inline]
-fn apply_signed_delay(t: u32, delay: i32) -> u32 {
-    (t as i64 + delay as i64).max(0) as u32
+// ── Pass-3 tightening source selection (validation scaffolding) ───────────────
+//
+// The plan-tightening bounds are produced either by the full backward RAPTOR
+// pass (`Lambda`) or the O(k) plan chain sweep (`Chain`, the S1 replacement).
+// `Diff` runs Chain live but *also* recomputes Lambda and asserts they agree
+// wherever a time-consistent Lambda plan requires it — the differential gate.
+// This toggle + the stat counters are temporary validation machinery and are
+// removed once the chain sweep is the sole path.
+pub const TIGHTEN_MODE_CHAIN: u8 = 0;
+pub const TIGHTEN_MODE_LAMBDA: u8 = 1;
+pub const TIGHTEN_MODE_DIFF: u8 = 2;
+
+static TIGHTEN_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(TIGHTEN_MODE_CHAIN);
+static DIFF_INIT: std::sync::Once = std::sync::Once::new();
+
+static DIFF_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIFF_IDENTICAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIFF_CLASS1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIFF_CLASS2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIFF_CLASS3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIFF_SEED_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tighten_mode() -> u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    // First read also honours the MAAS_TIGHTEN_DIFF / MAAS_TIGHTEN_MODE env vars
+    // so the CLI-driven probe run can enable the gate without code changes.
+    DIFF_INIT.call_once(|| {
+        if std::env::var("MAAS_TIGHTEN_DIFF").is_ok() {
+            TIGHTEN_MODE.store(TIGHTEN_MODE_DIFF, Relaxed);
+        } else if let Ok(m) = std::env::var("MAAS_TIGHTEN_MODE") {
+            match m.as_str() {
+                "chain" => TIGHTEN_MODE.store(TIGHTEN_MODE_CHAIN, Relaxed),
+                "lambda" => TIGHTEN_MODE.store(TIGHTEN_MODE_LAMBDA, Relaxed),
+                "diff" => TIGHTEN_MODE.store(TIGHTEN_MODE_DIFF, Relaxed),
+                _ => {}
+            }
+        }
+    });
+    TIGHTEN_MODE.load(Relaxed)
+}
+
+/// Whether the S1 chain sweep should tighten off-table (long) transfers using
+/// the plan's own walk instead of no-oping them (the lambda-identical default).
+/// True when the per-graph `tighten_long_transfers` flag is set OR the
+/// `MAAS_TIGHTEN_LONG_TRANSFERS` env var is present (cached once).
+fn long_transfer_tightening(g: &Graph) -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    g.raptor.tighten_long_transfers
+        || *ENV.get_or_init(|| std::env::var("MAAS_TIGHTEN_LONG_TRANSFERS").is_ok())
+}
+
+/// Transfer margins (seconds) between consecutive transit legs of a tightened
+/// plan: `next.start - (prev.end + inter-leg walk)`. Negative ⇒ time-inconsistent
+/// (the plan boards a vehicle it cannot physically catch).
+fn plan_transfer_margins(legs: &[PlanLeg]) -> Vec<i32> {
+    let mut margins = Vec::new();
+    let mut prev_transit_end: Option<u32> = None;
+    let mut walk_acc: u32 = 0;
+    for l in legs {
+        match l {
+            PlanLeg::Transit(t) => {
+                if let Some(end) = prev_transit_end {
+                    margins.push(t.start as i32 - (end + walk_acc) as i32);
+                }
+                prev_transit_end = Some(t.end);
+                walk_acc = 0;
+            }
+            PlanLeg::Walk(w) => {
+                if prev_transit_end.is_some() {
+                    walk_acc += w.duration;
+                }
+            }
+        }
+    }
+    margins
+}
+
+/// Structural timing equality of two tightened plans: same transit trips at the
+/// same times and same walk-leg timings. Ignores float reliability metadata.
+fn legs_timing_eq(a: &[PlanLeg], b: &[PlanLeg]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).all(|(x, y)| match (x, y) {
+        (PlanLeg::Transit(p), PlanLeg::Transit(q)) => {
+            p.trip_id == q.trip_id && p.start == q.start && p.end == q.end
+        }
+        (PlanLeg::Walk(p), PlanLeg::Walk(q)) => {
+            p.start == q.start && p.end == q.end && p.duration == q.duration
+        }
+        _ => false,
+    })
+}
+
+/// Whether any inter-leg transfer walk exceeds the capped reverse-footpath table
+/// distance (`MAX_TRANSFER_DISTANCE_M`) — the lambda-no-op class-2 signature.
+fn plan_has_long_transfer(legs: &[PlanLeg], max_m: f64) -> bool {
+    let ti: Vec<usize> = legs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| matches!(l, PlanLeg::Transit(_)).then_some(i))
+        .collect();
+    if ti.len() < 2 {
+        return false;
+    }
+    let (first, last) = (ti[0], *ti.last().unwrap());
+    legs[first..last]
+        .iter()
+        .any(|l| matches!(l, PlanLeg::Walk(w) if (w.length as f64) > max_m))
 }
 
 impl Graph {
@@ -258,13 +364,13 @@ impl Graph {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn extract_with_debug(
+    pub(super) fn extract_with_debug<R: LabelRow>(
         &self,
         mc: &ModeContext,
         start_time: u32,
         date: u32,
         weekday: u8,
-        labels: &[Vec<LabelSet>],
+        labels: &[R],
         buckets: &ReliabilityBuckets,
         origin: NodeID,
         destination: NodeID,
@@ -273,6 +379,7 @@ impl Graph {
         departure_stamp: u32,
         arena: &[Label],
         onboard: bool,
+        bw_cache: &mut std::collections::HashMap<(usize, u32, usize, u32, u8), Vec<Vec<u32>>>,
     ) -> Vec<Plan> {
         use super::MAX_ROUNDS;
 
@@ -299,6 +406,13 @@ impl Graph {
         let n_keys = n_classes * n_buckets;
         let mut bucket_best = vec![u32::MAX; n_keys];
 
+        // `bw_cache` (passed in) memoizes `raptor_backward`, a pure function of
+        // (target stop, target arrival, leg count, date, weekday). Within one extract the
+        // reliability-bucket variants of an arrival share keys; ACROSS the range driver's
+        // per-departure extracts, adjacent departures rediscover the same trips (same
+        // alighting stop + arrival), so a cache scoped to the whole range query collapses
+        // both. Exact — pure function, same labels, same output.
+
         for k in 0..=MAX_ROUNDS {
             // For this round, the earliest arrival (incl. egress walk/ride) per
             // (class, bucket), and which (stop, walk, state) achieves it.
@@ -306,18 +420,21 @@ impl Graph {
             for (sidx, vs) in mc.am.states() {
                 let class = class_of(vs);
                 for &(s, w) in &mc.egress[sidx] {
-                    for l in labels[k][s * n_states + sidx].iter() {
-                        if l.created_by != departure_stamp {
+                    let set = labels[k].cell(s * n_states + sidx);
+                    for i in 0..set.count() {
+                        let sm = set.summary_at(i);
+                        if sm.created_by != departure_stamp {
                             continue;
                         }
-                        let b = buckets.bucket(l.reliability) as usize;
+                        let b = buckets.bucket(sm.reliability) as usize;
                         let key = class * n_buckets + b;
-                        let arr = l.bag.earliest().saturating_add(w);
-                        let intra_member_transfer = l.trace.is_transfer()
+                        let arr = sm.earliest.saturating_add(w);
+                        let full = set.full_at(i, arena);
+                        let intra_member_transfer = full.trace.is_transfer()
                             && mc
                                 .dest_station
                                 .as_ref()
-                                .is_some_and(|m| m.contains(&(l.trace.from_stop as usize)));
+                                .is_some_and(|m| m.contains(&(full.trace.from_stop as usize)));
                         match per_key[key] {
                             Some((cur_arr, cur_intra, ..))
                                 if (cur_arr, cur_intra) <= (arr, intra_member_transfer) => {}
@@ -345,17 +462,40 @@ impl Graph {
                     }
                     continue;
                 }
-                bucket_best[key] = best_arr;
-
                 // The destination-stop label this candidate was built from; its arena
                 // chain is the EXACT journey (no grid re-lookup → no bucket drift).
                 let cell = best_stop * n_states + dest_sidx;
-                let chosen = Self::pick_label(&labels[k][cell], buckets, b as u8, departure_stamp);
+                let chosen =
+                    Self::pick_label(&labels[k].cell(cell), buckets, b as u8, departure_stamp, arena);
+
+                // Drop candidates whose arena chain carries no transit leg BEFORE
+                // committing `bucket_best` or reconstructing. Committing first let a
+                // zero-transit chain (e.g. an access+transfer walk-chain — always
+                // dropped below as a degenerate direct ride) poison the (class, bucket)
+                // cross-round bound and suppress a genuine transit candidate at another
+                // egress cell in a later round. `chain_has_transit` is exact: reconstruct
+                // emits a Transit leg iff a transit trace is in the chain, and chosen=None
+                // ⇔ empty legs — so this subsumes the old `legs.is_empty()` /
+                // `transit_count == 0` drops with the identical `ReconstructionEmpty` tag,
+                // and also skips the wasted `street_path_geom` work reconstruct would do.
+                if !chosen.is_some_and(|l| Self::chain_has_transit(arena, l.arena_id)) {
+                    if let Some(ref mut sink) = debug_sink {
+                        sink.push(PlanCandidate {
+                            round: k,
+                            origin_departure: start_time,
+                            plan: None,
+                            status: CandidateStatus::ReconstructionEmpty,
+                        });
+                    }
+                    continue;
+                }
+                bucket_best[key] = best_arr;
+
                 let chosen_bag = chosen.map(|l| l.bag).unwrap_or(ScenarioBag::EMPTY);
                 let chosen_rt = chosen.and_then(|l| l.route_type);
 
                 let (mut legs, origin_stop, root_state) = match chosen {
-                    Some(l) => self.reconstruct(arena, l.arena_id, date, weekday),
+                    Some(l) => self.reconstruct(arena, l.arena_id, date, weekday, rt),
                     None => (Vec::new(), best_stop, 0),
                 };
 
@@ -387,55 +527,78 @@ impl Graph {
                     },
                 };
 
-                if legs.is_empty() {
-                    if let Some(ref mut sink) = debug_sink {
-                        sink.push(PlanCandidate {
-                            round: k,
-                            origin_departure: start_time,
-                            plan: None,
-                            status: CandidateStatus::ReconstructionEmpty,
-                        });
-                    }
-                    continue;
-                }
-
+                // Guaranteed non-empty with ≥1 transit leg: the pre-reconstruct
+                // `chain_has_transit` gate dropped every zero-transit / empty chain
+                // (degenerate access+transfer+egress "direct rides" the search can reach
+                // with a wide vehicle access radius). Direct rides are emitted by the
+                // direct-plan machinery instead.
                 let transit_count = legs
                     .iter()
                     .filter(|l| matches!(l, PlanLeg::Transit(_)))
                     .count();
-                // A transit-mode candidate must actually use transit. With a wide
-                // vehicle access radius the search can reach the destination via
-                // access + transfer + egress with zero transit legs — a degenerate
-                // direct ride that also dodges the direct-duration filter (it looks
-                // "direct"). Direct rides are emitted by the direct-plan machinery, so
-                // drop any zero-transit candidate here.
-                if transit_count == 0 {
-                    if let Some(ref mut sink) = debug_sink {
-                        sink.push(PlanCandidate {
-                            round: k,
-                            origin_departure: start_time,
-                            plan: None,
-                            status: CandidateStatus::ReconstructionEmpty,
-                        });
-                    }
-                    continue;
-                }
                 // The backward pass is bike-unaware (it would re-board trips a carried
                 // bike is not allowed on), so only walk-rooted plans are tightened.
                 if transit_count > 0 && mode == Mode::WalkTransit {
-                    let lambda = self.raptor_backward(
-                        best_stop,
-                        best_arr.saturating_sub(best_walk),
-                        transit_count,
-                        date,
-                        weekday,
-                    );
-                    self.tighten_with_backward_labels(&mut legs, &lambda, date, weekday, onboard);
+                    let target = best_arr.saturating_sub(best_walk);
+                    let tmode = tighten_mode();
+                    if tmode == TIGHTEN_MODE_CHAIN {
+                        // S1: O(k) plan chain sweep — no backward pass. Timed under the
+                        // profiler's `backward` phase so the decomposition shows the collapse.
+                        let bounds = super::latency_profile::time_backward(|| {
+                            self.chain_bounds(&legs, best_stop, target, date, weekday, rt)
+                        });
+                        self.tighten_with_bounds(
+                            &mut legs, &bounds, date, weekday, rt, onboard, true,
+                        );
+                    } else {
+                        // Lambda / Diff: recompute the full backward pass (timed).
+                        let bw_key = (best_stop, target, transit_count, date, weekday);
+                        let lambda = bw_cache.entry(bw_key).or_insert_with(|| {
+                            super::latency_profile::time_backward(|| {
+                                self.raptor_backward(
+                                    bw_key.0, bw_key.1, bw_key.2, bw_key.3, bw_key.4, rt,
+                                )
+                            })
+                        });
+                        let bounds_lambda = self.bounds_from_lambda(&legs, lambda);
+                        if tmode == TIGHTEN_MODE_DIFF {
+                            let bounds_chain =
+                                self.chain_bounds(&legs, best_stop, target, date, weekday, rt);
+                            self.tighten_diff_check(
+                                &legs,
+                                &bounds_lambda,
+                                &bounds_chain,
+                                date,
+                                weekday,
+                                rt,
+                                onboard,
+                            );
+                            self.tighten_with_bounds(
+                                &mut legs,
+                                &bounds_chain,
+                                date,
+                                weekday,
+                                rt,
+                                onboard,
+                                true,
+                            );
+                        } else {
+                            self.tighten_with_bounds(
+                                &mut legs,
+                                &bounds_lambda,
+                                date,
+                                weekday,
+                                rt,
+                                onboard,
+                                false,
+                            );
+                        }
+                    }
                 }
 
                 // Realtime post-pass: shift leg times by live delays, re-chain the
                 // timeline, and recompute transfer reliability on the new margins.
-                self.apply_realtime(&mut legs, rt);
+                self.apply_realtime(&mut legs, rt, onboard);
 
                 // Record each transit leg's downstream connection *after* tighten and
                 // realtime have settled the final scheduled times, so the outbound
@@ -706,19 +869,49 @@ impl Graph {
     /// label `0` and pass `stamp = 0`, so the filter is a no-op there; the range
     /// driver passes the current departure index so reconstruction follows only
     /// that departure's traces through the grid shared across departures.
-    fn pick_label<'a>(
-        set: &'a LabelSet,
+    /// Whether the arena parent chain rooted at `start_id` contains any transit
+    /// trace. Equivalent to "reconstruct would emit ≥1 Transit leg", but computed
+    /// without building any legs or street geometry.
+    fn chain_has_transit(arena: &[Label], start_id: u32) -> bool {
+        let mut cur = start_id;
+        while cur != u32::MAX {
+            let node = &arena[cur as usize];
+            if node.trace.is_transit() {
+                return true;
+            }
+            cur = node.parent;
+        }
+        false
+    }
+
+    fn pick_label<C: LabelCell>(
+        set: &C,
         buckets: &ReliabilityBuckets,
         b: u8,
         stamp: u32,
-    ) -> Option<&'a Label> {
-        set.iter()
-            .find(|l| l.created_by == stamp && buckets.bucket(l.reliability) == b)
-            .or_else(|| {
-                set.iter()
-                    .filter(|l| l.created_by == stamp)
-                    .min_by_key(|l| l.bag.earliest())
-            })
+        arena: &[Label],
+    ) -> Option<Label> {
+        // Primary: first current-stamp member in bucket `b` (order-sensitive `find`).
+        for i in 0..set.count() {
+            let sm = set.summary_at(i);
+            if sm.created_by == stamp && buckets.bucket(sm.reliability) == b {
+                return Some(set.full_at(i, arena));
+            }
+        }
+        // Fallback: min-earliest among current-stamp members (first-wins on ties,
+        // matching `min_by_key`).
+        let mut best: Option<(usize, u32)> = None;
+        for i in 0..set.count() {
+            let sm = set.summary_at(i);
+            if sm.created_by != stamp {
+                continue;
+            }
+            match best {
+                Some((_, be)) if be <= sm.earliest => {}
+                _ => best = Some((i, sm.earliest)),
+            }
+        }
+        best.map(|(i, _)| set.full_at(i, arena))
     }
 
     /// Rebuilds the ordered legs of a journey by following EXACT parent pointers
@@ -732,6 +925,9 @@ impl Graph {
         start_id: u32,
         date: u32,
         weekday: u8,
+        // Named `realtime` (not `rt`) because the transfer-risk block below binds a
+        // local `rt: RouteType` that would otherwise shadow it.
+        realtime: &RealtimeIndex,
     ) -> (Vec<PlanLeg>, usize, u8) {
         let mut legs = Vec::new();
         let mut origin_stop = 0usize;
@@ -821,8 +1017,14 @@ impl Graph {
                 (preceding_rt, preceding_arr)
             {
                 let margin = board_dep as i32 - arrival_at_bs as i32;
-                let next_departure =
-                    self.next_active_trip_departure(trip_ids, t + 1, boarding_col, date, weekday);
+                let next_departure = self.next_active_trip_departure(
+                    trip_ids,
+                    t + 1,
+                    boarding_col,
+                    date,
+                    weekday,
+                    realtime,
+                );
                 let board = self
                     .route_type_of_trip(trip_ids[t])
                     .and_then(|brt| self.raptor.transit_delay_models.get(&brt));
@@ -891,6 +1093,12 @@ impl Graph {
                             None
                         },
                     },
+                    scheduled_arrival: Some(arr),
+                    scheduled_departure: if s < ap {
+                        Some(times[s * n_trips + t].departure)
+                    } else {
+                        None
+                    },
                     date,
                     weekday,
                     timetable_segment,
@@ -925,14 +1133,14 @@ impl Graph {
             legs.push(PlanLeg::Transit(PlanTransitLeg {
                 from: PlanPlace {
                     stop_position: Some(bp as u32),
-                    arrival: None,
+                    arrival: Some(times[bp * n_trips + t].arrival),
                     departure: Some(board_dep),
                     node_id: pat_stops[bp],
                 },
                 to: PlanPlace {
                     stop_position: Some(ap as u32),
                     arrival: Some(alight_arr),
-                    departure: None,
+                    departure: Some(times[ap * n_trips + t].departure),
                     node_id: pat_stops[ap],
                 },
                 start: board_dep,
@@ -1018,7 +1226,7 @@ impl Graph {
     ///
     /// Runs *before* the access/egress walks are attached, so `legs` here is the
     /// transit/transfer chain only; `cursor` is the running effective arrival.
-    pub(super) fn apply_realtime(&self, legs: &mut [PlanLeg], rt: &RealtimeIndex) {
+    pub(super) fn apply_realtime(&self, legs: &mut [PlanLeg], rt: &RealtimeIndex, onboard: bool) {
         if rt.is_empty() {
             return;
         }
@@ -1028,9 +1236,37 @@ impl Graph {
         };
 
         let mut cursor: Option<u32> = None;
+        let mut first_transit = true;
         for leg in legs.iter_mut() {
             match leg {
                 PlanLeg::Transit(t) => {
+                    let is_first_transit = first_transit;
+                    first_transit = false;
+
+                    // After the forward-search cancellation guards (A1/B1/B2), the
+                    // only way a reconstructed plan can carry a CANCELED transit leg
+                    // is as the ONBOARD first leg — the vehicle the user is
+                    // physically riding. Any other canceled leg means the search
+                    // boarded a dead trip; this tripwire catches a regression.
+                    let canceled = rt.is_canceled(t.trip_id);
+                    debug_assert!(
+                        !canceled || (onboard && is_first_transit),
+                        "apply_realtime: a non-onboard transit leg is CANCELED (trip {:?}) — \
+                         the boarding guards should have prevented this",
+                        t.trip_id,
+                    );
+                    if canceled && onboard && is_first_transit {
+                        // Cancellation outranks stale per-stop delays: keep the
+                        // scheduled times and do not flag the leg realtime (mirrors
+                        // live_refresh in app.rs). The boarded trip itself is NOT
+                        // excluded — it is the user's reality.
+                        t.scheduled_start = t.start;
+                        t.scheduled_end = t.end;
+                        t.realtime = false;
+                        cursor = Some(t.end);
+                        continue;
+                    }
+
                     let board = compact(t.from.node_id);
                     let alight = compact(t.to.node_id);
                     let d_board = board.map_or(0, |s| rt.delay(t.trip_id, s));
@@ -1040,20 +1276,22 @@ impl Graph {
 
                     t.scheduled_start = t.start;
                     t.scheduled_end = t.end;
-                    t.start = apply_signed_delay(t.start, d_board);
-                    t.end = apply_signed_delay(t.end, d_alight);
+                    t.start = apply_delay(t.start, d_board);
+                    t.end = apply_delay(t.end, d_alight);
                     t.realtime = has_rt;
                     t.duration = t.end.saturating_sub(t.start);
                     t.from.departure = Some(t.start);
                     t.to.arrival = Some(t.end);
+                    t.from.arrival = t.from.arrival.map(|a| apply_delay(a, d_board));
+                    t.to.departure = t.to.departure.map(|x| apply_delay(x, d_alight));
 
                     for step in t.steps.iter_mut() {
                         if let PlanLegStep::Transit(s) = step
                             && let Some(sc) = compact(s.place.node_id)
                         {
                             let d = rt.delay(t.trip_id, sc);
-                            s.place.arrival = s.place.arrival.map(|a| apply_signed_delay(a, d));
-                            s.place.departure = s.place.departure.map(|x| apply_signed_delay(x, d));
+                            s.place.arrival = s.place.arrival.map(|a| apply_delay(a, d));
+                            s.place.departure = s.place.departure.map(|x| apply_delay(x, d));
                         }
                     }
 
@@ -1145,13 +1383,374 @@ impl Graph {
         lo
     }
 
-    pub(super) fn tighten_with_backward_labels(
+    /// Per-transit-leg alighting bounds `B[i]` derived from the backward labels
+    /// `lambda[remaining][stop]`, exactly as the tighten loop read them before
+    /// the S1 chain-sweep replacement. `B[i] = lambda[k-i-1][alighting_stop_i]`
+    /// (raw, pre-reliability-cap; 0 = no bound). Kept only for the differential
+    /// gate that validates `chain_bounds` against the full backward pass.
+    pub(super) fn bounds_from_lambda(&self, legs: &[PlanLeg], lambda: &[Vec<u32>]) -> Vec<u32> {
+        let transit_indices: Vec<usize> = legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| matches!(l, PlanLeg::Transit(_)).then_some(i))
+            .collect();
+        let k = transit_indices.len();
+        let mut bounds = vec![0u32; k];
+        for (i, &ti) in transit_indices.iter().enumerate() {
+            let remaining = k - i - 1;
+            let alighting_node = match &legs[ti] {
+                PlanLeg::Transit(t) => t.to.node_id,
+                _ => unreachable!(),
+            };
+            let ac = self.raptor.transit_node_to_stop[alighting_node.0];
+            bounds[i] = if ac != u32::MAX && remaining < lambda.len() {
+                lambda[remaining][ac as usize]
+            } else {
+                0
+            };
+        }
+        bounds
+    }
+
+    /// O(k) chain-bounds sweep (S1): the plan-consistent replacement for the full
+    /// backward pass. Returns `B[i]` = latest permitted arrival at transit leg
+    /// `i`'s alighting stop, computed purely from the plan's own fixed legs and
+    /// inter-leg walks. Cap-unaware (mirrors lambda); the reliability cap is
+    /// applied downstream in `tighten_with_bounds`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn chain_bounds(
         &self,
-        legs: &mut [PlanLeg],
-        lambda: &[Vec<u32>],
+        legs: &[PlanLeg],
+        target_stop: usize, // compact destination stop (== lambda's target_compact_stop)
+        target: u32,        // latest arrival at target_stop (== best_arr - best_walk)
         date: u32,
         weekday: u8,
+        rt: &RealtimeIndex,
+    ) -> Vec<u32> {
+        let transit_indices: Vec<usize> = legs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| matches!(l, PlanLeg::Transit(_)).then_some(i))
+            .collect();
+        let k = transit_indices.len();
+        let mut bounds = vec![0u32; k];
+        if k == 0 {
+            return bounds;
+        }
+
+        // B[k-1]: reproduce lambda[0][alighting_of_last_leg] exactly — the seed
+        // target arrival, minus the egress reverse-transfer walk when the last
+        // leg alights at a sibling of the destination stop.
+        let last_ti = transit_indices[k - 1];
+        let last_alight = match &legs[last_ti] {
+            PlanLeg::Transit(t) => t.to.node_id,
+            _ => unreachable!(),
+        };
+        let last_compact = self.raptor.transit_node_to_stop[last_alight.0];
+        bounds[k - 1] = if last_compact != u32::MAX && last_compact as usize == target_stop {
+            target
+        } else if target > 0 && last_compact != u32::MAX {
+            // lambda seeds target_stop then relaxes reverse footpaths one hop:
+            //   lambda[0][source] = target - walk over (source, walk) in
+            //   reverse_transfers[target_stop]. Reproduce for source == the last
+            //   alighting stop. Off-table (long) egress ⇒ lambda has no label ⇒ 0.
+            match self.reverse_transfer_walk(target_stop, last_compact as usize) {
+                Some(walk) => target.saturating_sub(walk),
+                None => 0,
+            }
+        } else {
+            0
+        };
+
+        // Chain backward through the fixed legs. For leg i, find the latest trip
+        // on its (board, alight) node pair arriving <= B[i] (min boarding = the
+        // original leg start, so the original trip is always feasible); the
+        // earlier leg's arrival bound is that departure minus the inter-leg walk.
+        //
+        // The walk uses the capped reverse-transfer table value (identical to
+        // lambda's reverse footpath) when the transfer is on-table, so the chain
+        // reproduces lambda exactly for short transfers. For an off-table (long,
+        // > MAX_TRANSFER_DISTANCE_M) transfer — where lambda's capped footpath
+        // yields no label (class 2) — it falls back to the plan's reconstructed
+        // walk so the chain still tightens the leg validly.
+        for i in (1..k).rev() {
+            let ti = transit_indices[i];
+            let (board, alight, leg_start) = match &legs[ti] {
+                PlanLeg::Transit(t) => (t.from.node_id, t.to.node_id, t.start),
+                _ => unreachable!(),
+            };
+            let dep_i = self
+                .latest_departure_before_arrival(
+                    board, alight, leg_start, bounds[i], date, weekday, rt,
+                )
+                .map(|(_, dep, _)| dep);
+
+            let prev_ti = transit_indices[i - 1];
+            let prev_alight = match &legs[prev_ti] {
+                PlanLeg::Transit(t) => t.to.node_id,
+                _ => unreachable!(),
+            };
+            let board_compact = self.raptor.transit_node_to_stop[board.0];
+            let prev_alight_compact = self.raptor.transit_node_to_stop[prev_alight.0];
+            // Inter-leg transfer: total reconstructed walk (length in metres,
+            // duration in seconds).
+            let (plan_walk_len, plan_walk_dur) = legs[prev_ti + 1..ti].iter().fold(
+                (0usize, 0u32),
+                |(len, dur), l| match l {
+                    PlanLeg::Walk(w) => (len + w.length, dur + w.duration),
+                    _ => (len, dur),
+                },
+            );
+            // A transfer longer than the capped reverse-footpath table
+            // (`MAX_TRANSFER_DISTANCE_M`) is exactly the case lambda cannot
+            // represent: its `apply_reverse_footpaths` has no entry, so the leg's
+            // backward label is 0 (left untightened). Everything ≤ the cap is a
+            // short / same-stop transfer that lambda DOES tighten.
+            let off_table = (plan_walk_len as f64) > super::MAX_TRANSFER_DISTANCE_M;
+            bounds[i - 1] = if off_table {
+                // Match lambda's no-op by default; opt-in tightens with the plan
+                // walk — surfacing valid plans lambda's capped table hides.
+                if long_transfer_tightening(self) {
+                    dep_i.map(|d| d.saturating_sub(plan_walk_dur)).unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                // Short / same-stop transfer: use the capped table walk (identical
+                // to lambda's reverse footpath) when present, else the plan's own
+                // reconstructed walk (0 for a same-stop transfer ⇒ bound = the
+                // trip departure, exactly as lambda's direct label).
+                let w = if board_compact != u32::MAX && prev_alight_compact != u32::MAX {
+                    self.reverse_transfer_walk(board_compact as usize, prev_alight_compact as usize)
+                        .unwrap_or(plan_walk_dur)
+                } else {
+                    plan_walk_dur
+                };
+                dep_i.map(|d| d.saturating_sub(w)).unwrap_or(0)
+            };
+        }
+        bounds
+    }
+
+    /// Capped reverse-transfer table walk (seconds) from `from_stop` to
+    /// `to_stop`, or `None` when the transfer is not on-table (same stop, or a
+    /// transfer beyond `MAX_TRANSFER_DISTANCE_M`). Mirrors the walk lambda's
+    /// reverse footpath applies: `reverse_transfers[to_stop]` lists `(source,
+    /// walk)` for every `source` that can walk to `to_stop`. When several entries
+    /// name the same source, lambda keeps the largest bound ⇒ the smallest walk.
+    pub(super) fn reverse_transfer_walk(&self, to_stop: usize, from_stop: usize) -> Option<u32> {
+        if to_stop >= self.raptor.transit_idx_stop_reverse_transfers.len() {
+            return None;
+        }
+        self.raptor.transit_idx_stop_reverse_transfers[to_stop]
+            .of(&self.raptor.transit_stop_reverse_transfers)
+            .iter()
+            .filter(|&&(source, _)| source == from_stop)
+            .map(|&(_, walk)| walk)
+            .min()
+    }
+
+    /// Public hook: force the pass-3 tightening source (validation scaffolding).
+    pub fn set_tighten_mode(mode: u8) {
+        TIGHTEN_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Use the S1 chain sweep (the default / production path).
+    pub fn set_tighten_mode_chain() {
+        Self::set_tighten_mode(TIGHTEN_MODE_CHAIN);
+    }
+    /// Use the legacy full backward pass (kept for differential review).
+    pub fn set_tighten_mode_lambda() {
+        Self::set_tighten_mode(TIGHTEN_MODE_LAMBDA);
+    }
+    /// Run both and assert the chain plan is consistent + classify divergence.
+    pub fn set_tighten_mode_diff() {
+        Self::set_tighten_mode(TIGHTEN_MODE_DIFF);
+    }
+    /// Opt-in: tighten long (off-table) transfers with the plan's own walk. When
+    /// `false` (default) the chain sweep is byte-identical to the backward pass.
+    pub fn set_tighten_long_transfers(&mut self, on: bool) {
+        self.raptor.tighten_long_transfers = on;
+    }
+
+    /// Reset the differential-gate counters.
+    pub fn reset_tighten_diff_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        for c in [
+            &DIFF_CHECKS,
+            &DIFF_IDENTICAL,
+            &DIFF_CLASS1,
+            &DIFF_CLASS2,
+            &DIFF_CLASS3,
+            &DIFF_SEED_MISMATCH,
+        ] {
+            c.store(0, Relaxed);
+        }
+    }
+
+    /// Test hook: chain-sweep bounds for a plan's legs (validation scaffolding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn chain_bounds_pub(
+        &self,
+        legs: &[PlanLeg],
+        target_stop: usize,
+        target: u32,
+        date: u32,
+        weekday: u8,
+        rt: &RealtimeIndex,
+    ) -> Vec<u32> {
+        self.chain_bounds(legs, target_stop, target, date, weekday, rt)
+    }
+
+    /// Test hook: backward-pass (lambda) bounds for a plan's legs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bounds_from_lambda_pub(
+        &self,
+        legs: &[PlanLeg],
+        target_stop: usize,
+        target: u32,
+        transit_count: usize,
+        date: u32,
+        weekday: u8,
+        rt: &RealtimeIndex,
+    ) -> Vec<u32> {
+        let lambda = self.raptor_backward(target_stop, target, transit_count, date, weekday, rt);
+        self.bounds_from_lambda(legs, &lambda)
+    }
+
+    /// Test hook: drive the forward tighten loop with explicit bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tighten_with_bounds_pub(
+        &self,
+        legs: &mut Vec<PlanLeg>,
+        bounds: &[u32],
+        date: u32,
+        weekday: u8,
+        rt: &RealtimeIndex,
         onboard: bool,
+        debug_check: bool,
+    ) {
+        self.tighten_with_bounds(legs, bounds, date, weekday, rt, onboard, debug_check);
+    }
+
+    /// Differential-gate counters:
+    /// `(checks, identical, class1, class2, class3, seed_mismatch)`.
+    pub fn tighten_diff_stats() -> (u64, u64, u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            DIFF_CHECKS.load(Relaxed),
+            DIFF_IDENTICAL.load(Relaxed),
+            DIFF_CLASS1.load(Relaxed),
+            DIFF_CLASS2.load(Relaxed),
+            DIFF_CLASS3.load(Relaxed),
+            DIFF_SEED_MISMATCH.load(Relaxed),
+        )
+    }
+
+    /// Differential gate: tighten a plan under both the backward-pass bounds
+    /// (`bounds_lambda`) and the chain-sweep bounds (`bounds_chain`), assert the
+    /// chain plan is time-consistent, and classify any divergence. Panics on a
+    /// chain inconsistency or an unexplained (neither-class) divergence.
+    #[allow(clippy::too_many_arguments)]
+    fn tighten_diff_check(
+        &self,
+        legs: &[PlanLeg],
+        bounds_lambda: &[u32],
+        bounds_chain: &[u32],
+        date: u32,
+        weekday: u8,
+        rt: &RealtimeIndex,
+        onboard: bool,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        DIFF_CHECKS.fetch_add(1, Relaxed);
+        let k = bounds_lambda.len();
+
+        // Seed fidelity (recorded, not fatal): chain's last-leg bound should
+        // reproduce lambda[0][last-alight]. A mismatch means the egress-transfer
+        // walk was reconstructed differently from the capped reverse-footpath
+        // table — benign as long as the chain plan stays consistent (asserted
+        // below), so it is counted and surfaced rather than aborting.
+        if k > 0 && bounds_chain[k - 1] != bounds_lambda[k - 1] {
+            DIFF_SEED_MISMATCH.fetch_add(1, Relaxed);
+            eprintln!(
+                "TIGHTEN_DIFF seed-mismatch B[k-1] chain={} lambda={}",
+                bounds_chain[k - 1],
+                bounds_lambda[k - 1]
+            );
+        }
+
+        let mut l = legs.to_vec();
+        let mut c = legs.to_vec();
+        self.tighten_with_bounds(&mut l, bounds_lambda, date, weekday, rt, onboard, false);
+        self.tighten_with_bounds(&mut c, bounds_chain, date, weekday, rt, onboard, true);
+
+        // THE net (hard gate): the chain plan must be time-consistent everywhere.
+        // A negative margin here is a genuine chain_bounds bug — stop and report.
+        for (idx, m) in plan_transfer_margins(&c).into_iter().enumerate() {
+            assert!(
+                m >= 0,
+                "S1 chain plan has NEGATIVE transfer margin {m}s at transfer {idx} — chain_bounds bug. \
+                 bounds_chain={bounds_chain:?} bounds_lambda={bounds_lambda:?}"
+            );
+        }
+
+        if legs_timing_eq(&l, &c) {
+            DIFF_IDENTICAL.fetch_add(1, Relaxed);
+            return;
+        }
+
+        // Divergence classification (reporting only — the chain plan is already
+        // proven consistent above):
+        //   class 1: the lambda plan is time-INCONSISTENT (the bug S1 fixes) —
+        //            lambda over-tightened via a parallel line / bound it could
+        //            not honour.
+        //   class 2: a long (> MAX_TRANSFER_DISTANCE_M) transfer that lambda's
+        //            capped reverse footpath left untightened (bound 0) while the
+        //            chain tightened it validly.
+        //   class 3: both plans consistent but differ — the chain used a walk
+        //            value (plan-reconstructed) that differs from lambda's capped
+        //            table walk, tightening a leg to a different still-valid trip.
+        let l_consistent = plan_transfer_margins(&l).into_iter().all(|m| m >= 0);
+        let lambda_noop = (0..k).any(|i| bounds_lambda[i] == 0 && bounds_chain[i] > 0);
+        let long_transfer = plan_has_long_transfer(&c, super::MAX_TRANSFER_DISTANCE_M);
+        if !l_consistent {
+            DIFF_CLASS1.fetch_add(1, Relaxed);
+            eprintln!(
+                "TIGHTEN_DIFF class=1 (lambda negative margin) lambda={bounds_lambda:?} chain={bounds_chain:?}"
+            );
+        } else if long_transfer || lambda_noop {
+            DIFF_CLASS2.fetch_add(1, Relaxed);
+            eprintln!(
+                "TIGHTEN_DIFF class=2 (long transfer untightened by lambda) lambda={bounds_lambda:?} chain={bounds_chain:?}"
+            );
+        } else {
+            DIFF_CLASS3.fetch_add(1, Relaxed);
+            eprintln!(
+                "TIGHTEN_DIFF class=3 (walk-value drift, both consistent) lambda={bounds_lambda:?} chain={bounds_chain:?}"
+            );
+        }
+    }
+
+    /// Pass-3 tightening driven by per-leg alighting bounds `bounds[i]` (the
+    /// latest arrival permitted at transit leg `i`'s alighting stop). The bounds
+    /// are produced either by the backward pass (`bounds_from_lambda`) or the
+    /// O(k) plan chain sweep (`chain_bounds`); this forward loop is agnostic to
+    /// their origin. The reliability cap and all timing wrinkles live here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tighten_with_bounds(
+        &self,
+        legs: &mut [PlanLeg],
+        bounds: &[u32],
+        date: u32,
+        weekday: u8,
+        rt: &RealtimeIndex,
+        onboard: bool,
+        // When true (the S1 chain-sweep live path), assert every recomputed
+        // transfer margin is non-negative — the chain bounds must never re-time a
+        // leg past a downstream connection. Left false for the legacy backward
+        // (lambda) path, which can legitimately emit a negative margin (the bug
+        // S1 fixes), so the differential gate can still observe it.
+        debug_check: bool,
     ) {
         let transit_indices: Vec<usize> = legs
             .iter()
@@ -1174,20 +1773,14 @@ impl Graph {
 
         for i in 0..k {
             let ti = transit_indices[i];
-            let remaining = k - i - 1;
 
             let (boarding_node, alighting_node, leg_start) = match &legs[ti] {
                 PlanLeg::Transit(t) => (t.from.node_id, t.to.node_id, t.start),
                 _ => unreachable!(),
             };
+            let _ = alighting_node;
 
-            let alighting_compact = self.raptor.transit_node_to_stop[alighting_node.0];
-
-            let max_alighting = if alighting_compact != u32::MAX && remaining < lambda.len() {
-                lambda[remaining][alighting_compact as usize]
-            } else {
-                0
-            };
+            let max_alighting = bounds.get(i).copied().unwrap_or(0);
 
             let walk_to_next: u32 = if i < k - 1 {
                 let next_ti = transit_indices[i + 1];
@@ -1236,6 +1829,7 @@ impl Graph {
                     max_alighting,
                     date,
                     weekday,
+                    rt,
                 ) && new_dep > leg_start
                 {
                     let cloned = match &legs[ti] {
@@ -1282,6 +1876,16 @@ impl Graph {
 
                 if let PlanLeg::Transit(next_t) = &mut legs[next_ti] {
                     next_t.preceding_arrival = Some(cursor);
+                    // S1 invariant: a bound must never re-time this leg past its
+                    // downstream connection. `cursor` is the arrival at this leg's
+                    // boarding stop after the (re-chained) transfer walk.
+                    debug_assert!(
+                        !debug_check || next_t.start >= cursor,
+                        "tighten produced a negative transfer margin: start={} cursor={} (margin={})",
+                        next_t.start,
+                        cursor,
+                        next_t.start as i32 - cursor as i32,
+                    );
                     if let Some(prt) = next_t.preceding_route_type {
                         let margin = next_t.start as i32 - cursor as i32;
                         let next_dep = next_t.transfer_risk.as_ref().and_then(|r| r.next_departure);
@@ -1689,6 +2293,142 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::structures::delay::{DelayCDF, ScenarioBag};
+
+    /// `chain_has_transit` is the exact pre-reconstruct predicate that gates the
+    /// `bucket_best` commit: a candidate is committed and reconstructed only if its
+    /// arena parent chain carries ≥1 transit trace. It must match "reconstruct emits
+    /// a Transit leg", following `parent` pointers and stopping at `u32::MAX`.
+    #[test]
+    fn chain_has_transit_matches_transit_trace_in_arena_chain() {
+        use crate::structures::raptor::Trace;
+        let transit_trace = Trace {
+            pattern: 3,
+            ..Trace::NONE
+        };
+        let transfer_trace = Trace {
+            from_stop: 7,
+            ..Trace::NONE
+        };
+        // arena[0] = access root (Trace::NONE), arena[1] = transfer off the root,
+        // arena[2] = transit boarding off the transfer.
+        let root = Label {
+            trace: Trace::NONE,
+            parent: u32::MAX,
+            ..Label::NONE
+        };
+        let transfer = Label {
+            trace: transfer_trace,
+            parent: 0,
+            ..Label::NONE
+        };
+        let transit = Label {
+            trace: transit_trace,
+            parent: 1,
+            ..Label::NONE
+        };
+        let arena = vec![root, transfer, transit];
+
+        // Chain transit → transfer → root contains a transit trace.
+        assert!(Graph::chain_has_transit(&arena, 2));
+        // Chain transfer → root is all-walk (access + footpath) — no transit.
+        assert!(!Graph::chain_has_transit(&arena, 1));
+        // The root alone (a pure access/walk-chain candidate) — no transit.
+        assert!(!Graph::chain_has_transit(&arena, 0));
+        // Empty/absent chain.
+        assert!(!Graph::chain_has_transit(&arena, u32::MAX));
+    }
+
+    #[test]
+    fn apply_realtime_keeps_scheduled_step_times_and_delays_effective() {
+        use crate::ingestion::gtfs::TripId;
+
+        let trip = TripId(0);
+        let mut g = Graph::new();
+        g.raptor.transit_node_to_stop = vec![0, 1, 2];
+
+        let place = |node: usize, arr: Option<u32>, dep: Option<u32>| PlanPlace {
+            stop_position: Some(node as u32),
+            arrival: arr,
+            departure: dep,
+            node_id: NodeID(node),
+        };
+        let step = |node: usize, arr: u32, dep: Option<u32>| {
+            PlanLegStep::Transit(PlanTransitLegStep {
+                length: 0,
+                time: 0,
+                place: place(node, Some(arr), dep),
+                scheduled_arrival: Some(arr),
+                scheduled_departure: dep,
+                timetable_segment: TimetableSegment { start: 0, len: 0 },
+                departure_index: 0,
+                date: 0,
+                weekday: 0,
+            })
+        };
+
+        // Board 1000, mid stop dwells 1100→1130, alight 1300.
+        let leg = PlanTransitLeg {
+            length: 0,
+            start: 1000,
+            end: 1300,
+            duration: 300,
+            scheduled_start: 1000,
+            scheduled_end: 1300,
+            realtime: false,
+            from: place(0, Some(1000), Some(1000)),
+            to: place(2, Some(1300), Some(1300)),
+            steps: vec![step(1, 1100, Some(1130)), step(2, 1300, None)],
+            geometry: vec![],
+            transfer_risk: None,
+            trip_id: trip,
+            preceding_arrival: None,
+            preceding_route_type: None,
+            route_type: None,
+            following_route_type: None,
+            following_margin_secs: None,
+            bikes_allowed: None,
+            time_shift: 0,
+        };
+        let mut legs = vec![PlanLeg::Transit(leg)];
+
+        let rt = RealtimeIndex::from_delays(
+            0,
+            [((trip, 0), 60), ((trip, 1), 120), ((trip, 2), 180)],
+        );
+        g.apply_realtime(&mut legs, &rt, false);
+
+        let PlanLeg::Transit(t) = &legs[0] else {
+            panic!("expected a transit leg");
+        };
+
+        // Endpoints: scheduled preserved, effective shifted by the stop delay.
+        assert!(t.realtime);
+        assert_eq!((t.scheduled_start, t.scheduled_end), (1000, 1300));
+        assert_eq!((t.start, t.end), (1060, 1480));
+        assert_eq!(t.from.arrival, Some(1060));
+        assert_eq!(t.to.departure, Some(1480));
+
+        let mid = match &t.steps[0] {
+            PlanLegStep::Transit(s) => s,
+            _ => panic!("mid step"),
+        };
+        // scheduled_* is the untouched timetable (dwell 1100→1130 intact)…
+        assert_eq!(mid.scheduled_arrival, Some(1100));
+        assert_eq!(mid.scheduled_departure, Some(1130));
+        assert_ne!(mid.scheduled_arrival, mid.scheduled_departure);
+        // …while place.* carries the effective (delayed) times.
+        assert_eq!(mid.place.arrival, Some(1220));
+        assert_eq!(mid.place.departure, Some(1250));
+
+        let alight = match &t.steps[1] {
+            PlanLegStep::Transit(s) => s,
+            _ => panic!("alight step"),
+        };
+        assert_eq!(alight.scheduled_arrival, Some(1300));
+        assert_eq!(alight.scheduled_departure, None);
+        assert_eq!(alight.place.arrival, Some(1480));
+        assert_eq!(alight.place.departure, None);
+    }
 
     #[test]
     fn access_leg_leave_by_is_board_minus_p95() {
@@ -2140,6 +2880,8 @@ mod tests {
             window_minutes: None,
             min_access_secs: Some(600),
             arrival_slack_secs: None,
+            unrestricted_transfers: None,
+            use_cch_access: None,
             reliability_bucket_edges: None,
             modes: Some(vec![Mode::Walk, Mode::WalkTransit]),
             bike_profile: None,
@@ -2147,6 +2889,7 @@ mod tests {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
 
         eprintln!("SMOKE stop_count={}", g.raptor.transit_stop_to_node.len());

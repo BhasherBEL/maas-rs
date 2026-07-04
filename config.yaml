@@ -86,14 +86,6 @@ build:
 log_level: info
 
 default_routing:
-  multiobj_street: true
-  # Max scalar leg length (m) to enrich with bike/car route alternatives. Alternatives
-  # come from a few fast corridor-bounded scalar searches, so this is a high safety net
-  # against pathological cross-country legs, not a perf cliff. Walk is never gated.
-  multiobj_street_max_len_m: 50000
-  # Secondary Time weight in a single-axis bike/car alternative ("champion") so a
-  # near-degenerate objective (e.g. flattest) still prefers the shorter equal route.
-  champion_time_tiebreak: 0.1
   # ADGW limited-sharing threshold: drop a bike/car alternative sharing more than this
   # fraction of its length with a higher-ranked one (0.6 = GraphHopper default).
   alt_max_share_factor: 0.6
@@ -208,6 +200,26 @@ default_routing:
   # a city leg (~2 s); 0.02 ≈ 5 (~2.8 s). Costs per-node frontier on long legs (gated).
   bike_bucket_cyc_k: 0.025
   bike_bucket_dpl_k: 0.013
+  # Same grid-bucketing mechanism, on Drive's Variance axis and Walk's Surface axis:
+  # both accumulate per-edge like the bike diversity axes and combine combinatorially
+  # on long direct legs. 0 disables bucketing on that axis. See multiobj.rs tests
+  # (synthetic fan-out diagnostic) for the calibration methodology and mechanism
+  # proof: on a controlled graph both axes' frontier growth is bounded as intended.
+  #
+  # walk_bucket_surf_k measured on the real Belgium graph (direct WALK, bearing 135°
+  # from 50.846,4.352): 3/5/10/20 km went from 1.4/4.4/9.5/27.5 s (k=0) to
+  # 1.0/2.3/5.3/6.5 s at 0.025 — a real, monotonic improvement, enabled by default.
+  #
+  # drive_bucket_var_k: LEFT DISABLED — bucketing Drive's Variance axis does not help
+  # and made direct CAR worse as k increased (10 km: 26 s → 42 s → 95 s+). Root cause
+  # was since identified and fixed elsewhere: direct CAR's bottleneck was NOT the
+  # Variance-axis frontier size but pathological A* label-churn on the constant-speed
+  # car graph, so the A* Time-heuristic is now force-disabled for Drive in
+  # `multiobj_search_core` (Drive's front is admissible-invariant to it anyway). With
+  # that fix a Drive Variance bucket is unnecessary; keep this at 0 unless a future
+  # measurement shows the frontier (not the heuristic) is the constraint.
+  drive_bucket_var_k: 0.0
+  walk_bucket_surf_k: 0.025
   # Whether D+ (ascent) is a bike SELECTION axis. false (default): D+ is displayed but
   # does not pick routes — the gradient power model already prices climbing into Time, so
   # a separate min-D+ axis only manufactured absurd extremes (a ~1.5 km walk to shave a
@@ -264,10 +276,26 @@ auto_update:
 
 realtime:
   enabled: true
-  poll_interval_secs: 30
+  # 6 requests/cycle (sncb, sncb-alerts, delijn, delijn-alerts, STIB
+  # waiting-times + vehicle-positions) at 60s = 6 req/min, 8,640 req/day — within
+  # the shared gateway quota (~8 req/min, ~12k req/day). Polling faster (the old
+  # 30s = 12 req/min, ~17k/day) trips the gateway's 403 "out of call volume
+  # quota" and forces the fetcher into backoff.
+  poll_interval_secs: 60
   # A vehicle position older than this many seconds is considered stale; the live
   # UI falls back to schedule interpolation when the position is absent or stale.
   vehicle_position_max_age_secs: 120
+  # A realtime snapshot older than this many seconds is considered STALE: routing
+  # ignores it and falls back to schedule-only. When every feed fails the poller
+  # keeps the last good index with no TTL of its own, so this bounds how long a
+  # feed outage can keep serving stale delays/cancellations (default 600 = 10 min).
+  index_max_age_secs: 600
+  # How long (seconds) the poller retains a TRACKED journey's last-known live delay
+  # after the feed stops reporting it (STIB waiting-times only predict upcoming
+  # departures, so a boarded vehicle's delay would otherwise vanish once it leaves
+  # the window). The sticky delay is exposed ONLY to the live-refresh overlay, never
+  # to routing/planning (default 86400 = ~24h).
+  tracked_delay_ttl_secs: 86400
   feeds:
     - type: gtfs-rt
       name: sncb

@@ -14,6 +14,7 @@ pub use raptor_index::{RaptorIndex, StationInfo, StationLine};
 mod bike_cost;
 pub mod contraction;
 mod edge_index;
+pub mod latency_profile;
 mod multiobj;
 mod multiobj_plan;
 mod path_distribution;
@@ -22,6 +23,7 @@ mod railway;
 mod raptor_access;
 mod raptor_backward;
 mod raptor_build;
+mod raptor_cch;
 mod raptor_index;
 mod raptor_plan;
 mod raptor_route;
@@ -33,6 +35,7 @@ mod transit;
 pub use bike_cost::{BikeCost, PrevCtx};
 pub use platform_reach::ConnectorReach;
 pub use raptor_access::StreetProfile;
+pub use raptor_cch::CchAccess;
 pub use raptor_route::{OnboardRide, OnboardSeed, QueryEndpoints};
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 pub use transit::StationBackup;
@@ -52,29 +55,6 @@ pub enum Endpoint {
         dist_b: usize,
         proj: LatLng,
     },
-}
-
-impl Endpoint {
-    /// The endpoint's representative node — the nearer edge end, or the node
-    /// itself. Used as a fallback where edge-awareness isn't wired in.
-    pub fn node(&self) -> NodeID {
-        match *self {
-            Endpoint::Node(n) => n,
-            Endpoint::OnEdge {
-                a,
-                b,
-                dist_a,
-                dist_b,
-                ..
-            } => {
-                if dist_a <= dist_b {
-                    a
-                } else {
-                    b
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +95,11 @@ pub struct Graph {
     /// Runtime-only knob for the B1 measurement's added-time stat; not serialized.
     #[serde(skip, default)]
     connector_cost: ConnectorCost,
+    /// Foot access/egress CCH (runtime-only, never serialized — adds no bytes to the
+    /// postcard layout, so `GRAPH_SCHEMA_VERSION` need not change). Built on demand;
+    /// chunk 2 wires it into startup. `None` until [`Graph::set_cch`] installs it.
+    #[serde(skip, default)]
+    pub cch: Option<raptor_cch::CchAccess>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +150,7 @@ impl Graph {
             node_levels: HashMap::new(),
             connector_edges: HashMap::new(),
             connector_cost: ConnectorCost::default(),
+            cch: None,
         }
     }
 
@@ -210,6 +196,7 @@ impl Graph {
             node_levels: o.node_levels,
             connector_edges: o.connector_edges,
             connector_cost: ConnectorCost::default(),
+            cch: None,
         })
     }
 
@@ -364,6 +351,14 @@ impl Graph {
         self.raptor.bike_bucket_dpl_k = k;
     }
 
+    pub fn set_drive_bucket_var_k(&mut self, k: f64) {
+        self.raptor.drive_bucket_var_k = k;
+    }
+
+    pub fn set_walk_bucket_surf_k(&mut self, k: f64) {
+        self.raptor.walk_bucket_surf_k = k;
+    }
+
     pub fn set_variance_model(&mut self, m: crate::structures::cost::VarianceModel) {
         self.raptor.variance_model = m;
     }
@@ -374,18 +369,6 @@ impl Graph {
 
     pub fn set_representatives_k(&mut self, k: usize) {
         self.raptor.representatives_k = k;
-    }
-
-    pub fn set_multiobj_street(&mut self, on: bool) {
-        self.raptor.multiobj_street = on;
-    }
-
-    pub fn set_multiobj_street_max_len_m(&mut self, m: usize) {
-        self.raptor.multiobj_street_max_len_m = m;
-    }
-
-    pub fn set_champion_time_tiebreak(&mut self, t: f64) {
-        self.raptor.champion_time_tiebreak = t;
     }
 
     pub fn set_alt_max_share_factor(&mut self, f: f64) {
@@ -433,6 +416,20 @@ impl Graph {
 
     pub fn set_arrival_slack_secs(&mut self, secs: u32) {
         self.raptor.arrival_slack_secs = secs;
+    }
+
+    pub fn set_unrestricted_transfers(&mut self, on: bool) {
+        self.raptor.unrestricted_transfers = on;
+    }
+
+    pub fn set_use_cch_access(&mut self, on: bool) {
+        self.raptor.use_cch_access = on;
+    }
+
+    /// Sets the graph-level default for the query-latency decomposition profiler
+    /// (`GraphQL raptor(profileLatency: ...)` overrides this per-query).
+    pub fn set_profile_latency(&mut self, on: bool) {
+        self.raptor.profile_latency = on;
     }
 
     pub fn set_max_window_secs(&mut self, secs: u32) {

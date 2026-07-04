@@ -128,7 +128,7 @@ fn run_update_cycle(graph: &SharedGraph, config: &Config, cache_dir: &str) -> Re
         config.default_routing.station_merge_radius_m,
     )
     .ok_or_else(|| "GTFS rebuild failed".to_string())?;
-    apply_routing_defaults(&mut new_graph, &config.default_routing);
+    apply_routing_defaults(&mut new_graph, &config.default_routing, &config.build.output);
     // P3f: drop the interior arrays before persisting + swapping in, else the background
     // refresh silently reverts the memory win and saves a bloated graph.bin.
     finalize_contraction(&mut new_graph)?;

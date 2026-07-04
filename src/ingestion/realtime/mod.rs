@@ -85,6 +85,11 @@ pub struct FeedUpdate {
     /// Actual RT stop_id per trip stop, captured without delay gating so
     /// platform assignments are recorded even when a stop runs on time.
     pub actual_stops: Vec<ActualStopId>,
+    /// `(trip_id, stop_id)` pairs the feed marked `SKIPPED` (partial
+    /// cancellation of a stop the trip no longer serves). Kept separate from
+    /// `delays`/`actual_stops` so the poller can record them without fabricating
+    /// a delay or a platform assignment. Empty for feeds that never skip stops.
+    pub skipped_stops: Vec<(String, String)>,
 }
 
 /// A pollable realtime data source. Implementations fetch and parse their feed,
@@ -92,5 +97,5 @@ pub struct FeedUpdate {
 /// are returned, not panicked — the poller isolates failures per feed.
 pub trait RealtimeFeed: Send + Sync {
     fn name(&self) -> &str;
-    fn poll(&self, fetcher: &fetcher::Fetcher) -> Result<FeedUpdate, String>;
+    fn poll(&self, fetcher: &fetcher::Fetcher) -> Result<FeedUpdate, fetcher::FetchError>;
 }

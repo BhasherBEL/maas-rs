@@ -786,13 +786,27 @@ header a.head-btn { text-decoration: none; }
 .it-live.late .pulse { background: var(--rel-low); }
 .it-live b { font-weight: 700; white-space: nowrap; }
 
+/* Next-day marker: a small muted superscript "+N" appended to an absolute time
+   that lands on a following day (secs >= 86400). Superscript keeps it from
+   widening the time column. */
+.day-sup { font-size: 0.62em; font-weight: 600; color: var(--ds-ink-4, var(--ink-4)); margin-left: 1px; vertical-align: super; line-height: 0; letter-spacing: 0; text-decoration: none; }
+
 .it-row { display: grid; grid-template-columns: 50px 22px 1fr; column-gap: 11px; }
 .it-t { padding-top: 10px; text-align: right; font-family: var(--mono); letter-spacing: -.02em; line-height: 1.15; }
 .it-t .s { font-size: 12.5px; font-weight: 700; color: var(--ink); }
 .it-t.ontime .s { color: oklch(0.46 0.13 152); }
-.it-t.late .s { color: var(--ink-4); font-weight: 500; text-decoration: line-through; text-decoration-thickness: 1.5px; }
-.it-t.late .r { display: block; font-size: 12.5px; font-weight: 700; color: oklch(0.53 0.18 30); margin-top: 1px; }
+.it-t.late .s, .it-t.early .s { color: var(--ink-4); font-weight: 500; text-decoration: line-through; text-decoration-thickness: 1.5px; }
+.it-t.late .r, .it-t.early .r { display: block; font-size: 12.5px; font-weight: 700; margin-top: 1px; }
+.it-t.late .r        { color: oklch(0.62 0.10 40); }
+.it-t.late.major .r  { color: oklch(0.53 0.18 30); }
+.it-t.early .r       { color: oklch(0.56 0.08 152); }
+.it-t.early.major .r { color: oklch(0.46 0.13 152); }
 .it-t.dim .s { color: var(--ink-4); font-weight: 500; font-size: 11.5px; }
+.it-t2 { padding-top: 10px; }
+.it-t2 .it-t { padding-top: 0; }
+.it-t2row { display: flex; justify-content: flex-end; align-items: baseline; gap: 5px; }
+.it-t2row + .it-t2row { margin-top: 3px; }
+.it-t2lab { font-size: 8.5px; font-weight: 600; color: var(--ink-4); text-transform: uppercase; letter-spacing: .04em; }
 
 .it-rail { position: relative; display: flex; justify-content: center; align-self: stretch; }
 .it-rail .ln { position: absolute; top: 0; bottom: 0; width: 4px; border-radius: 2px; background: var(--lc, var(--line)); }
@@ -815,6 +829,7 @@ header a.head-btn { text-decoration: none; }
 .it-role.arrive { color: var(--accent); }
 .it-platform { font-size: 9px; font-weight: 700; letter-spacing: .04em; color: var(--ink-3); background: var(--surface-2); border-radius: 4px; padding: 1px 5px; margin-left: 7px; }
 .it-platform--changed { color: var(--danger, #c0392b); background: color-mix(in oklab, var(--danger, #c0392b) 12%, var(--surface-2)); }
+.it-platform--mid { font-size: 8px; font-weight: 600; padding: 0 4px; margin-left: 6px; background: transparent; color: var(--ink-4); border: 1px solid var(--line); }
 .it-mid { padding: 4px 0; }
 .it-midstop { font-size: 12.5px; color: var(--ink-3); font-weight: 500; padding: 3px 0; }
 
@@ -1150,7 +1165,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   </button>
   <button id="reverse-btn" class="head-btn" title="Swap origin and destination (R)">⇅ Reverse</button>
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
-  <a href="/debug" class="head-btn" target="_blank">Debug ↗</a>
   <a href="/graphiql" class="head-btn" target="_blank">GraphQL ↗</a>
   <button id="pwa-install-btn" class="head-btn" style="display:none" title="Install MaaS as an app">⊕ Install</button>
 </header>
@@ -1361,12 +1375,13 @@ const PLAN_FRAGMENT = `
         headsign
         route { shortName longName mode color textColor agency { name } }
       }
-      from { departure stopId platform node { name lat lon } }
-      to   { arrival   stopId platform node { name lat lon } }
+      from { arrival departure stopId platform node { name lat lon } }
+      to   { arrival departure stopId platform node { name lat lon } }
       geometry { lat lon }
       steps {
         ... on PlanTransitLegStep {
-          place { arrival departure node { name lat lon } }
+          scheduledArrival scheduledDeparture
+          place { arrival departure platform node { name lat lon } }
         }
       }
     }
@@ -2092,27 +2107,58 @@ function mkShieldIcon(s) {
 }
 function mkChev() { return mkEl('span', 'chev', '▾'); }
 
-// Realtime-aware time descriptor → {s, real?, rt}. rt: 'ontime' | 'late' | 'plain' | 'dim'.
+// Realtime-aware time descriptor → {s, real?, delta?, rt}.
+// rt: 'plain' | 'ontime' | 'shifted' (realtime differs from schedule, early or late) | 'dim'.
 function rtTime(schedSecs, actualSecs, realtime) {
   if (schedSecs == null && actualSecs == null) return null;
-  if (!realtime) return { s: fmtTime(actualSecs ?? schedSecs), rt: 'plain' };
-  if (schedSecs != null && actualSecs != null && actualSecs - schedSecs >= 60)
-    return { s: fmtTime(schedSecs), real: fmtTime(actualSecs), rt: 'late' };
-  return { s: fmtTime(actualSecs ?? schedSecs), rt: 'ontime' };
+  const v = actualSecs ?? schedSecs;
+  if (!realtime) return { s: fmtTime(v), sSecs: v, rt: 'plain' };
+  if (schedSecs == null || actualSecs == null)
+    return { s: fmtTime(v), sSecs: v, rt: 'ontime' };
+  const sSched = fmtTime(schedSecs), sReal = fmtTime(actualSecs);
+  if (sSched !== sReal)
+    return { s: sSched, sSecs: schedSecs, real: sReal, rSecs: actualSecs, delta: actualSecs - schedSecs, rt: 'shifted' };
+  return { s: sReal, sSecs: actualSecs, rt: 'ontime' };
+}
+// A time span carrying the wall-clock string plus a day marker when the time
+// crosses midnight. Same-day → byte-identical to mkEl('span', cls, text).
+function mkTimeSpan(cls, text, secs) {
+  const el = mkEl('span', cls, text);
+  const mk = mkDayMark(secs);
+  if (mk) el.appendChild(mk);
+  return el;
 }
 // Render an .it-t time cell from an rtTime() descriptor.
 function mkTimeCell(t) {
   const w = mkEl('div', 'it-t');
   if (!t) return w;
-  if (t.rt === 'late') {
-    w.classList.add('late');
-    w.appendChild(mkEl('span', 's', t.s));
-    w.appendChild(mkEl('span', 'r', t.real));
+  if (t.rt === 'shifted') {
+    w.classList.add(t.delta < 0 ? 'early' : 'late');
+    if (Math.abs(t.delta) >= 60) w.classList.add('major');
+    w.appendChild(mkTimeSpan('s', t.s, t.sSecs));
+    w.appendChild(mkTimeSpan('r', t.real, t.rSecs));
     return w;
   }
   if (t.rt === 'ontime') w.classList.add('ontime');
   else if (t.rt === 'dim') w.classList.add('dim');
-  w.appendChild(mkEl('span', 's', t.s));
+  w.appendChild(mkTimeSpan('s', t.s, t.sSecs));
+  return w;
+}
+function mkDwellCell(schedArr, arr, schedDep, dep, rt, dim) {
+  const D = d => (dim && d && d.rt === 'plain') ? { ...d, rt: 'dim' } : d;
+  const aDesc = D(rtTime(schedArr, arr, rt));
+  const dDesc = D(rtTime(schedDep, dep, rt));
+  const merged = arr === dep && schedArr === schedDep;
+  if (merged || !aDesc || !dDesc) return mkTimeCell(aDesc || dDesc);
+  const w = mkEl('div', 'it-t2');
+  const line = (lab, d) => {
+    const row = mkEl('div', 'it-t2row');
+    row.appendChild(mkEl('span', 'it-t2lab', lab));
+    row.appendChild(mkTimeCell(d));
+    return row;
+  };
+  w.appendChild(line('arr', aDesc));
+  w.appendChild(line('dep', dDesc));
   return w;
 }
 
@@ -2273,7 +2319,7 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
       b.appendChild(document.createTextNode('Running '));
       b.appendChild(mkEl('b', null, Math.round(lateSecs / 60) + ' min late'));
       b.appendChild(document.createTextNode(' · now arriving '));
-      b.appendChild(mkEl('b', null, fmtTime(plan.end)));
+      b.appendChild(mkTimeEl('b', null, plan.end));
       it.appendChild(b);
     } else {
       const b = mkEl('div', 'it-live ontime');
@@ -2310,7 +2356,7 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 
       if (isFirst) {
         const o = mkEl('div', 'it-row');
-        o.appendChild(mkTimeCell({ s: fmtTime(leg.start), rt: 'dim' }));
+        o.appendChild(mkTimeCell({ s: fmtTime(leg.start), sSecs: leg.start, rt: 'dim' }));
         const rail = mkEl('div', 'it-rail');
         rail.appendChild(mkEl('span', 'ln half-down dash'));
         rail.appendChild(mkEl('span', 'nd origin'));
@@ -2337,7 +2383,7 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
         const uncertMin = (selAlt?.p95 != null && selAlt?.p50 != null)
           ? Math.max(0, Math.round((selAlt.p95 - selAlt.p50) / 60))
           : 0;
-        wc.appendChild(mkWalkSplit(fmtTime(leg.start), mins, uncertMin,
+        wc.appendChild(mkWalkSplit(fmtTimeDay(leg.start), mins, uncertMin,
           uncertMin > 0 ? '± ' + uncertMin + ' min' : null, isBike ? 'bike' : 'walk'));
       }
       if (isBike) wc.appendChild(mkBikeStats(leg));
@@ -2348,7 +2394,7 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
         const a   = mkEl('div', 'it-row');
         const arr = lastTransit
           ? rtTime(plan.end - arrLateSecs, plan.end, !!lastTransit.realtime)
-          : { s: fmtTime(plan.end), rt: 'plain' };
+          : { s: fmtTime(plan.end), sSecs: plan.end, rt: 'plain' };
         a.appendChild(mkTimeCell(arr));
         const arail = mkEl('div', 'it-rail');
         arail.appendChild(mkEl('span', 'ln half-up dash'));
@@ -2435,7 +2481,9 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 
       // board row + boxed vehicle descriptor
       const b = mkEl('div', 'it-row');
-      b.appendChild(mkTimeCell(rtTime(leg.scheduledStart, leg.start, leg.realtime)));
+      const boardArr = leg.from?.arrival ?? null;
+      const schedBoardArr = boardArr != null ? boardArr - (leg.start - leg.scheduledStart) : null;
+      b.appendChild(mkDwellCell(schedBoardArr, boardArr, leg.scheduledStart, leg.start, leg.realtime, false));
       const brail = mkEl('div', 'it-rail');
       const bln = mkEl('span', 'ln'); bln.style.setProperty('--lc', bg); brail.appendChild(bln);
       const bnd = mkEl('span', 'nd board'); bnd.style.setProperty('--lc', bg); brail.appendChild(bnd);
@@ -2476,7 +2524,14 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 
       // expandable in-between stops — keep name AND arrival time per stop
       const between = (leg.steps || [])
-        .map(st => ({ name: st.place?.node?.name, t: st.place?.arrival ?? st.place?.departure }))
+        .map(st => ({
+          name: st.place?.node?.name,
+          arr: st.place?.arrival ?? null,
+          dep: st.place?.departure ?? null,
+          schedArr: st.scheduledArrival ?? null,
+          schedDep: st.scheduledDeparture ?? null,
+          platform: st.place?.platform,
+        }))
         .filter(s => s.name && s.name !== board && s.name !== alight);
       const key    = idx + ':' + i;
       const isOpen = state.openStops.has(key);
@@ -2521,20 +2576,23 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 
       if (isOpen) between.forEach(s => {
         const m = mkEl('div', 'it-row');
-        m.appendChild(mkTimeCell(s.t != null ? { s: fmtTime(s.t), rt: 'dim' } : null));
+        m.appendChild(mkDwellCell(s.schedArr, s.arr, s.schedDep, s.dep, leg.realtime, true));
         const mr = mkEl('div', 'it-rail');
         const mln = mkEl('span', 'ln'); mln.style.setProperty('--lc', bg); mr.appendChild(mln);
         const mnd = mkEl('span', 'nd mid'); mnd.style.setProperty('--lc', bg); mr.appendChild(mnd);
         m.appendChild(mr);
         const mc = mkEl('div', 'it-c it-mid');
         mc.appendChild(mkEl('span', 'it-midstop', s.name));
+        if (s.platform) mc.appendChild(mkEl('span', 'it-platform it-platform--mid', 'Pl. ' + s.platform));
         m.appendChild(mc);
         it.appendChild(m);
       });
 
       // alight row
       const a = mkEl('div', 'it-row');
-      a.appendChild(mkTimeCell(rtTime(leg.scheduledEnd, leg.end, leg.realtime)));
+      const alightDep = leg.to?.departure ?? null;
+      const schedAlightDep = alightDep != null ? alightDep - (leg.end - leg.scheduledEnd) : null;
+      a.appendChild(mkDwellCell(leg.scheduledEnd, leg.end, schedAlightDep, alightDep, leg.realtime, false));
       const arail = mkEl('div', 'it-rail');
       const aln = mkEl('span', 'ln'); aln.style.setProperty('--lc', bg); arail.appendChild(aln);
       const and2 = mkEl('span', 'nd alight'); and2.style.setProperty('--lc', bg); arail.appendChild(and2);
@@ -2572,7 +2630,7 @@ function renderConnection(leg, planIdx, legIdx) {
   const head = mkEl('div', 'conn-head');
   head.appendChild(mkBadge(line, bg, fg));
   const title = mkEl('span', 'conn-title');
-  title.textContent = fmtTime(leg.start) + ' ' + kind + ' → ' + (leg.to?.node?.name || '—');
+  title.textContent = fmtTimeDay(leg.start) + ' ' + kind + ' → ' + (leg.to?.node?.name || '—');
   head.appendChild(title);
   if (r) {
     const connRel = mkEl('span', 'conn-rel');
@@ -2610,7 +2668,7 @@ function renderConnection(leg, planIdx, legIdx) {
   // A single departure option: time + swap-reliability donut + delta vs planned.
   const mkOption = (dep, { planned = false } = {}) => {
     const btn = mkEl('button', 'fopt' + (planned ? ' planned' : ''));
-    btn.appendChild(mkEl('span', 'fopt-time', fmtTime(dep.start)));
+    btn.appendChild(mkTimeEl('span', 'fopt-time', dep.start));
     const rel = planned ? r?.reliability : dep.reliability;
     if (rel != null) {
       const fr = mkEl('span', 'fopt-rel');
@@ -2660,7 +2718,7 @@ function renderConnection(leg, planIdx, legIdx) {
     miss.appendChild(document.createTextNode(' '));
     miss.appendChild(mkBadge(line, bg, fg, true));
     miss.appendChild(document.createTextNode(' '));
-    miss.appendChild(mkEl('span', 'cf-mono', fmtTime(r.nextDeparture)));
+    miss.appendChild(mkTimeEl('span', 'cf-mono', r.nextDeparture));
     if (r.nextReliability != null) {
       miss.appendChild(document.createTextNode(' · ' + relPct(r.nextReliability) + ' on time'));
     }
@@ -2705,8 +2763,8 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
     plan.accessAlternatives.forEach(a => {
       const mins = Math.round((a.streetSecs || 0) / 60);
       altsEl.appendChild(mkEl('span', 'alt',
-        `or ${MODE_LABEL[a.mode] || a.mode}: leave ${fmtTime(a.start)}` +
-        (a.end !== plan.end ? `, arrive ${fmtTime(a.end)}` : '') +
+        `or ${MODE_LABEL[a.mode] || a.mode}: leave ${fmtTimeDay(a.start)}` +
+        (a.end !== plan.end ? `, arrive ${fmtTimeDay(a.end)}` : '') +
         (mins ? ` (${mins}′ on street)` : '')));
     });
     detail.appendChild(altsEl);
@@ -2744,9 +2802,9 @@ function renderTripCard(plan, idx, isOpen) {
   // header — departure → arrival, tag, reliability chip
   const head  = mkEl('div', 'rc-head');
   const times = mkEl('div', 'rc-times');
-  times.appendChild(mkEl('span', 'big', fmtTime(plan.legs[0]?.start ?? plan.start)));
+  times.appendChild(mkTimeEl('span', 'big', plan.legs[0]?.start ?? plan.start));
   times.appendChild(mkEl('span', 'ar', '→'));
-  times.appendChild(mkEl('span', 'big', fmtTime(plan.end)));
+  times.appendChild(mkTimeEl('span', 'big', plan.end));
   head.appendChild(times);
   const tag = planTag(state.plans, plan);
   if (tag) head.appendChild(mkEl('span', 'rc-tag', tag));
@@ -2775,6 +2833,7 @@ function renderTripCard(plan, idx, isOpen) {
     const time = mkEl('span', 'rc-ftime');
     time.appendChild(mkEl('span', 'pre', 'dep'));
     time.appendChild(document.createTextNode(fmtTime(ft.time)));
+    { const mk = mkDayMark(ft.time); if (mk) time.appendChild(mk); }
     row.appendChild(time);
     card.appendChild(row);
   }
@@ -2865,7 +2924,9 @@ function renderOptionRow(plan, idx, mode, pos) {
   lead.appendChild(mkEl('span', 'pg-opt-lbl' + (risky ? ' risky' : (pos === 0 ? ' lead' : '')), lbl));
   const time = mkEl('span', 'pg-opt-time');
   time.appendChild(mkEl('span', 'pg-opt-tk', mode === 'arrival' ? 'leave ' : 'land '));
-  time.appendChild(document.createTextNode(fmtTime(mode === 'arrival' ? plan.start : plan.end)));
+  { const s = mode === 'arrival' ? plan.start : plan.end;
+    time.appendChild(document.createTextNode(fmtTime(s)));
+    const mk = mkDayMark(s); if (mk) time.appendChild(mk); }
   lead.appendChild(time);
   if (rel < 1) lead.appendChild(mkRelChip(rel));
   row.appendChild(lead);
@@ -2899,16 +2960,16 @@ function renderGroupCard(group, mode, isFirst) {
     timeWrap.appendChild(mkEl('b', null, 'Direct'));
     if (right) {
       timeWrap.appendChild(mkEl('span', 'pg-time-sub', 'arrive'));
-      timeWrap.appendChild(mkEl('b', null, fmtTime(g.sortT)));
+      timeWrap.appendChild(mkTimeEl('b', null, g.sortT));
     }
   } else if (right) {
-    timeWrap.appendChild(mkEl('b', null, fmtTime(g.time)));
+    timeWrap.appendChild(mkTimeEl('b', null, g.time));
     if (isFirst) timeWrap.appendChild(mkEl('span', 'pg-time-sub', 'earliest'));
   } else {
     const bestArr = Math.min(...group.indices.map(i => state.plans[i].end));
-    timeWrap.appendChild(mkEl('b', null, fmtTime(g.time)));
+    timeWrap.appendChild(mkTimeEl('b', null, g.time));
     timeWrap.appendChild(mkEl('span', 'pg-arrow', '→'));
-    timeWrap.appendChild(mkEl('b', null, fmtTime(bestArr)));
+    timeWrap.appendChild(mkTimeEl('b', null, bestArr));
     if (isFirst) timeWrap.appendChild(mkEl('span', 'pg-tag', 'Recommended'));
   }
 
@@ -2995,7 +3056,7 @@ const DEP_LEG_FIELDS = `
   from { departure stopId platform node { name lat lon } }
   to   { arrival   stopId platform node { name lat lon } }
   geometry { lat lon }
-  steps { ... on PlanTransitLegStep { place { arrival departure node { name lat lon } } } }
+  steps { ... on PlanTransitLegStep { place { arrival departure platform node { name lat lon } } } }
 `;
 const LIVE_DEP_QUERY = `query LiveDep(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
@@ -3200,7 +3261,7 @@ function enterLiveView(plan, descriptor, origin, dest) {
   el('lv-status').className = 'lv-status';
   el('lv-status').textContent = '';
   el('lv-eta').textContent = window.MaaSLive?.logic?.secOfDayToHHMM
-    ? window.MaaSLive.logic.secOfDayToHHMM(plan.end) : fmtTime(plan.end);
+    ? window.MaaSLive.logic.secOfDayToHHMM(plan.end) : fmtTimeDay(plan.end);
   el('lv-sheet').hidden = true;
   el('lv-hist').hidden = true;
   renderLiveSpine(plan.legs);
@@ -3358,9 +3419,9 @@ function renderLiveSpine(legs, endSec) {
   // header — departure → realtime arrival, LIVE eyebrow, reliability bead
   const head  = mkEl('div', 'rc-head lv-rc-head');
   const times = mkEl('div', 'rc-times');
-  times.appendChild(mkEl('span', 'big', fmtTime(legs[0]?.start ?? view.start)));
+  times.appendChild(mkTimeEl('span', 'big', legs[0]?.start ?? view.start));
   times.appendChild(mkEl('span', 'ar', '→'));
-  times.appendChild(mkEl('span', 'big', fmtTime(view.end)));
+  times.appendChild(mkTimeEl('span', 'big', view.end));
   head.appendChild(times);
   head.appendChild(mkEl('span', 'rc-tag', 'Live'));
   const rel = planReliability(view);
@@ -3387,6 +3448,7 @@ function renderLiveSpine(legs, endSec) {
     const time = mkEl('span', 'rc-ftime');
     time.appendChild(mkEl('span', 'pre', 'dep'));
     time.appendChild(document.createTextNode(fmtTime(ft.time)));
+    { const mk = mkDayMark(ft.time); if (mk) time.appendChild(mk); }
     row.appendChild(time);
     card.appendChild(row);
   }
@@ -3609,7 +3671,7 @@ function openLiveDepartureEdit(leg) {
   }
   const mkRow = (dep, planned) => {
     const row = mkEl('button', 'lv-opt' + (planned ? ' cur' : ''));
-    row.appendChild(mkEl('span', 'lv-opt-t', fmtTime(dep.start)));
+    row.appendChild(mkTimeEl('span', 'lv-opt-t', dep.start));
     const dmin = Math.round((dep.start - leg.start) / 60);
     row.appendChild(mkEl('span', 'lv-opt-d',
       planned ? 'current' : (dmin <= 0 ? Math.abs(dmin) + ' min earlier' : dmin + ' min later')));
@@ -3631,7 +3693,7 @@ function confirmDepartureChange(transitIndex, chosen, oldLeg) {
     live.plan.legs[legPos] = merged;
   }
   live.descriptor = L.applyDepartureChange(live.descriptor, transitIndex, chosen);
-  const summary = `Departure changed to ${fmtTime(chosen.start)}`
+  const summary = `Departure changed to ${fmtTimeDay(chosen.start)}`
     + (chosen.trip?.route?.shortName ? ` (${chosen.trip.route.shortName})` : '');
   recordLiveEvent('departure_change', summary, { transitIndex, tripId: chosen.tripId, start: chosen.start });
   persistLiveJourney();
@@ -3649,7 +3711,7 @@ function mkBackupChip(model) {
   const chip = mkEl('span', 'lv-bk-chip');
   chip.dataset.rel = model.relClass || 'none';
   chip.appendChild(mkEl('span', 'bead'));
-  chip.appendChild(document.createTextNode('Backup ' + fmtTime(model.depSec) + ' ' + model.line));
+  chip.appendChild(document.createTextNode('Backup ' + fmtTimeDay(model.depSec) + ' ' + model.line));
   if (model.reliability != null) chip.appendChild(mkEl('span', 'pct', model.relPct));
   return chip;
 }
@@ -3714,7 +3776,7 @@ function renderAlternativesRail(leg, boardName, mainLine) {
   const route = leg.trip?.route; const { bg, fg } = routeColors(route);
   const keep = mkEl('div', 'lv-keep-row');
   const kb = mkEl('span', 'lv-bk-badge', mainLine); kb.style.background = bg; kb.style.color = fg; keep.appendChild(kb);
-  keep.appendChild(mkEl('span', 'lv-bk-dep', fmtTime(leg.start)));
+  keep.appendChild(mkTimeEl('span', 'lv-bk-dep', leg.start));
   keep.appendChild(mkEl('span', 'lv-keep-tag', 'keep'));
   const rk = leg._liveRisk, mainRel = leg.transferRisk?.reliability;
   if (rk && rk.delta) {
@@ -3742,15 +3804,15 @@ function renderAlternativesRail(leg, boardName, mainLine) {
     const col = routeColors({ color: m.routeColor, mode: m.mode });
     bd.style.background = col.bg; bd.style.color = col.fg; row.appendChild(bd);
     const dep = mkEl('span', 'lv-bk-dep');
-    if (m.depShifted) dep.appendChild(mkEl('s', null, fmtTime(m.schedDepSec)));
-    dep.appendChild(mkEl('b', null, fmtTime(m.depSec)));
+    if (m.depShifted) dep.appendChild(mkTimeEl('s', null, m.schedDepSec));
+    dep.appendChild(mkTimeEl('b', null, m.depSec));
     row.appendChild(dep);
     row.appendChild(mkEl('span', 'lv-bk-hint', m.hint));
     const rel = mkEl('span', 'rel ' + (m.relClass || 'none'));
     rel.appendChild(mkEl('span', 'bead'));
     rel.appendChild(document.createTextNode(m.relPct));
     row.appendChild(rel);
-    if (m.arrSec != null) row.appendChild(mkEl('span', 'lv-bk-arr', 'arr ' + fmtTime(m.arrSec)));
+    if (m.arrSec != null) row.appendChild(mkEl('span', 'lv-bk-arr', 'arr ' + fmtTimeDay(m.arrSec)));
     row.addEventListener('click', () => {
       live._railSel = sel ? null : i;
       renderAlternativesRail(leg, boardName, mainLine);
@@ -3860,6 +3922,7 @@ function appendSwitchCards(rail, leg, boardName, mainLine) {
     const arr = mkEl('span', 'lv-sw-arr');
     arr.appendChild(mkEl('span', 'pre', 'arr'));
     arr.appendChild(document.createTextNode(fmtTime(m.arrSec)));
+    { const mk = mkDayMark(m.arrSec); if (mk) arr.appendChild(mk); }
     meta.appendChild(arr);
     const rel = mkEl('span', 'rel ' + (m.relClass || 'none'));
     rel.appendChild(mkEl('span', 'bead'));
@@ -3920,7 +3983,7 @@ function confirmSwitch(plan, model, boardName) {
   el('lv-fresh').classList.remove('stale');
   el('lv-status').className = 'lv-status';
   el('lv-status').textContent = '';
-  el('lv-eta').textContent = L.secOfDayToHHMM ? L.secOfDayToHHMM(plan.end) : fmtTime(plan.end);
+  el('lv-eta').textContent = L.secOfDayToHHMM ? L.secOfDayToHHMM(plan.end) : fmtTimeDay(plan.end);
   recordLiveEvent('switch', L.switchEventSummary(model, boardName), { tripSeq: model.tripSeq, arr: model.arrSec });
   persistLiveJourney();
   closeLiveSheet();
@@ -4084,15 +4147,16 @@ function openTripModal(leg) {
   const body = el('trip-modal-body');
   body.replaceChildren();
   body.appendChild(mkEl('p', 'hint',
-    `Departs ${fmtTime(leg.start)} from ${leg.from?.node?.name || '—'}, ` +
-    `arrives ${fmtTime(leg.end)} at ${leg.to?.node?.name || '—'} (${fmtDuration(leg.duration)}).`));
+    `Departs ${fmtTimeDay(leg.start)} from ${leg.from?.node?.name || '—'}, ` +
+    `arrives ${fmtTimeDay(leg.end)} at ${leg.to?.node?.name || '—'} (${fmtDuration(leg.duration)}).`));
 
   const stopsEl = mkEl('div', 'stops');
   buildStopList(leg).forEach((s, i, arr) => {
     const isFirst = i === 0, isLast = i === arr.length - 1;
     const row = mkEl('div', 'stop' + (isFirst || isLast ? ' terminus' : ''));
-    row.appendChild(mkEl('span', 't', isFirst ? fmtTime(s.departure) : fmtTime(s.arrival)));
+    row.appendChild(mkTimeEl('span', 't', isFirst ? s.departure : s.arrival));
     const n = mkEl('span', 'n', s.name || '—');
+    if (s.platform) n.appendChild(mkEl('span', 'it-platform it-platform--mid', 'Pl. ' + s.platform));
     n.addEventListener('click', () => { if (s.lat != null && s.lon != null) map.setView([s.lat, s.lon], 16); });
     row.appendChild(n);
     stopsEl.appendChild(row);
@@ -4385,7 +4449,7 @@ function renderPicker() {
 
   const back = mkEl('div', 'rp-back');
   back.append(document.createTextNode('‹ '), mkEl('span', null, 'Back to results · '),
-    mkEl('b', null, fmtTime(plan.start) + ' → ' + fmtTime(plan.end)));
+    mkEl('b', null, fmtTimeDay(plan.start) + ' → ' + fmtTimeDay(plan.end)));
   back.addEventListener('click', closePicker);
   rp.appendChild(back);
 

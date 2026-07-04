@@ -444,6 +444,9 @@ impl Graph {
         astar: bool,
     ) -> MultiObjResult {
         let _ = role;
+        // A* Time heuristic helps Walk/Bike but is pathological for Drive (label churn on
+        // the un-prunable Variance axis; slower and collapses the front), so force it off.
+        let astar = astar && mode != RoutingMode::Drive;
         let front_axes = mode.effective_front_axes(self.raptor.bike_select_dplus);
         let speed = self.mode_speed(mode);
         let profile = bike.profile();
@@ -502,33 +505,57 @@ impl Graph {
             Vec::new()
         };
         let dest_loc = self.node_loc(destination);
-        // Distance-adaptive grid bucketing on the bike diversity axes (CyclewayDeficit,
-        // Dplus). Cell size ∝ origin→dest straight-line distance, so the per-node
-        // frontier stays bounded regardless of route length while the cycleway/climb
-        // span (which the user routes on) is preserved cell-by-cell. Off for Walk/Drive
-        // and when the coefficients are 0 (strict no-op ⇒ unchanged behavior).
+        // Distance-adaptive grid bucketing on each mode's diversity axes. Cell size ∝
+        // origin→dest straight-line distance, so the per-node frontier stays bounded
+        // regardless of route length while the relevant trade-off span (which the
+        // user routes on) is preserved cell-by-cell. Bike buckets CyclewayDeficit/
+        // Dplus; Drive buckets Variance; Walk buckets Surface — the axes measured to
+        // grow combinatorially with distance on each mode's un-bucketed front. A
+        // coefficient of 0 disables bucketing on that axis (strict no-op ⇒ unchanged
+        // behavior).
         let buckets = {
-            let kc = self.raptor.bike_bucket_cyc_k;
-            // Drop the Dplus bucket dimension when D+ is demoted from the front axes
-            // (it is no longer a selection/diversity axis).
-            let kd = if front_axes.contains(&Axis::Dplus) {
-                self.raptor.bike_bucket_dpl_k
-            } else {
-                0.0
-            };
-            if mode == RoutingMode::Bike && (kc > 0.0 || kd > 0.0) {
-                let d = self.node_loc(origin).dist(dest_loc);
-                let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
-                if kc > 0.0 {
-                    sizes[Axis::CyclewayDeficit.index()] = kc * d;
+            let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
+            let mut active = false;
+            match mode {
+                RoutingMode::Bike => {
+                    let kc = self.raptor.bike_bucket_cyc_k;
+                    // Drop the Dplus bucket dimension when D+ is demoted from the
+                    // front axes (it is no longer a selection/diversity axis).
+                    let kd = if front_axes.contains(&Axis::Dplus) {
+                        self.raptor.bike_bucket_dpl_k
+                    } else {
+                        0.0
+                    };
+                    if kc > 0.0 || kd > 0.0 {
+                        let d = self.node_loc(origin).dist(dest_loc);
+                        if kc > 0.0 {
+                            sizes[Axis::CyclewayDeficit.index()] = kc * d;
+                            active = true;
+                        }
+                        if kd > 0.0 {
+                            sizes[Axis::Dplus.index()] = kd * d;
+                            active = true;
+                        }
+                    }
                 }
-                if kd > 0.0 {
-                    sizes[Axis::Dplus.index()] = kd * d;
+                RoutingMode::Drive => {
+                    let kv = self.raptor.drive_bucket_var_k;
+                    if kv > 0.0 {
+                        let d = self.node_loc(origin).dist(dest_loc);
+                        sizes[Axis::Variance.index()] = kv * d;
+                        active = true;
+                    }
                 }
-                Buckets { sizes }
-            } else {
-                Buckets::NONE
+                RoutingMode::Walk => {
+                    let ks = self.raptor.walk_bucket_surf_k;
+                    if ks > 0.0 {
+                        let d = self.node_loc(origin).dist(dest_loc);
+                        sizes[Axis::Surface.index()] = ks * d;
+                        active = true;
+                    }
+                }
             }
+            if active { Buckets { sizes } } else { Buckets::NONE }
         };
         // A* lower bound on remaining Time = straight-line distance / the FASTEST
         // speed the cost model can produce, so it can never exceed the true remaining
@@ -1278,7 +1305,7 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::structures::cost::{Axis, CostVector, Epsilon};
-    use crate::structures::{Graph, NodeID};
+    use crate::structures::{Graph, NodeID, RaptorIndex};
 
     fn cv(time: f64, variance: f64) -> CostVector {
         CostVector::from_active(&[Axis::Time, Axis::Variance], &[time, variance])
@@ -1995,6 +2022,98 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
+    // ---- bucket pruning on Drive's Variance axis / Walk's Surface axis ----
+    // Mirrors the CyclewayDeficit bucket tests above: same generic mechanism
+    // (`Buckets`/`LabelSet`), applied to the axes each mode buckets.
+
+    fn cvv(time: f64, variance: f64) -> CostVector {
+        CostVector::from_active(&[Axis::Time, Axis::Variance], &[time, variance])
+    }
+    fn buckets_var(size: f64) -> Buckets {
+        let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
+        sizes[Axis::Variance.index()] = size;
+        Buckets { sizes }
+    }
+
+    #[test]
+    fn bucket_collapses_variance_tradeoff_on_drive_axis() {
+        // (300,150) and (250,180) trade Time against Variance (neither dominates),
+        // so ε-Pareto alone keeps both. They share variance cell 1 (150,180 →
+        // ⌊x/100⌋=1), so bucketing collapses them to the lower-Time representative —
+        // exactly the CyclewayDeficit bucket behavior, on Drive's axis instead.
+        let eps = Epsilon::uniform(0.0, 0.0);
+        let bk = buckets_var(100.0);
+        let mut set = LabelSet::new();
+        assert!(set.try_add(cvv(300.0, 150.0), &eps, &bk));
+        assert!(set.try_add(cvv(250.0, 180.0), &eps, &bk));
+        assert_eq!(set.len(), 1, "same-cell trade-off collapses to one label");
+        assert_eq!(
+            set.costs[0].get(Axis::Time),
+            250.0,
+            "the cell keeps the lower-Time (fastest-for-this-trade-off) representative"
+        );
+    }
+
+    #[test]
+    fn bucket_keeps_distinct_variance_cells_preserves_extreme() {
+        // Three trade-off labels (variance up as time down) in DIFFERENT variance
+        // cells (50→0, 150→1, 250→2) all survive, preserving the low-variance
+        // extreme — the reliability-conscious route stays on the frontier instead
+        // of being absorbed by a faster, higher-variance neighbour.
+        let eps = Epsilon::uniform(0.0, 0.0);
+        let bk = buckets_var(100.0);
+        let mut set = LabelSet::new();
+        assert!(set.try_add(cvv(400.0, 50.0), &eps, &bk));
+        assert!(set.try_add(cvv(300.0, 150.0), &eps, &bk));
+        assert!(set.try_add(cvv(250.0, 250.0), &eps, &bk));
+        assert_eq!(set.len(), 3, "labels in distinct cells all survive");
+        let min_var = set
+            .costs
+            .iter()
+            .map(|c| c.get(Axis::Variance))
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_var, 50.0, "the low-variance extreme cell keeps its representative");
+    }
+
+    fn cvs(time: f64, surface: f64) -> CostVector {
+        CostVector::from_active(&[Axis::Time, Axis::Surface], &[time, surface])
+    }
+    fn buckets_surf(size: f64) -> Buckets {
+        let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
+        sizes[Axis::Surface.index()] = size;
+        Buckets { sizes }
+    }
+
+    #[test]
+    fn bucket_collapses_surface_tradeoff_on_walk_axis() {
+        // Same mechanism, on Walk's Surface axis: a paved-but-slower vs. faster-but-
+        // rougher trade-off sharing a surface cell collapses to the faster one.
+        let eps = Epsilon::uniform(0.0, 0.0);
+        let bk = buckets_surf(100.0);
+        let mut set = LabelSet::new();
+        assert!(set.try_add(cvs(300.0, 150.0), &eps, &bk));
+        assert!(set.try_add(cvs(250.0, 180.0), &eps, &bk));
+        assert_eq!(set.len(), 1, "same-cell trade-off collapses to one label");
+        assert_eq!(set.costs[0].get(Axis::Time), 250.0);
+    }
+
+    #[test]
+    fn bucket_keeps_distinct_surface_cells_preserves_extreme() {
+        let eps = Epsilon::uniform(0.0, 0.0);
+        let bk = buckets_surf(100.0);
+        let mut set = LabelSet::new();
+        assert!(set.try_add(cvs(400.0, 50.0), &eps, &bk));
+        assert!(set.try_add(cvs(300.0, 150.0), &eps, &bk));
+        assert!(set.try_add(cvs(250.0, 250.0), &eps, &bk));
+        assert_eq!(set.len(), 3, "labels in distinct cells all survive");
+        let min_surf = set
+            .costs
+            .iter()
+            .map(|c| c.get(Axis::Surface))
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_surf, 50.0, "the smoothest-surface extreme cell keeps its representative");
+    }
+
     #[test]
     fn distance_budget_prunes_long_detours() {
         let (g, a, b) = tiny_detour_graph();
@@ -2538,5 +2657,257 @@ mod tests {
             a, b, RoutingMode::Bike, LegRole::Neutral, &bike, f64::INFINITY, true,
         );
         assert_eq!(front.len(), 1, "3-axis front collapses Surface/Variance-only trade-offs");
+    }
+
+    // ---- synthetic diagnostic: distance-adaptive bucketing bounds the frontier
+    // regardless of route length (Drive/Variance, Walk/Surface) ----
+    //
+    // K disjoint origin→hub_i→destination branches (private hub/sub-chain per
+    // branch, sharing no intermediate node), each a genuine Time↔diversity-axis
+    // trade-off: as i increases, Time strictly decreases and the diversity axis
+    // (Variance or Surface) strictly increases, so all K branches are mutually
+    // non-dominated. This is the combinatorial-with-distance blowup the design
+    // notes describe: every branch is a candidate route (e.g. "take i more
+    // signalized junctions to save a little time"), so the un-bucketed frontier
+    // grows with the number of branches (i.e. with route length/complexity), while
+    // distance-adaptive bucketing (cell ∝ origin→dest straight-line distance)
+    // should keep the frontier roughly constant as that grows, instead of scaling
+    // with it. Branches are disjoint (only O and D are shared) so bucket eviction
+    // is exercised exactly once, at the destination — matching how the bucket cap
+    // is meant to pick representatives from otherwise-independent alternatives,
+    // not how it behaves when forced to arbitrate at every hop of a shared path
+    // (see `bucket_eviction_can_keep_a_dominated_label` for that lossy property).
+
+    #[cfg(test)]
+    fn drive_fanout_graph(n: usize, hop_m: f64) -> (Graph, NodeID, NodeID) {
+        use crate::structures::cost::VarGen;
+        use crate::structures::{
+            BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData,
+            Surface,
+        };
+        let mut g = Graph::new();
+        g.set_distance_budget(f64::INFINITY);
+        g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
+        let lat: f64 = 50.850;
+        let m_per_deg = 111_320.0 * lat.to_radians().cos();
+        let mk = |eid: String| NodeData::OsmNode(OsmNodeData { eid, lat_lng: LatLng { latitude: lat, longitude: 4.300 } });
+        let o = g.add_node(mk("o".into()));
+        let d = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "d".into(),
+            lat_lng: LatLng { latitude: lat, longitude: 4.300 + (n as f64 * hop_m) / m_per_deg },
+        }));
+        // Branch i: i private zero-length signalized (SIGNALIZED, Secondary) hops
+        // — each a fixed, realistic +324 s² (secondary-road signal σ=18) — followed
+        // by one non-signalized "safe distance" edge whose length (and therefore
+        // Time) strictly decreases with i. Variance and Time are controlled by
+        // fully independent knobs (hop count vs. final edge length), so every
+        // branch i=0..n is a genuine, mutually non-dominated trade-off.
+        let mut hub_nodes = Vec::new();
+        for i in 0..=n {
+            let mut cur = o;
+            for j in 0..i {
+                let nxt = g.add_node(mk(format!("sig{i}_{j}")));
+                hub_nodes.push((cur, nxt));
+                cur = nxt;
+            }
+            hub_nodes.push((cur, d)); // marker: final safe edge endpoint pair, length filled below
+        }
+        g.build_raptor_index();
+        let signal_edge = |o: NodeID, dn: NodeID| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Secondary;
+            at.surface = Surface::Paved;
+            EdgeData::Street(StreetEdgeData {
+                origin: o, destination: dn, partial: false, length: 0,
+                foot: false, bike: false, car: true, attrs: at, elev_delta: 0,
+                surface_speed: 100, var_gen: VarGen::SIGNALIZED,
+            })
+        };
+        let safe_edge = |o: NodeID, dn: NodeID, len: usize| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Residential;
+            at.surface = Surface::Paved;
+            EdgeData::Street(StreetEdgeData {
+                origin: o, destination: dn, partial: false, length: len,
+                foot: false, bike: false, car: true, attrs: at, elev_delta: 0,
+                surface_speed: 100, var_gen: VarGen::NONE,
+            })
+        };
+        const L0: usize = 20_000;
+        // Speed=11 m/s ⇒ street_secs truncates to whole seconds (speed_mms/1000 = 11 m
+        // per second); DL must exceed that so every branch gets a distinct integer
+        // Time, or truncation ties would let a same-Time, higher-variance branch get
+        // weakly-dominated away — an artifact of the test fixture, not of bucketing.
+        const DL: usize = 20;
+        let mut idx = 0;
+        for i in 0..=n {
+            for _ in 0..i {
+                let (a, b) = hub_nodes[idx];
+                g.add_edge(a, signal_edge(a, b));
+                idx += 1;
+            }
+            let (a, b) = hub_nodes[idx];
+            idx += 1;
+            g.add_edge(a, safe_edge(a, b, L0 - i * DL));
+        }
+        (g, o, d)
+    }
+
+    #[test]
+    fn drive_variance_bucket_bounds_frontier_growth_with_distance() {
+        let bike = BikeCost::new(crate::structures::BikeProfile::default());
+        let w = CostWeights::default();
+        let eps = Epsilon::uniform(0.0, 0.0);
+        // ~700 m/branch-equivalent: N=15 ⇒ ~10.5 km, N=60 ⇒ ~42 km O-D distance
+        // (realistic direct-drive scale); both the Variance range (324·N) and the
+        // O-D distance (700·N) scale linearly with N in lockstep, so the
+        // range/(k·distance) bucket-count ratio is invariant to N by construction.
+        let hop_m = 702.82;
+
+        let search = |n: usize, kv: f64| {
+            let (mut g, a, b) = drive_fanout_graph(n, hop_m);
+            g.set_drive_bucket_var_k(kv);
+            g.multiobj_search(
+                a, b, RoutingMode::Drive, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, false,
+            )
+            .front
+            .len()
+        };
+
+        let plain_15 = search(15, 0.0);
+        let plain_60 = search(60, 0.0);
+        // Not exactly N+1: the Variance axis also carries a systematic (cv·Time)²
+        // term (see `variance_slot_holds_reliability_var_not_raw`) that shrinks
+        // slightly as Time drops, occasionally dominating a close-by branch. The
+        // qualitative property under test is growth with route length/complexity,
+        // not the exact combinatorial count.
+        assert!(
+            plain_15 >= 8,
+            "at least half the 16 branches must be genuine (non-dominated) trade-offs, got {plain_15}"
+        );
+        assert!(
+            plain_60 >= plain_15 * 2,
+            "unbucketed frontier must keep growing as route length/complexity grows: {plain_15} -> {plain_60}"
+        );
+
+        let kv = RaptorIndex::default_drive_bucket_var_k();
+        let bucketed_15 = search(15, kv);
+        let bucketed_60 = search(60, kv);
+        assert!(
+            bucketed_15 < plain_15 && bucketed_60 < plain_60,
+            "bucketing must shrink the frontier at both scales: {bucketed_15} vs {plain_15}, {bucketed_60} vs {plain_60}"
+        );
+        assert!(
+            bucketed_60 <= bucketed_15 + 3,
+            "bucketed frontier must stay roughly flat as distance quadruples (15={bucketed_15}, 60={bucketed_60}), not scale with route length like the unbucketed case ({plain_15} -> {plain_60})"
+        );
+        assert!(
+            bucketed_60 >= 2,
+            "bucketing must not collapse all diversity — at least a low-variance/fast trade-off must survive, got {bucketed_60}"
+        );
+    }
+
+    #[cfg(test)]
+    fn walk_fanout_graph(n: usize, hop_m: f64) -> (Graph, NodeID, NodeID) {
+        use crate::structures::cost::VarGen;
+        use crate::structures::{
+            BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData,
+            Surface,
+        };
+        let mut g = Graph::new();
+        g.set_distance_budget(f64::INFINITY);
+        g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
+        let lat: f64 = 50.850;
+        let m_per_deg = 111_320.0 * lat.to_radians().cos();
+        let mk = |eid: String| NodeData::OsmNode(OsmNodeData { eid, lat_lng: LatLng { latitude: lat, longitude: 4.300 } });
+        let o = g.add_node(mk("o".into()));
+        let d = g.add_node(NodeData::OsmNode(OsmNodeData {
+            eid: "d".into(),
+            lat_lng: LatLng { latitude: lat, longitude: 4.300 + (n as f64 * hop_m) / m_per_deg },
+        }));
+        let mut hubs = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            hubs.push(g.add_node(mk(format!("h{i}"))));
+        }
+        g.build_raptor_index();
+        let edge = |o: NodeID, dn: NodeID, len: usize, surface: Surface| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Residential;
+            at.surface = surface;
+            EdgeData::Street(StreetEdgeData {
+                origin: o, destination: dn, partial: false, length: len,
+                foot: true, bike: false, car: false, attrs: at, elev_delta: 0,
+                surface_speed: 100, var_gen: VarGen::NONE,
+            })
+        };
+        // Branch i: an Unpaved leg of length x_i (roughness) followed by a Paved
+        // leg of length y_i, solved so Time_i = (x_i+y_i)/speed strictly decreases
+        // and Surface_i = 2.5·x_i + y_i strictly increases with i (independent
+        // linear staircases: L_i = L0 - i·DL for total length, S_i = L0 + i·DS for
+        // target Surface, both anchored at branch 0 = all-paved, x_0=0).
+        const L0: f64 = 20_000.0;
+        // Speed=1.2 m/s ⇒ street_secs truncates to whole seconds (speed_mms/1000 =
+        // 1.2 m per second); DL must exceed that so every branch gets a distinct
+        // integer Time (see the analogous comment in `drive_fanout_graph`).
+        const DL: f64 = 5.0;
+        const DS: f64 = 88.0;
+        for i in 0..=n {
+            let l_i = L0 - i as f64 * DL;
+            let s_i = L0 + i as f64 * DS;
+            let x_i = ((s_i - l_i) / 1.5).round().max(0.0);
+            let y_i = (l_i - x_i).max(0.0);
+            g.add_edge(o, edge(o, hubs[i], x_i as usize, Surface::Unpaved));
+            g.add_edge(hubs[i], edge(hubs[i], d, y_i as usize, Surface::Paved));
+        }
+        (g, o, d)
+    }
+
+    #[test]
+    fn walk_surface_bucket_bounds_frontier_growth_with_distance() {
+        let bike = BikeCost::new(crate::structures::BikeProfile::default());
+        let w = CostWeights::default();
+        let eps = Epsilon::uniform(0.0, 0.0);
+        let hop_m = 702.82;
+
+        let search = |n: usize, ks: f64| {
+            let (mut g, a, b) = walk_fanout_graph(n, hop_m);
+            g.set_walk_bucket_surf_k(ks);
+            g.multiobj_search(
+                a, b, RoutingMode::Walk, LegRole::Neutral, &bike, &w, &eps, f64::INFINITY, false,
+            )
+            .front
+            .len()
+        };
+
+        let plain_15 = search(15, 0.0);
+        let plain_60 = search(60, 0.0);
+        // Not exactly N+1: Walk's Variance axis also carries the (cv·Time)²
+        // systematic term (constant here, since these edges never set var_gen), so
+        // this is looser than the drive test's caveat, but kept the same shape for
+        // consistency and robustness to future cost-model changes.
+        assert!(
+            plain_15 >= 8,
+            "at least half the 16 branches must be genuine (non-dominated) trade-offs, got {plain_15}"
+        );
+        assert!(
+            plain_60 >= plain_15 * 2,
+            "unbucketed frontier must keep growing as route length/complexity grows: {plain_15} -> {plain_60}"
+        );
+
+        let ks = RaptorIndex::default_walk_bucket_surf_k();
+        let bucketed_15 = search(15, ks);
+        let bucketed_60 = search(60, ks);
+        assert!(
+            bucketed_15 < plain_15 && bucketed_60 < plain_60,
+            "bucketing must shrink the frontier at both scales: {bucketed_15} vs {plain_15}, {bucketed_60} vs {plain_60}"
+        );
+        assert!(
+            bucketed_60 <= bucketed_15 + 3,
+            "bucketed frontier must stay roughly flat as distance quadruples (15={bucketed_15}, 60={bucketed_60}), not scale with route length like the unbucketed case ({plain_15} -> {plain_60})"
+        );
+        assert!(
+            bucketed_60 >= 2,
+            "bucketing must not collapse all diversity — at least a smooth/rough trade-off must survive, got {bucketed_60}"
+        );
     }
 }

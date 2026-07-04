@@ -178,12 +178,37 @@ fn parse_postal_lookup(xml: &[u8]) -> Result<HashMap<String, String>, String> {
     Ok(out)
 }
 
+/// Rough WGS84 bounding box that comfortably contains all of Belgium (including the
+/// Baarle-Hertog enclaves and the eastern cantons). Used as a data-validity net to
+/// reject BeST records whose Lambert72→WGS84 coordinate lands outside the country —
+/// notably the ~140 k un-geocoded records the feed stores with a placeholder
+/// `<pos>0 0</pos>`, which transform to a point in northern France (~49.29, 2.31).
+/// This is a hard geographic validity bound (not a tuning knob), so it lives as
+/// documented consts rather than in `config.yaml`.
+const BELGIUM_LAT_MIN: f64 = 49.4;
+const BELGIUM_LAT_MAX: f64 = 51.6;
+const BELGIUM_LON_MIN: f64 = 2.5;
+const BELGIUM_LON_MAX: f64 = 6.5;
+
+/// How many address records `stream_addresses` dropped as invalid, split by cause so
+/// the ingestion log can report the (expected, large) placeholder count separately
+/// from any other out-of-country junk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DropCounts {
+    /// Records whose raw `<pos>` was the `0 0` un-geocoded placeholder.
+    placeholder: usize,
+    /// Records whose converted coordinate fell outside the Belgium bounding box.
+    out_of_belgium: usize,
+}
+
 /// Stream a BeST `address` XML into the index builder, joining each address to the
 /// pre-parsed street / municipality / postal lookup tables by FK id and converting
 /// its Lambert72 position to WGS84. The reader is consumed incrementally with
 /// buffer reuse so memory stays flat across the millions of addresses in the large
 /// regional files. Records whose street FK is unknown are skipped (cannot be
-/// labelled).
+/// labelled). Records with the `0 0` placeholder position (un-geocoded addresses) or
+/// a converted coordinate outside Belgium are dropped as invalid; the returned
+/// [`DropCounts`] tallies both causes.
 fn stream_addresses<R: std::io::BufRead>(
     reader: R,
     streets: &HashMap<String, Named>,
@@ -191,7 +216,8 @@ fn stream_addresses<R: std::io::BufRead>(
     postals: &HashMap<String, String>,
     conv: &Lambert72Converter,
     builder: &mut AddressIndexBuilder,
-) -> Result<(), String> {
+) -> Result<DropCounts, String> {
+    let mut drops = DropCounts::default();
     let mut reader = Reader::from_reader(reader);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -264,10 +290,27 @@ fn stream_addresses<R: std::io::BufRead>(
                     let (Ok(x), Ok(y)) = (xs.parse::<f64>(), ys.parse::<f64>()) else {
                         continue;
                     };
+                    // Primary net: the raw `0 0` un-geocoded placeholder. Belgian
+                    // Lambert72 coordinates never legitimately sit at the origin, so
+                    // this exactly targets the ~140 k addresses BeST ships without a
+                    // surveyed location (they would otherwise transform to a point in
+                    // northern France and poison street centroids).
+                    if x == 0.0 && y == 0.0 {
+                        drops.placeholder += 1;
+                        continue;
+                    }
                     let (lat, lon) = match conv.to_wgs84(x, y) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // Secondary net: any converted coordinate outside Belgium is junk
+                    // (a bad projection or other non-placeholder garbage).
+                    if !(BELGIUM_LAT_MIN..=BELGIUM_LAT_MAX).contains(&lat)
+                        || !(BELGIUM_LON_MIN..=BELGIUM_LON_MAX).contains(&lon)
+                    {
+                        drops.out_of_belgium += 1;
+                        continue;
+                    }
                     let sid = builder.intern_street(&street_key, street_named.clone());
                     let muni_key = composite_key(&muni_ns, &muni_fk);
                     let muni_named = munis.get(&muni_key).cloned().unwrap_or_default();
@@ -291,7 +334,7 @@ fn stream_addresses<R: std::io::BufRead>(
         }
         buf.clear();
     }
-    Ok(())
+    Ok(drops)
 }
 
 /// BeST file kind, classified from the OUTER zip entry name. The real FULL feed is
@@ -424,6 +467,7 @@ fn load_bestadd_zip_filtered(
 
     let mut builder = AddressIndexBuilder::new();
     builder.set_box_coord_epsilon_m(box_coord_epsilon_m);
+    let mut drops = DropCounts::default();
     for i in address_indices {
         let outer = read_entry(&mut archive, i)?;
         let mut inner = zip::ZipArchive::new(Cursor::new(outer.as_slice()))
@@ -432,7 +476,7 @@ fn load_bestadd_zip_filtered(
         let entry = inner
             .by_index(idx)
             .map_err(|e| format!("failed to read nested address xml: {e}"))?;
-        stream_addresses(
+        let file_drops = stream_addresses(
             BufReader::new(entry),
             &streets,
             &munis,
@@ -440,6 +484,15 @@ fn load_bestadd_zip_filtered(
             &conv,
             &mut builder,
         )?;
+        drops.placeholder += file_drops.placeholder;
+        drops.out_of_belgium += file_drops.out_of_belgium;
+    }
+    if drops.placeholder > 0 || drops.out_of_belgium > 0 {
+        tracing::info!(
+            "BeST-Add: dropped {} un-geocoded placeholder (0 0) + {} out-of-Belgium address records",
+            drops.placeholder,
+            drops.out_of_belgium
+        );
     }
     Ok(builder.finish())
 }
@@ -733,6 +786,74 @@ mod tests {
         assert!(wal[0].label.contains("VilleWal"), "label {}", wal[0].label);
     }
 
+    /// Three addresses on the same street: a valid Brussels position, the
+    /// un-geocoded `0 0` placeholder, and a non-zero position (`1 1`) that converts
+    /// to the same northern-France point outside Belgium. Only the valid one must
+    /// survive, and the drop counts must attribute one to each cause.
+    const ADDR_VALIDITY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<tns:addressResponseBySource xmlns:com="http://fsb.belgium.be/data/common" xmlns:tns="http://fsb.belgium.be/mappingservices/FullDownload/v1_00">
+  <tns:address>
+    <com:code><com:namespace>x</com:namespace><com:objectIdentifier>OK</com:objectIdentifier></com:code>
+    <com:position><com:pointGeometry><com:point><com:pos srsName="http://www.opengis.net/def/crs/EPSG/0/31370">148378.77 172011.96</com:pos></com:point></com:pointGeometry></com:position>
+    <com:houseNumber>16</com:houseNumber>
+    <com:hasStreetName><com:namespace>x</com:namespace><com:objectIdentifier>S1</com:objectIdentifier></com:hasStreetName>
+    <com:hasMunicipality><com:namespace>x</com:namespace><com:objectIdentifier>M1</com:objectIdentifier></com:hasMunicipality>
+    <com:hasPostalInfo><com:namespace>x</com:namespace><com:objectIdentifier>1000</com:objectIdentifier></com:hasPostalInfo>
+  </tns:address>
+  <tns:address>
+    <com:code><com:namespace>x</com:namespace><com:objectIdentifier>ZERO</com:objectIdentifier></com:code>
+    <com:position><com:pointGeometry><com:point><com:pos srsName="http://www.opengis.net/def/crs/EPSG/0/31370">0 0</com:pos></com:point></com:pointGeometry></com:position>
+    <com:houseNumber>2</com:houseNumber>
+    <com:hasStreetName><com:namespace>x</com:namespace><com:objectIdentifier>S1</com:objectIdentifier></com:hasStreetName>
+    <com:hasMunicipality><com:namespace>x</com:namespace><com:objectIdentifier>M1</com:objectIdentifier></com:hasMunicipality>
+    <com:hasPostalInfo><com:namespace>x</com:namespace><com:objectIdentifier>1000</com:objectIdentifier></com:hasPostalInfo>
+  </tns:address>
+  <tns:address>
+    <com:code><com:namespace>x</com:namespace><com:objectIdentifier>OOB</com:objectIdentifier></com:code>
+    <com:position><com:pointGeometry><com:point><com:pos srsName="http://www.opengis.net/def/crs/EPSG/0/31370">1 1</com:pos></com:point></com:pointGeometry></com:position>
+    <com:houseNumber>4</com:houseNumber>
+    <com:hasStreetName><com:namespace>x</com:namespace><com:objectIdentifier>S1</com:objectIdentifier></com:hasStreetName>
+    <com:hasMunicipality><com:namespace>x</com:namespace><com:objectIdentifier>M1</com:objectIdentifier></com:hasMunicipality>
+    <com:hasPostalInfo><com:namespace>x</com:namespace><com:objectIdentifier>1000</com:objectIdentifier></com:hasPostalInfo>
+  </tns:address>
+</tns:addressResponseBySource>"#;
+
+    #[test]
+    fn guard_drops_placeholder_and_out_of_belgium_keeps_valid() {
+        let streets = parse_named_lookup(STREETS_A.as_bytes(), "streetName").unwrap();
+        let munis = parse_named_lookup(MUNIS.as_bytes(), "municipality").unwrap();
+        let postals = parse_postal_lookup(POSTALS.as_bytes()).unwrap();
+        let conv = Lambert72Converter::new().unwrap();
+        let mut builder = AddressIndexBuilder::new();
+
+        let drops = stream_addresses(
+            Cursor::new(ADDR_VALIDITY.as_bytes()),
+            &streets,
+            &munis,
+            &postals,
+            &conv,
+            &mut builder,
+        )
+        .unwrap();
+
+        // (a) the `0 0` placeholder is dropped, (b) the `1 1` out-of-Belgium coord is
+        // dropped, each attributed to its own cause.
+        assert_eq!(drops.placeholder, 1, "one 0 0 placeholder dropped");
+        assert_eq!(drops.out_of_belgium, 1, "one out-of-Belgium coord dropped");
+
+        // (c) the valid in-Belgium record is kept — and nothing else.
+        let idx = builder.finish();
+        assert_eq!(idx.record_count(), 1, "only the valid record survives");
+        let ok = idx.search("rue de la loi 16", 10, None);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].id, "OK");
+        assert!((49.4..=51.6).contains(&ok[0].lat), "kept lat {}", ok[0].lat);
+        assert!((2.5..=6.5).contains(&ok[0].lon), "kept lon {}", ok[0].lon);
+        // The dropped house numbers resolve to nothing.
+        assert!(idx.search("rue de la loi 2", 10, None).is_empty());
+        assert!(idx.search("rue de la loi 4", 10, None).is_empty());
+    }
+
     #[test]
     #[ignore]
     fn real_brussels_data_parses_into_belgium() {
@@ -881,5 +1002,59 @@ mod tests {
             per_muni.values().all(|&n| n == 1),
             "apartments collapsed: exactly one house-16 building per municipality, got {per_muni:?}"
         );
+    }
+
+    /// The regression gate. On the real feed, "Rue de la Gare, 6800
+    /// Libramont-Chevigny" (street-level, no house number) must resolve to the
+    /// Libramont station area (~49.921, 5.379), NOT the border point (~49.860,
+    /// 5.082) the un-geocoded placeholders used to drag the centroid to; and the
+    /// building-level "Rue de la Gare 2" must land in Belgium, not northern France.
+    #[test]
+    #[ignore]
+    fn real_libramont_gare_resolves_on_street() {
+        let path = "cache/bestadd.zip";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {path} not present");
+            return;
+        }
+        let idx =
+            load_bestadd_zip_filtered(path, 5.0, |name| name.starts_with("Wallonia")).unwrap();
+
+        // Street-level (no house/postcode number token) exercises group_by_street /
+        // Part B's median. "libramont" disambiguates the municipality.
+        let street = idx.search("rue de la gare libramont", 20, None);
+        let hit = street
+            .iter()
+            .find(|h| h.postcode == "6800" && h.house_number.is_empty())
+            .expect("Rue de la Gare in 6800 Libramont must resolve street-level");
+        eprintln!("street-level: {} @ {},{}", hit.label, hit.lat, hit.lon);
+        assert!(
+            (hit.lat - 49.921).abs() < 0.02 && (hit.lon - 5.379).abs() < 0.05,
+            "street-level must land at Libramont station, got {},{}",
+            hit.lat,
+            hit.lon
+        );
+        // Explicitly reject the pre-fix border-straddling centroid (~49.860, 5.082).
+        assert!(
+            (hit.lat - 49.860).abs() > 0.02 || (hit.lon - 5.082).abs() > 0.05,
+            "must not be the old placeholder-poisoned centroid, got {},{}",
+            hit.lat,
+            hit.lon
+        );
+        assert!(
+            (2.5..=6.5).contains(&hit.lon) && (49.4..=51.6).contains(&hit.lat),
+            "must be inside Belgium"
+        );
+
+        let building = idx.search("rue de la gare 2 6800 libramont", 20, None);
+        for h in building.iter().filter(|h| h.postcode == "6800") {
+            eprintln!("building: {} @ {},{}", h.label, h.lat, h.lon);
+            assert!(
+                (2.5..=6.5).contains(&h.lon) && (49.4..=51.6).contains(&h.lat),
+                "building-level hit must be in Belgium, not France: {},{}",
+                h.lat,
+                h.lon
+            );
+        }
     }
 }

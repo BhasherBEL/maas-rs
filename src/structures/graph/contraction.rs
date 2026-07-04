@@ -1068,6 +1068,21 @@ impl ContractedGraph {
             .map(|&(ji, _)| self.junctions[ji])
     }
 
+    /// Foot-snap seed entries `(bounding-junction index, stub foot-secs)` for a coord, or
+    /// `None` if nothing foot-usable within `radius_m`. Public twin of the seed set that
+    /// [`ContractedGraph::nearby_stops_arena`] computes internally and discards — used by the
+    /// CCH access/egress one-to-many, which needs the multi-source seeds to enter the
+    /// contracted graph at the same ≤2 bounding junctions with the proj→junction stub paid.
+    pub(crate) fn foot_snap_entries(
+        &self,
+        g: &Graph,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+    ) -> Option<Vec<(usize, u32)>> {
+        self.foot_snap(g, lat, lon, radius_m).map(|(_, _, _, _, entries)| entries)
+    }
+
     /// Foot stops within `max_secs` of the foot-snap of `(lat, lon)` over the contracted
     /// graph — the coord-based twin of [`Graph::nearby_stops_union`] for a snapped origin
     /// whose interior node is gone (g-free). Same shape/order as `nearby_stops`.

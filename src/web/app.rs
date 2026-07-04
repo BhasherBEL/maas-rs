@@ -839,11 +839,11 @@ fn live_refresh(
         // Cancellation overrides any (possibly stale) per-stop delay: times stay
         // scheduled and the delay reads 0. Otherwise shift each end by its own delay.
         let (status, delay_secs, realtime_start, realtime_end) =
-            match rt.status(trip, board as u32) {
+            match rt.status_with_sticky(trip, board as u32) {
                 TripStatus::Canceled => (LiveStatusGql::Canceled, 0, sched_start, sched_end),
                 non_canceled => {
-                    let d_board = rt.delay(trip, board as u32);
-                    let d_alight = rt.delay(trip, alight as u32);
+                    let d_board = rt.delay_with_sticky(trip, board as u32);
+                    let d_alight = rt.delay_with_sticky(trip, alight as u32);
                     let status = match non_canceled {
                         TripStatus::OnTime => LiveStatusGql::OnTime,
                         TripStatus::Delayed(_) => LiveStatusGql::Delayed,
@@ -1056,6 +1056,11 @@ impl QueryRoot {
         // Arrival-slack (seconds): explore plans arriving up to this much after the
         // fastest, surfacing safer-but-slower alternatives. Falls back to config (900 s).
         arrival_slack_secs: Option<i32>,
+        // When set, override the graph default for MCR uncapped inter-stop transfers
+        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
+        unrestricted_transfers: Option<bool>,
+        // When set, override the graph default for exact CCH foot access/egress.
+        use_cch_access: Option<bool>,
         // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
         // Finer edges surface more reliability-distinct alternatives. Falls back to config.
         reliability_bucket_edges: Option<Vec<f64>>,
@@ -1067,6 +1072,13 @@ impl QueryRoot {
         terminal_deadline: Option<bool>,
         from_station_id: Option<String>,
         to_station_id: Option<String>,
+        // When true, emit a per-phase wall-clock decomposition of this query
+        // (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/
+        // range/departure counts) as one structured log line. Purely additive
+        // observability — never changes routing behavior or results. Falls back
+        // to the graph default (config.yaml `profile_latency`, itself off by
+        // default) when omitted.
+        profile_latency: Option<bool>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -1081,6 +1093,8 @@ impl QueryRoot {
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            unrestricted_transfers,
+            use_cch_access,
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
@@ -1089,6 +1103,7 @@ impl QueryRoot {
             onboard_origin: None,
             from_station_id,
             to_station_id,
+            profile_latency,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1114,6 +1129,11 @@ impl QueryRoot {
         // Arrival-slack (seconds): explore plans arriving up to this much after the
         // fastest, surfacing safer-but-slower alternatives. Falls back to config (900 s).
         arrival_slack_secs: Option<i32>,
+        // When set, override the graph default for MCR uncapped inter-stop transfers
+        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
+        unrestricted_transfers: Option<bool>,
+        // When set, override the graph default for exact CCH foot access/egress.
+        use_cch_access: Option<bool>,
         // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
         reliability_bucket_edges: Option<Vec<f64>>,
         // Bike cost profile override; sparse fields overlay the graph default.
@@ -1134,6 +1154,8 @@ impl QueryRoot {
             window_minutes: None,
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            unrestricted_transfers,
+            use_cch_access,
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes: None,
@@ -1146,6 +1168,7 @@ impl QueryRoot {
             }),
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1166,6 +1189,11 @@ impl QueryRoot {
         window_minutes: Option<i32>,
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
+        // When set, override the graph default for MCR uncapped inter-stop transfers
+        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
+        unrestricted_transfers: Option<bool>,
+        // When set, override the graph default for exact CCH foot access/egress.
+        use_cch_access: Option<bool>,
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
         bike_profile: Option<BikeProfileInput>,
@@ -1184,6 +1212,8 @@ impl QueryRoot {
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            unrestricted_transfers,
+            use_cch_access,
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
@@ -1192,6 +1222,7 @@ impl QueryRoot {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1252,6 +1283,11 @@ impl QueryRoot {
         window_minutes: Option<i32>,
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
+        // When set, override the graph default for MCR uncapped inter-stop transfers
+        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
+        unrestricted_transfers: Option<bool>,
+        // When set, override the graph default for exact CCH foot access/egress.
+        use_cch_access: Option<bool>,
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
         plan_index: i32,
@@ -1272,6 +1308,8 @@ impl QueryRoot {
             window_minutes: window_minutes.map(|w| w.max(0) as u32),
             min_access_secs: walk_radius_secs.map(|s| s.max(0) as u32),
             arrival_slack_secs: arrival_slack_secs.map(|s| s.max(0) as u32),
+            unrestricted_transfers,
+            use_cch_access,
             reliability_bucket_edges: reliability_bucket_edges
                 .map(|v| v.into_iter().map(|x| x as f32).collect()),
             modes,
@@ -1280,6 +1318,7 @@ impl QueryRoot {
             onboard_origin: None,
             from_station_id: None,
             to_station_id: None,
+            profile_latency: None,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1488,7 +1527,6 @@ impl QueryRoot {
     }
 }
 
-const DEBUG_HTML: &str = include_str!("static/debug.html");
 const INDEX_HTML: &str = include_str!("static/index.html");
 const MAAS_JS: &str = include_str!("static/maas.js");
 const SW_JS: &str = include_str!("static/sw.js");
@@ -1540,11 +1578,6 @@ impl IntoResponse for Svg {
             .content_type("image/svg+xml; charset=utf-8")
             .body(self.0)
     }
-}
-
-#[handler]
-pub async fn debug_page() -> Html<&'static str> {
-    Html(DEBUG_HTML)
 }
 
 #[handler]
@@ -1702,7 +1735,6 @@ pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<
         .at("/manifest.webmanifest", get(manifest_handler))
         .at("/icon.svg", get(icon_svg_handler))
         .at("/icon-maskable.svg", get(icon_maskable_svg_handler))
-        .at("/debug", get(debug_page))
         .at("/", get(index_page));
 
     let bind = format!("{}:{}", config.server.host, config.server.port);

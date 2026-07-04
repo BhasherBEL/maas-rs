@@ -196,10 +196,13 @@ pub struct PlanTransitLeg {
     pub bikes_allowed: Option<bool>,
 
     /// Seconds subtracted from raw timetable times when this leg was built from an
-    /// overnight RAPTOR pass (86400 for prev-day trips, 0 otherwise). Used by the
+    /// overnight RAPTOR pass. Signed: `+86400` for a previous-service-day trip whose
+    /// raw times exceed 24 h (date-1 extension), `-86400` for a next-service-day trip
+    /// pulled into a late-night query's window (date+1 extension), `0` otherwise.
+    /// `raw_time = displayed_time + time_shift`. Used by the
     /// `previousDepartures`/`nextDepartures` resolvers to normalize returned times.
     #[graphql(skip)]
-    pub time_shift: u32,
+    pub time_shift: i64,
 }
 
 #[ComplexObject]
@@ -276,7 +279,7 @@ impl PlanTransitLeg {
             self.from.node_id,
             self.to.node_id,
             first.timetable_segment,
-            self.start + self.time_shift,
+            (self.start as i64 + self.time_shift) as u32,
             first.date,
             first.weekday,
             false,
@@ -288,7 +291,7 @@ impl PlanTransitLeg {
             self.from.node_id,
             self.to.node_id,
         ));
-        if self.time_shift > 0 {
+        if self.time_shift != 0 {
             results = results
                 .into_iter()
                 .map(|l| shift_transit_leg(l, self.time_shift))
@@ -333,7 +336,7 @@ impl PlanTransitLeg {
             self.from.node_id,
             self.to.node_id,
             first.timetable_segment,
-            self.start + self.time_shift,
+            (self.start as i64 + self.time_shift) as u32,
             first.date,
             first.weekday,
             true,
@@ -345,7 +348,7 @@ impl PlanTransitLeg {
             self.from.node_id,
             self.to.node_id,
         ));
-        if self.time_shift > 0 {
+        if self.time_shift != 0 {
             results = results
                 .into_iter()
                 .map(|l| shift_transit_leg(l, self.time_shift))
@@ -357,22 +360,27 @@ impl PlanTransitLeg {
     }
 }
 
-/// Subtract `s` from raw-timetable times in a result leg to normalize it to
-/// wall-clock time. Used when returning alternatives for an overnight-shifted leg.
-fn shift_transit_leg(mut l: PlanTransitLeg, s: u32) -> PlanTransitLeg {
-    l.start = l.start.saturating_sub(s);
-    l.end = l.end.saturating_sub(s);
-    l.scheduled_start = l.scheduled_start.saturating_sub(s);
-    l.scheduled_end = l.scheduled_end.saturating_sub(s);
-    l.from.departure = l.from.departure.map(|d| d.saturating_sub(s));
-    l.to.arrival = l.to.arrival.map(|a| a.saturating_sub(s));
+/// Subtract the signed shift `s` from raw-timetable times in a result leg to
+/// normalize it to wall-clock time. Used when returning alternatives for an
+/// overnight-shifted leg. `s > 0` shifts a prev-day (date-1) leg down; `s < 0`
+/// shifts a next-day (date+1) leg up. Clamps at 0.
+fn shift_transit_leg(mut l: PlanTransitLeg, s: i64) -> PlanTransitLeg {
+    let sub = |x: u32| (x as i64 - s).max(0) as u32;
+    l.start = sub(l.start);
+    l.end = sub(l.end);
+    l.scheduled_start = sub(l.scheduled_start);
+    l.scheduled_end = sub(l.scheduled_end);
+    l.from.departure = l.from.departure.map(sub);
+    l.to.arrival = l.to.arrival.map(sub);
+    l.from.arrival = l.from.arrival.map(sub);
+    l.to.departure = l.to.departure.map(sub);
     if let Some(tr) = &mut l.transfer_risk {
-        tr.scheduled_departure = tr.scheduled_departure.saturating_sub(s);
-        tr.next_departure = tr.next_departure.map(|d| d.saturating_sub(s));
+        tr.scheduled_departure = sub(tr.scheduled_departure);
+        tr.next_departure = tr.next_departure.map(sub);
     }
     for step in &mut l.steps {
         if let PlanLegStep::Transit(ts) = step {
-            ts.time = ts.time.saturating_sub(s);
+            ts.time = sub(ts.time);
         }
     }
     l
@@ -405,7 +413,7 @@ impl PlanTransitLeg {
 
         let (p_in, in_margin) = match (self.preceding_arrival, self.preceding_route_type) {
             (Some(pa), Some(prt)) => {
-                let margin = alt_dep as i32 - (pa + s) as i32;
+                let margin = alt_dep as i32 - (pa as i64 + s) as i32;
                 let board = alt_rt.and_then(|rt| graph.get_delay_model(rt));
                 let p = match graph.get_delay_model(prt) {
                     Some(cdf) => cdf.prob_on_time_vs(board, margin),
@@ -425,7 +433,7 @@ impl PlanTransitLeg {
             alt_rt,
             self.following_route_type,
             self.following_margin_secs,
-            (self.scheduled_end + s) as i32 - alt_end as i32,
+            (self.scheduled_end as i64 + s) as i32 - alt_end as i32,
         );
 
         Some(TransferRisk {
@@ -528,6 +536,8 @@ impl PlanTransitLeg {
                     timetable_segment: first.timetable_segment,
                     time: first_seg.departure,
                     place: first.place,
+                    scheduled_arrival: Some(first_seg.arrival),
+                    scheduled_departure: Some(first_seg.departure),
                     length: first.length,
                 }));
 
@@ -545,6 +555,8 @@ impl PlanTransitLeg {
                         length: step.length,
                         time: seg.departure,
                         place: step.place,
+                        scheduled_arrival: Some(seg.arrival),
+                        scheduled_departure: Some(seg.departure),
                         timetable_segment: step.timetable_segment,
                         departure_index: tt.start + local_idx,
                         date: step.date,
@@ -632,6 +644,49 @@ mod tests {
         assert_eq!(leg.leave_by, None, "non-access legs carry no leave-by");
         leg.leave_by = Some(28_800);
         assert_eq!(leg.leave_by, Some(28_800));
+    }
+
+    fn sample_transit_leg() -> PlanTransitLeg {
+        use crate::ingestion::gtfs::TripId;
+        let place = |node: usize, arr: u32, dep: u32| PlanPlace {
+            stop_position: Some(node as u32),
+            arrival: Some(arr),
+            departure: Some(dep),
+            node_id: NodeID(node),
+        };
+        PlanTransitLeg {
+            length: 0,
+            start: 90_000,
+            end: 90_600,
+            duration: 600,
+            scheduled_start: 90_000,
+            scheduled_end: 90_600,
+            realtime: false,
+            from: place(0, 90_000, 90_060),
+            to: place(1, 90_600, 90_720),
+            steps: vec![],
+            geometry: vec![],
+            transfer_risk: None,
+            trip_id: TripId(0),
+            preceding_arrival: None,
+            preceding_route_type: None,
+            route_type: None,
+            following_route_type: None,
+            following_margin_secs: None,
+            bikes_allowed: None,
+            time_shift: 0,
+        }
+    }
+
+    #[test]
+    fn shift_transit_leg_shifts_both_endpoint_dwell_fields() {
+        let shifted = shift_transit_leg(sample_transit_leg(), 86_400);
+        // The new endpoint dwell fields shift into the display frame consistently
+        // with the pre-existing from.departure / to.arrival shifts.
+        assert_eq!(shifted.from.departure, Some(3_660));
+        assert_eq!(shifted.from.arrival, Some(3_600));
+        assert_eq!(shifted.to.arrival, Some(4_200));
+        assert_eq!(shifted.to.departure, Some(4_320));
     }
 
     #[test]

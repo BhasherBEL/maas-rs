@@ -378,6 +378,23 @@ fn box_label_eq(label: &str, q: &str) -> bool {
     numeric(&l) && numeric(q) && l.trim_start_matches('0') == q.trim_start_matches('0')
 }
 
+/// Component-wise median of a coordinate axis: sorts `vals` in place and returns the
+/// middle value (mean of the two middle values for an even count). Robust to a stray
+/// outlier that would drag an arithmetic mean off the street. `vals` is never empty
+/// at the call site (a group always has ≥ 1 matched building).
+fn median(vals: &mut [f64]) -> f64 {
+    vals.sort_by(f64::total_cmp);
+    let n = vals.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+    }
+}
+
 fn push_unique(map: &mut BTreeMap<String, Vec<u32>>, token: String, id: u32) {
     let v = map.entry(token).or_default();
     if v.last() != Some(&id) {
@@ -729,28 +746,30 @@ impl AddressIndex {
     /// Street-level collapse (no number token in the query): one hit per
     /// `(street, municipality)`, scored by the MAX of the group's building scores
     /// (preserving proximity/fuzzy ranking) with a deterministic record-id
-    /// tie-break, the coordinate set to the centroid of the matched buildings.
+    /// tie-break. The coordinate is the component-wise MEDIAN of the matched
+    /// buildings' coordinates rather than the arithmetic mean: the median is robust
+    /// to a stray out-of-range building (e.g. a mis-geocoded record) that would drag
+    /// a mean off the street, so a street query lands on a real on-street point.
     fn group_by_street(&self, scored: Vec<(f64, u32)>, limit: usize) -> Vec<AddressHit> {
-        let mut groups: HashMap<(u32, u32), (f64, u32, f64, f64, usize)> = HashMap::new();
+        let mut groups: HashMap<(u32, u32), (f64, u32, Vec<f64>, Vec<f64>)> = HashMap::new();
         for (score, rid) in scored {
             let r = &self.records[rid as usize];
             let e = groups
                 .entry((r.street, r.municipality))
-                .or_insert((f64::NEG_INFINITY, rid, 0.0, 0.0, 0));
+                .or_insert((f64::NEG_INFINITY, rid, Vec::new(), Vec::new()));
             if score > e.0 || (score == e.0 && rid < e.1) {
                 e.0 = score;
                 e.1 = rid;
             }
-            e.2 += r.lat;
-            e.3 += r.lon;
-            e.4 += 1;
+            e.2.push(r.lat);
+            e.3.push(r.lon);
         }
-        let mut ranked: Vec<(f64, u32, f64, f64, usize)> = groups.into_values().collect();
+        let mut ranked: Vec<(f64, u32, Vec<f64>, Vec<f64>)> = groups.into_values().collect();
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         ranked.truncate(limit);
         ranked
             .into_iter()
-            .map(|(_, rid, sum_lat, sum_lon, n)| {
+            .map(|(_, rid, mut lats, mut lons)| {
                 let r = &self.records[rid as usize];
                 let street = self.streets[r.street as usize].display.clone();
                 let municipality = self.municipalities[r.municipality as usize].display.clone();
@@ -759,8 +778,8 @@ impl AddressIndex {
                 AddressHit {
                     id: r.id.clone(),
                     label,
-                    lat: sum_lat / n as f64,
-                    lon: sum_lon / n as f64,
+                    lat: median(&mut lats),
+                    lon: median(&mut lons),
                     street,
                     house_number: String::new(),
                     postcode,
@@ -1441,10 +1460,12 @@ mod tests {
         let bxl = hits.iter().find(|h| h.municipality == "Bruxelles").unwrap();
         assert_eq!(bxl.label, "Rue de la Loi, 1000 Bruxelles");
         assert!(bxl.house_number.is_empty(), "street-level carries no house number");
-        let centroid_lat = (50.846 + 50.847 + 50.848) / 3.0;
+        // Component-wise median of the matched buildings; for these three
+        // evenly-spaced points the median equals the mean (50.847).
+        let median_lat = 50.847;
         assert!(
-            (bxl.lat - centroid_lat).abs() < 1e-9,
-            "coordinate is the centroid of the matched buildings"
+            (bxl.lat - median_lat).abs() < 1e-9,
+            "coordinate is the median of the matched buildings"
         );
         assert!(hits.iter().any(|h| h.municipality == "Liège"));
     }
@@ -1669,5 +1690,63 @@ mod tests {
                 "query {q:?} selects the letter box"
             );
         }
+    }
+
+    /// A street whose buildings cluster near Libramont station (~49.921, 5.379) plus
+    /// one mis-geocoded outlier in northern France (~49.293, 2.307). This mirrors the
+    /// original bug where placeholder records dragged the street centroid to a border
+    /// point. Even without Part A's ingestion guard, the street-level collapse must
+    /// return a coordinate on the cluster (the median), NOT the arithmetic mean the
+    /// outlier would pull off toward the border.
+    fn outlier_street() -> AddressIndex {
+        let mut b = AddressIndexBuilder::new();
+        let gare = b.intern_street("S1", named("Rue de la Gare", &["Rue de la Gare"]));
+        let lib = b.intern_municipality("M1", named("Libramont", &["Libramont"]));
+        let pc = b.intern_postal("P1", "6800".to_string());
+        for (i, (lat, lon)) in [
+            (49.920, 5.378),
+            (49.921, 5.379),
+            (49.921, 5.380),
+            (49.922, 5.381),
+            (49.920, 5.379),
+        ]
+        .iter()
+        .enumerate()
+        {
+            b.push_record(
+                format!("G{i}"),
+                gare,
+                lib,
+                pc,
+                format!("{}", 2 * i + 1),
+                String::new(),
+                *lat,
+                *lon,
+            );
+        }
+        // Mis-geocoded outlier in northern France.
+        b.push_record("GBAD".into(), gare, lib, pc, "99".into(), String::new(), 49.293, 2.307);
+        b.finish()
+    }
+
+    #[test]
+    fn street_collapse_median_ignores_outlier() {
+        let idx = outlier_street();
+        let hits = idx.search("rue de la gare", 10, None);
+        assert_eq!(hits.len(), 1, "one street-level hit");
+        let h = &hits[0];
+        // The median lands on the station cluster, not the border-straddling mean.
+        assert!(
+            (h.lat - 49.921).abs() < 0.01 && (h.lon - 5.379).abs() < 0.01,
+            "median must land on the cluster near the station, got {},{}",
+            h.lat,
+            h.lon
+        );
+        // The arithmetic mean (~49.816, 4.867) would be far off — prove we are not it.
+        let mean_lat = (49.920 + 49.921 + 49.921 + 49.922 + 49.920 + 49.293) / 6.0;
+        assert!(
+            (h.lat - mean_lat).abs() > 0.05,
+            "must not be the outlier-dragged mean {mean_lat}"
+        );
     }
 }

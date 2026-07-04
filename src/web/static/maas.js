@@ -1,5 +1,5 @@
 'use strict';
-// Shared MaaS utilities — included by both index.html and debug.html
+// Shared MaaS utilities — included by index.html
 
 const GRAPHQL_URL = '/graphql';
 
@@ -23,6 +23,36 @@ function fmtTime(secs) {
   return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
 }
 
+// Times are seconds since midnight of the QUERY date, so a value >= 86400 lands
+// on a following day. fmtTime keeps the correct wall-clock hour (e.g. 170520 →
+// "23:12") but drops that day context; these helpers surface it.
+function dayOffset(secs) {
+  return secs == null ? 0 : Math.floor(secs / 86400);
+}
+
+// A styled superscript "+N" day marker element, or null for same-day times.
+function mkDayMark(secs) {
+  const off = dayOffset(secs);
+  return off > 0 ? mkEl('sup', 'day-sup', '+' + off) : null;
+}
+
+// HH:MM plus a plain-text " (+N)" day suffix — for prose/tooltip strings that
+// cannot host a DOM element. Same-day renders exactly like fmtTime.
+function fmtTimeDay(secs) {
+  if (secs == null) return '—';
+  const off = dayOffset(secs);
+  return fmtTime(secs) + (off > 0 ? ' (+' + off + ')' : '');
+}
+
+// mkEl carrying a time string plus an appended day marker when it crosses
+// midnight. Same-day → byte-identical DOM to mkEl(tag, cls, fmtTime(secs)).
+function mkTimeEl(tag, cls, secs) {
+  const el = mkEl(tag, cls, fmtTime(secs));
+  const mk = mkDayMark(secs);
+  if (mk) el.appendChild(mk);
+  return el;
+}
+
 // Build a leg-time-col cell that reflects realtime: non-RT legs show a plain
 // (black) time; RT legs are green; an RT time that differs from schedule shows
 // the scheduled time struck through with the realtime time in red.
@@ -30,13 +60,13 @@ function mkLegTime(secs, schedSecs, isRealtime) {
   const wrap = mkEl('div', 'leg-time-col');
   if (isRealtime && schedSecs != null && secs !== schedSecs) {
     wrap.classList.add('rt', 'rt-late');
-    wrap.appendChild(mkEl('span', 'lt-sched', fmtTime(schedSecs)));
-    wrap.appendChild(mkEl('span', 'lt-rt', fmtTime(secs)));
+    wrap.appendChild(mkTimeEl('span', 'lt-sched', schedSecs));
+    wrap.appendChild(mkTimeEl('span', 'lt-rt', secs));
   } else if (isRealtime) {
     wrap.classList.add('rt', 'rt-ontime');
-    wrap.appendChild(mkEl('span', 'lt-rt', fmtTime(secs)));
+    wrap.appendChild(mkTimeEl('span', 'lt-rt', secs));
   } else {
-    wrap.textContent = fmtTime(secs);
+    wrap.appendChild(mkTimeEl('span', 'lt-plain', secs));
   }
   return wrap;
 }
@@ -155,6 +185,7 @@ function buildStopList(leg) {
     lon:       fromNode?.lon  ?? leg.geometry?.[0]?.lon,
     arrival:   null,
     departure: leg.from?.departure ?? leg.start,
+    platform:  leg.from?.platform ?? null,
   });
   (leg.steps || []).forEach(step => {
     const node = step.place?.node;
@@ -164,6 +195,7 @@ function buildStopList(leg) {
       lon:       node?.lon,
       arrival:   step.place?.arrival   ?? null,
       departure: step.place?.departure ?? null,
+      platform:  step.place?.platform  ?? null,
     });
   });
   return stops;
@@ -292,6 +324,63 @@ function _focusArgs() {
   return { flat: null, flng: null };
 }
 
+// ── Station-search ranking ────────────────────────────────────
+// Inlined here because maas.js is loaded as a CLASSIC <script> (see index.html),
+// so it cannot `import`. The CANONICAL, unit-tested copy lives in
+// static/js/station-rank.mjs (station-rank.test.mjs) — keep the two IN SYNC.
+const STATION_RESULT_LIMIT = 25;   // ranked cap (was an unranked hard 8)
+const _MATCH_TIER = { NONE: 0, SUBSTRING: 1, WORD_PREFIX: 2, PREFIX: 3, EXACT: 4 };
+
+function _normStation(s) {
+  if (s == null) return '';
+  return String(s)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function _scoreStation(name, q) {
+  const n = _normStation(name);
+  if (!q || !n) return _MATCH_TIER.NONE;
+  if (n === q) return _MATCH_TIER.EXACT;
+  if (n.startsWith(q)) return _MATCH_TIER.PREFIX;
+  if (n.split(' ').some(w => w.startsWith(q))) return _MATCH_TIER.WORD_PREFIX;
+  if (n.includes(q)) return _MATCH_TIER.SUBSTRING;
+  return _MATCH_TIER.NONE;
+}
+
+function _rankStations(stations, query, focus) {
+  const q = _normStation(query);
+  if (!q) return [];
+  const scored = [];
+  for (const s of stations || []) {
+    const score = _scoreStation(s.name, q);
+    if (score === _MATCH_TIER.NONE) continue;
+    let dist2 = null;
+    if (focus && Number.isFinite(focus.flat) && Number.isFinite(focus.flng)) {
+      dist2 = (!Number.isFinite(s.lat) || !Number.isFinite(s.lon)) ? Infinity
+        : (() => {
+            const dLat = s.lat - focus.flat;
+            const dLon = (s.lon - focus.flng) * Math.cos((focus.flat * Math.PI) / 180);
+            return dLat * dLat + dLon * dLon;
+          })();
+    }
+    scored.push({ s, score, nameLen: _normStation(s.name).length, dist2 });
+  }
+  scored.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    if (a.nameLen !== b.nameLen) return a.nameLen - b.nameLen;
+    if (a.dist2 != null && b.dist2 != null && a.dist2 !== b.dist2) return a.dist2 - b.dist2;
+    const ai = a.s.id != null ? String(a.s.id) : '';
+    const bi = b.s.id != null ? String(b.s.id) : '';
+    return ai.localeCompare(bi);
+  });
+  return scored.map(x => x.s);
+}
+
 function createStopSearch(parentEl, placeholder, onChange) {
   let selLat = null, selLng = null, selStationId = null;
 
@@ -382,7 +471,7 @@ function createStopSearch(parentEl, placeholder, onChange) {
   function renderResults() {
     drop.textContent = '';
     highlighted = -1;
-    const sts = stationMatches.slice(0, 8);
+    const sts = stationMatches.slice(0, STATION_RESULT_LIMIT);
     const addrs = addressResults.slice(0, 6);
     if (!sts.length && !addrs.length) { closeDropdown(); return; }
     sts.forEach(s => drop.appendChild(buildStationRow(s)));
@@ -423,7 +512,7 @@ function createStopSearch(parentEl, placeholder, onChange) {
     if (q.length < 2) { cancelAddr(); closeDropdown(); return; }
     await _ensureStations();
     if (input.value !== raw0) return;
-    stationMatches = (_stationsCache || []).filter(s => s.name.toLowerCase().includes(q));
+    stationMatches = _rankStations(_stationsCache || [], raw, _focusArgs());
     renderResults();
     clearTimeout(addrTimer);
     const seq = ++addrSeq;

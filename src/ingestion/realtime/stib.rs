@@ -21,7 +21,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Time
 use serde::Deserialize;
 
 use crate::ingestion::gtfs::date_to_days;
-use crate::ingestion::realtime::fetcher::Fetcher;
+use crate::ingestion::realtime::fetcher::{FetchError, Fetcher};
 use crate::ingestion::realtime::{FeedUpdate, RealtimeFeed, TripDelay, VehicleObservation};
 use crate::structures::{Graph, MatchParams, ScheduledArrival, best_match};
 
@@ -103,7 +103,7 @@ impl RealtimeFeed for StibFeed {
         &self.name
     }
 
-    fn poll(&self, fetcher: &Fetcher) -> Result<FeedUpdate, String> {
+    fn poll(&self, fetcher: &Fetcher) -> Result<FeedUpdate, FetchError> {
         let bytes = fetcher.get(&self.waiting_time_url, &self.headers)?;
         let wt: WaitingTimes =
             serde_json::from_slice(&bytes).map_err(|e| format!("parsing STIB JSON: {e}"))?;
@@ -164,7 +164,8 @@ impl RealtimeFeed for StibFeed {
                     );
                     positions = obs;
                 }
-                Err(e) => {
+                Err(FetchError::Throttled) => {}
+                Err(FetchError::Failed(e)) => {
                     tracing::error!(feed = %self.name, "STIB VP fetch failed: {e}");
                 }
             }
@@ -176,6 +177,7 @@ impl RealtimeFeed for StibFeed {
             positions,
             alerts: Vec::new(),
             actual_stops: Vec::new(),
+            skipped_stops: Vec::new(),
         })
     }
 }

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use crate::ingestion::realtime::fetcher::Fetcher;
+use crate::ingestion::realtime::fetcher::{FetchError, Fetcher};
 use crate::ingestion::realtime::proto::FeedMessage;
 use crate::ingestion::realtime::proto::trip_descriptor::ScheduleRelationship;
 use crate::ingestion::realtime::{ActualStopId, AlertEntitySelector, FeedUpdate, RealtimeFeed, ServiceAlert, TripDelay};
@@ -32,7 +32,7 @@ impl RealtimeFeed for GtfsRtFeed {
         &self.name
     }
 
-    fn poll(&self, fetcher: &Fetcher) -> Result<FeedUpdate, String> {
+    fn poll(&self, fetcher: &Fetcher) -> Result<FeedUpdate, FetchError> {
         let bytes = fetcher.get(&self.url, &self.headers)?;
         let update = parse_trip_updates(&bytes)?;
         tracing::info!(
@@ -67,23 +67,51 @@ fn first_translation(ts: &crate::ingestion::realtime::proto::TranslatedString) -
 pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
     let feed = FeedMessage::decode(bytes).map_err(|e| format!("decoding GTFS-RT protobuf: {e}"))?;
 
+    use crate::ingestion::realtime::proto::trip_update::stop_time_update::ScheduleRelationship as StopRel;
+
     let mut out = Vec::new();
     let mut canceled = Vec::new();
     let mut alerts = Vec::new();
     let mut actual_stops = Vec::new();
+    let mut skipped_stops = Vec::new();
 
     for entity in &feed.entity {
         if let Some(tu) = &entity.trip_update {
             let Some(trip_id) = tu.trip.trip_id.clone() else {
                 continue;
             };
-            if tu.trip.schedule_relationship == Some(ScheduleRelationship::Canceled as i32) {
+            // CANCELED and DELETED both mean the whole trip will not run; DELETED
+            // additionally asks consumers to hide it, but for routing purposes we
+            // treat it exactly like a cancellation (never boarded).
+            if tu.trip.schedule_relationship == Some(ScheduleRelationship::Canceled as i32)
+                || tu.trip.schedule_relationship == Some(ScheduleRelationship::Deleted as i32)
+            {
                 canceled.push(trip_id);
                 continue;
             }
             for stu in &tu.stop_time_update {
                 if stu.stop_id.is_none() && stu.stop_sequence.is_none() {
                     continue;
+                }
+                // Honour the stop-time schedule_relationship BEFORE recording an
+                // actual stop or a delay:
+                //   SKIPPED  → the trip no longer serves this stop. Record it as a
+                //              skip (partial cancellation) and emit neither a delay
+                //              nor an actual_stop (which would fabricate a platform
+                //              assignment at an un-served stop).
+                //   NO_DATA  → no prediction here; any event fields are meaningless,
+                //              so skip the update entirely.
+                match stu.schedule_relationship {
+                    Some(sr) if sr == StopRel::Skipped as i32 => {
+                        if let Some(stop_id) = &stu.stop_id {
+                            skipped_stops.push((trip_id.clone(), stop_id.clone()));
+                        }
+                        continue;
+                    }
+                    Some(sr) if sr == StopRel::NoData as i32 => {
+                        continue;
+                    }
+                    _ => {}
                 }
                 // Capture the actual RT stop_id unconditionally (not gated on delay)
                 // so platform assignments are recorded even for on-time stops.
@@ -139,6 +167,7 @@ pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
         positions: Vec::new(),
         alerts,
         actual_stops,
+        skipped_stops,
     })
 }
 
@@ -195,6 +224,110 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn skipped_stop_update(seq: u32) -> StopTimeUpdate {
+        use crate::ingestion::realtime::proto::trip_update::stop_time_update::ScheduleRelationship;
+        StopTimeUpdate {
+            stop_sequence: Some(seq),
+            stop_id: Some(format!("stop_{seq}")),
+            schedule_relationship: Some(ScheduleRelationship::Skipped as i32),
+            // A malformed feed may even carry event fields on a SKIPPED stop; they
+            // must be ignored, never turned into a delay.
+            arrival: Some(StopTimeEvent {
+                delay: Some(600),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn no_data_stop_update(seq: u32) -> StopTimeUpdate {
+        use crate::ingestion::realtime::proto::trip_update::stop_time_update::ScheduleRelationship;
+        StopTimeUpdate {
+            stop_sequence: Some(seq),
+            stop_id: Some(format!("stop_{seq}")),
+            schedule_relationship: Some(ScheduleRelationship::NoData as i32),
+            arrival: Some(StopTimeEvent {
+                delay: Some(120),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn deleted_trip_entity(trip_id: &str) -> FeedEntity {
+        let mut tu = TripUpdate::default();
+        tu.trip.trip_id = Some(trip_id.to_string());
+        tu.trip.schedule_relationship = Some(ScheduleRelationship::Deleted as i32);
+        FeedEntity {
+            id: trip_id.to_string(),
+            trip_update: Some(tu),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skipped_stop_emits_no_delay_no_actual_stop_and_is_recorded() {
+        let bytes = encode_feed(vec![trip_update_entity(
+            "trip_skip",
+            vec![stop_update(1, Some(60)), skipped_stop_update(2), stop_update(3, Some(180))],
+        )]);
+        let update = parse_trip_updates(&bytes).unwrap();
+        // The skipped stop (seq 2) produces neither a delay nor an actual_stop.
+        assert_eq!(
+            update.delays,
+            vec![
+                TripDelay {
+                    trip_id: "trip_skip".into(),
+                    stop_id: Some("stop_1".into()),
+                    stop_sequence: Some(1),
+                    delay: 60
+                },
+                TripDelay {
+                    trip_id: "trip_skip".into(),
+                    stop_id: Some("stop_3".into()),
+                    stop_sequence: Some(3),
+                    delay: 180
+                },
+            ]
+        );
+        assert_eq!(
+            update.actual_stops,
+            vec![
+                ActualStopId { trip_id: "trip_skip".into(), stop_id: "stop_1".into() },
+                ActualStopId { trip_id: "trip_skip".into(), stop_id: "stop_3".into() },
+            ],
+            "skipped stop must not fabricate a platform assignment"
+        );
+        assert_eq!(
+            update.skipped_stops,
+            vec![("trip_skip".to_string(), "stop_2".to_string())],
+            "the skipped stop is recorded so routing can avoid boarding/alighting"
+        );
+    }
+
+    #[test]
+    fn no_data_stop_update_is_ignored_entirely() {
+        let bytes = encode_feed(vec![trip_update_entity(
+            "trip_nd",
+            vec![no_data_stop_update(4)],
+        )]);
+        let update = parse_trip_updates(&bytes).unwrap();
+        assert!(update.delays.is_empty(), "NO_DATA event fields must not become a delay");
+        assert!(update.actual_stops.is_empty(), "NO_DATA yields no actual stop");
+        assert!(update.skipped_stops.is_empty(), "NO_DATA is not a skip");
+    }
+
+    #[test]
+    fn deleted_trip_is_treated_as_canceled() {
+        let bytes = encode_feed(vec![
+            deleted_trip_entity("trip_gone"),
+            trip_update_entity("trip_live", vec![stop_update(1, Some(30))]),
+        ]);
+        let update = parse_trip_updates(&bytes).unwrap();
+        assert_eq!(update.canceled, vec!["trip_gone".to_string()]);
+        assert_eq!(update.delays.len(), 1, "the live trip's delay survives");
     }
 
     #[test]

@@ -894,7 +894,6 @@ fn graphql_walk_plan_alternatives_resolve_with_brackets() {
     let c = g.add_node(osm_node("c", 50.00001, 4.00005));
     g.build_raptor_index();
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     let mk_edge = |o, d, len, s| {
         let mut at = BikeAttrs::road_default();
         at.surface = s;
@@ -1150,7 +1149,6 @@ fn graphql_transit_plan_access_leg_has_alternatives_and_leave_by() {
         });
     }
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     g.build_raptor_index();
     enable_contraction(&mut g);
 
@@ -1397,7 +1395,6 @@ fn transit_handles_graph() -> Graph {
         });
     }
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     g.build_raptor_index();
     enable_contraction(&mut g);
     g
@@ -1701,7 +1698,6 @@ fn live_refresh_graph() -> Graph {
     );
 
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     g.build_raptor_index();
     g
 }
@@ -2279,27 +2275,6 @@ async fn get_index_returns_html() {
     let app = Route::new().at("/", get(index_page));
     let client = TestClient::new(app);
     let resp = client.get("/").send().await;
-    resp.assert_status_is_ok();
-    let ct = resp
-        .0
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        ct.contains("text/html"),
-        "expected text/html content-type, got: {ct}"
-    );
-}
-
-#[tokio::test]
-async fn get_debug_returns_html() {
-    use maas_rs::web::app::debug_page;
-    use poem::{Route, get, test::TestClient};
-
-    let app = Route::new().at("/debug", get(debug_page));
-    let client = TestClient::new(app);
-    let resp = client.get("/debug").send().await;
     resp.assert_status_is_ok();
     let ct = resp
         .0
@@ -3077,7 +3052,6 @@ fn transit_graph_with_platform() -> Graph {
         g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
     }
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     g.build_raptor_index();
     enable_contraction(&mut g);
     g
@@ -3207,7 +3181,6 @@ fn live_refresh_platform_graph() -> Graph {
     push_pattern(&mut g, &[stop_a11, stop_b], TripId(0), &[(36000, 36000), (36900, 36900)]);
 
     g.set_distance_budget(f64::INFINITY);
-    g.set_multiobj_street(true);
     g.build_raptor_index();
     g
 }

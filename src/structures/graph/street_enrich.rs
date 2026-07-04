@@ -2,7 +2,7 @@
 //! with their multi-objective versions (alternatives + [p50,p95], ingress leave_by),
 //! deduped per distinct (from,to,mode,role) leg. Runs once over the FINAL plans in
 //! route()/route_explain — not inside per-departure reconstruction — so a Range
-//! query never re-derives the same leg. Gated by `multiobj_street`.
+//! query never re-derives the same leg.
 
 use std::collections::HashMap;
 
@@ -23,9 +23,6 @@ impl Graph {
         bike: &BikeCost,
         terminal_deadline: bool,
     ) {
-        if !self.raptor.multiobj_street {
-            return;
-        }
         let mut memo: HashMap<(NodeID, NodeID, RoutingMode, LegRole), Vec<LegOption>> =
             HashMap::new();
         for plan in plans.iter_mut() {
@@ -38,13 +35,6 @@ impl Graph {
                 &mut memo,
             );
         }
-    }
-
-    /// Whether a leg is too long to enrich for its mode. Walk is never gated; the
-    /// state-expanded bike/car search scales super-linearly with distance, so legs
-    /// beyond `multiobj_street_max_len_m` are left scalar (single route, fast).
-    fn street_enrich_gated(&self, mode: RoutingMode, scalar_len: usize) -> bool {
-        mode != RoutingMode::Walk && scalar_len > self.raptor.multiobj_street_max_len_m
     }
 
     fn enrich_one(
@@ -62,22 +52,14 @@ impl Graph {
             for i in 0..n {
                 if let PlanLeg::Walk(w) = &plan.legs[i] {
                     let mode = mode_of(w.street_mode);
-                    let gated = self.street_enrich_gated(mode, w.length);
                     let role = if terminal_deadline {
                         LegRole::Deadline
                     } else {
                         LegRole::Neutral
                     };
-                    // Gated (too-long) legs are left scalar (no alternatives); others
-                    // are rebuilt with their multi-objective alternatives.
-                    let new = if gated {
-                        None
-                    } else {
-                        let opts =
-                            options(self, w.from.node_id, w.to.node_id, mode, role, bike, memo);
-                        self.rebuild_leg(w, &opts, mode, bike, None)
-                    };
-                    if let Some(new) = new {
+                    let opts =
+                        options(self, w.from.node_id, w.to.node_id, mode, role, bike, memo);
+                    if let Some(new) = self.rebuild_leg(w, &opts, mode, bike, None) {
                         plan.legs[i] = PlanLeg::Walk(new);
                     }
                 }
@@ -88,21 +70,19 @@ impl Graph {
             if w.from.node_id == origin {
                 let board = leg_start(&plan.legs[1]);
                 let mode = mode_of(w.street_mode);
-                if !self.street_enrich_gated(mode, w.length) {
-                    let opts = options(
-                        self,
-                        origin,
-                        w.to.node_id,
-                        mode,
-                        LegRole::Deadline,
-                        bike,
-                        memo,
-                    );
-                    if let Some(new) =
-                        self.rebuild_leg(w, &opts, mode, bike, Some((board, plan.start)))
-                    {
-                        plan.legs[0] = PlanLeg::Walk(new);
-                    }
+                let opts = options(
+                    self,
+                    origin,
+                    w.to.node_id,
+                    mode,
+                    LegRole::Deadline,
+                    bike,
+                    memo,
+                );
+                if let Some(new) =
+                    self.rebuild_leg(w, &opts, mode, bike, Some((board, plan.start)))
+                {
+                    plan.legs[0] = PlanLeg::Walk(new);
                 }
             }
         }
@@ -112,19 +92,15 @@ impl Graph {
                     let alight = w.start;
                     let old_end = w.end;
                     let mode = mode_of(w.street_mode);
-                    let opts = if self.street_enrich_gated(mode, w.length) {
-                        Vec::new()
-                    } else {
-                        options(
-                            self,
-                            w.from.node_id,
-                            destination,
-                            mode,
-                            LegRole::Neutral,
-                            bike,
-                            memo,
-                        )
-                    };
+                    let opts = options(
+                        self,
+                        w.from.node_id,
+                        destination,
+                        mode,
+                        LegRole::Neutral,
+                        bike,
+                        memo,
+                    );
                     if !opts.is_empty() {
                         let cur = highlight_index(&opts, None, &self.raptor.balance);
                         let chosen = &opts[cur];
@@ -412,7 +388,6 @@ mod tests {
     #[test]
     fn enrich_sets_access_alternatives_and_leave_by() {
         let (mut g, o, s) = enrich_graph();
-        g.set_multiobj_street(true);
         enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let access = walk_leg(o, s, 500, 600);
@@ -522,7 +497,6 @@ mod tests {
         // Reuse the o→s two-route graph with `o` as the alight stop and `s` as the
         // destination: [transit ending at o] then [egress walk o→s].
         let (mut g, o, s) = enrich_graph();
-        g.set_multiobj_street(true);
         enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let alight = 2000u32;
@@ -582,7 +556,6 @@ mod tests {
     #[test]
     fn enrich_direct_plan_gets_alternatives_anchored_at_start() {
         let (mut g, o, s) = enrich_graph();
-        g.set_multiobj_street(true);
         enable_contraction(&mut g);
         let bike = g.default_bike_cost();
         let leg = walk_leg(o, s, 300, 400);
@@ -619,39 +592,8 @@ mod tests {
     }
 
     #[test]
-    fn enrich_off_when_flag_disabled() {
-        let (g, o, s) = enrich_graph();
-        let bike = g.default_bike_cost();
-        let leg = walk_leg(o, s, 300, 400);
-        let mut plans = vec![Plan {
-            legs: vec![PlanLeg::Walk(leg)],
-            start: 300,
-            end: 400,
-            mode: Mode::Walk,
-            access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario {
-                time: 400,
-                probability: 1.0,
-            }],
-            expected_end: 400,
-        }];
-        g.enrich_street_legs(
-            &mut plans,
-            o,
-            s,
-            &bike,
-            false,
-        );
-        let PlanLeg::Walk(w) = &plans[0].legs[0] else {
-            panic!()
-        };
-        assert!(w.alternatives.is_empty(), "flag off ⇒ no enrichment");
-    }
-
-    #[test]
     fn enrich_direct_bike_plan_gets_alternatives_anchored_at_start() {
-        let (mut g, o, s) = bike_enrich_graph();
-        g.set_multiobj_street(true);
+        let (g, o, s) = bike_enrich_graph();
         let bike = g.default_bike_cost();
         let leg = bike_leg(o, s, 300, 400);
         let plan = Plan {
@@ -689,8 +631,7 @@ mod tests {
 
     #[test]
     fn enrich_sets_bike_access_alternatives_and_leave_by() {
-        let (mut g, o, s) = bike_enrich_graph();
-        g.set_multiobj_street(true);
+        let (g, o, s) = bike_enrich_graph();
         let bike = g.default_bike_cost();
         let access = bike_leg(o, s, 500, 600);
         let transit = transit_leg(s, s, 600, 900);
@@ -731,8 +672,7 @@ mod tests {
 
     #[test]
     fn enrich_bike_egress_recomputes_arrival_from_highlighted_p50() {
-        let (mut g, o, s) = bike_enrich_graph();
-        g.set_multiobj_street(true);
+        let (g, o, s) = bike_enrich_graph();
         let bike = g.default_bike_cost();
         let alight = 2000u32;
         let transit = transit_leg(s, o, 1000, alight);
@@ -772,81 +712,6 @@ mod tests {
         assert_eq!(
             plans[0].end, end,
             "plan arrival recomputed from the highlighted egress"
-        );
-    }
-
-    #[test]
-    fn enrich_skips_bike_leg_over_length_gate() {
-        let (mut g, o, s) = bike_enrich_graph();
-        g.set_multiobj_street(true);
-        g.set_multiobj_street_max_len_m(50); // gate well below the leg's scalar length
-        let bike = g.default_bike_cost();
-        let mut leg = bike_leg(o, s, 300, 400);
-        leg.length = 5000; // 5 km scalar bike leg exceeds the 50 m gate
-        let plan = Plan {
-            legs: vec![PlanLeg::Walk(leg)],
-            start: 300,
-            end: 400,
-            mode: Mode::Bike,
-            access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario {
-                time: 400,
-                probability: 1.0,
-            }],
-            expected_end: 400,
-        };
-        let mut plans = vec![plan];
-        g.enrich_street_legs(
-            &mut plans,
-            o,
-            s,
-            &bike,
-            false,
-        );
-        let PlanLeg::Walk(w) = &plans[0].legs[0] else {
-            panic!()
-        };
-        assert!(
-            w.alternatives.is_empty(),
-            "bike leg over the length gate stays scalar (no enrichment)"
-        );
-    }
-
-    #[test]
-    fn enrich_does_not_gate_walk_legs_by_length() {
-        let (mut g, o, s) = enrich_graph();
-        g.set_multiobj_street(true);
-        enable_contraction(&mut g);
-        g.set_multiobj_street_max_len_m(50); // tiny gate must not affect walk
-        let bike = g.default_bike_cost();
-        let mut leg = walk_leg(o, s, 300, 400);
-        leg.length = 5000;
-        let plan = Plan {
-            legs: vec![PlanLeg::Walk(leg)],
-            start: 300,
-            end: 400,
-            mode: Mode::Walk,
-            access_alternatives: vec![],
-            arrival_distribution: vec![ArrivalScenario {
-                time: 400,
-                probability: 1.0,
-            }],
-            expected_end: 400,
-        };
-        let mut plans = vec![plan];
-        g.enrich_street_legs(
-            &mut plans,
-            o,
-            s,
-            &bike,
-            false,
-        );
-        let PlanLeg::Walk(w) = &plans[0].legs[0] else {
-            panic!()
-        };
-        assert!(
-            w.alternatives.len() >= 2,
-            "walk legs ignore the bike/car length gate"
         );
     }
 }

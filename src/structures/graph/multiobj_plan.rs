@@ -38,7 +38,15 @@ impl Graph {
             .iter()
             .map(|p| self.leg_option(&p.nodes, &p.edges, p.cost, mode, bike, 0))
             .collect::<Vec<_>>();
-        let opts = Graph::dedup_leg_options(opts);
+        // Drive has no displayed diversity axis (cycleway/surface/D+ are inert), so the
+        // display-granularity dedup degenerates to a (time,reliability)-minute Pareto that
+        // drops geographically distinct roads. Skip it for Drive and let the geographic
+        // `select_diverse` (edge-share ≤ alt_max_share_factor) be the sole dedup.
+        let opts = if mode == RoutingMode::Drive {
+            opts
+        } else {
+            Graph::dedup_leg_options(opts)
+        };
         self.select_diverse(opts, self.raptor.alt_max_share_factor)
     }
 
@@ -287,11 +295,21 @@ impl Graph {
         } else {
             Some(dplus.round() as usize)
         };
-        let cycleroute_length = if mode == RoutingMode::Bike {
-            Some(length.saturating_sub(cyc_deficit.round() as usize))
-        } else {
-            None
-        };
+        // Metres of the route on cycle infrastructure. Uses the SAME on-infra
+        // predicate as the CyclewayDeficit cost axis (mode_axes.rs `bike_vector`).
+        // (Previously this subtracted `cyc_deficit` — a *seconds* cost — from
+        // `length` in *metres*, a unit mismatch that produced a nonsensical value.)
+        let cycleroute_length = (mode == RoutingMode::Bike).then(|| {
+            recon
+                .iter()
+                .filter(|e| {
+                    e.attrs.cycleroute
+                        || e.attrs.isbike
+                        || matches!(e.attrs.highway, crate::structures::HighwayClass::Cycleway)
+                })
+                .map(|e| e.length)
+                .sum()
+        });
         let dismount_length: usize = if mode == RoutingMode::Bike {
             recon
                 .iter()
@@ -730,6 +748,48 @@ mod tests {
     }
 
     #[test]
+    fn bike_leg_option_cycleroute_length_counts_only_infra_metres() {
+        // cycleroute_length must be the METRES of the route on cycle infrastructure —
+        // the same on-infra predicate as the CyclewayDeficit axis — not a unit-mixed
+        // `length(m) - deficit(s)`. Path: one on-infra edge (500 m) + one plain road
+        // (700 m) ⇒ cycleroute_length == 500, independent of ride time.
+        use crate::structures::cost::VarGen;
+        use crate::structures::{BikeAttrs, EdgeData, LatLng, NodeData, OsmNodeData, StreetEdgeData};
+        let mut g = Graph::new();
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng { latitude: lat, longitude: lon },
+            })
+        };
+        let a = g.add_node(mk("a", 50.0000, 4.0000));
+        let b = g.add_node(mk("b", 50.0000, 4.0100));
+        let c = g.add_node(mk("c", 50.0000, 4.0200));
+        g.build_raptor_index();
+        let mut infra = BikeAttrs::road_default();
+        infra.cycleroute = true; // on cycle infrastructure
+        let road = BikeAttrs::road_default(); // plain road, not on infra
+        let edge = |o: NodeID, d: NodeID, len: usize, at: BikeAttrs| {
+            EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, partial: false, length: len,
+                foot: true, bike: true, car: false, attrs: at, elev_delta: 0,
+                surface_speed: 100,
+                var_gen: VarGen::NONE,
+            })
+        };
+        g.add_edge(a, edge(a, b, 500, infra));
+        g.add_edge(b, edge(b, c, 700, road));
+        let bike = g.default_bike_cost();
+        let o = g.leg_option_for_nodes_test(&[a, b, c], RoutingMode::Bike, &bike);
+        assert_eq!(o.length, 1200, "total length is both edges");
+        assert_eq!(
+            o.cycleroute_length,
+            Some(500),
+            "only the on-infra edge's metres count as cycleroute_length"
+        );
+    }
+
+    #[test]
     fn bike_search_times_push_at_push_speed_not_cycling() {
         // A push (dismount) edge must be costed in the search at the (slow) PUSH speed,
         // like its displayed time — not at cycling speed, which would make footway
@@ -1140,6 +1200,83 @@ mod tests {
         assert!(
             kept.iter().any(|o| o.cycleway_deficit < 1000.0),
             "the low-deficit (most-cycleway) option is kept"
+        );
+    }
+
+    #[test]
+    fn drive_keeps_distinct_alternatives_through_pipeline() {
+        // Two fully disjoint car routes a→b: the direct one is faster but noisier
+        // (SIGNALIZED variance), the detour is slower but calmer (NONE) — a genuine
+        // Time↔Variance trade-off, so both are on the Drive front. For Drive the
+        // display-granularity `dedup_leg_options` key degenerates (cycleway/surface/D+
+        // all inert) and would drop the slower-but-distinct road as "display-dominated".
+        // The pipeline must skip that dedup for Drive and let the geographic
+        // `select_diverse` keep both distinct roads.
+        let mut g = Graph::new();
+        g.set_distance_budget(f64::INFINITY);
+        let mk = |id: &str, lat: f64, lon: f64| {
+            NodeData::OsmNode(OsmNodeData {
+                eid: id.into(),
+                lat_lng: LatLng { latitude: lat, longitude: lon },
+            })
+        };
+        let a = g.add_node(mk("a", 50.0000, 4.0000));
+        let b = g.add_node(mk("b", 50.0000, 4.0100));
+        let c = g.add_node(mk("c", 50.0030, 4.0050));
+        g.build_raptor_index();
+        // Both routes read the same whole minute (≈55 s vs ≈58 s at 11 m/s), so for Drive
+        // their displayed dedup key degenerates to identical (time, reliability) minutes —
+        // exactly the real-graph condition where `dedup_leg_options` collapses distinct
+        // roads. foot/bike are set so the contraction builder keeps the car edges (Drive
+        // still routes on `car`), and ε is zeroed so the Time↔Variance trade-off keeps
+        // both roads on the front rather than ε-collapsing.
+        let edge = |o: NodeID, d: NodeID, len: usize, vg: VarGen| {
+            let mut at = BikeAttrs::road_default();
+            at.highway = HighwayClass::Residential;
+            at.surface = Surface::Paved;
+            EdgeData::Street(StreetEdgeData {
+                origin: o, destination: d, partial: false, length: len,
+                foot: true, bike: true, car: true, attrs: at, elev_delta: 0,
+                surface_speed: 100, var_gen: vg,
+            })
+        };
+        g.raptor.epsilon = crate::structures::cost::Epsilon::uniform(0.0, 0.0);
+        // Direct a→b: 600 m, noisy (signal). Detour a→c→b: 640 m, calm. Reverse edges make
+        // a/b proper junctions and c a degree-2 interior node the contraction removes.
+        g.add_edge(a, edge(a, b, 600, VarGen::SIGNALIZED));
+        g.add_edge(b, edge(b, a, 600, VarGen::SIGNALIZED));
+        g.add_edge(a, edge(a, c, 320, VarGen::NONE));
+        g.add_edge(c, edge(c, a, 320, VarGen::NONE));
+        g.add_edge(c, edge(c, b, 320, VarGen::NONE));
+        g.add_edge(b, edge(b, c, 320, VarGen::NONE));
+        enable_contraction(&mut g);
+        let bike = g.default_bike_cost();
+        let opts = g.multiobj_leg_options(a, b, RoutingMode::Drive, LegRole::Neutral, &bike);
+        assert!(
+            opts.len() >= 2,
+            "Drive must surface both distinct car roads (Time↔Variance trade-off), got {}",
+            opts.len()
+        );
+        // The two surfaced roads are geographically distinct (disjoint edges).
+        for i in 0..opts.len() {
+            for j in (i + 1)..opts.len() {
+                let share = g.shared_fraction_edges(&opts[i].edges, &opts[j].edges);
+                assert!(
+                    share <= g.raptor.alt_max_share_factor,
+                    "alternatives must be geographically distinct (share {share} > {})",
+                    g.raptor.alt_max_share_factor
+                );
+            }
+        }
+        // Regression guard: the display-granularity dedup (the pre-fix step) would
+        // collapse these Drive routes, since their displayed key degenerates to
+        // (time, reliability). Skipping it for Drive is exactly what preserves them.
+        let collapsed = Graph::dedup_leg_options(opts.clone());
+        assert!(
+            collapsed.len() < opts.len(),
+            "dedup_leg_options collapses the distinct Drive roads ({} → {}), which is why it is skipped for Drive",
+            opts.len(),
+            collapsed.len()
         );
     }
 

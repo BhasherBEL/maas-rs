@@ -90,7 +90,25 @@ pub const GRAPH_SCHEMA_VERSION: u32 = 20;
 /// v2: records are building-level (keyed by `(street, house_number)`); per-row box
 ///     numbers collapsed into a `boxes: Vec<AddressBox>` metadata list. Rebuild
 ///     required so apartment rows aggregate into one building candidate.
-pub const ADDRESS_SCHEMA_VERSION: u32 = 2;
+/// v3: ingestion drops the ~140 k un-geocoded `<pos>0 0</pos>` placeholder records
+///     (and any out-of-Belgium coordinate); street-level collapse now uses the
+///     component-wise median instead of the mean. Rebuild required so the poisoned
+///     records leave the index and street centroids land on-street.
+pub const ADDRESS_SCHEMA_VERSION: u32 = 3;
+
+/// Bump when the persisted `cch.bin` payload layout (the metric-independent nested-
+/// dissection ORDER + vertex count) changes. Independent of the CCH *metric*, which is
+/// re-customized from the live graph on every load. `cch.bin` is ALSO implicitly gated
+/// by `GRAPH_SCHEMA_VERSION` (the order's vertex set is the built graph's junction
+/// topology): the on-disk header stores `GRAPH_SCHEMA_VERSION ^ CCH_SCHEMA_VERSION` so a
+/// graph-layout bump invalidates a stale order without a manual bump here.
+/// v1: initial — stores `(n: u32, order: Vec<u32>)` for the foot-access CCH.
+pub const CCH_SCHEMA_VERSION: u32 = 1;
+
+/// Combined header version for `cch.bin`: mixes the CCH payload version with the graph
+/// schema so any graph rebuild (which changes the junction set the order indexes)
+/// invalidates a cached order automatically.
+const CCH_HEADER_VERSION: u32 = CCH_SCHEMA_VERSION ^ GRAPH_SCHEMA_VERSION;
 
 const HEADER_LEN: usize = 8;
 
@@ -167,6 +185,49 @@ pub fn load_osm_graph(path: &str) -> Result<Graph, String> {
     let graph = Graph::from_osm_postcard(payload)?;
     tracing::info!("OSM graph restored from {path}");
     Ok(graph)
+}
+
+/// Sibling cache path for the foot-access CCH order, placed next to `graph.bin`
+/// (`cch.bin` in the same directory as `graph_output`).
+pub fn cch_cache_path(graph_output: &str) -> String {
+    let p = std::path::Path::new(graph_output);
+    match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join("cch.bin").to_string_lossy().into_owned()
+        }
+        _ => "cch.bin".to_string(),
+    }
+}
+
+/// Save ONLY the metric-independent CCH order (the ~56 s nested-dissection result) plus
+/// the vertex count `n`, headered so a graph-schema or CCH-layout change invalidates it.
+/// The CCH structure, walk-second metric, and target set are all re-derived from the live
+/// graph at load, so this file is small and cheap to rewrite.
+pub fn save_cch(order: &[u32], path: &str) -> Result<(), String> {
+    let n = order.len() as u32;
+    let payload = to_allocvec(&(n, order.to_vec()))
+        .map_err(|e| format!("Failed to serialize CCH order: {e}"))?;
+    let bytes = with_header(CCH_HEADER_VERSION, &payload);
+    fs::write(path, &bytes).map_err(|e| format!("Failed to save CCH order: {e}"))?;
+    tracing::info!("CCH order saved to {path} ({n} vertices)");
+    Ok(())
+}
+
+/// Load the cached CCH order from `path`, verifying the magic + combined
+/// (CCH ^ GRAPH) schema header and the internal `n == order.len()` integrity check.
+/// Returns the order; any mismatch is an `Err` so the caller recomputes.
+pub fn load_cch(path: &str) -> Result<Vec<u32>, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read CCH file: {e}"))?;
+    let payload = split_header(&bytes, CCH_HEADER_VERSION, path)?;
+    let (n, order): (u32, Vec<u32>) =
+        from_bytes(payload).map_err(|e| format!("Failed to deserialize CCH order: {e}"))?;
+    if n as usize != order.len() {
+        return Err(format!(
+            "'{path}' CCH order corrupt (n={n}, order.len()={})",
+            order.len()
+        ));
+    }
+    Ok(order)
 }
 
 /// Save the sibling [`AddressIndex`] to `path`, headered with `ADDRESS_SCHEMA_VERSION`.
@@ -477,6 +538,57 @@ mod tests {
         let loaded = load_address_index(path_s).unwrap();
         assert_eq!(loaded.search("rue de la loi 16", 5, None).len(), 1);
         assert_eq!(loaded.search("wetstraat 16", 5, None)[0].id, "A1");
+    }
+
+    #[test]
+    fn cch_order_round_trip() {
+        let dir = std::env::temp_dir().join("maas_persist_cch_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cch.bin");
+        let path_s = path.to_str().unwrap();
+
+        let order: Vec<u32> = vec![3, 0, 4, 1, 2];
+        save_cch(&order, path_s).unwrap();
+        let loaded = load_cch(path_s).unwrap();
+        assert_eq!(loaded, order, "CCH order survives the round trip");
+    }
+
+    #[test]
+    fn cch_load_rejects_version_mismatch() {
+        let dir = std::env::temp_dir().join("maas_persist_cch_ver_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cch.bin");
+        let path_s = path.to_str().unwrap();
+
+        // Write a payload under a deliberately wrong header version.
+        let payload = to_allocvec(&(2u32, vec![0u32, 1])).unwrap();
+        let bytes = with_header(CCH_HEADER_VERSION.wrapping_add(1), &payload);
+        std::fs::write(path_s, &bytes).unwrap();
+
+        let err = load_cch(path_s).unwrap_err();
+        assert!(err.contains("version mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn cch_load_rejects_corrupt_count() {
+        let dir = std::env::temp_dir().join("maas_persist_cch_corrupt_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cch.bin");
+        let path_s = path.to_str().unwrap();
+
+        // n disagrees with the actual order length → integrity failure.
+        let payload = to_allocvec(&(9u32, vec![0u32, 1, 2])).unwrap();
+        let bytes = with_header(CCH_HEADER_VERSION, &payload);
+        std::fs::write(path_s, &bytes).unwrap();
+
+        let err = load_cch(path_s).unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+    }
+
+    #[test]
+    fn cch_cache_path_is_sibling_of_graph() {
+        assert_eq!(cch_cache_path("data/graph.bin"), "data/cch.bin");
+        assert_eq!(cch_cache_path("graph.bin"), "cch.bin");
     }
 
     #[test]

@@ -28,7 +28,10 @@ pub struct RealtimeConfig {
     /// When false (or the section is absent) no realtime polling runs.
     #[serde(default)]
     pub enabled: bool,
-    /// Seconds between poll cycles across all feeds.
+    /// Seconds between poll cycles across all feeds. The steady-state request
+    /// rate is `(Σ feed.requests_per_poll) / poll_interval_secs`; the shipped
+    /// default keeps it under the gateway's ~8 req/min and ~12k req/day quota
+    /// (see [`RealtimeConfig::request_rate`]).
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
     /// Per-request HTTP timeout for realtime polls.
@@ -39,6 +42,23 @@ pub struct RealtimeConfig {
     /// when the position is absent or older than this window.
     #[serde(default = "default_vehicle_position_max_age_secs")]
     pub vehicle_position_max_age_secs: u64,
+    /// A realtime snapshot older than this many seconds is considered STALE and is
+    /// NOT applied to routing — the router falls back to schedule-only for that
+    /// query. Guards against a feed outage (the poller keeps the last good index
+    /// with no TTL of its own) serving hours-old delays and cancellations forever.
+    /// The poller stamps every published snapshot with this value; the routing
+    /// consumer boundary enforces it against wall-clock `now`.
+    #[serde(default = "default_index_max_age_secs")]
+    pub index_max_age_secs: u64,
+    /// How long (seconds) the poller retains a TRACKED journey's last-known live
+    /// delay after the feed stops reporting it. STIB waiting-times only predict
+    /// upcoming departures, so once a user boards, their vehicle leaves the feed
+    /// window and its delay would vanish. The poller keeps a cross-cycle sticky
+    /// cache of `(trip, stop) → delay` and evicts entries older than this TTL.
+    /// The sticky delay is exposed ONLY to the live-refresh overlay (a tracked
+    /// journey), never to routing/planning. Defaults to ~24h.
+    #[serde(default = "default_tracked_delay_ttl_secs")]
+    pub tracked_delay_ttl_secs: u64,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
@@ -46,7 +66,7 @@ pub struct RealtimeConfig {
 }
 
 fn default_poll_interval_secs() -> u64 {
-    30
+    60
 }
 
 fn default_rt_timeout_secs() -> u64 {
@@ -57,29 +77,59 @@ fn default_vehicle_position_max_age_secs() -> u64 {
     120
 }
 
+fn default_index_max_age_secs() -> u64 {
+    600
+}
+
+fn default_tracked_delay_ttl_secs() -> u64 {
+    86_400
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {
-    #[serde(default = "default_429_threshold")]
-    pub consecutive_429_threshold: u32,
+    /// Consecutive throttle responses (HTTP 403 "out of quota" or 429) before the
+    /// fetcher backs off and all feeds skip until a probe succeeds.
+    #[serde(
+        default = "default_failure_threshold",
+        alias = "consecutive_429_threshold"
+    )]
+    pub consecutive_failure_threshold: u32,
+    /// While backed off, at most one probe request is issued per this interval.
     #[serde(default = "default_throttled_interval_secs")]
     pub throttled_min_interval_secs: u64,
+    /// Documented gateway quota ceilings, used to warn at startup (and gate in
+    /// tests) if the configured cadence would exceed them.
+    #[serde(default = "default_max_requests_per_min")]
+    pub max_requests_per_min: u32,
+    #[serde(default = "default_max_requests_per_day")]
+    pub max_requests_per_day: u32,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            consecutive_429_threshold: default_429_threshold(),
+            consecutive_failure_threshold: default_failure_threshold(),
             throttled_min_interval_secs: default_throttled_interval_secs(),
+            max_requests_per_min: default_max_requests_per_min(),
+            max_requests_per_day: default_max_requests_per_day(),
         }
     }
 }
 
-fn default_429_threshold() -> u32 {
+fn default_failure_threshold() -> u32 {
     3
 }
 
 fn default_throttled_interval_secs() -> u64 {
     60
+}
+
+fn default_max_requests_per_min() -> u32 {
+    8
+}
+
+fn default_max_requests_per_day() -> u32 {
+    12_000
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -103,6 +153,48 @@ pub enum RealtimeFeedConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+}
+
+impl RealtimeFeedConfig {
+    /// Number of HTTP requests one poll of this feed issues to the gateway. A
+    /// GTFS-RT feed is a single GET; a STIB feed fetches waiting-times plus, when
+    /// configured, vehicle-positions — two requests. Miscounting the STIB feed as
+    /// one was the arithmetic root of the original quota overshoot.
+    pub fn requests_per_poll(&self) -> u32 {
+        match self {
+            RealtimeFeedConfig::GtfsRt { .. } => 1,
+            RealtimeFeedConfig::Stib {
+                vehicle_position_url,
+                ..
+            } => {
+                if vehicle_position_url.is_some() {
+                    2
+                } else {
+                    1
+                }
+            }
+        }
+    }
+}
+
+impl RealtimeConfig {
+    /// Steady-state request rate implied by the configured cadence, as
+    /// `(requests_per_minute, requests_per_day)`, counting each feed's per-poll
+    /// request count. Used for the startup quota warning and the quota test.
+    pub fn request_rate(&self) -> (f64, f64) {
+        let interval = self.poll_interval_secs.max(1) as f64;
+        let per_cycle: u32 = self.feeds.iter().map(|f| f.requests_per_poll()).sum();
+        let per_sec = per_cycle as f64 / interval;
+        (per_sec * 60.0, per_sec * 86_400.0)
+    }
+
+    /// True when the configured cadence stays within the documented gateway
+    /// quota (`rate_limit.max_requests_per_min` and `_per_day`).
+    pub fn within_quota(&self) -> bool {
+        let (per_min, per_day) = self.request_rate();
+        per_min <= self.rate_limit.max_requests_per_min as f64
+            && per_day <= self.rate_limit.max_requests_per_day as f64
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -306,6 +398,29 @@ pub struct RoutingDefaultConfig {
     /// widening the explored band so safer-but-slower plans survive. Default 900 s.
     #[serde(default)]
     pub arrival_slack_secs: Option<u32>,
+    /// When true, inter-stop transfers are found by a live per-round multi-source
+    /// bounded foot-Dijkstra (MCR) over the contracted graph instead of the precomputed
+    /// ≤1 km table, so >1 km inter-stop walks are discovered. Default false.
+    #[serde(default)]
+    pub unrestricted_transfers: Option<bool>,
+    /// When true, foot access/egress stop discovery uses the exact CCH one-to-many
+    /// instead of the radius-bounded two-pass foot Dijkstra. Requires a built `cch`;
+    /// falls back to the two-pass path when absent. Default false.
+    #[serde(default)]
+    pub use_cch_access: Option<bool>,
+    /// When true, a range/window query emits a per-phase wall-clock decomposition
+    /// (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/range/
+    /// departure counts) as one structured log line. Purely additive observability
+    /// — never changes routing behavior or results. Per-query `profileLatency`
+    /// (GraphQL `raptor` argument) overrides this default. Absent ⇒ false.
+    #[serde(default)]
+    pub profile_latency: Option<bool>,
+    /// When true (default), the exact foot-access CCH is built (or loaded from
+    /// `cch.bin`) at startup so the per-query `useCchAccess` flag has a live index to
+    /// dispatch to. When false, `g.cch` stays `None` and the CCH seam always falls back
+    /// to the two-pass foot Dijkstra. Absent ⇒ true.
+    #[serde(default)]
+    pub prepare_cch_access: Option<bool>,
     /// Upper bound on the `windowMinutes` query argument (Range-RAPTOR window).
     /// Requests above it are clamped. When absent, defaults to 1440 (24 h).
     #[serde(default)]
@@ -335,6 +450,18 @@ pub struct RoutingDefaultConfig {
     pub bike_bucket_cyc_k: Option<f64>,
     #[serde(default)]
     pub bike_bucket_dpl_k: Option<f64>,
+    /// Drive grid-bucketing cell-size coefficient per metre of origin→dest
+    /// straight-line distance, on the Variance selection axis (cell = k·D). Bounds
+    /// the per-node Pareto frontier on long direct drive legs. `0` disables
+    /// bucketing. Absent ⇒ compiled-in default.
+    #[serde(default)]
+    pub drive_bucket_var_k: Option<f64>,
+    /// Walk grid-bucketing cell-size coefficient per metre of origin→dest
+    /// straight-line distance, on the Surface selection axis (cell = k·D). Bounds
+    /// the per-node Pareto frontier on long direct walk legs. `0` disables
+    /// bucketing. Absent ⇒ compiled-in default.
+    #[serde(default)]
+    pub walk_bucket_surf_k: Option<f64>,
     /// Whether D+ is a bike selection axis. Absent ⇒ compiled default (false: D+ is
     /// displayed-only; Time already prices climbing via the gradient power model).
     #[serde(default)]
@@ -349,22 +476,6 @@ pub struct RoutingDefaultConfig {
     /// Absent ⇒ compiled-in default (6).
     #[serde(default)]
     pub representatives_k: Option<usize>,
-    /// Enable multi-objective street routing (per-leg alternatives + brackets on
-    /// direct and access/egress walk/bike legs). Absent ⇒ disabled: the per-leg
-    /// Pareto search is currently too slow on a country-sized graph (needs an
-    /// A*-bounded search), so it is opt-in until that lands.
-    #[serde(default)]
-    pub multiobj_street: Option<bool>,
-    /// Max scalar leg length (metres) to enrich with multi-objective alternatives
-    /// for non-walk street modes (bike/car); longer legs stay scalar because the
-    /// state-expanded search is too slow / memory-heavy past a few km. Absent ⇒
-    /// default (1500).
-    #[serde(default)]
-    pub multiobj_street_max_len_m: Option<usize>,
-    /// Secondary Time weight in a single-axis bike/car "champion" scalarization, to
-    /// break ties toward shorter routes. Absent ⇒ default (0.1).
-    #[serde(default)]
-    pub champion_time_tiebreak: Option<f64>,
     /// ADGW limited-sharing threshold for bike/car alternatives. Absent ⇒ default (0.6).
     #[serde(default)]
     pub alt_max_share_factor: Option<f64>,
@@ -934,10 +1045,105 @@ feeds:
     fn realtime_rate_limit_defaults() {
         let yaml = "enabled: true";
         let rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(rt.rate_limit.consecutive_429_threshold, 3);
+        assert_eq!(rt.rate_limit.consecutive_failure_threshold, 3);
         assert_eq!(rt.rate_limit.throttled_min_interval_secs, 60);
-        assert_eq!(rt.poll_interval_secs, 30);
+        assert_eq!(rt.rate_limit.max_requests_per_min, 8);
+        assert_eq!(rt.rate_limit.max_requests_per_day, 12_000);
+        assert_eq!(rt.poll_interval_secs, 60);
         assert!(rt.feeds.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_threshold_accepts_legacy_429_alias() {
+        let yaml = "enabled: true\nrate_limit:\n  consecutive_429_threshold: 5";
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(rt.rate_limit.consecutive_failure_threshold, 5);
+    }
+
+    #[test]
+    fn requests_per_poll_counts_stib_vehicle_positions() {
+        let gtfs = RealtimeFeedConfig::GtfsRt {
+            name: "sncb".into(),
+            url: "https://x/rt".into(),
+            headers: HashMap::new(),
+        };
+        assert_eq!(gtfs.requests_per_poll(), 1);
+
+        let stib_vp = RealtimeFeedConfig::Stib {
+            name: "stib".into(),
+            waiting_time_url: "https://x/WaitingTimes/".into(),
+            vehicle_position_url: Some("https://x/VehiclePositions/".into()),
+            headers: HashMap::new(),
+        };
+        assert_eq!(stib_vp.requests_per_poll(), 2, "waiting-times + vehicle-positions");
+
+        let stib_no_vp = RealtimeFeedConfig::Stib {
+            name: "stib".into(),
+            waiting_time_url: "https://x/WaitingTimes/".into(),
+            vehicle_position_url: None,
+            headers: HashMap::new(),
+        };
+        assert_eq!(stib_no_vp.requests_per_poll(), 1);
+    }
+
+    fn production_like_feeds() -> Vec<RealtimeFeedConfig> {
+        let gtfs = |name: &str| RealtimeFeedConfig::GtfsRt {
+            name: name.into(),
+            url: "https://x/rt".into(),
+            headers: HashMap::new(),
+        };
+        vec![
+            gtfs("sncb"),
+            gtfs("sncb-alerts"),
+            gtfs("delijn"),
+            gtfs("delijn-alerts"),
+            RealtimeFeedConfig::Stib {
+                name: "stib".into(),
+                waiting_time_url: "https://x/WaitingTimes/".into(),
+                vehicle_position_url: Some("https://x/VehiclePositions/".into()),
+                headers: HashMap::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn default_cadence_request_rate_fits_gateway_quota() {
+        let yaml = "enabled: true";
+        let mut rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        rt.feeds = production_like_feeds();
+
+        let (per_min, per_day) = rt.request_rate();
+        assert!((per_min - 6.0).abs() < 1e-9, "6 req/cycle at 60s = 6/min, got {per_min}");
+        assert!((per_day - 8_640.0).abs() < 1e-6, "6/min = 8,640/day, got {per_day}");
+        assert!(per_min <= 8.0, "must be <= 8 req/min quota");
+        assert!(per_day <= 12_000.0, "must be <= 12k req/day quota");
+        assert!(rt.within_quota());
+    }
+
+    #[test]
+    fn old_30s_cadence_would_have_exceeded_quota() {
+        let yaml = "enabled: true\npoll_interval_secs: 30";
+        let mut rt: RealtimeConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        rt.feeds = production_like_feeds();
+        let (per_min, per_day) = rt.request_rate();
+        assert!(per_min > 8.0, "30s cadence = 12/min, exceeds 8/min");
+        assert!(per_day > 12_000.0, "30s cadence = 17,280/day, exceeds 12k");
+        assert!(!rt.within_quota());
+    }
+
+    #[test]
+    fn shipped_config_yaml_cadence_is_quota_safe() {
+        let cfg = Config::load("config.yaml").expect("config.yaml must parse");
+        if let Some(rt) = cfg.realtime.filter(|r| r.enabled && !r.feeds.is_empty()) {
+            let (per_min, per_day) = rt.request_rate();
+            assert!(
+                rt.within_quota(),
+                "shipped config.yaml realtime cadence exceeds quota: \
+                 {per_min:.2} req/min (max {}), {per_day:.0} req/day (max {})",
+                rt.rate_limit.max_requests_per_min,
+                rt.rate_limit.max_requests_per_day,
+            );
+        }
     }
 
     #[test]
@@ -949,6 +1155,28 @@ feeds:
         let without_age = "enabled: true";
         let rt2: RealtimeConfig = serde_yaml_ng::from_str(without_age).unwrap();
         assert_eq!(rt2.vehicle_position_max_age_secs, 120, "default should be 120");
+    }
+
+    #[test]
+    fn index_max_age_secs_parses_and_defaults() {
+        let with_age = "enabled: true\nindex_max_age_secs: 90";
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(with_age).unwrap();
+        assert_eq!(rt.index_max_age_secs, 90);
+
+        let without_age = "enabled: true";
+        let rt2: RealtimeConfig = serde_yaml_ng::from_str(without_age).unwrap();
+        assert_eq!(rt2.index_max_age_secs, 600, "default should be 600");
+    }
+
+    #[test]
+    fn tracked_delay_ttl_secs_parses_and_defaults() {
+        let with_ttl = "enabled: true\ntracked_delay_ttl_secs: 3600";
+        let rt: RealtimeConfig = serde_yaml_ng::from_str(with_ttl).unwrap();
+        assert_eq!(rt.tracked_delay_ttl_secs, 3600);
+
+        let without_ttl = "enabled: true";
+        let rt2: RealtimeConfig = serde_yaml_ng::from_str(without_ttl).unwrap();
+        assert_eq!(rt2.tracked_delay_ttl_secs, 86_400, "default should be ~24h");
     }
 
     #[test]

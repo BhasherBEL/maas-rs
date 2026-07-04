@@ -85,7 +85,8 @@ pub struct AccessInfo {
     pub walk_radius_meters: u32,
     pub origin_stops_found: u32,
     pub destination_stops_found: u32,
-    /// How many times the walk radius doubled before a result was found.
+    /// How many extra access passes ran beyond the initial near-stop pass
+    /// (0 = the near-radius Pass A alone; 1 = the admissible-radius Pass B also ran).
     pub access_attempts: u32,
     /// `true` when transit routing failed and a walk-only plan was returned.
     pub fell_back_to_walk_only: bool,

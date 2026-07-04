@@ -8,7 +8,7 @@ use crate::{
         TripInfo, TripSegment, display_route_type,
     },
     structures::{
-        DelayCDF, LatLng, NodeID,
+        DelayCDF, LatLng, NodeID, RealtimeIndex,
         raptor::{Lookup, PatternInfo},
     },
 };
@@ -86,6 +86,14 @@ impl Graph {
             return None;
         }
         self.stop_id_str(compact as usize)
+    }
+
+    /// Compact stop index for a `NodeID`, if it is a transit stop.
+    pub fn compact_stop_of_node(&self, id: NodeID) -> Option<usize> {
+        match self.raptor.transit_node_to_stop.get(id.0) {
+            Some(&c) if c != u32::MAX => Some(c as usize),
+            _ => None,
+        }
     }
 
     /// GTFS `platform_code` for a `NodeID`, if it is a transit stop with a platform.
@@ -724,6 +732,7 @@ impl Graph {
     ///   - trip is active on date/weekday
     ///
     /// Returns (dep_abs_idx_in_transit_departures, boarding_dep, alighting_arr).
+    #[allow(clippy::too_many_arguments)]
     pub fn latest_departure_before_arrival(
         &self,
         boarding_node: NodeID,
@@ -732,6 +741,7 @@ impl Graph {
         max_alighting: u32,
         date: u32,
         weekday: u8,
+        rt: &RealtimeIndex,
     ) -> Option<(usize, u32, u32)> {
         let boarding_compact = self.raptor.transit_node_to_stop[boarding_node.0];
         if boarding_compact == u32::MAX {
@@ -802,8 +812,28 @@ impl Graph {
                 }
 
                 let trip_id = trip_ids[t];
+                // Schedule activity AND realtime cancellation, evaluated with the
+                // SAME predicate that chain_bounds and tighten_with_bounds use (both
+                // route through this fn), so the tightening oracle never selects a
+                // CANCELED trip and the two passes cannot disagree — the S1
+                // non-negative-margin invariant depends on that agreement. Inert on
+                // an empty index (is_canceled == false) → byte-identical with no feed.
                 let svc = self.raptor.transit_trips[trip_id.0 as usize].service_id;
-                if !self.raptor.transit_services[svc.0 as usize].is_active(date, weekday) {
+                if !self.raptor.transit_services[svc.0 as usize].is_active(date, weekday)
+                    || rt.is_canceled(trip_id)
+                {
+                    continue;
+                }
+                // GTFS pickup_type==1 / drop_off_type==1: the candidate must be
+                // boardable at the boarding stop AND alightable at the alighting
+                // stop, exactly as the forward scan (`scan_route_collect`) enforces.
+                // Absent this, tightening could re-time a leg onto a same-pattern
+                // later trip that cannot be boarded/alighted here (common at rail /
+                // tram terminals) → an un-boardable output plan. Kept in this one
+                // shared oracle so chain_bounds and tighten_with_bounds stay in
+                // lock-step (S1 invariant). Inert on a feed-free corpus where every
+                // stop-time defaults to board_allowed == alight_allowed == true.
+                if !boarding_col[t].board_allowed || !alighting_col[t].alight_allowed {
                     continue;
                 }
 

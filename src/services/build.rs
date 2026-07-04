@@ -9,7 +9,9 @@ use crate::{
         gtfs::{load_gtfs, load_gtfs_sncb, load_gtfs_stib, prepare_sncb},
         osm::{self, Dem},
     },
-    services::persistence::{load_address_index, save_address_index},
+    services::persistence::{
+        cch_cache_path, load_address_index, load_cch, save_address_index, save_cch,
+    },
     structures::{AddressIndex, BuildConfig, DelayCDF, Graph, Ingestor, RoutingDefaultConfig},
 };
 
@@ -321,8 +323,14 @@ pub fn gtfs_input_labels(config: &BuildConfig) -> Vec<String> {
 }
 
 /// Apply config.yaml routing defaults onto a freshly built or restored graph.
-/// Shared by `main` (startup) and the scheduler (after a hot rebuild).
-pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
+/// Shared by `main` (startup) and the scheduler (after a hot rebuild). `graph_output` is
+/// the configured `graph.bin` path; the foot-access CCH order is cached in a sibling
+/// `cch.bin` next to it (see [`prepare_cch_access`]).
+pub fn apply_routing_defaults(
+    g: &mut Graph,
+    routing: &RoutingDefaultConfig,
+    graph_output: &str,
+) {
     if let Some(s) = routing.min_access_secs {
         g.set_min_access_secs(s);
     }
@@ -357,6 +365,15 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(s) = routing.arrival_slack_secs {
         g.set_arrival_slack_secs(s);
     }
+    if let Some(v) = routing.unrestricted_transfers {
+        g.set_unrestricted_transfers(v);
+    }
+    if let Some(v) = routing.use_cch_access {
+        g.set_use_cch_access(v);
+    }
+    if let Some(v) = routing.profile_latency {
+        g.set_profile_latency(v);
+    }
     if let Some(m) = routing.max_window_minutes {
         g.set_max_window_secs(m.saturating_mul(60));
     }
@@ -375,6 +392,12 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if let Some(k) = routing.bike_bucket_dpl_k {
         g.set_bike_bucket_dpl_k(k);
     }
+    if let Some(k) = routing.drive_bucket_var_k {
+        g.set_drive_bucket_var_k(k);
+    }
+    if let Some(k) = routing.walk_bucket_surf_k {
+        g.set_walk_bucket_surf_k(k);
+    }
     if let Some(on) = routing.bike_select_dplus {
         g.raptor.set_bike_select_dplus(on);
     }
@@ -386,15 +409,6 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     }
     if let Some(k) = routing.representatives_k {
         g.set_representatives_k(k);
-    }
-    if let Some(on) = routing.multiobj_street {
-        g.set_multiobj_street(on);
-    }
-    if let Some(m) = routing.multiobj_street_max_len_m {
-        g.set_multiobj_street_max_len_m(m);
-    }
-    if let Some(t) = routing.champion_time_tiebreak {
-        g.set_champion_time_tiebreak(t);
     }
     if let Some(f) = routing.alt_max_share_factor {
         g.set_alt_max_share_factor(f);
@@ -419,6 +433,55 @@ pub fn apply_routing_defaults(g: &mut Graph, routing: &RoutingDefaultConfig) {
     if g.contracted.is_some() {
         g.bake_bike_on_contracted_default();
     }
+
+    // Foot-access CCH (serde-skipped runtime index). Behind `prepare_cch_access` (default
+    // true) so the per-query `useCchAccess` flag has a live index to dispatch to; when
+    // false the seam always falls back to the two-pass foot Dijkstra.
+    if routing.prepare_cch_access.unwrap_or(true) && g.contracted.is_some() {
+        prepare_cch_access(g, graph_output);
+    }
+}
+
+/// Install the foot-access CCH on `g`, reusing the cached nested-dissection ORDER in the
+/// sibling `cch.bin` when present + version/size-matching, else computing it (~56 s) and
+/// caching it so later restarts skip that cost. The CCH structure + walk-second metric are
+/// always (re)built from the live graph (~1.3 s), so the metric never goes stale. Requires
+/// `g.contracted` (checked by the caller).
+fn prepare_cch_access(g: &mut Graph, graph_output: &str) {
+    // Idempotent: on the auto/no-flag path apply_routing_defaults runs twice (once inside
+    // acquire_auto, once in main), so skip the redundant ~1.3 s rebuild if already installed.
+    if g.cch.is_some() {
+        return;
+    }
+    let path = cch_cache_path(graph_output);
+    let n = g.cch_vertex_count();
+    let order = match load_cch(&path) {
+        Ok(order) if order.len() == n => {
+            tracing::info!("reusing cached CCH order from {path} ({n} vertices)");
+            order
+        }
+        Ok(order) => {
+            tracing::info!(
+                "cached CCH order size mismatch (cached {}, graph {n}); recomputing",
+                order.len()
+            );
+            let order = g.compute_cch_order();
+            if let Err(e) = save_cch(&order, &path) {
+                tracing::warn!("failed to save CCH order: {e}");
+            }
+            order
+        }
+        Err(e) => {
+            tracing::info!("building CCH order ({e})");
+            let order = g.compute_cch_order();
+            if let Err(e) = save_cch(&order, &path) {
+                tracing::warn!("failed to save CCH order: {e}");
+            }
+            order
+        }
+    };
+    let cch = g.build_cch_access_with_order(&order);
+    g.set_cch(cch);
 }
 
 /// Enforce the contraction runtime invariant for a graph about to be served or
