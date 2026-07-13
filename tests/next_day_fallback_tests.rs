@@ -180,6 +180,7 @@ fn overnight_windowless(g: &Graph, o: NodeID, d: NodeID, oll: LatLng, dll: LatLn
         o, d, time, 1000, 0x01, 300, &buckets, g.raptor.arrival_slack_secs,
         g.raptor.unrestricted_transfers, g.raptor.use_cch_access, &RealtimeIndex::new(),
         &ActiveModes::default(), &BikeCost::new(BikeProfile::default()), Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     )
 }
 
@@ -191,6 +192,7 @@ fn overnight_range(g: &Graph, o: NodeID, d: NodeID, oll: LatLng, dll: LatLng, ti
         o, d, time, window, 1000, 0x01, 300, &buckets, g.raptor.arrival_slack_secs,
         g.raptor.unrestricted_transfers, g.raptor.use_cch_access, &RealtimeIndex::new(),
         &ActiveModes::default(), &BikeCost::new(BikeProfile::default()), Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     )
 }
 

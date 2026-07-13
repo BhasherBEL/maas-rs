@@ -184,6 +184,18 @@ pub struct ContractedGraph {
     pub seg_index: super::edge_index::EdgeIndex,
 }
 
+/// Foot-snap descriptor for a coordinate in the inverted travel-time map fill: the ≤2
+/// bounding-junction foot-second entries, the owning super-edge chain identity
+/// (`seg_start`,`seg_len`) used to detect a same-chain pair with the centre, and the
+/// `from_ji`→projection prefix foot-secs for the same-chain direct-walk term.
+#[derive(Clone, Debug)]
+pub struct TravelMapSnap {
+    pub entries: Vec<(usize, u32)>,
+    pub seg_start: u32,
+    pub seg_len: u32,
+    pub from_ji_prefix: Option<u32>,
+}
+
 /// Flat record locating a super-edge's segments + bounding junctions (`segs` order).
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SuperEdgeMeta {
@@ -1083,6 +1095,30 @@ impl ContractedGraph {
         self.foot_snap(g, lat, lon, radius_m).map(|(_, _, _, _, entries)| entries)
     }
 
+    /// Travel-map snap descriptor for a coordinate: the ≤2 bounding-junction foot-second
+    /// entries (as [`ContractedGraph::foot_snap_entries`]), the owning super-edge chain
+    /// identity `(seg_start, seg_len)`, and the exact `from_ji`→projection prefix foot-secs.
+    /// The chain identity + prefix are what [`ContractedGraph::walk_secs_coord_to_coord`]'s
+    /// same-super-edge direct shortcut needs, exposed so the inverted travel-map fill can
+    /// reproduce that per-cell centre-direct term without re-snapping through the full
+    /// point-to-point routine. `None` if nothing foot-usable within `radius_m`.
+    pub fn foot_snap_travel_map(
+        &self,
+        g: &Graph,
+        lat: f64,
+        lon: f64,
+        radius_m: f64,
+    ) -> Option<TravelMapSnap> {
+        let (sm, gi, da, _db, entries) = self.foot_snap(g, lat, lon, radius_m)?;
+        let from_ji_prefix = self.from_ji_prefix_foot_secs(g, &sm, gi, da);
+        Some(TravelMapSnap {
+            entries,
+            seg_start: sm.seg_start,
+            seg_len: sm.seg_len,
+            from_ji_prefix,
+        })
+    }
+
     /// Foot stops within `max_secs` of the foot-snap of `(lat, lon)` over the contracted
     /// graph — the coord-based twin of [`Graph::nearby_stops_union`] for a snapped origin
     /// whose interior node is gone (g-free). Same shape/order as `nearby_stops`.
@@ -1584,6 +1620,108 @@ impl Graph {
                 continue;
             }
             // A transit-stop junction is a dead-end for through-walking.
+            if self.raptor.transit_node_to_stop.get(jn.0).copied().unwrap_or(u32::MAX) != u32::MAX {
+                continue;
+            }
+            for se in &cg.adjacency[ji] {
+                let Some(t) = cg.walk_secs(self, se) else {
+                    continue;
+                };
+                let nd = d.saturating_add(t);
+                if nd > max_seconds {
+                    continue;
+                }
+                let to = cg.junctions[se.to as usize];
+                let entry = dist.entry(to).or_insert(u32::MAX);
+                if nd < *entry {
+                    *entry = nd;
+                    pq.push(Reverse((nd, se.to as usize)));
+                }
+            }
+        }
+        dist
+    }
+
+    /// Multi-source foot field for the travel-time map (isochrone inversion). Seeds the
+    /// bounded foot flood with (a) **stop sources** — reached transit stops, each pinned at
+    /// its departure-relative arrival `offset`, and (b) **coord sources** — the centre's
+    /// bounding-junction snap entries at their proj→junction stub. Returns the best foot
+    /// seconds to every reachable junction, i.e. at each junction `j`
+    /// `min( min_s (offset_s + walk(stop_s -> j)),  min_e (stub_e + walk(centre_e -> j)) )`,
+    /// where every walk path respects the stop-junction **sink** rule (never routed *through*
+    /// another stop).
+    ///
+    /// Because a stop junction is a sink (its outgoing arcs are dropped from through-routing,
+    /// mirroring [`Graph::extract_foot_graph`] / the sink check in
+    /// [`ContractedGraph::walk_dijkstra_union_seeded`]), a stop source cannot be expanded by
+    /// simply pushing it onto the queue. Instead each stop source is relaxed **manually** at
+    /// seed time: its own distance is recorded (so a query point snapping onto the stop's
+    /// junction reads `offset`), and each super-edge out of that stop's junction is relaxed
+    /// once with `offset + walk_secs(se)`. The centre's coord sources are ordinary junction
+    /// seeds. Foot cost is direction-symmetric, so reading this forward field at a query
+    /// point's snap junctions reproduces exactly the per-cell `min over reached stops of
+    /// arrival + walk(stop -> P)` and the centre's via-junction walk that the un-inverted
+    /// per-cell searches computed, merged over all sources in ONE flood.
+    pub fn walk_dijkstra_travel_map_field(
+        &self,
+        stop_seeds: &[(usize, u32)],
+        coord_seeds: &[(usize, u32)],
+        max_seconds: u32,
+        cg: &ContractedGraph,
+    ) -> HashMap<NodeID, u32> {
+        let mut dist: HashMap<NodeID, u32> = HashMap::new();
+        let mut pq: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+
+        // Stop sources: record the stop's own junction distance, then MANUALLY relax its
+        // outgoing super-edges (the stop junction is a sink, so the main loop will never
+        // expand it). We never push the stop junction itself onto the queue.
+        for &(js_idx, o) in stop_seeds {
+            if o > max_seconds {
+                continue;
+            }
+            let jn = cg.junctions[js_idx];
+            let e = dist.entry(jn).or_insert(u32::MAX);
+            if o < *e {
+                *e = o;
+            }
+            for se in &cg.adjacency[js_idx] {
+                let Some(t) = cg.walk_secs(self, se) else {
+                    continue;
+                };
+                let nd = o.saturating_add(t);
+                if nd > max_seconds {
+                    continue;
+                }
+                let to = cg.junctions[se.to as usize];
+                let entry = dist.entry(to).or_insert(u32::MAX);
+                if nd < *entry {
+                    *entry = nd;
+                    pq.push(Reverse((nd, se.to as usize)));
+                }
+            }
+        }
+
+        // Coord (centre) sources: ordinary junction seeds. If a centre entry happens to be a
+        // stop junction it is seeded and pushed, but the main loop's sink check keeps it a
+        // dead-end — exactly as `walk_dijkstra_union_seeded` treats it.
+        for &(ji, s0) in coord_seeds {
+            if s0 > max_seconds {
+                continue;
+            }
+            let jn = cg.junctions[ji];
+            let e = dist.entry(jn).or_insert(u32::MAX);
+            if s0 < *e {
+                *e = s0;
+                pq.push(Reverse((s0, ji)));
+            }
+        }
+
+        while let Some(Reverse((d, ji))) = pq.pop() {
+            let jn = cg.junctions[ji];
+            if d > *dist.get(&jn).unwrap_or(&u32::MAX) {
+                continue;
+            }
+            // A transit-stop junction is a dead-end for through-walking (sink).
             if self.raptor.transit_node_to_stop.get(jn.0).copied().unwrap_or(u32::MAX) != u32::MAX {
                 continue;
             }

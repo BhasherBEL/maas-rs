@@ -166,6 +166,85 @@ fn raptor_accepts_bike_profile_input() {
 }
 
 #[test]
+fn plan_price_breakdown_is_exposed() {
+    // The fare-detail shopping list is on PlanPrice.breakdown → FareBreakdownItem
+    // with the exact field names the UI reads.
+    let schema = build_schema(shared(Graph::new()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ __type(name: "FareBreakdownItem") { fields { name } } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    let names: Vec<String> = match &data["__type"] {
+        Value::Object(o) => match &o["fields"] {
+            Value::List(fs) => fs
+                .iter()
+                .filter_map(|f| match f {
+                    Value::Object(fo) => match &fo["name"] {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("no fields: {other:?}"),
+        },
+        other => panic!("FareBreakdownItem not in schema: {other:?}"),
+    };
+    for f in ["operator", "description", "euros", "coverage"] {
+        assert!(names.iter().any(|n| n == f), "missing FareBreakdownItem.{f}: {names:?}");
+    }
+}
+
+#[test]
+fn raptor_accepts_travel_class_first() {
+    // The fareProfile.travelClass enum must parse (no "unknown argument/field"),
+    // proving FIRST is wired through the GraphQL surface.
+    let schema = build_schema(shared(Graph::new()));
+    let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
+                 fareProfile: { travelClass: FIRST }) { mode } }"#;
+    let resp = execute_sync(&schema, q);
+    for e in &resp.errors {
+        let m = e.message.to_lowercase();
+        assert!(!m.contains("unknown"), "schema rejected travelClass: {}", e.message);
+        assert!(!m.contains("travelclass"), "travelClass not wired: {}", e.message);
+    }
+}
+
+#[test]
+fn fare_profile_input_no_longer_exposes_brupass() {
+    // Brupass is NOT a user option any more (it is an automatic post-hoc cap). The
+    // GraphQL FareProfileInput must not carry a `brupass` INPUT field: a query that
+    // sets it must be rejected as an unknown field. (The Brupass BREAKDOWN item still
+    // appears in output — that is a value, not a user input.)
+    let schema = build_schema(shared(Graph::new()));
+    let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
+                 fareProfile: { brupass: true }) { mode } }"#;
+    let resp = execute_sync(&schema, q);
+    assert!(
+        resp.errors.iter().any(|e| {
+            let m = e.message.to_lowercase();
+            m.contains("brupass") || m.contains("unknown") || m.contains("not")
+        }),
+        "setting fareProfile.brupass must be rejected, got: {:?}",
+        resp.errors
+    );
+    // The FareProfileInput SDL block must not declare a brupass field. Extract the
+    // input object and assert no `brupass` line within it.
+    let sdl = schema.sdl();
+    if let Some(start) = sdl.find("input FareProfileInput") {
+        let block = &sdl[start..];
+        let end = block.find('}').map(|e| start + e).unwrap_or(sdl.len());
+        assert!(
+            !sdl[start..end].to_lowercase().contains("brupass"),
+            "FareProfileInput must not declare a brupass field:\n{}",
+            &sdl[start..end]
+        );
+    }
+}
+
+#[test]
 fn graphql_ping_returns_pong() {
     let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(&schema, "{ ping }");
@@ -3379,4 +3458,126 @@ fn live_refresh_route_level_alert_not_surfaced_for_different_route() {
         alerts.is_empty(),
         "alert for R99 must not surface for trip on route R1"
     );
+}
+
+// ── travelTimeMap ───────────────────────────────────────────────────────────────
+
+/// A tiny walk-only street graph is enough to exercise the `travelTimeMap` resolver
+/// end-to-end: schema wiring, argument parsing, the returned cell shape, and the
+/// `maxSeconds`/`centerLat`/`centerLng` echo.
+fn walk_grid_graph() -> Graph {
+    let mut g = Graph::new();
+    let a = g.add_node(osm_node("a", 50.0, 4.0));
+    let b = g.add_node(osm_node("b", 50.0, 4.001));
+    g.add_edge(a, foot_street(a, b, 80));
+    g.add_edge(b, foot_street(b, a, 80));
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+    g
+}
+
+#[test]
+fn graphql_travel_time_map_returns_cells() {
+    let schema = build_schema(shared(walk_grid_graph()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ travelTimeMap(centerLat: 50.0, centerLng: 4.0, maxSeconds: 600, modes: [WALK]) {
+            maxSeconds centerLat centerLng cells { lat lng seconds }
+        } }"#,
+    );
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+
+    let data = data_obj(resp);
+    let map = match &data["travelTimeMap"] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    assert_eq!(map["maxSeconds"], Value::Number(600.into()));
+    let cells = match &map["cells"] {
+        Value::List(v) => v,
+        other => panic!("expected cells list, got {other:?}"),
+    };
+    assert!(!cells.is_empty(), "expected at least one reachable cell");
+    // Every emitted cell's time must be within the budget.
+    for c in cells {
+        let obj = match c {
+            Value::Object(m) => m,
+            other => panic!("expected cell object, got {other:?}"),
+        };
+        let secs = match &obj["seconds"] {
+            Value::Number(n) => n.as_i64().unwrap(),
+            other => panic!("expected number, got {other:?}"),
+        };
+        assert!(secs <= 600, "cell exceeds maxSeconds: {secs}");
+    }
+}
+
+/// `gridStepM` is exposed on `travelTimeMap` and controls cell density: a finer
+/// (smaller) step must yield strictly more cells than a coarser one on the same
+/// query, and omitting it reproduces the graph default behaviour.
+#[test]
+fn graphql_travel_time_map_grid_step_controls_density() {
+    let schema = build_schema(shared(walk_grid_graph()));
+
+    // The argument is exposed on the schema with the exact name `gridStepM`.
+    let sdl = schema.sdl();
+    assert!(
+        sdl.contains("gridStepM"),
+        "travelTimeMap schema must expose gridStepM"
+    );
+
+    let count = |grid_arg: &str| -> usize {
+        let q = format!(
+            r#"{{ travelTimeMap(centerLat: 50.0, centerLng: 4.0, maxSeconds: 600, modes: [WALK]{grid_arg}) {{ cells {{ lat }} }} }}"#
+        );
+        let resp = execute_sync(&schema, &q);
+        assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+        let data = data_obj(resp);
+        match &data["travelTimeMap"] {
+            Value::Object(m) => match &m["cells"] {
+                Value::List(v) => v.len(),
+                other => panic!("expected cells list, got {other:?}"),
+            },
+            other => panic!("expected object, got {other:?}"),
+        }
+    };
+
+    // gridStepM is a valid argument (no schema error) and a fine step yields more
+    // cells than a coarse one.
+    let fine = count(", gridStepM: 50.0");
+    let coarse = count(", gridStepM: 400.0");
+    assert!(
+        fine > coarse,
+        "finer gridStepM must yield more cells: fine={fine} coarse={coarse}"
+    );
+
+    // Omitting gridStepM uses the graph default (walk_grid_graph leaves it at the
+    // RaptorIndex default), reproducing a valid, non-empty fill.
+    let default = count("");
+    assert!(default > 0, "default fill must emit cells");
+}
+
+#[test]
+fn graphql_travel_time_map_rejects_empty_modes() {
+    let schema = build_schema(shared(walk_grid_graph()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ travelTimeMap(centerLat: 50.0, centerLng: 4.0, maxSeconds: 600, modes: []) { maxSeconds } }"#,
+    );
+    assert!(!resp.errors.is_empty(), "expected an error for empty modes");
+    assert!(
+        resp.errors[0].message.to_lowercase().contains("modes"),
+        "unexpected error: {}",
+        resp.errors[0].message
+    );
+}
+
+#[test]
+fn graphql_travel_time_map_rejects_nonpositive_max() {
+    let schema = build_schema(shared(walk_grid_graph()));
+    let resp = execute_sync(
+        &schema,
+        r#"{ travelTimeMap(centerLat: 50.0, centerLng: 4.0, maxSeconds: 0) { maxSeconds } }"#,
+    );
+    assert!(!resp.errors.is_empty(), "expected an error for maxSeconds <= 0");
 }

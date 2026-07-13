@@ -105,6 +105,20 @@ pub(super) struct ModeContext<'a> {
     /// `is_trip_active` directly (default / toggle off). Built once per query in
     /// `build_mode_context`, reused across every windowed pass.
     pub trip_active_memo: Option<TripActiveMemo>,
+    /// Resolved, FIXED-per-query fare profile. Combined with the pass's `weekday`
+    /// at the boarding site to form the `FareContext` the fare functions consume.
+    /// `FareProfile::default()` (adult, no products) when no profile is supplied.
+    pub fare_profile: crate::structures::cost::FareProfile,
+    /// OPT-B (travel-map only): an OPT-IN absolute-time horizon. When `Some(h)`,
+    /// `target_cutoff` mins every per-state cutoff with `h`, so any label/candidate
+    /// whose arrival is `>= h` is pruned and the marked frontier empties (rounds
+    /// terminate) once nothing under `h` improves. `None` (the default for EVERY
+    /// production caller) leaves the pass completely unbounded — behaviour is
+    /// provably unchanged. RAPTOR arrivals are monotone non-decreasing along a
+    /// journey, so pruning a label with arrival `> h` cannot lower any arrival
+    /// `<= h`; the isochrone consumer (`fill_area`) then discards every stop with
+    /// offset `> max_secs`, so cells stay bit-identical (see `stop_arrivals_grid`).
+    pub horizon: Option<u32>,
 }
 
 impl<'a> ModeContext<'a> {
@@ -148,6 +162,8 @@ impl<'a> ModeContext<'a> {
             dest_station: dest_station.map(|p| p.to_vec()),
             unrestricted_transfers,
             trip_active_memo: None,
+            fare_profile: crate::structures::cost::FareProfile::default(),
+            horizon: None,
         }
     }
 
@@ -997,10 +1013,12 @@ pub(super) enum BestGrid {
 }
 
 impl BestGrid {
-    /// Builds the grid for `n_cells` cells. Uses the compact backend only when the
-    /// toggle is on AND `n_buckets <= MAX_LABELS` (above that the same-stamp
-    /// LabelSet can overflow and drop per-bucket minima, so compact would be
-    /// *stronger* than — hence diverge from — the legacy path; fall back to exact).
+    /// Builds the grid for `n_cells` cells. Uses the compact backend when the toggle
+    /// is on AND `n_buckets <= MAX_LABELS` (above that the same-stamp LabelSet can
+    /// overflow and drop per-bucket minima, so compact would be *stronger* than —
+    /// hence diverge from — the legacy path; fall back to exact). Price is no longer
+    /// a dominance axis (it is annotated post-hoc), so the search is price-blind and
+    /// the compact backend is used regardless of whether fares are enabled.
     pub(super) fn new(n_cells: usize, buckets: &ReliabilityBuckets) -> Self {
         let n_buckets = buckets.bucket(1.0) as usize + 1;
         if compact_best_enabled() && n_buckets <= MAX_LABELS {
@@ -1501,6 +1519,7 @@ impl Graph {
         (bound, w_opt)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_access_search<F>(
         &self,
         origin: NodeID,
@@ -1514,6 +1533,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
         mut try_routing: F,
     ) -> Vec<Plan>
     where
@@ -1579,7 +1599,7 @@ impl Graph {
 
         // Pass A — near-stop radius.
         let mc = latency_profile::time_discovery(|| {
-            self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep)
+            self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile)
         });
         if mc.any_access() && mc.any_egress() {
             latency_profile::begin_pass();
@@ -1623,7 +1643,7 @@ impl Graph {
         if access_secs < bound {
             access_secs = bound;
             let mc = latency_profile::time_discovery(|| {
-                self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep)
+                self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile)
             });
             if mc.any_access() && mc.any_egress() {
                 latency_profile::begin_pass();
@@ -1679,7 +1699,9 @@ impl Graph {
     /// `Walked`/`CarEgress`, bike access for the bike states, car access for
     /// `CarParked`; egress mirror-imaged (foot for parked/dropped/walked, bike
     /// for `BikeInHand`, car for `CarEgress`).
-    fn build_mode_context<'a>(
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_mode_context<'a>(
         &self,
         am: &'a ActiveModes,
         origin: NodeID,
@@ -1689,6 +1711,37 @@ impl Graph {
         unrestricted: bool,
         use_cch: bool,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
+    ) -> ModeContext<'a> {
+        self.build_mode_context_opts(
+            am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile,
+            false,
+        )
+    }
+
+    /// `build_mode_context` with an extra `skip_egress` flag. OPT-C1 (travel-map
+    /// only): when `true`, the (unused, immediately-cleared) center egress is left
+    /// EMPTY without running the CCH one-to-many / two-pass egress sweep — saving a
+    /// full ~83k-target pass per call. The caller MUST guarantee the egress set is
+    /// unobserved: it feeds only (a) the per-state `egress` grid, which the isochrone
+    /// forces empty anyway, and (b) the park&ride vehicle-access retain-filter below,
+    /// which is a no-op ONLY when there are no bike/car access states. So this is
+    /// bit-identical iff `!am.uses_vehicle()`; the caller gates on exactly that.
+    /// Every OTHER caller passes `skip_egress = false` (via `build_mode_context`) and
+    /// is provably unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_mode_context_opts<'a>(
+        &self,
+        am: &'a ActiveModes,
+        origin: NodeID,
+        destination: NodeID,
+        access_secs: u32,
+        bike: &BikeCost,
+        unrestricted: bool,
+        use_cch: bool,
+        ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
+        skip_egress: bool,
     ) -> ModeContext<'a> {
         use VehicleState::*;
         let has = |s| am.state_of(s).is_some();
@@ -1734,7 +1787,12 @@ impl Graph {
         } else {
             vec![]
         };
-        let foot_egress = if let Some(p) = dest_station {
+        // OPT-C1: when the caller forces egress empty (isochrone), skip the whole
+        // egress computation — the expensive CCH/two-pass one-to-many sweep — since
+        // the results are unobserved (see `build_mode_context_opts`).
+        let foot_egress = if skip_egress {
+            vec![]
+        } else if let Some(p) = dest_station {
             station_zero(p)
         } else if has(Walked) || has(BikeDropped) || has(CarParked) {
             let raw = if use_cch && self.cch.is_some() {
@@ -1747,14 +1805,18 @@ impl Graph {
         } else {
             vec![]
         };
-        let bike_egress = if let Some(p) = dest_station {
+        let bike_egress = if skip_egress {
+            vec![]
+        } else if let Some(p) = dest_station {
             station_zero(p)
         } else if has(BikeInHand) || has(BikeEgress) {
             self.egress_times(self.bike_nearby_stops(destination, vehicle_secs, bike))
         } else {
             vec![]
         };
-        let car_egress = if let Some(p) = dest_station {
+        let car_egress = if skip_egress {
+            vec![]
+        } else if let Some(p) = dest_station {
             station_zero(p)
         } else if has(CarEgress) {
             self.egress_times(self.car_nearby_stops(destination, vehicle_secs))
@@ -1797,6 +1859,7 @@ impl Graph {
         if trip_memo_enabled() {
             mc.trip_active_memo = Some(TripActiveMemo::new(self.raptor.transit_trips.len()));
         }
+        mc.fare_profile = fare_profile;
         mc
     }
 
@@ -2021,6 +2084,7 @@ impl Graph {
             am,
             bike,
             None,
+            crate::structures::cost::FareProfile::default(),
         )
     }
 
@@ -2043,6 +2107,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
         self.with_access_search(
             origin,
@@ -2056,6 +2121,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
             |mc, access_secs| {
                 self.raptor_inner(
                     mc,
@@ -2268,7 +2334,7 @@ impl Graph {
     /// the round-start carry-forward Pareto-**merges** `labels[k-1]` into the
     /// already-populated `labels[k]`; single-pass uses the faster `copy_from_slice`.
     #[allow(clippy::too_many_arguments)]
-    fn run_departure_into<R: LabelRow>(
+    pub(super) fn run_departure_into<R: LabelRow>(
         &self,
         mc: &ModeContext,
         start_time: u32,
@@ -2674,6 +2740,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
         mut try_routing: F,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, AccessInfo, Vec<StopReach>)
     where
@@ -2720,7 +2787,7 @@ impl Graph {
 
         // Pass A — near-stop radius.
         let mc =
-            self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep);
+            self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile);
         if mc.any_access() && mc.any_egress() {
             origin_stops = mc.merged_access().len() as u32;
             dest_stops = mc.egress.iter().map(|e| e.len()).max().unwrap_or(0) as u32;
@@ -2752,7 +2819,7 @@ impl Graph {
             if access_secs < bound {
                 access_secs = bound;
                 let mc = self.build_mode_context(
-                    am, origin, destination, access_secs, bike, unrestricted, use_cch, ep,
+                    am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile,
                 );
                 if mc.any_access() && mc.any_egress() {
                     if !recorded {
@@ -2817,6 +2884,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -2829,6 +2897,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
             |mc, access_secs| {
                 let (plans, cands, stops) = self.raptor_inner_with_debug(
                     mc,
@@ -2896,6 +2965,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> ExplainResult {
         let (plans, candidates, access, stops_reached) = self.with_access_search_debug(
             origin,
@@ -2908,6 +2978,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
             |mc, access_secs| {
                 let (probe, probe_cands, probe_stops) = self.raptor_inner_with_debug(
                     mc,
@@ -3032,6 +3103,12 @@ impl Graph {
 
         let route_id = self.raptor.transit_patterns[pattern].route;
         let pat_rt = self.raptor.transit_routes[route_id.0 as usize].route_type;
+
+        // Price is NOT accrued in the search anymore: it is annotated post-hoc on the
+        // finished plan (`plan_price_posthoc`), so the scan is price-blind. The SNCB
+        // per-km / airport-OD / ticket-window accrual that once ran per alight and per
+        // board here is gone; the fare model is walked once over each kept plan's fixed
+        // leg sequence instead.
 
         let all_times = self.raptor.transit_idx_pattern_stop_times[pattern]
             .of(&self.raptor.transit_pattern_stop_times);
@@ -3213,6 +3290,9 @@ impl Graph {
                             })
                             .sum();
 
+                        // No fare is charged in the search: price is annotated post-hoc
+                        // (`plan_price_posthoc`) over each kept plan's fixed leg order,
+                        // so the scan is price-blind (identical plan set fares on/off).
                         Self::push_riding(
                             &mut riding,
                             Riding {
@@ -3780,6 +3860,19 @@ impl Graph {
         for (sidx, vs) in mc.am.states() {
             out[sidx] = prefix[vs.burden() as usize];
         }
+        // OPT-B: an OPT-IN absolute-time horizon (travel-map only; `None` for every
+        // production caller). No arrival `>= h` can matter for a `<= h` isochrone, so
+        // min each cutoff with `h`; unreached burdens (still `u32::MAX`) are pulled
+        // down to `h` too, which is what caps the flood and empties the frontier so
+        // rounds terminate early. RAPTOR arrivals are monotone non-decreasing along a
+        // journey (a later boarding never yields an earlier arrival), so pruning any
+        // label with arrival `> h` cannot change an arrival `<= h`; `fill_area` then
+        // drops every stop with offset `> max_secs`, so cells stay bit-identical.
+        if let Some(h) = mc.horizon {
+            for c in out.iter_mut() {
+                *c = (*c).min(h);
+            }
+        }
         out
     }
 
@@ -3977,6 +4070,7 @@ impl Graph {
             am,
             bike,
             None,
+            crate::structures::cost::FareProfile::default(),
         )
     }
 
@@ -3999,6 +4093,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
         // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
         // interesting departures, which are processed **latest → earliest** so a
@@ -4026,6 +4121,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
             |mc, access_secs| {
                 // Interesting departures are cheap to collect and independent of any
                 // probe. Compute them FIRST. When the window has NO service departure,
@@ -4335,6 +4431,7 @@ impl Graph {
             am,
             &self.default_bike_cost(),
             None,
+            crate::structures::cost::FareProfile::default(),
             |mc, access_secs| {
                 // Same probe-gate redesign as the tuned driver, kept structurally
                 // trivial so this stays the trustworthy oracle: compute interesting
@@ -4523,6 +4620,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
         let forward = self.raptor_tuned_rt_modes_ep(
             origin,
@@ -4539,6 +4637,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
         );
         forward
             .into_iter()
@@ -4564,6 +4663,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
         let mut plans = self.raptor_tuned_rt_modes_ep(
             origin,
@@ -4580,6 +4680,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
         );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
@@ -4598,6 +4699,7 @@ impl Graph {
                 am,
                 bike,
                 ep,
+                fare_profile,
             );
             let normalized: Vec<Plan> = overnight
                 .into_iter()
@@ -4637,6 +4739,7 @@ impl Graph {
                 am,
                 bike,
                 ep,
+                fare_profile,
             );
             if !forward.is_empty() {
                 plans.extend(forward);
@@ -4665,6 +4768,7 @@ impl Graph {
         am: &ActiveModes,
         bike: &BikeCost,
         ep: Option<&QueryEndpoints>,
+        fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
         let mut plans = self.raptor_range_tuned_rt_modes_ep(
             origin,
@@ -4682,6 +4786,7 @@ impl Graph {
             am,
             bike,
             ep,
+            fare_profile,
         );
 
         if start_time < Self::OVERNIGHT_THRESHOLD_SECS && date > 0 {
@@ -4701,6 +4806,7 @@ impl Graph {
                 am,
                 bike,
                 ep,
+                fare_profile,
             );
             let normalized: Vec<Plan> = overnight
                 .into_iter()
@@ -4745,6 +4851,7 @@ impl Graph {
                 am,
                 bike,
                 ep,
+                fare_profile,
             );
             // Enforce the window bound on DEPARTURE. The underlying range driver
             // falls back to an unbounded earliest-arrival probe when the trimmed
@@ -4794,6 +4901,7 @@ impl Graph {
                 am,
                 bike,
                 ep,
+                fare_profile,
             );
             if !forward.is_empty() {
                 plans.extend(forward);
@@ -4822,6 +4930,21 @@ mod label_tests {
             arena_id: u32::MAX,
             state: 0,
         }
+    }
+
+    #[test]
+    fn labelset_dominance_is_price_blind() {
+        // Price is no longer a dominance axis (it is annotated post-hoc), so the
+        // label set decides purely on (arrival ↓, bucket ↑): a strictly-later
+        // same-bucket label is dominated regardless of any fare it would carry.
+        let b = ReliabilityBuckets::default();
+        let mut s = LabelSet::EMPTY;
+        assert!(s.insert(lbl(100, 1.0), &b));
+        assert!(
+            !s.insert(lbl(200, 1.0), &b),
+            "later same-bucket label is dominated (search is price-blind)"
+        );
+        assert_eq!(s.iter().count(), 1);
     }
 
     /// `next_weekday` is the exact inverse of `prev_weekday` and wraps

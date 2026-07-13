@@ -429,6 +429,21 @@ pub struct RoutingDefaultConfig {
     /// network; farther queries are rejected. When absent, defaults to 10000.
     #[serde(default)]
     pub max_snap_distance_m: Option<u32>,
+    /// Travel-time-map (isochrone) sampling grid step, in metres. Smaller = finer
+    /// heatmap, more cells, slower. When absent, defaults to 300.
+    #[serde(default)]
+    pub travel_map_grid_step_m: Option<f64>,
+    /// Travel-time-map safety cap on total grid cells. When a (possibly
+    /// per-query overridden) grid step would produce more cells than this over
+    /// the reachable bounding box, the step is coarsened so the output stays
+    /// bounded. When absent, defaults to 150000.
+    #[serde(default)]
+    pub travel_map_max_cells: Option<u64>,
+    /// Travel-time-map departure-window sample interval, in seconds. When a
+    /// `travelTimeMap` query supplies a window, the isochrone is evaluated at
+    /// departures spaced this many seconds apart. When absent, defaults to 600.
+    #[serde(default)]
+    pub travel_map_window_sample_secs: Option<u32>,
     /// Default bike cost profile. Absent ⇒ compiled-in BRouter trekking defaults.
     #[serde(default)]
     pub bike_profile: Option<crate::structures::BikeProfile>,
@@ -487,6 +502,11 @@ pub struct RoutingDefaultConfig {
     /// Absent ⇒ compiled-in defaults. Touches presentation only, never the search.
     #[serde(default)]
     pub balance: Option<crate::structures::cost::BalanceWeights>,
+    /// Transit-pricing model (price as an in-search Pareto dominance axis).
+    /// Absent ⇒ feature off (byte-identical to pre-feature routing). The single
+    /// master switch is `fares.enabled`; there are no per-piece feature flags.
+    #[serde(default)]
+    pub fares: Option<FaresConfig>,
     /// Pedestrian vertical-connector (stairs/elevator/ramp) cost model, used by the
     /// Stage B1 connector-coverage measurement to report the extra walk time a
     /// vertical-access path adds. Absent ⇒ compiled-in defaults. (B1 does not charge
@@ -648,6 +668,349 @@ impl EpsilonConfig {
         a[Axis::Variance.index()] = self.variance_a;
         b[Axis::Variance.index()] = self.variance_b;
         crate::structures::cost::Epsilon::new(a, b)
+    }
+}
+
+/// ε-bucket params for the euro (known-cents) price axis, shaped like `epsilon.*`
+/// (`a + b * value`). `a` is an absolute cent width, `b` a relative fraction.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct KnownEurosEpsilonConfig {
+    #[serde(default)]
+    pub a: f64,
+    #[serde(default)]
+    pub b: f64,
+}
+
+/// One fare-modeled operator, keyed by normalized `agency.name`. `model` selects
+/// the marginal-fare function. Fields not used by the selected model deserialize
+/// leniently and are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FareOperatorConfig {
+    /// Normalized agency name key (e.g. "STIB").
+    pub name: String,
+    /// Model tag: `time_window_flat` (STIB / De Lijn), `time_window_flat_tiered`
+    /// (TEC classic/express), or `distance_base_per_km` (SNCB).
+    pub model: String,
+    // --- time_window_flat (STIB / De Lijn) ---
+    #[serde(default)]
+    pub ticket_euros: Option<f64>,
+    #[serde(default)]
+    pub validity_secs: Option<u32>,
+    /// Per-journey price of a held N-journey card (De Lijn 10-journey). Selected
+    /// by the `delijn10Journey` profile flag; absent ⇒ card == single price.
+    #[serde(default)]
+    pub card_euros: Option<f64>,
+    /// Which time-window operator (`stib` | `delijn`) — selects the independent
+    /// ticket-window state. Absent ⇒ `stib`.
+    #[serde(default)]
+    pub time_window_operator: Option<String>,
+    // --- time_window_flat_tiered (TEC) ---
+    #[serde(default)]
+    pub classic_single_euros: Option<f64>,
+    #[serde(default)]
+    pub express_single_euros: Option<f64>,
+    #[serde(default)]
+    pub classic_card6_euros: Option<f64>,
+    #[serde(default)]
+    pub express_card6_euros: Option<f64>,
+    #[serde(default)]
+    pub classic_card6_reduced_euros: Option<f64>,
+    #[serde(default)]
+    pub express_card6_reduced_euros: Option<f64>,
+    /// Route-name tokens marking an EXPRESS route (matched as an uppercased
+    /// substring of `route_short_name`/`route_long_name`). Config-driven
+    /// classification rule.
+    #[serde(default)]
+    pub express_route_names: Vec<String>,
+    /// Route-name PREFIXES marking an EXPRESS route (an uppercased
+    /// `route_short_name` ONLY that starts with any of these; long-name matching is
+    /// intentionally excluded to avoid misclassifying E-initial destination names
+    /// like Eupen/Eghezée/Esneux). TEC express lines are those whose route number
+    /// starts with "E" (e.g. E12), which this rule expresses without hardcoding the
+    /// letter in Rust.
+    #[serde(default)]
+    pub express_route_prefixes: Vec<String>,
+    // --- distance_base_per_km (SNCB) ---
+    /// Base single-fare-of-distance model. `bracketed` (default, the EXACT published
+    /// 2026 SNCB 2nd-class tariff), `band` (a legacy piecewise placeholder), or
+    /// `linear` (an inert linear-fit alternative). Absent ⇒ `bracketed`.
+    #[serde(default)]
+    pub distance_tariff: Option<String>,
+    // bracketed model (default, exact 2026 2nd-class): raw = a*d_eff + b, floored,
+    // then rounded to the 0.10-EUR grid (half up); d_eff snaps to the SNCB bracket
+    // midpoints (structure fixed in code).
+    /// Slope `a` (EUR per effective km) of the exact 2nd-class linear formula.
+    #[serde(default)]
+    pub a_euros_per_km: Option<f64>,
+    /// Intercept `b` (EUR) of the exact 2nd-class linear formula.
+    #[serde(default)]
+    pub b_euros: Option<f64>,
+    /// Distance (km) at/above which the fare caps (`d_eff = cap_km`). Default 116.
+    #[serde(default)]
+    pub cap_from_km: Option<u32>,
+    /// The capped effective distance (km) used at/above `cap_from_km`. Default 118.
+    #[serde(default)]
+    pub cap_km: Option<u32>,
+    /// 1st-class multiplier km thresholds over `d_eff` (default [36, 51]): coeff[0]
+    /// applies for `d_eff <= t0`, coeff[1] for `t0 < d_eff <= t1`, else coeff[2].
+    #[serde(default)]
+    pub first_class_thresholds: Vec<u32>,
+    /// 1st-class multipliers applied to the UNROUNDED 2nd-class raw (default
+    /// [1.40, 1.50, 1.60]).
+    #[serde(default)]
+    pub first_class_coefficients: Vec<f64>,
+    /// 1st-class rounding tier boundaries (EUR, ascending, default [25, 50]): base
+    /// fares below `first_class_round_thresholds[0]` round to
+    /// `first_class_round_grids[0]`, in `[t0, t1]` to grid[1], above `t1` to grid[2].
+    #[serde(default)]
+    pub first_class_round_thresholds: Vec<f64>,
+    /// 1st-class rounding grid (EUR) per tier (default [0.10, 0.50, 1.00]). Rounding
+    /// is half-up onto the grid.
+    #[serde(default)]
+    pub first_class_round_grids: Vec<f64>,
+    /// Absolute fare floor (euros) — the minimum any SNCB single costs, and the
+    /// amount charged at board (default 2.60).
+    #[serde(default)]
+    pub floor_euros: Option<f64>,
+    /// Tariff-distance clamp (whole km): trips shorter than `min_km` bill as `min_km`,
+    /// longer than `max_km` bill as `max_km` (the advertised "120 km" cap → 118).
+    #[serde(default)]
+    pub min_km: Option<u32>,
+    #[serde(default)]
+    pub max_km: Option<u32>,
+    // band model (default): fare = per_km_rate * band_coeff(tariff_km) * tariff_km.
+    /// SNCB base per-km rate (euros/km) — the tariff constant. PLACEHOLDER pending
+    /// the exact value from SNCB's tariff PDF / fare API.
+    #[serde(default)]
+    pub per_km_rate: Option<f64>,
+    /// Two ascending km thresholds delimiting the three band coefficients (e.g. [36, 51]).
+    #[serde(default)]
+    pub band_thresholds: Vec<u32>,
+    /// The three band coefficients (e.g. [1.40, 1.50, 1.60]).
+    #[serde(default)]
+    pub band_coefficients: Vec<f64>,
+    // linear model (inert alternative): fare = intercept_euros + slope_euros_per_km * tariff_km.
+    #[serde(default)]
+    pub intercept_euros: Option<f64>,
+    #[serde(default)]
+    pub slope_euros_per_km: Option<f64>,
+    #[serde(default)]
+    pub railway_distance_source: Option<String>,
+    /// SNCB peak windows as `[[start_hhmm_secs, end_hhmm_secs], ...]` (seconds
+    /// since midnight), weekdays only. Up to 2 windows are used.
+    #[serde(default)]
+    pub peak_windows: Vec<(u32, u32)>,
+    /// Weekend discount (fraction removed) without Train+: adult / reduced.
+    #[serde(default)]
+    pub weekend_discount_adult: Option<f64>,
+    #[serde(default)]
+    pub weekend_discount_reduced: Option<f64>,
+    /// Off-peak (incl. weekend) discount WITH Train+, all categories.
+    #[serde(default)]
+    pub train_plus_offpeak_discount: Option<f64>,
+    /// Train+ peak per-journey cap (euros): adult / reduced.
+    #[serde(default)]
+    pub train_plus_peak_cap_adult_euros: Option<f64>,
+    #[serde(default)]
+    pub train_plus_peak_cap_reduced_euros: Option<f64>,
+    /// Fixed airport special-OD fare (euros); overrides base+per-km for an OD
+    /// touching an airport station.
+    #[serde(default)]
+    pub airport_od_euros: Option<f64>,
+    /// Substrings identifying an airport station name (e.g. "Airport",
+    /// "Luchthaven", "Aeroport"). Config-driven.
+    #[serde(default)]
+    pub airport_station_names: Vec<String>,
+}
+
+/// Display-only day/journey cap for an operator (spec §9). Deserializes leniently;
+/// caps are applied only at plan output in a later increment, never in dominance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FareCapConfig {
+    pub name: String,
+    #[serde(default)]
+    pub day_cap_euros: Option<f64>,
+}
+
+/// Transit-pricing config. `enabled` is THE master switch for the whole feature.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FaresConfig {
+    /// Master switch. When false the price axis, dominance clause, and price
+    /// output are all absent and the hot loop is untouched.
+    #[serde(default)]
+    pub enabled: bool,
+    /// ε-bucket on the known-cents axis. Absent ⇒ compiled-in default.
+    #[serde(default)]
+    pub known_euros_epsilon: Option<KnownEurosEpsilonConfig>,
+    /// Fare-modeled operators. Operators absent here are unmodeled (contribute an
+    /// incomparable `unknown` token).
+    #[serde(default)]
+    pub operators: Vec<FareOperatorConfig>,
+    /// Display-only caps (inert this increment; spec §9).
+    #[serde(default)]
+    pub caps: Vec<FareCapConfig>,
+    /// SNCB flat agglomeration zones (Brussels / Antwerpen). Each is a config-driven
+    /// bounding polygon; a stop inside a zone is collapsed to that zone's single fare
+    /// node so railway distance within the zone is not charged (spec Appendix A.2).
+    /// Absent ⇒ no zones ⇒ plain full-km SNCB pricing.
+    #[serde(default)]
+    pub agglomerations: Vec<FareAgglomerationConfig>,
+    /// Brupass single-journey price (euros); absent/`None` ⇒ Brupass unavailable.
+    /// PLACEHOLDER value — see the config comment. Brupass is NOT a user option: it is
+    /// applied automatically as a post-hoc CAP on the Brussels multi-operator fare
+    /// (paid in-zone boardings spanning 2+ distinct operators are capped at this price
+    /// when cheaper than the individual tickets).
+    #[serde(default)]
+    pub brupass_euros: Option<f64>,
+    /// Brupass coverage window (seconds). Retained for config back-compat; the
+    /// post-hoc cap is window-agnostic. Absent ⇒ 3600.
+    #[serde(default)]
+    pub brupass_validity_secs: Option<u32>,
+}
+
+/// One SNCB flat agglomeration zone: an identity plus a bounding polygon. The
+/// polygon is a documented approximation of the exact OSM admin boundary
+/// (Brussels-Capital Region admin_level 4; City of Antwerp admin_level 8 for the
+/// Antwerpen fare zone). `admin_level` and `osm_relation` are recorded for
+/// provenance/future exact-boundary refinement; only `polygon` is used at runtime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FareAgglomerationConfig {
+    /// Zone identifier: "brussels" or "antwerpen" (case-insensitive). An unknown
+    /// name is skipped with a warning.
+    pub name: String,
+    /// OSM admin level the polygon approximates (provenance only; e.g. 4 or 8).
+    #[serde(default)]
+    pub admin_level: Option<u32>,
+    /// OSM boundary relation id the polygon approximates (provenance only).
+    #[serde(default)]
+    pub osm_relation: Option<u64>,
+    /// Bounding polygon as `[[lat, lng], ...]` vertices in order, implicitly closed.
+    #[serde(default)]
+    pub polygon: Vec<(f64, f64)>,
+    /// Canonical central-station name for this zone's fare reference node (spec
+    /// Appendix A.2 zone collapse), e.g. "Bruxelles-Central". Matched
+    /// (case-insensitive substring) against SNCB stop names to pick the reference
+    /// railway node; unset/unmatched falls back to the polygon centroid's nearest
+    /// railway node. Provenance/tuning only.
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+impl FaresConfig {
+    /// Compile into the runtime `FareModel`. Each operator's model is a data-driven
+    /// marginal-fare function (`time_window_flat` STIB/De Lijn, `time_window_flat_tiered`
+    /// TEC, `distance_base_per_km` SNCB); unknown tags are skipped with a warning.
+    /// Euro amounts are converted to integer cents (rounded). Profile-dependent
+    /// selection (subscription/card/reduced) happens at charge time, so every price
+    /// variant the profile can pick is carried in the model. The TEC express tier is
+    /// resolved per route later (`rebuild_operator_fare_lookup`), so the compiled
+    /// template starts `is_express = false`.
+    pub fn to_fare_model(&self) -> crate::structures::cost::FareModel {
+        use crate::structures::cost::{FareModel, KnownEurosEpsilon, OperatorFare};
+        // Per-operator fare interpretation is OWNED BY EACH OPERATOR'S INGESTOR, not
+        // this generic engine (operator-agnostic policy): `to_fare_model` only maps
+        // the config's model tag to the matching ingestor builder and assembles the
+        // shared, operator-agnostic wrapper (ε-bucket, zones, Brupass). The builders
+        // compose the reusable fare primitives that live in `structures::cost::fares`.
+        //   - `time_window_flat`        → STIB/De Lijn ingestor (`gtfs::stib`)
+        //   - `time_window_flat_tiered` → generic/TEC ingestor (`gtfs::gtfs`)
+        //   - `distance_base_per_km`    → SNCB ingestor (`gtfs::sncb`)
+        use crate::ingestion::gtfs::{
+            build_sncb_operator, build_tec_operator, build_time_window_operator,
+        };
+        let cents = |e: Option<f64>| (e.unwrap_or(0.0) * 100.0).round() as u32;
+        let known_euros_epsilon = self
+            .known_euros_epsilon
+            .map(|e| KnownEurosEpsilon { a: e.a, b: e.b })
+            .unwrap_or_default();
+        let mut operators = Vec::new();
+        for op in &self.operators {
+            let mut express_route_names = Vec::new();
+            let mut express_route_prefixes = Vec::new();
+            let mut express_single_cents = 0;
+            let mut express_card6_cents = 0;
+            let mut express_card6_reduced_cents = 0;
+            let mut airport_station_names = Vec::new();
+            let model = match op.model.as_str() {
+                "time_window_flat" => build_time_window_operator(op, cents),
+                "time_window_flat_tiered" => {
+                    let tec = build_tec_operator(op, cents);
+                    express_route_names = tec.express_route_names;
+                    express_route_prefixes = tec.express_route_prefixes;
+                    express_single_cents = tec.express_single_cents;
+                    express_card6_cents = tec.express_card6_cents;
+                    express_card6_reduced_cents = tec.express_card6_reduced_cents;
+                    tec.model
+                }
+                "distance_base_per_km" => {
+                    let (model, names) = build_sncb_operator(op, cents);
+                    airport_station_names = names;
+                    model
+                }
+                other => {
+                    tracing::warn!(
+                        "fares: unknown operator model '{}' for '{}' — ignored",
+                        other,
+                        op.name
+                    );
+                    continue;
+                }
+            };
+            operators.push(OperatorFare {
+                name: op.name.clone(),
+                model,
+                express_route_names,
+                express_route_prefixes,
+                express_single_cents,
+                express_card6_cents,
+                express_card6_reduced_cents,
+                airport_station_names,
+            });
+        }
+        // SNCB flat agglomeration zones (spec Appendix A.2). Config-driven bounding
+        // polygons; an unknown name or a degenerate (<3-vertex) polygon is skipped
+        // with a warning so a malformed entry never silently mis-tags stops.
+        use crate::structures::LatLng;
+        use crate::structures::cost::{Agglomeration, AgglomerationZone};
+        let mut agglomerations = Vec::new();
+        for a in &self.agglomerations {
+            let zone = match a.name.trim().to_ascii_lowercase().as_str() {
+                "brussels" | "bruxelles" | "brussel" => Agglomeration::Brussels,
+                "antwerpen" | "antwerp" | "anvers" => Agglomeration::Antwerpen,
+                other => {
+                    tracing::warn!("fares: unknown agglomeration '{}' — ignored", other);
+                    continue;
+                }
+            };
+            if a.polygon.len() < 3 {
+                tracing::warn!(
+                    "fares: agglomeration '{}' has a degenerate polygon ({} vertices) — ignored",
+                    a.name,
+                    a.polygon.len()
+                );
+                continue;
+            }
+            let polygon = a
+                .polygon
+                .iter()
+                .map(|&(latitude, longitude)| LatLng { latitude, longitude })
+                .collect();
+            let reference = a
+                .reference
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            agglomerations.push(AgglomerationZone { zone, polygon, reference });
+        }
+
+        FareModel {
+            enabled: self.enabled,
+            known_euros_epsilon,
+            operators,
+            agglomerations,
+            brupass_cents: self.brupass_euros.map(|e| cents(Some(e))).unwrap_or(0),
+            brupass_validity_secs: self.brupass_validity_secs.unwrap_or(3600),
+        }
     }
 }
 
@@ -1132,6 +1495,57 @@ feeds:
     }
 
     #[test]
+    fn shipped_config_yaml_has_stib_fares_enabled() {
+        let cfg = Config::load("config.yaml").expect("config.yaml must parse");
+        let fares = cfg
+            .default_routing
+            .fares
+            .expect("shipped config.yaml carries a fares block");
+        assert!(fares.enabled, "fares are live on the shipped config");
+        let model = fares.to_fare_model();
+        // STIB must compile to an active time_window_flat operator.
+        assert!(
+            model.operators.iter().any(|op| op.name.eq_ignore_ascii_case("STIB")
+                && matches!(op.model, crate::structures::cost::OperatorModel::TimeWindowFlat { .. })),
+            "shipped config models STIB as a time-window flat ticket"
+        );
+        // SNCB must compile to the EXACT 2026 2nd-class BRACKETED distance tariff.
+        let sncb = model
+            .operators
+            .iter()
+            .find(|op| op.name.eq_ignore_ascii_case("SNCB"))
+            .expect("shipped config models SNCB");
+        match sncb.model {
+            crate::structures::cost::OperatorModel::DistanceBasePerKm { tariff, .. } => {
+                match tariff {
+                    crate::structures::cost::DistanceTariff::Bracketed {
+                        a_cents_per_km,
+                        b_cents,
+                        floor_cents,
+                        min_km,
+                        cap_from_km,
+                        cap_km,
+                        ..
+                    } => {
+                        assert!((a_cents_per_km - 16.8546).abs() < 1e-9);
+                        assert!((b_cents - 145.1226).abs() < 1e-9);
+                        assert_eq!(floor_cents, 262, "2.6151 EUR → 262 c");
+                        assert_eq!(min_km, 3);
+                        assert_eq!(cap_from_km, 116);
+                        assert_eq!(cap_km, 118);
+                        // Spot-check the exact published samples through the shipped tariff.
+                        assert_eq!(tariff.fare_cents(47.0), 940, "d_eff=47 → 9.40 EUR");
+                        assert_eq!(tariff.fare_cents(118.0), 2130, "d_eff=118 → 21.30 EUR");
+                        assert_eq!(tariff.fare_cents(1.0), 260, "d=1 → floor 2.60 EUR");
+                    }
+                    _ => panic!("shipped SNCB must be the bracketed tariff"),
+                }
+            }
+            _ => panic!("shipped SNCB must be distance_base_per_km"),
+        }
+    }
+
+    #[test]
     fn shipped_config_yaml_cadence_is_quota_safe() {
         let cfg = Config::load("config.yaml").expect("config.yaml must parse");
         if let Some(rt) = cfg.realtime.filter(|r| r.enabled && !r.feeds.is_empty()) {
@@ -1318,6 +1732,231 @@ address_box_coord_epsilon_m: 12.0
         assert_eq!(p.fuzzy_min_len_1typo, 4);
         assert_eq!(p.fuzzy_min_len_2typos, 9);
         assert_eq!(p.fuzzy_token_weight, 0.3);
+    }
+
+    #[test]
+    fn fares_config_parses_and_compiles_to_fare_model() {
+        use crate::structures::cost::OperatorModel;
+        let yaml = r#"
+walking_speed_mps: 1.2
+fares:
+  enabled: true
+  known_euros_epsilon: { a: 10.0, b: 0.0 }
+  operators:
+    - name: STIB
+      model: time_window_flat
+      ticket_euros: 2.10
+      validity_secs: 5400
+    - name: SNCB
+      model: distance_base_per_km
+      a_euros_per_km: 0.168546
+      b_euros: 1.451226
+      min_km: 3
+      cap_from_km: 116
+      cap_km: 118
+      floor_euros: 2.6151
+      first_class_thresholds: [36, 51]
+      first_class_coefficients: [1.40, 1.50, 1.60]
+      railway_distance_source: topology
+  caps:
+    - name: STIB
+      day_cap_euros: 7.50
+"#;
+        let r: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let fares = r.fares.expect("fares block parsed");
+        assert!(fares.enabled);
+        assert_eq!(fares.operators.len(), 2);
+        assert_eq!(fares.caps.len(), 1);
+
+        let model = fares.to_fare_model();
+        assert!(model.enabled);
+        assert_eq!(model.known_euros_epsilon.a, 10.0);
+        assert_eq!(model.operators.len(), 2);
+        // STIB: euros -> cents, active model.
+        match model.operators[0].model {
+            OperatorModel::TimeWindowFlat { ticket_cents, validity_secs, .. } => {
+                assert_eq!(ticket_cents, 210);
+                assert_eq!(validity_secs, 5400);
+            }
+            _ => panic!("STIB should be time_window_flat"),
+        }
+        // SNCB: default BRACKETED (exact 2026 2nd-class) tariff; a/b/floor/caps + the
+        // inert 1st-class fields compiled from config.
+        match model.operators[1].model {
+            OperatorModel::DistanceBasePerKm { tariff, .. } => match tariff {
+                crate::structures::cost::DistanceTariff::Bracketed {
+                    a_cents_per_km,
+                    b_cents,
+                    floor_cents,
+                    min_km,
+                    cap_from_km,
+                    cap_km,
+                    first_class_thresholds,
+                    first_class_coeffs,
+                    first_class_round_thresholds,
+                    first_class_round_grids,
+                } => {
+                    assert!((a_cents_per_km - 16.8546).abs() < 1e-9, "0.168546 EUR/km → 16.8546 c/km");
+                    assert!((b_cents - 145.1226).abs() < 1e-9, "1.451226 EUR → 145.1226 c");
+                    assert_eq!(min_km, 3);
+                    assert_eq!(cap_from_km, 116);
+                    assert_eq!(cap_km, 118);
+                    // 2.6151 EUR → 262 cents (rounded to whole cents at compile).
+                    assert_eq!(floor_cents, 262);
+                    assert_eq!(first_class_thresholds, [36, 51]);
+                    assert_eq!(first_class_coeffs, [1.40, 1.50, 1.60]);
+                    // 1st-class rounding defaults: 0.10 below 25 EUR, 0.50 in [25,50],
+                    // 1 EUR above 50 (thresholds/grids in cents).
+                    assert_eq!(first_class_round_thresholds, [2500, 5000]);
+                    assert_eq!(first_class_round_grids, [10, 50, 100]);
+                }
+                _ => panic!("SNCB should default to the bracketed tariff"),
+            },
+            _ => panic!("SNCB should be distance_base_per_km"),
+        }
+    }
+
+    #[test]
+    fn fares_config_compiles_agglomeration_zones() {
+        use crate::structures::LatLng;
+        use crate::structures::cost::Agglomeration;
+        let yaml = r#"
+fares:
+  enabled: true
+  operators:
+    - name: SNCB
+      model: distance_base_per_km
+      base_euros: 2.60
+      per_km_euros: 0.25
+  agglomerations:
+    - name: brussels
+      admin_level: 4
+      osm_relation: 54094
+      polygon:
+        - [50.797, 4.242]
+        - [50.764, 4.312]
+        - [50.905, 4.402]
+        - [50.860, 4.245]
+    - name: antwerpen
+      admin_level: 8
+      polygon:
+        - [51.160, 4.352]
+        - [51.160, 4.485]
+        - [51.275, 4.485]
+        - [51.275, 4.352]
+    - name: nowhere
+      polygon:
+        - [0.0, 0.0]
+        - [0.0, 1.0]
+    - name: unknownzone
+      polygon:
+        - [1.0, 1.0]
+        - [1.0, 2.0]
+        - [2.0, 2.0]
+"#;
+        let r: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let model = r.fares.unwrap().to_fare_model();
+        // Only the two valid, known-name, >=3-vertex zones survive; the degenerate
+        // "nowhere" (2 vertices) and the unknown-name "unknownzone" are skipped.
+        assert_eq!(model.agglomerations.len(), 2, "degenerate/unknown zones dropped");
+        assert_eq!(model.agglomerations[0].zone, Agglomeration::Brussels);
+        assert_eq!(model.agglomerations[1].zone, Agglomeration::Antwerpen);
+        // A central-Brussels coordinate falls inside the Brussels polygon.
+        assert!(
+            model.agglomerations[0].contains(LatLng { latitude: 50.83, longitude: 4.30 }),
+            "central Brussels is inside the compiled Brussels polygon"
+        );
+    }
+
+    #[test]
+    fn fares_config_compiles_delijn_tec_and_sncb_rules() {
+        use crate::structures::cost::{OperatorModel, SncbTimeRules, TimeWindowOperator};
+        let yaml = r#"
+fares:
+  enabled: true
+  operators:
+    - name: De Lijn
+      model: time_window_flat
+      time_window_operator: delijn
+      ticket_euros: 3.00
+      card_euros: 2.20
+      validity_secs: 3600
+    - name: TEC
+      model: time_window_flat_tiered
+      classic_single_euros: 2.80
+      express_single_euros: 5.50
+      classic_card6_euros: 2.23
+      express_card6_euros: 4.40
+      classic_card6_reduced_euros: 1.80
+      express_card6_reduced_euros: 3.52
+      express_route_names: ["EXPRESS", "E"]
+    - name: SNCB
+      model: distance_base_per_km
+      per_km_rate: 0.1240
+      floor_euros: 2.60
+      peak_windows: [[21600, 32400], [57600, 64800]]
+      weekend_discount_adult: 0.30
+      weekend_discount_reduced: 0.40
+      train_plus_offpeak_discount: 0.40
+      train_plus_peak_cap_adult_euros: 14.00
+      train_plus_peak_cap_reduced_euros: 5.50
+      airport_od_euros: 7.90
+      airport_station_names: ["Airport", "Luchthaven"]
+  brupass_euros: 2.60
+  brupass_validity_secs: 3600
+"#;
+        let r: RoutingDefaultConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let model = r.fares.unwrap().to_fare_model();
+        assert_eq!(model.operators.len(), 3);
+        // Brupass placeholder compiles into cents + window.
+        assert_eq!(model.brupass_cents, 260, "brupass_euros → cents");
+        assert_eq!(model.brupass_validity_secs, 3600);
+        match model.operators[0].model {
+            OperatorModel::TimeWindowFlat { ticket_cents, card_cents, operator, .. } => {
+                assert_eq!(ticket_cents, 300);
+                assert_eq!(card_cents, Some(220));
+                assert_eq!(operator, TimeWindowOperator::Delijn);
+            }
+            _ => panic!("De Lijn should be time_window_flat/delijn"),
+        }
+        match model.operators[1].model {
+            OperatorModel::TimeWindowFlatTiered { single_cents, card6_cents, card6_reduced_cents, is_express } => {
+                assert!(!is_express, "template tier is classic; per-route express resolved later");
+                assert_eq!(single_cents, 280);
+                assert_eq!(card6_cents, 223);
+                assert_eq!(card6_reduced_cents, 180);
+            }
+            _ => panic!("TEC should be time_window_flat_tiered"),
+        }
+        assert_eq!(model.operators[1].express_route_names, vec!["EXPRESS", "E"]);
+        match model.operators[2].model {
+            OperatorModel::DistanceBasePerKm { tariff, rules, airport_od_cents } => {
+                assert_eq!(tariff.floor_cents(), 260, "floor 2.60 compiled");
+                assert_eq!(airport_od_cents, 790);
+                let SncbTimeRules {
+                    n_peak_windows,
+                    weekend_discount_adult,
+                    train_plus_peak_cap_adult,
+                    train_plus_peak_cap_reduced,
+                    ..
+                } = rules;
+                assert_eq!(n_peak_windows, 2);
+                assert_eq!(weekend_discount_adult, 0.30);
+                assert_eq!(train_plus_peak_cap_adult, 1400);
+                assert_eq!(train_plus_peak_cap_reduced, 550);
+            }
+            _ => panic!("SNCB should be distance_base_per_km"),
+        }
+        assert_eq!(model.operators[2].airport_station_names, vec!["AIRPORT", "LUCHTHAVEN"]);
+    }
+
+    #[test]
+    fn fares_absent_means_feature_off() {
+        // No `fares` block ⇒ None ⇒ the graph keeps FareModel::default() (disabled),
+        // so routing is byte-identical to pre-feature.
+        let r: RoutingDefaultConfig =
+            serde_yaml_ng::from_str("walking_speed_mps: 1.2\n").unwrap();
+        assert!(r.fares.is_none());
     }
 
     #[test]

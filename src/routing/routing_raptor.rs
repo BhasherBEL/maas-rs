@@ -55,6 +55,45 @@ pub struct RouteQuery {
     /// — never changes routing behavior or results. `None` → graph default
     /// (`graph.raptor.profile_latency`, itself defaulting to off).
     pub profile_latency: Option<bool>,
+    /// Pre-committed fare products (passenger category, passes, reduction/N-trip
+    /// cards, Train+, Brupass) that select each operator's marginal fare. FIXED per
+    /// query, so every boarding's fare stays deterministic and additive. `None` ⇒
+    /// full single-ticket adult price, no products.
+    pub fare_profile: Option<FareProfile>,
+}
+
+/// A pre-committed user fare profile. Mirrors the GraphQL `FareProfileInput` and
+/// maps into the cost-layer [`crate::structures::cost::FareProfile`] the fare
+/// functions consume (via [`FareProfile::to_cost`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FareProfile {
+    pub category: crate::structures::cost::PassengerCategory,
+    pub stib_subscription: bool,
+    pub delijn_subscription: bool,
+    pub tec_subscription: bool,
+    pub sncb_subscription: bool,
+    pub sncb_train_plus: bool,
+    pub delijn_10_journey: bool,
+    pub tec_6_journey: bool,
+    /// SNCB travel class (default `Second`). Affects ONLY SNCB fares.
+    pub travel_class: crate::structures::cost::TravelClass,
+}
+
+impl FareProfile {
+    /// Map into the cost-layer profile consumed by the RAPTOR fare charging.
+    pub fn to_cost(&self) -> crate::structures::cost::FareProfile {
+        crate::structures::cost::FareProfile {
+            category: self.category,
+            stib_subscription: self.stib_subscription,
+            delijn_subscription: self.delijn_subscription,
+            tec_subscription: self.tec_subscription,
+            sncb_subscription: self.sncb_subscription,
+            sncb_train_plus: self.sncb_train_plus,
+            delijn_10_journey: self.delijn_10_journey,
+            tec_6_journey: self.tec_6_journey,
+            travel_class: self.travel_class,
+        }
+    }
 }
 
 /// A position aboard a transit trip: the boarded GTFS `trip_id`, plus an optional
@@ -71,6 +110,16 @@ pub struct OnboardOrigin {
 /// else the graph's configured default.
 fn resolve_bike_profile(graph: &Graph, query: &RouteQuery) -> crate::structures::BikeProfile {
     query.bike_profile.unwrap_or(graph.raptor.bike_profile)
+}
+
+/// The cost-layer fare profile for a query: the request's profile if present,
+/// else the default (full single-ticket adult price, no products). FIXED per
+/// query so every boarding's marginal fare stays deterministic and additive.
+fn resolve_fare_profile(query: &RouteQuery) -> crate::structures::cost::FareProfile {
+    query
+        .fare_profile
+        .map(|p| p.to_cost())
+        .unwrap_or_default()
 }
 
 /// Resolves the effective buckets + slack for a query, honouring per-request overrides
@@ -395,6 +444,7 @@ pub fn route(
     let profile_start = crate::structures::latency_profile::begin_query(profiling);
 
     let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
+    let fare_profile = resolve_fare_profile(query);
     let mut plans = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
@@ -414,6 +464,7 @@ pub fn route(
                 &am,
                 &bike,
                 ep,
+                fare_profile,
             )
         }
         _ => graph.raptor_tuned_rt_overnight_modes(
@@ -431,6 +482,7 @@ pub fn route(
             &am,
             &bike,
             ep,
+            fare_profile,
         ),
     };
 
@@ -477,6 +529,7 @@ pub fn route_explain(
     // Note: the explain path does not apply the overnight pass — it's a debug view
     // of a single RAPTOR run and overnight merging would complicate candidate provenance.
     let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
+    let fare_profile = resolve_fare_profile(query);
     let mut result = match query.window_minutes {
         Some(w) if w > 0 => {
             let window = effective_window_secs(w, graph.raptor.max_window_secs);
@@ -496,6 +549,7 @@ pub fn route_explain(
                 &am,
                 &bike,
                 ep,
+                fare_profile,
             )
         }
         _ => graph.raptor_explain_tuned_rt_modes(
@@ -513,6 +567,7 @@ pub fn route_explain(
             &am,
             &bike,
             ep,
+            fare_profile,
         ),
     };
 
@@ -591,6 +646,7 @@ mod tests {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: None,
         }
     }
 
@@ -831,6 +887,7 @@ mod tests {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let walk = plans
@@ -921,6 +978,7 @@ mod tests {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: None,
         };
         let plans = route(&g, &q, &RealtimeIndex::new()).unwrap();
         let bike = plans

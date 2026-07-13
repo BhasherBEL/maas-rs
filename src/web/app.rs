@@ -171,6 +171,52 @@ struct StopReachGql {
     path: Vec<StopPathLegGql>,
 }
 
+// ---------------------------------------------------------------------------
+// travelTimeMap (isochrone / one-to-many reachability) types
+// ---------------------------------------------------------------------------
+
+/// Per-cell aggregation across a departure window.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+#[graphql(name = "TravelAggregation")]
+enum TravelAggregationGql {
+    /// Best (minimum) travel time across the sampled departures ("if you time it
+    /// perfectly"). The default; matches a single-departure isochrone.
+    Best,
+    /// Mean travel time across the sampled departures ("on an average departure").
+    /// Departures on which a cell is unreachable within `maxSeconds` count as
+    /// `maxSeconds`, so a sometimes-reachable cell reads as slower, not faster.
+    Average,
+}
+
+impl From<TravelAggregationGql> for crate::structures::TravelAggregation {
+    fn from(a: TravelAggregationGql) -> Self {
+        match a {
+            TravelAggregationGql::Best => crate::structures::TravelAggregation::Best,
+            TravelAggregationGql::Average => crate::structures::TravelAggregation::Average,
+        }
+    }
+}
+
+/// One sampled reachability cell: a coordinate and the travel time (seconds) to
+/// reach it from the centre at the query departure.
+#[derive(SimpleObject)]
+struct TravelCell {
+    lat: f64,
+    lng: f64,
+    seconds: i32,
+}
+
+/// A travel-time map: sampled reachability cells plus the query echo the client
+/// needs to paint a green(0)->red(maxSeconds) heatmap.
+#[derive(SimpleObject)]
+struct TravelTimeMap {
+    /// Sampled cells reachable within `maxSeconds`; cells beyond it are omitted.
+    cells: Vec<TravelCell>,
+    max_seconds: i32,
+    center_lat: f64,
+    center_lng: f64,
+}
+
 #[derive(SimpleObject)]
 struct RaptorExplainResult {
     /// Same plans as the `raptor` query would return for identical parameters.
@@ -605,6 +651,90 @@ impl HighwayFactorsInput {
             b.other = v;
         }
         b
+    }
+}
+
+/// Passenger category (GraphQL enum). `YOUNG`/`SENIOR`/`BIM` are the "reduced"
+/// categories driving TEC reduced pricing and SNCB reductions/caps.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Default)]
+enum PassengerCategoryInput {
+    #[default]
+    Adult,
+    Young,
+    Senior,
+    Bim,
+}
+
+impl PassengerCategoryInput {
+    fn to_cost(self) -> crate::structures::cost::PassengerCategory {
+        use crate::structures::cost::PassengerCategory as C;
+        match self {
+            PassengerCategoryInput::Adult => C::Adult,
+            PassengerCategoryInput::Young => C::Young,
+            PassengerCategoryInput::Senior => C::Senior,
+            PassengerCategoryInput::Bim => C::Bim,
+        }
+    }
+}
+
+/// SNCB travel class (default `Second`). Affects ONLY SNCB fares.
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Default)]
+enum TravelClassInput {
+    #[default]
+    Second,
+    First,
+}
+
+impl TravelClassInput {
+    fn to_cost(self) -> crate::structures::cost::TravelClass {
+        use crate::structures::cost::TravelClass as T;
+        match self {
+            TravelClassInput::Second => T::Second,
+            TravelClassInput::First => T::First,
+        }
+    }
+}
+
+/// Pre-committed user fare profile: passenger category plus held products. FIXED
+/// per query, so every boarding's marginal fare is deterministic. An absent
+/// profile means "full single-ticket adult price, no products". All fields
+/// optional; camelCase in GraphQL (spec Appendix A.1).
+#[derive(InputObject, Default)]
+struct FareProfileInput {
+    /// `ADULT` | `YOUNG` | `SENIOR` | `BIM` (default `ADULT`).
+    passenger_category: Option<PassengerCategoryInput>,
+    /// A subscription makes that operator's legs free (0).
+    stib_subscription: Option<bool>,
+    delijn_subscription: Option<bool>,
+    tec_subscription: Option<bool>,
+    sncb_subscription: Option<bool>,
+    /// SNCB Train+ advantage card.
+    sncb_train_plus: Option<bool>,
+    /// De Lijn 10-journey card.
+    delijn10_journey: Option<bool>,
+    /// TEC 6-journey card.
+    tec6_journey: Option<bool>,
+    /// SNCB travel class (`SECOND` default | `FIRST`). Affects ONLY SNCB fares.
+    ///
+    /// NOTE: the Brussels multi-operator pass is NOT a user option. It is applied
+    /// automatically as a post-hoc cap on the Brussels multi-operator fare (see the
+    /// fare model's Brussels single-journey price in config).
+    travel_class: Option<TravelClassInput>,
+}
+
+impl FareProfileInput {
+    fn into_profile(self) -> routing_raptor::FareProfile {
+        routing_raptor::FareProfile {
+            category: self.passenger_category.unwrap_or_default().to_cost(),
+            stib_subscription: self.stib_subscription.unwrap_or(false),
+            delijn_subscription: self.delijn_subscription.unwrap_or(false),
+            tec_subscription: self.tec_subscription.unwrap_or(false),
+            sncb_subscription: self.sncb_subscription.unwrap_or(false),
+            sncb_train_plus: self.sncb_train_plus.unwrap_or(false),
+            delijn_10_journey: self.delijn10_journey.unwrap_or(false),
+            tec_6_journey: self.tec6_journey.unwrap_or(false),
+            travel_class: self.travel_class.unwrap_or_default().to_cost(),
+        }
     }
 }
 
@@ -1079,6 +1209,11 @@ impl QueryRoot {
         // to the graph default (config.yaml `profile_latency`, itself off by
         // default) when omitted.
         profile_latency: Option<bool>,
+        // Pre-committed fare products (subscriptions, cards, passenger category,
+        // Brupass) scaling each operator's marginal fare. Applied: each returned
+        // plan's `price` is computed post-hoc from its boardings under this
+        // profile. Absent ⇒ default single-ticket pricing.
+        fare_profile: Option<FareProfileInput>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -1104,6 +1239,7 @@ impl QueryRoot {
             from_station_id,
             to_station_id,
             profile_latency,
+            fare_profile: fare_profile.map(|i| i.into_profile()),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1140,6 +1276,9 @@ impl QueryRoot {
         bike_profile: Option<BikeProfileInput>,
         // When true, direct walk/bike plans are built with the Deadline leg role.
         terminal_deadline: Option<bool>,
+        // Fare profile so onboard re-planning prices with the same options as the
+        // originating journey (categories, subscriptions, Train+, cards).
+        fare_profile: Option<FareProfileInput>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -1169,6 +1308,7 @@ impl QueryRoot {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: fare_profile.map(|i| i.into_profile()),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1198,6 +1338,9 @@ impl QueryRoot {
         modes: Option<Vec<Mode>>,
         bike_profile: Option<BikeProfileInput>,
         terminal_deadline: Option<bool>,
+        // Fare profile, applied like `raptor`: each plan's `price` is computed
+        // post-hoc from its boardings under this profile.
+        fare_profile: Option<FareProfileInput>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
@@ -1223,6 +1366,7 @@ impl QueryRoot {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: fare_profile.map(|i| i.into_profile()),
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1319,6 +1463,7 @@ impl QueryRoot {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: None,
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
@@ -1408,6 +1553,113 @@ impl QueryRoot {
             after_count.max(0) as usize,
             parsed_date,
         ))
+    }
+
+    /// Travel-time map (isochrone / one-to-many reachability). From `center` at the
+    /// given day + `time`, compute the travel time to reach many sampled points, so
+    /// the client can paint a continuous green(0)->red(maxSeconds) heatmap. Reuses
+    /// the RAPTOR forward pass + the exact one-to-many foot machinery (no separate
+    /// engine). When `windowEndTime` is set, the isochrone is evaluated across the
+    /// departure window `[time, windowEndTime]` and aggregated per cell by `aggregation`.
+    #[allow(clippy::too_many_arguments)]
+    async fn travel_time_map(
+        &self,
+        ctx: &Context<'_>,
+        center_lat: f64,
+        center_lng: f64,
+        date: Option<String>,
+        time: Option<String>,
+        max_seconds: i32,
+        // Allowed travel modes (same enum the router uses). Defaults to
+        // [WALK, WALK_TRANSIT]. Empty is rejected.
+        modes: Option<Vec<Mode>>,
+        // Per-cell aggregation across the departure window. Defaults to BEST.
+        aggregation: Option<TravelAggregationGql>,
+        // When set, evaluate over the departure window [time, windowEndTime]
+        // instead of a single departure.
+        window_end_time: Option<String>,
+        // Grid cell edge in metres. Clamped to [10, 1000]; absent ⇒ the configured
+        // default (travel_map_grid_step_m). A safety cap coarsens it further if a
+        // fine step over a large area would produce too many cells.
+        grid_step_m: Option<f64>,
+        // Override the CCH foot-access default (A/B). Falls back to graph default.
+        use_cch_access: Option<bool>,
+        // Override MCR uncapped inter-stop transfers. Falls back to graph default.
+        unrestricted_transfers: Option<bool>,
+    ) -> Result<TravelTimeMap, Error> {
+        use chrono::{Datelike, Timelike};
+
+        let graph = ctx.data::<SharedGraph>()?.load_full();
+        let rt = ctx.data::<SharedRealtime>()?.load_full();
+        let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+
+        if max_seconds <= 0 {
+            return Err(Error::new("maxSeconds must be positive"));
+        }
+        let max_secs = max_seconds as u32;
+
+        let am = match &modes {
+            None => crate::structures::ActiveModes::default(),
+            Some(m) if m.is_empty() => return Err(Error::new("modes must not be empty")),
+            Some(m) => crate::structures::ActiveModes::new(m),
+        };
+        let agg: crate::structures::TravelAggregation =
+            aggregation.unwrap_or(TravelAggregationGql::Best).into();
+
+        let start_time = parsed_time.num_seconds_from_midnight();
+        let days = crate::ingestion::gtfs::date_to_days(parsed_date);
+        let weekday = 1u8 << parsed_date.weekday().num_days_from_monday();
+
+        let buckets = crate::structures::ReliabilityBuckets::new(&graph.raptor.reliability_bucket_edges);
+        let slack = graph.raptor.arrival_slack_secs;
+        let unrestricted = unrestricted_transfers.unwrap_or(graph.raptor.unrestricted_transfers);
+        let use_cch = use_cch_access.unwrap_or(graph.raptor.use_cch_access);
+        // Per-query grid cell size: clamp to [10, 1000] m; absent ⇒ configured default.
+        // The graph fill applies a further safety cap (travel_map_max_cells) so a fine
+        // step over a large reachable box can never blow up the cell count.
+        let grid_step = match grid_step_m {
+            Some(v) => v.clamp(10.0, 1000.0),
+            None => graph.raptor.travel_map_grid_step_m,
+        };
+        let bike = crate::structures::BikeCost::new(graph.raptor.bike_profile);
+        let center = crate::structures::LatLng {
+            latitude: center_lat,
+            longitude: center_lng,
+        };
+
+        let window_end = match &window_end_time {
+            Some(t) => {
+                let (_, end_t) = parse_date_time(&date, &Some(t.clone()))?;
+                Some(end_t.num_seconds_from_midnight())
+            }
+            None => None,
+        };
+
+        let g = graph.as_ref();
+        let cells = match window_end {
+            Some(end) if end > start_time => g.travel_time_map_window(
+                center, start_time, end, days, weekday, max_secs, grid_step, agg, &am, &buckets,
+                slack, unrestricted, use_cch, rt.as_ref(), &bike,
+            ),
+            _ => g.travel_time_map(
+                center, start_time, days, weekday, max_secs, grid_step, &am, &buckets, slack,
+                unrestricted, use_cch, rt.as_ref(), &bike,
+            ),
+        };
+
+        Ok(TravelTimeMap {
+            cells: cells
+                .into_iter()
+                .map(|c| TravelCell {
+                    lat: c.loc.latitude,
+                    lng: c.loc.longitude,
+                    seconds: c.seconds as i32,
+                })
+                .collect(),
+            max_seconds,
+            center_lat,
+            center_lng,
+        })
     }
 
     /// Returns every transit stop loaded from GTFS.
@@ -1528,6 +1780,8 @@ impl QueryRoot {
 }
 
 const INDEX_HTML: &str = include_str!("static/index.html");
+const TRAVEL_MAP_HTML: &str = include_str!("static/travel_map.html");
+const TRAVEL_MAP_JS: &str = include_str!("static/js/travel-map.mjs");
 const MAAS_JS: &str = include_str!("static/maas.js");
 const SW_JS: &str = include_str!("static/sw.js");
 const MANIFEST: &str = include_str!("static/manifest.webmanifest");
@@ -1583,6 +1837,16 @@ impl IntoResponse for Svg {
 #[handler]
 pub async fn index_page() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+#[handler]
+pub async fn travel_map_page() -> Html<&'static str> {
+    Html(TRAVEL_MAP_HTML)
+}
+
+#[handler]
+pub async fn travel_map_js_handler() -> Js {
+    Js(TRAVEL_MAP_JS)
 }
 
 #[handler]
@@ -1735,6 +1999,8 @@ pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<
         .at("/manifest.webmanifest", get(manifest_handler))
         .at("/icon.svg", get(icon_svg_handler))
         .at("/icon-maskable.svg", get(icon_maskable_svg_handler))
+        .at("/static/js/travel-map.mjs", get(travel_map_js_handler))
+        .at("/travel_map", get(travel_map_page))
         .at("/", get(index_page));
 
     let bind = format!("{}:{}", config.server.host, config.server.port);

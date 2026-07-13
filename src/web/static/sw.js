@@ -1,11 +1,13 @@
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v10';
 const CACHE_NAME = `maas-shell-${CACHE_VERSION}`;
 
 const SHELL_URLS = [
   '/',
+  '/travel_map',
   '/maas.js',
   '/manifest.webmanifest',
   '/icon.svg',
+  '/static/js/travel-map.mjs',
   '/static/js/live-view.mjs',
   '/static/js/live-logic.mjs',
   '/static/js/live-db.mjs',
@@ -78,6 +80,20 @@ self.addEventListener('fetch', (event) => {
         }
         return resp;
       })
-      .catch(() => caches.match(request).then((cached) => cached || caches.match('/')))
+      .catch(() => offlineFallback(request, url))
   );
 });
+
+// Offline/failed-fetch fallback. Match the cache query-string-agnostically so a
+// request like `/travel_map?date=…&modes=…` still resolves to the cached
+// `/travel_map` document. For a navigation whose exact URL isn't cached, serve
+// the cached document for the SAME path (`/travel_map` for a /travel_map nav,
+// otherwise `/`) — never blindly `/`, which would land the user on the wrong
+// page. Non-navigation requests just get their (search-agnostic) cache hit.
+async function offlineFallback(request, url) {
+  const cached = await caches.match(request, { ignoreSearch: true });
+  if (cached) return cached;
+  if (request.mode !== 'navigate') return cached; // undefined -> network error
+  const path = url.pathname.startsWith('/travel_map') ? '/travel_map' : '/';
+  return caches.match(path, { ignoreSearch: true });
+}

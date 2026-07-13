@@ -24,6 +24,53 @@ pub struct AccessAlternative {
     pub street_secs: u32,
 }
 
+/// Transit price carried by a plan (present only when the fares feature is on).
+///
+/// `known_euros` is the accumulated modeled spend (STIB / De Lijn / TEC / SNCB)
+/// under the query's fare profile. `capped_euros` applies the display-time SNCB
+/// per-journey cap (Train+ peak) as `known − sncb_spend + min(sncb_spend, cap)`;
+/// it equals `known_euros` when no cap is in force (spec §9 — the cap is carried
+/// as raw spend in dominance, applied only at display). `unknown_operators` names
+/// the unmodeled operators the plan boards, each contributing an incomparable
+/// price token so the plan is never dominated on price by a modeled-only plan.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct PlanPrice {
+    pub known_euros: f64,
+    pub capped_euros: f64,
+    pub unknown_operators: Vec<String>,
+    /// SNCB tariff distance (km) of the last contiguous rail run in the plan, the
+    /// zone-collapsed distance that feeds the SNCB fare formula. Exposed for fare
+    /// calibration against SNCB's official tariff-distance table. `None` when the
+    /// plan has no SNCB run.
+    pub sncb_fare_km: Option<f64>,
+    /// Itemized "shopping list" of the tickets/products the journey buys: one item
+    /// per chargeable ticket (consecutive same-ticket boardings grouped: a STIB
+    /// 90-min window is ONE item across transfers; a contiguous SNCB run is ONE
+    /// item; a Brupass covering several in-zone legs is ONE item). Subscription- or
+    /// pass-covered legs appear as a €0.00 item with `coverage` set. The sum of item
+    /// `euros` (with caps applied) equals `capped_euros`.
+    pub breakdown: Vec<FareBreakdownItem>,
+}
+
+/// One line of the fare breakdown (a single ticket or product the traveller buys,
+/// or a covered leg). `euros` is what it costs (0.00 when covered); `coverage` is
+/// `None` when paid, else the reason it is free (e.g. a subscription or Brupass).
+#[derive(Debug, Clone, SimpleObject)]
+pub struct FareBreakdownItem {
+    /// Operator/agency the ticket is for (e.g. "STIB", "SNCB", "De Lijn", "TEC",
+    /// or "Brupass" for the multi-operator pass).
+    pub operator: String,
+    /// The ticket/product bought, e.g. "STIB single (90 min)",
+    /// "SNCB 2nd class Brussels->Antwerpen", "De Lijn 10-journey card",
+    /// "TEC classic 6-journey", "Brupass (Brussels)".
+    pub description: String,
+    /// What this item costs in euros (0.00 when covered by a pass/subscription).
+    pub euros: f64,
+    /// `None` when paid; else the reason it is free/covered, e.g.
+    /// "De Lijn subscription", "Brupass", "SNCB subscription".
+    pub coverage: Option<String>,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct Plan {
     pub legs: Vec<PlanLeg>,
@@ -40,6 +87,9 @@ pub struct Plan {
     /// Equals `end` for deterministic routes; higher than `end` when transfers
     /// carry risk (infeasible transfer → high-delay scenario shifts expectation up).
     pub expected_end: u32,
+    /// Transit price of this plan. `None` when the fares feature is disabled;
+    /// `Some` (computed post-hoc from the plan's boardings) when enabled.
+    pub price: Option<PlanPrice>,
 }
 
 // ---------------------------------------------------------------------------

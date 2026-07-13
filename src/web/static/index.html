@@ -51,6 +51,10 @@
   --ds-rel-high-soft: oklch(0.95 0.04 152);
   --ds-rel-mid-soft:  oklch(0.955 0.05 88);
   --ds-rel-low-soft:  oklch(0.955 0.045 33);
+  /* Bike-leg palette (ride = green, dismount/push = orange). Themed like the
+     rel-* tokens so bike badges/stats stay legible in dark mode. */
+  --ds-bike:       oklch(0.52 0.13 149);
+  --ds-bike-push:  oklch(0.58 0.19 45);
   --ds-stone:      oklch(0.55 0.018 75);
   --ds-stone-soft: oklch(0.915 0.012 80);
   --ds-mode-mark:  #c01722;
@@ -73,7 +77,60 @@
     --accent-2: #1a2a4a;
     --shadow:   0 1px 2px rgba(0,0,0,.4);
     --shadow-l: 0 8px 24px rgba(0,0,0,.6);
+    /* ── Design-system palette (dark) ──
+       These --ds-* tokens back most of the modern UI (search panel, plan
+       cards, route picker, breakdown popup). They live only in :root as light
+       values, so without these dark overrides the bulk of the UI renders with
+       light surfaces/ink in dark mode. Every consumer resolves through them
+       (incl. the .pd-root aliases and the --ink-*/--accent-deep aliases). */
+    --ds-bg:        #0e1116;
+    --ds-surface:   #161a21;
+    --ds-surface-2: #1c2129;
+    --ds-surface-3: #232a34;
+    --ds-line:      #2b323d;
+    --ds-line-soft: #232932;
+    --ds-ink:       #e6e9ee;
+    --ds-ink-2:     #b7c0cc;
+    --ds-ink-3:     #8a95a1;
+    --ds-ink-4:     #6c7682;
+    --ds-accent:      #6f9bff;
+    --ds-accent-deep: #9bbaff;
+    --ds-accent-soft: #1a2a4a;
+    --ds-rel-high: oklch(0.68 0.13 152);
+    --ds-rel-mid:  oklch(0.76 0.135 80);
+    --ds-rel-low:  oklch(0.66 0.165 33);
+    --ds-rel-high-soft: oklch(0.30 0.05 152);
+    --ds-rel-mid-soft:  oklch(0.32 0.05 88);
+    --ds-rel-low-soft:  oklch(0.32 0.055 33);
+    --ds-bike:       oklch(0.78 0.15 150);
+    --ds-bike-push:  oklch(0.76 0.16 55);
+    --ds-stone:      oklch(0.72 0.018 75);
+    --ds-stone-soft: oklch(0.30 0.012 80);
+    --ds-mode-mark:  #ff5a63;
+    --ds-shadow-sm: 0 1px 2px rgba(0,0,0,.5), 0 1px 1px rgba(0,0,0,.4);
+    --ds-shadow-md: 0 2px 6px rgba(0,0,0,.55), 0 8px 24px rgba(0,0,0,.5);
   }
+}
+
+@media (prefers-color-scheme: dark) {
+  /* Reliability chip TEXT colors are hardcoded dark oklch (L~0.42-0.5) tuned for
+     the light "soft" backgrounds. In dark mode those soft backgrounds are now
+     dark, so the text is dark-on-dark. Lift the text to a light tint of the same
+     hue so the chips stay legible. Grouped by hue: green (high/ontime),
+     amber (mid/open), red (low/late). */
+  .rel.high, .xfer-prob[data-rel="high"], .conn-rel[data-rel="high"],
+  .rc-rel[data-rel="high"], .rib .s.xf[data-rel="high"] .pc,
+  .it-live.ontime, .it-t.ontime .s, .it-t.early.major .r, .it-t.early .r,
+  .it-rel[data-rel="high"], .lv-bk-chip[data-rel="high"] { color: oklch(0.82 0.13 152); }
+  .rel.mid, .rc-rel[data-rel="mid"], .rib .s.xf[data-rel="mid"] .pc,
+  .t-mid, .rb-transfer.rel-mid .rb-rel, .card-foot .warn-txt,
+  .xfer-prob[data-rel="mid"], .conn-rel[data-rel="mid"],
+  .it-rel[data-rel="mid"], .lv-xfer-state[data-state="open"],
+  .lv-xfer-state[data-state="open"] .xod b, .lv-bk-chip[data-rel="mid"] { color: oklch(0.84 0.135 80); }
+  .rel.low, .rb-transfer.rel-low .rb-rel, .rc-rel[data-rel="low"],
+  .xfer-prob[data-rel="low"], .conn-rel[data-rel="low"],
+  .it-t.late .r, .it-t.late.major .r,
+  .it-live.late, .it-rel[data-rel="low"], .lv-bk-chip[data-rel="low"] { color: oklch(0.76 0.165 33); }
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -296,6 +353,72 @@ header a.head-btn { text-decoration: none; }
 .advanced input[type=number], .advanced input[type=range], .advanced select { width: 110px; padding: 4px 6px; font-size: 12px; }
 .advanced input[type=range] { width: 130px; }
 .advanced .val { width: 44px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--fg); }
+/* ── Fare-profile card (main page, mirrors #modes-card) ───────── */
+#fare-card { border: 1px solid var(--ds-line, var(--border)); border-radius: 12px;
+  background: var(--ds-surface-2, var(--panel-2)); margin-bottom: 10px; overflow: hidden; }
+#fare-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; cursor: pointer; padding: 9px 12px;
+  font-size: 13px; font-weight: 700; color: var(--ds-ink, var(--fg));
+}
+.fh-title { white-space: nowrap; }
+.fh-summary { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--ds-ink-3, var(--fg-3));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+.fh-chev { font-size: 12px; color: var(--ds-ink-2, var(--fg-2)); transition: transform .15s; margin-left: 2px; flex: none; }
+#fare-card.collapsed .fh-chev { transform: rotate(-180deg); }
+#fare-body { padding: 4px 12px 12px; border-top: 1px solid var(--ds-line, var(--border)); }
+#fare-card.collapsed #fare-body { display: none; }
+.fare-subhead { display: flex; align-items: flex-start; gap: 10px; margin: 8px 0 4px; }
+.fare-hint { flex: 1; margin: 0; font-size: 10.5px; color: var(--ds-ink-4, var(--fg-3)); line-height: 1.35; }
+.fare-reset {
+  flex: none; font-size: 11px; font-weight: 600; color: var(--ds-ink-2, var(--fg-2));
+  background: var(--ds-surface, var(--panel)); border: 1px solid var(--ds-line, var(--border));
+  border-radius: 999px; padding: 2px 12px;
+}
+.fare-reset:hover { color: var(--ds-ink, var(--fg)); }
+.fare-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+.fare-lbl { flex: 1; font-size: 12px; color: var(--ds-ink-2, var(--fg-2)); }
+.fare-lbl small { display: block; color: var(--ds-ink-4, var(--fg-3)); font-size: 10.5px; margin-top: 1px; }
+.fare-row select { width: 130px; padding: 4px 6px; font-size: 12px;
+  background: var(--ds-surface, var(--panel)); color: var(--ds-ink, var(--fg));
+  border: 1px solid var(--ds-line, var(--border)); border-radius: 6px; }
+.fare-op { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--ds-line-soft, var(--border)); }
+.fare-op-head { font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ds-ink-3, var(--fg-3)); margin-bottom: 6px; }
+.fare-check { display: flex; align-items: center; gap: 7px; font-size: 12px;
+  color: var(--ds-ink-2, var(--fg-2)); cursor: pointer; padding: 3px 0; }
+.fare-check input[type=checkbox] { flex: none; margin: 0; accent-color: var(--ds-accent, var(--accent)); }
+
+/* ── Fare breakdown popup (clickable price) ───────────────────── */
+.fb-backdrop { display: none; position: fixed; inset: 0; z-index: 9100; background: rgba(0,0,0,.35); }
+.fb-backdrop.open { display: block; }
+.fb-pop {
+  position: fixed; z-index: 9101; width: 300px; max-width: calc(100vw - 24px);
+  background: var(--ds-surface, var(--panel)); color: var(--ds-ink, var(--fg));
+  border: 1px solid var(--ds-line, var(--border)); border-radius: 10px;
+  box-shadow: var(--ds-shadow-md, var(--shadow-l)); overflow: hidden;
+}
+.fb-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid var(--ds-line, var(--border)); }
+.fb-head .fb-t { flex: 1; font-size: 12px; font-weight: 700; color: var(--ds-ink, var(--fg)); }
+.fb-head .fb-x { background: none; border: none; font-size: 17px; line-height: 1;
+  color: var(--ds-ink-3, var(--fg-3)); padding: 0 2px; }
+.fb-head .fb-x:hover { color: var(--ds-ink, var(--fg)); }
+.fb-list { padding: 8px 12px; display: flex; flex-direction: column; gap: 7px; }
+.fb-item { display: flex; align-items: baseline; gap: 8px; font-size: 12px; }
+.fb-desc { flex: 1; color: var(--ds-ink-2, var(--fg-2)); }
+.fb-item.covered .fb-desc { color: var(--ds-ink-3, var(--fg-3)); }
+.fb-cov { display: block; font-size: 10px; color: var(--ds-ink-4, var(--fg-3)); margin-top: 1px; }
+.fb-amt { flex: none; font-family: var(--mono); font-weight: 700; color: var(--ds-ink, var(--fg)); white-space: nowrap; }
+.fb-item.covered .fb-amt { color: var(--ds-ink-4, var(--fg-3)); }
+.fb-dots { flex: 1; border-bottom: 1px dotted var(--ds-line, var(--border)); transform: translateY(-3px); margin: 0 2px; }
+.fb-total { display: flex; align-items: baseline; gap: 8px; padding: 9px 12px;
+  border-top: 1px solid var(--ds-line, var(--border)); font-size: 12px; }
+.fb-total .fb-tl { flex: 1; font-weight: 700; color: var(--ds-ink, var(--fg)); }
+.fb-total .fb-amt { font-size: 13px; }
+.fb-unknown { padding: 0 12px 10px; font-size: 10.5px; color: var(--ds-ink-4, var(--fg-3)); }
+.fb-empty { padding: 4px 12px 12px; font-size: 11px; color: var(--ds-ink-3, var(--fg-3)); }
+.rc-price { cursor: pointer; }
 .query-panel { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
 .query-panel textarea { width: 100%; box-sizing: border-box; margin-top: 6px; padding: 6px 8px;
   font-family: var(--mono); font-size: 11px; line-height: 1.4; background: var(--panel);
@@ -320,6 +443,22 @@ header a.head-btn { text-decoration: none; }
   text-transform: uppercase; color: var(--ds-ink-4);
 }
 #plans-list { padding: 4px 14px 20px; display: flex; flex-direction: column; }
+
+/* Extend-search-window buttons (earlier / later). Reuse --ds-* tokens only. */
+.extend-btn {
+  font: inherit; cursor: pointer; margin: 6px 14px;
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  font-size: 12px; font-weight: 650; letter-spacing: .01em;
+  color: var(--ds-ink-2); background: var(--ds-surface, var(--ds-bg));
+  border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm, 8px);
+  padding: 8px 12px; transition: .12s;
+}
+#extend-earlier { margin-top: 10px; }
+#extend-later { margin-bottom: 16px; }
+.extend-btn:hover:not(:disabled) { border-color: var(--ds-accent); color: var(--ds-accent); }
+.extend-btn:disabled { cursor: default; opacity: .6; }
+.extend-btn .ex-arrow { font-size: 13px; line-height: 1; }
+#plans-panel.rp-active .extend-btn { display: none !important; }
 
 .status-msg { color: var(--fg-3); font-size: 13px; padding: 24px 14px; text-align: center; }
 .status-msg.error { color: var(--danger); }
@@ -406,7 +545,7 @@ header a.head-btn { text-decoration: none; }
   border-radius: var(--ds-radius); padding: 13px 14px 11px; margin-bottom: 10px;
   cursor: pointer; transition: border-color .14s, box-shadow .14s;
 }
-.card:hover { border-color: oklch(0.86 0.01 70); box-shadow: var(--ds-shadow-sm); }
+.card:hover { border-color: color-mix(in oklab, var(--ds-ink-4) 55%, var(--ds-line)); box-shadow: var(--ds-shadow-sm); }
 .card.open { border-color: var(--ds-accent); box-shadow: var(--ds-shadow-md); cursor: default; }
 .card-top { display: flex; align-items: baseline; justify-content: space-between; }
 .card-times { display: flex; align-items: baseline; gap: 8px; }
@@ -593,19 +732,22 @@ header a.head-btn { text-decoration: none; }
 .pg-opt-time { font-size: 14px; font-weight: 700; color: var(--fg); }
 .pg-opt-tk { font-size: 12px; font-weight: 500; color: var(--fg-2); margin-right: 2px; }
 .pg-opt-lead .rel { margin-left: auto; }
+.pg-opt-lead .rc-price { margin-left: auto; }
+.pg-opt-lead .rc-price + .rel { margin-left: 10px; }
 .plan-mode-badge {
   font-size: 11px; padding: 1px 7px; border-radius: 999px; margin-left: 6px;
-  background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3255; white-space: nowrap;
+  background: color-mix(in oklab, var(--ds-bike) 13%, transparent); color: var(--ds-bike);
+  border: 1px solid color-mix(in oklab, var(--ds-bike) 33%, transparent); white-space: nowrap;
 }
-.leg-bike-lbl { color: #2e7d32; font-weight: 600; }
+.leg-bike-lbl { color: var(--ds-bike); font-weight: 600; }
 .leg-bike-stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .bike-stat {
   font-size: 11px; font-weight: 600; color: var(--ds-ink-3);
-  background: var(--ds-ink-1, #2e7d3211); border: 1px solid #2e7d3233;
+  background: color-mix(in oklab, var(--ds-bike) 7%, transparent); border: 1px solid color-mix(in oklab, var(--ds-bike) 20%, transparent);
   border-radius: 999px; padding: 1px 8px; white-space: nowrap;
 }
-.bike-stat-cr { color: #2e7d32; background: #2e7d3218; }
-.bike-stat-push { color: #e65100; background: #e6510018; border-color: #e6510033; }
+.bike-stat-cr { color: var(--ds-bike); background: color-mix(in oklab, var(--ds-bike) 10%, transparent); }
+.bike-stat-push { color: var(--ds-bike-push); background: color-mix(in oklab, var(--ds-bike-push) 10%, transparent); border-color: color-mix(in oklab, var(--ds-bike-push) 20%, transparent); }
 .access-alts { margin: 6px 0 2px; font-size: 12px; color: var(--fg-2); }
 .access-alts .alt { display: block; margin-top: 2px; }
 
@@ -681,26 +823,45 @@ header a.head-btn { text-decoration: none; }
 .conn-rel[data-rel="mid"]  { color: oklch(0.52 0.12 64); }
 .conn-rel[data-rel="low"]  { color: oklch(0.52 0.17 33); }
 .conn-block { margin-top: 11px; }
-.conn-lbl { font-size: 11px; color: var(--ds-ink-3); margin-bottom: 8px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.feeder { display: flex; gap: 7px; flex-wrap: wrap; }
-.fopt {
-  font: inherit; cursor: pointer; flex: 1; min-width: 80px; text-align: left;
-  display: flex; flex-direction: column; gap: 5px;
-  background: var(--ds-surface); border: 1px solid var(--ds-line); border-radius: 8px;
-  padding: 8px 9px; transition: .12s;
+/* Departures panel (prev/next departures for a transit leg) */
+.dep-toggle {
+  font: inherit; cursor: pointer; width: 100%; text-align: left;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11.5px; font-weight: 650; color: var(--ds-ink-2);
+  background: var(--ds-surface); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius-sm); padding: 6px 9px; transition: .12s;
 }
-.fopt:hover { border-color: oklch(0.84 0.02 70); }
-.fopt.planned { border-color: var(--ds-accent); background: var(--ds-accent-soft); }
-.fopt-time { font-size: 14px; font-weight: 600; color: var(--ds-ink); font-family: 'IBM Plex Mono', monospace; }
-.fopt-rel { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; }
-.fopt-delta { font-size: 10px; color: var(--ds-ink-4); }
-.fopt.planned .fopt-delta { color: var(--ds-accent); font-weight: 650; }
-.fopt-more {
-  flex: 1 0 100%; padding: 4px 8px; font-size: 11px; font-weight: 600;
+.dep-toggle:hover { border-color: var(--ds-accent); color: var(--ds-accent); }
+.dep-toggle .chev { margin-left: auto; transition: transform .15s; }
+.dep-toggle.open .chev { transform: rotate(180deg); }
+.dep-summary { margin: 9px 0 7px; font-size: 11.5px; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.dep-every { font-weight: 700; color: var(--ds-ink); }
+.dep-times { color: var(--ds-ink-3); font-family: 'IBM Plex Mono', monospace; }
+.dep-list { display: flex; flex-direction: column; gap: 5px; }
+.dep-opt {
+  font: inherit; cursor: pointer; text-align: left; width: 100%;
+  display: flex; align-items: center; gap: 9px;
+  background: var(--ds-surface); border: 1px solid var(--ds-line); border-radius: 8px;
+  padding: 7px 10px; transition: .12s;
+}
+.dep-opt:hover:not(:disabled) { border-color: var(--ds-accent); background: var(--ds-accent-soft); }
+.dep-opt.current { border-color: var(--ds-accent); background: var(--ds-accent-soft); cursor: default; }
+.dep-opt-t { font-size: 13.5px; font-weight: 600; color: var(--ds-ink); font-family: 'IBM Plex Mono', monospace; }
+.dep-opt-d { font-size: 10.5px; color: var(--ds-ink-4); }
+.dep-opt.current .dep-opt-d { color: var(--ds-accent); font-weight: 650; }
+.dep-opt-r { margin-left: auto; font-size: 11px; font-weight: 700; font-family: 'IBM Plex Mono', monospace; }
+.dep-opt-r[data-rel="high"] { color: var(--ds-rel-high, oklch(0.46 0.13 152)); }
+.dep-opt-r[data-rel="mid"]  { color: var(--ds-rel-mid,  oklch(0.52 0.12 64)); }
+.dep-opt-r[data-rel="low"]  { color: var(--ds-rel-low,  oklch(0.52 0.17 33)); }
+.dep-more {
+  font: inherit; cursor: pointer; width: 100%; margin-top: 7px;
+  padding: 5px 8px; font-size: 11px; font-weight: 600;
   color: var(--ds-ink-3); background: var(--ds-surface-2);
   border: 1px dashed var(--ds-line); border-radius: var(--ds-radius-sm);
 }
-.fopt-more:hover { color: var(--ds-accent); border-color: var(--ds-accent); }
+.dep-more:hover:not(:disabled) { color: var(--ds-accent); border-color: var(--ds-accent); }
+.dep-note { font-size: 11px; color: var(--ds-ink-3); margin-top: 8px; }
+.dep-note.err { color: var(--ds-rel-low, oklch(0.52 0.17 33)); }
 .conn-foot { margin-top: 11px; padding-top: 10px; border-top: 1px dashed var(--ds-line); display: flex; flex-direction: column; gap: 5px; }
 .cf-item { font-size: 11px; line-height: 1.5; color: var(--ds-ink-3); }
 .cf-k { font-weight: 700; color: var(--ds-ink-2); }
@@ -734,6 +895,10 @@ header a.head-btn { text-decoration: none; }
 .rc-times .big { font-family: var(--mono); font-size: 22px; font-weight: 600; color: var(--ink); letter-spacing: -.01em; }
 .rc-times .ar { color: var(--ink-4); font-size: 14px; }
 .rc-tag { font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: var(--accent-deep); }
+.rc-price { margin-left: auto; display: inline-flex; align-items: baseline; gap: 1px; font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--ink-2); white-space: nowrap; }
+.rc-price.partial { color: var(--ink-3); }
+.rc-price .q { color: var(--accent-deep); }
+.rc-price + .rc-rel { margin-left: 10px; }
 .rc-rel { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 13px; font-weight: 700; white-space: nowrap; }
 .rc-rel .bead { width: 8px; height: 8px; border-radius: 50%; }
 .rc-rel[data-rel="high"] { color: oklch(0.44 0.13 152); } .rc-rel[data-rel="high"] .bead { background: var(--rel-high); }
@@ -843,7 +1008,7 @@ header a.head-btn { text-decoration: none; }
 .it-dir { font-size: 13px; font-weight: 600; color: var(--ink); display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .it-dir .ar { color: var(--ink-4); font-weight: 700; }
 .it-stops { margin-top: 8px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 11.5px; font-weight: 600; color: var(--ink-2); cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px 3px 11px; transition: .12s; }
-.it-stops:hover { border-color: oklch(0.86 0.01 70); }
+.it-stops:hover { border-color: color-mix(in oklab, var(--ds-ink-4) 55%, var(--line)); }
 .it-stops .chev { font-size: 9px; color: var(--ink-4); transition: transform .15s; }
 .it-stops.open .chev { transform: rotate(180deg); }
 .it-stops .dur { color: var(--ink-4); }
@@ -891,6 +1056,30 @@ header a.head-btn { text-decoration: none; }
 .modal-head .close { background: none; border: none; font-size: 18px; color: var(--fg-3); padding: 0 4px; }
 .modal-body { padding: 14px 16px; overflow-y: auto; }
 .hint { font-size: 11px; color: var(--fg-3); margin-bottom: 8px; }
+
+/* ── Share view (QR + link) ──────────────────────────────────── */
+.share-modal { max-width: 380px; }
+.share-qr {
+  display: flex; align-items: center; justify-content: center;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px; margin: 2px auto 12px; width: min(240px, 68vw);
+}
+.share-qr svg { width: 100%; height: auto; display: block; }
+.share-link { display: flex; gap: 8px; align-items: stretch; }
+.share-url {
+  flex: 1; min-width: 0; padding: 7px 9px; font-size: 12px;
+  font-family: var(--mono); color: var(--fg-2);
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+}
+.share-copy {
+  flex: none; padding: 7px 12px; font-size: 12px; font-weight: 600;
+  color: var(--accent); background: var(--accent-2);
+  border: 1px solid var(--accent); border-radius: var(--radius-s);
+  cursor: pointer; white-space: nowrap;
+}
+.share-copy:hover { filter: brightness(1.04); }
+.share-copy.done { color: #fff; background: var(--accent); }
 .stops { margin-top: 8px; padding-left: 4px; border-left: 2px solid var(--border-2); }
 .stop { display: grid; grid-template-columns: 56px 1fr; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--fg-2); }
 .stop .t { font-family: var(--mono); font-size: 11.5px; color: var(--fg-3); white-space: nowrap; }
@@ -911,8 +1100,10 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   header { gap: 8px; padding: 8px 10px; }
   header .logo { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #view-toggle { display: inline-flex; flex-shrink: 0; }
-  /* Keep the header compact: drop the secondary desktop links. */
-  header a.head-btn { display: none; }
+  /* Keep the header compact: drop the secondary desktop links, but keep the
+     Travel-map link reachable (nav is symmetric with the map page's back-link). */
+  header a.head-btn:not([href="/travel_map"]) { display: none; }
+  header a.head-btn[href="/travel_map"] { padding: 6px 10px; }
 
   .main { position: relative; }
   #sidebar { width: 100%; overflow-y: auto; }
@@ -1165,6 +1356,8 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   </button>
   <button id="reverse-btn" class="head-btn" title="Swap origin and destination (R)">⇅ Reverse</button>
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
+  <button id="share-btn" class="head-btn" title="Share this view (QR code + link)" aria-label="Share this view">⧉ Share</button>
+  <a href="/travel_map" class="head-btn" title="Travel-time map">🗺 Travel map</a>
   <a href="/graphiql" class="head-btn" target="_blank">GraphQL ↗</a>
   <button id="pwa-install-btn" class="head-btn" style="display:none" title="Install MaaS as an app">⊕ Install</button>
 </header>
@@ -1225,6 +1418,62 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
           </div>
           <div id="modes-grid" role="group" aria-label="Travel modes"></div>
           <p class="modes-caption">Every valid pairing is a cell — striped cells aren’t possible (you can’t take a car onto the train).</p>
+        </div>
+      </div>
+      <div id="fare-card" class="collapsed">
+        <button type="button" id="fare-head" aria-expanded="false">
+          <span class="fh-title">Fare profile</span>
+          <span class="fh-summary" id="fare-summary" aria-hidden="true"></span>
+          <span class="fh-chev" aria-hidden="true">▾</span>
+        </button>
+        <div id="fare-body">
+          <div class="fare-subhead">
+            <p class="fare-hint">Your tickets and reduction cards. Used to price journeys for you. Saved on this device.</p>
+            <button type="button" id="fare-reset" class="fare-reset">Reset</button>
+          </div>
+          <div class="fare-row">
+            <label class="fare-lbl" for="fare-category">Passenger category
+              <small>Reduced categories drive TEC and SNCB discounts</small>
+            </label>
+            <select id="fare-category">
+              <option value="ADULT">Adult</option>
+              <option value="YOUNG">Young</option>
+              <option value="SENIOR">Senior</option>
+              <option value="BIM">BIM (increased reimbursement)</option>
+            </select>
+          </div>
+
+          <div class="fare-op">
+            <div class="fare-op-head">SNCB (train)</div>
+            <label class="fare-check"><input type="checkbox" id="fare-sncb-sub"> Season subscription</label>
+            <label class="fare-check"><input type="checkbox" id="fare-sncb-trainplus"> Train+ advantage card</label>
+            <div class="fare-row">
+              <label class="fare-lbl" for="fare-class">Travel class
+                <small>Affects SNCB fares only</small>
+              </label>
+              <select id="fare-class">
+                <option value="SECOND">2nd class</option>
+                <option value="FIRST">1st class</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="fare-op">
+            <div class="fare-op-head">STIB (Brussels)</div>
+            <label class="fare-check"><input type="checkbox" id="fare-stib-sub"> Season subscription</label>
+          </div>
+
+          <div class="fare-op">
+            <div class="fare-op-head">De Lijn (Flanders)</div>
+            <label class="fare-check"><input type="checkbox" id="fare-delijn-sub"> Season subscription</label>
+            <label class="fare-check"><input type="checkbox" id="fare-delijn-10"> 10-journey card</label>
+          </div>
+
+          <div class="fare-op">
+            <div class="fare-op-head">TEC (Wallonia)</div>
+            <label class="fare-check"><input type="checkbox" id="fare-tec-sub"> Season subscription</label>
+            <label class="fare-check"><input type="checkbox" id="fare-tec-6"> 6-journey card</label>
+          </div>
         </div>
       </div>
       <button id="go">
@@ -1290,9 +1539,11 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
           <button type="button" data-group="none" title="Flat list, no grouping">Anytime</button>
         </div>
       </div>
+      <button type="button" id="extend-earlier" class="extend-btn" hidden></button>
       <div id="plans-list" class="pd-root">
         <p class="status-msg">Set origin and destination above, or right-click the map.</p>
       </div>
+      <button type="button" id="extend-later" class="extend-btn" hidden></button>
     </div>
   </div>
 
@@ -1308,6 +1559,28 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
     <div class="modal-body" id="trip-modal-body"></div>
   </div>
 </div>
+
+<!-- Share view: QR code + copyable link for the current URL -->
+<div id="share-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Share this view">
+  <div class="modal share-modal">
+    <div class="modal-head">
+      <div class="title">Share this view</div>
+      <button class="close" id="share-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="hint">Scan this code to open the current search on another device, or copy the link.</p>
+      <div id="share-qr" class="share-qr" aria-hidden="false"></div>
+      <div class="share-link">
+        <input id="share-url" class="share-url" type="text" readonly aria-label="Shareable link">
+        <button id="share-copy" class="share-copy" type="button">Copy</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Fare breakdown popup — dismissable, anchored to a clicked price badge -->
+<div id="fb-backdrop" class="fb-backdrop"></div>
+<div id="fb-pop" class="fb-pop" role="dialog" aria-label="Fare breakdown" hidden></div>
 
 <!-- Live (realtime) journey view — additive overlay, hidden until SELECT -->
 <div id="live-view" class="lv" hidden>
@@ -1343,6 +1616,184 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/maas.js"></script>
+<!-- Self-contained QR Code encoder (byte mode, ECC M). No network/CDN. -->
+<!-- Adapted from Project Nayuki's QR Code generator (MIT License). Mirror of -->
+<!-- src/web/static/js/vendor/qr.mjs (kept in sync). Attaches window.QRCode. -->
+<script>
+(function () {
+  'use strict';
+  function gfMul(x, y) {
+    var z = 0;
+    for (var i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >>> 7) * 0x11D); z ^= ((y >>> i) & 1) * x; }
+    return z & 0xFF;
+  }
+  function rsDivisor(degree) {
+    var result = []; for (var i = 0; i < degree; i++) result.push(0);
+    result[degree - 1] = 1; var root = 1;
+    for (var i2 = 0; i2 < degree; i2++) {
+      for (var j = 0; j < result.length; j++) { result[j] = gfMul(result[j], root); if (j + 1 < result.length) result[j] ^= result[j + 1]; }
+      root = gfMul(root, 2);
+    }
+    return result;
+  }
+  function rsRemainder(data, divisor) {
+    var result = divisor.map(function () { return 0; });
+    for (var d = 0; d < data.length; d++) {
+      var factor = data[d] ^ result.shift(); result.push(0);
+      for (var i = 0; i < result.length; i++) result[i] ^= gfMul(divisor[i], factor);
+    }
+    return result;
+  }
+  var ECC_M = [-1,10,16,26,18,24,16,18,22,22,26,30,22,22,24,24,28,28,26,26,26];
+  var BLK_M = [-1,1,1,1,2,2,4,4,4,5,5,5,8,9,9,10,10,11,13,14,16];
+  function rawModules(ver) {
+    var r = (16 * ver + 128) * ver + 64;
+    if (ver >= 2) { var na = Math.floor(ver / 7) + 2; r -= (25 * na - 10) * na - 55; if (ver >= 7) r -= 36; }
+    return r;
+  }
+  function dataCodewords(ver) { return Math.floor(rawModules(ver) / 8) - ECC_M[ver] * BLK_M[ver]; }
+  function appendBits(val, len, bb) { for (var i = len - 1; i >= 0; i--) bb.push((val >>> i) & 1); }
+  function encodeBytes(text) {
+    var bytes = [], s = unescape(encodeURIComponent(text));
+    for (var c = 0; c < s.length; c++) bytes.push(s.charCodeAt(c) & 0xFF);
+    var version = 1;
+    for (; ; version++) {
+      if (version > 20) throw new Error('QR data too long');
+      var cap = dataCodewords(version) * 8, cc = version <= 9 ? 8 : 16;
+      if (4 + cc + bytes.length * 8 <= cap) break;
+    }
+    var bb = []; appendBits(0x4, 4, bb); appendBits(bytes.length, version <= 9 ? 8 : 16, bb);
+    for (var b = 0; b < bytes.length; b++) appendBits(bytes[b], 8, bb);
+    var capBits = dataCodewords(version) * 8;
+    appendBits(0, Math.min(4, capBits - bb.length), bb);
+    while (bb.length % 8 !== 0) bb.push(0);
+    for (var pad = 0xEC; bb.length < capBits; pad ^= 0xEC ^ 0x11) appendBits(pad, 8, bb);
+    var dcw = [];
+    for (var i = 0; i < bb.length; i += 8) { var byte = 0; for (var j = 0; j < 8; j++) byte = (byte << 1) | bb[i + j]; dcw.push(byte); }
+    return { version: version, dataCodewords: dcw };
+  }
+  function addEcc(version, data) {
+    var numBlocks = BLK_M[version], blockEccLen = ECC_M[version];
+    var rawCw = Math.floor(rawModules(version) / 8);
+    var numShort = numBlocks - (rawCw % numBlocks), shortLen = Math.floor(rawCw / numBlocks);
+    var blocks = [], rsDiv = rsDivisor(blockEccLen), k = 0;
+    for (var i = 0; i < numBlocks; i++) {
+      var datLen = shortLen - blockEccLen + (i < numShort ? 0 : 1);
+      var dat = data.slice(k, k + datLen); k += datLen;
+      var ecc = rsRemainder(dat.slice(), rsDiv);
+      var short = i < numShort; if (short) dat.push(0);
+      blocks.push({ dat: dat, ecc: ecc, short: short });
+    }
+    var result = [], maxDat = shortLen - blockEccLen + 1;
+    for (var d = 0; d < maxDat; d++) for (var bl = 0; bl < blocks.length; bl++) {
+      var realLen = blocks[bl].dat.length - (blocks[bl].short ? 1 : 0);
+      if (d < realLen) result.push(blocks[bl].dat[d]);
+    }
+    for (var e = 0; e < blockEccLen; e++) for (var bl2 = 0; bl2 < blocks.length; bl2++) result.push(blocks[bl2].ecc[e]);
+    return result;
+  }
+  function alignPositions(ver) {
+    if (ver === 1) return [];
+    var na = Math.floor(ver / 7) + 2;
+    var step = (ver === 32) ? 26 : Math.ceil((ver * 4 + 4) / (na * 2 - 2)) * 2;
+    var result = [6];
+    for (var pos = ver * 4 + 10; result.length < na; pos -= step) result.splice(1, 0, pos);
+    return result;
+  }
+  function buildMatrix(version, allCw) {
+    var size = version * 4 + 17, modules = [], isFunc = [];
+    for (var r = 0; r < size; r++) { modules.push(new Array(size).fill(false)); isFunc.push(new Array(size).fill(false)); }
+    function setF(x, y, d) { modules[y][x] = d; isFunc[y][x] = true; }
+    function finder(x, y) {
+      for (var dy = -4; dy <= 4; dy++) for (var dx = -4; dx <= 4; dx++) {
+        var dist = Math.max(Math.abs(dx), Math.abs(dy)), xx = x + dx, yy = y + dy;
+        if (xx >= 0 && xx < size && yy >= 0 && yy < size) setF(xx, yy, dist !== 2 && dist !== 4);
+      }
+    }
+    for (var i = 0; i < size; i++) { setF(6, i, i % 2 === 0); setF(i, 6, i % 2 === 0); }
+    finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+    var align = alignPositions(version), na = align.length;
+    for (var a = 0; a < na; a++) for (var bb2 = 0; bb2 < na; bb2++) {
+      if ((a === 0 && bb2 === 0) || (a === 0 && bb2 === na - 1) || (a === na - 1 && bb2 === 0)) continue;
+      var cx = align[a], cy = align[bb2];
+      for (var dy2 = -2; dy2 <= 2; dy2++) for (var dx2 = -2; dx2 <= 2; dx2++) setF(cx + dx2, cy + dy2, Math.max(Math.abs(dx2), Math.abs(dy2)) !== 1);
+    }
+    // reserve format region
+    for (var f = 0; f <= 5; f++) setF(8, f, false);
+    setF(8, 7, false); setF(8, 8, false); setF(7, 8, false);
+    for (var f2 = 9; f2 < 15; f2++) setF(14 - f2, 8, false);
+    for (var f3 = 0; f3 < 8; f3++) setF(size - 1 - f3, 8, false);
+    for (var f4 = 8; f4 < 15; f4++) setF(8, size - 15 + f4, false);
+    setF(8, size - 8, true);
+    if (version >= 7) {
+      var vrem = version; for (var vi = 0; vi < 12; vi++) vrem = (vrem << 1) ^ ((vrem >>> 11) * 0x1F25);
+      var vbits = (version << 12) | vrem;
+      for (var v = 0; v < 18; v++) { var bit = ((vbits >>> v) & 1) !== 0, aa = size - 11 + (v % 3), bb3 = Math.floor(v / 3); setF(aa, bb3, bit); setF(bb3, aa, bit); }
+    }
+    var bits = [];
+    for (var c = 0; c < allCw.length; c++) for (var q = 7; q >= 0; q--) bits.push((allCw[c] >>> q) & 1);
+    var idx = 0;
+    for (var right = size - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (var vert = 0; vert < size; vert++) for (var jj = 0; jj < 2; jj++) {
+        var x = right - jj, upward = ((right + 1) & 2) === 0, y = upward ? size - 1 - vert : vert;
+        if (!isFunc[y][x] && idx < bits.length) { modules[y][x] = bits[idx] !== 0; idx++; }
+      }
+    }
+    function applyMask(m, mask) {
+      for (var y = 0; y < size; y++) for (var x = 0; x < size; x++) {
+        if (isFunc[y][x]) continue; var inv;
+        switch (mask) {
+          case 0: inv = (x + y) % 2 === 0; break;
+          case 1: inv = y % 2 === 0; break;
+          case 2: inv = x % 3 === 0; break;
+          case 3: inv = (x + y) % 3 === 0; break;
+          case 4: inv = (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0; break;
+          case 5: inv = ((x * y) % 2) + ((x * y) % 3) === 0; break;
+          case 6: inv = (((x * y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+          case 7: inv = (((x + y) % 2) + ((x * y) % 3)) % 2 === 0; break;
+          default: inv = false;
+        }
+        if (inv) m[y][x] = !m[y][x];
+      }
+    }
+    function drawFormat(m, mask) {
+      var data = (0 << 3) | mask, rem = data;
+      for (var i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+      var fb = ((data << 10) | rem) ^ 0x5412;
+      for (var a2 = 0; a2 <= 5; a2++) m[a2][8] = ((fb >>> a2) & 1) !== 0;
+      m[7][8] = ((fb >>> 6) & 1) !== 0; m[8][8] = ((fb >>> 7) & 1) !== 0; m[8][7] = ((fb >>> 8) & 1) !== 0;
+      for (var a3 = 9; a3 < 15; a3++) m[8][14 - a3] = ((fb >>> a3) & 1) !== 0;
+      for (var a4 = 0; a4 < 8; a4++) m[8][size - 1 - a4] = ((fb >>> a4) & 1) !== 0;
+      for (var a5 = 8; a5 < 15; a5++) m[size - 15 + a5][8] = ((fb >>> a5) & 1) !== 0;
+    }
+    function penalty(m) {
+      var result = 0, y, x;
+      for (y = 0; y < size; y++) { var rc = false, run = 0; for (x = 0; x < size; x++) { if (m[y][x] === rc) { run++; if (run === 5) result += 3; else if (run > 5) result++; } else { rc = m[y][x]; run = 1; } } }
+      for (x = 0; x < size; x++) { var rc2 = false, run2 = 0; for (y = 0; y < size; y++) { if (m[y][x] === rc2) { run2++; if (run2 === 5) result += 3; else if (run2 > 5) result++; } else { rc2 = m[y][x]; run2 = 1; } } }
+      for (y = 0; y < size - 1; y++) for (x = 0; x < size - 1; x++) { var cc2 = m[y][x]; if (cc2 === m[y][x + 1] && cc2 === m[y + 1][x] && cc2 === m[y + 1][x + 1]) result += 3; }
+      return result;
+    }
+    var best = null, minP = Infinity;
+    for (var mask = 0; mask < 8; mask++) {
+      var trial = modules.map(function (row) { return row.slice(); });
+      applyMask(trial, mask); drawFormat(trial, mask);
+      var p = penalty(trial);
+      if (p < minP) { minP = p; best = trial; }
+    }
+    return best;
+  }
+  function qrMatrix(text) { var e = encodeBytes(text); return buildMatrix(e.version, addEcc(e.version, e.dataCodewords)); }
+  function qrSvg(text, opts) {
+    var o = opts || {}, border = o.border == null ? 4 : o.border, dark = o.dark || '#000000', light = o.light || '#ffffff';
+    var modules = qrMatrix(text), size = modules.length, dim = size + border * 2, path = '';
+    for (var y = 0; y < size; y++) for (var x = 0; x < size; x++) if (modules[y][x]) path += 'M' + (x + border) + ',' + (y + border) + 'h1v1h-1z';
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + dim + ' ' + dim + '" shape-rendering="crispEdges" role="img" aria-label="QR code">' +
+      '<rect width="' + dim + '" height="' + dim + '" fill="' + light + '"/><path d="' + path + '" fill="' + dark + '"/></svg>';
+  }
+  window.QRCode = { svg: qrSvg, matrix: qrMatrix };
+}());
+</script>
 <script type="module" src="/static/js/live-view.mjs"></script>
 <script>
 'use strict';
@@ -1350,6 +1801,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 // ── GraphQL query ─────────────────────────────────────────────
 const PLAN_FRAGMENT = `
   start end mode
+  price { knownEuros cappedEuros unknownOperators breakdown { operator description euros coverage } }
   accessAlternatives { mode start end expectedEnd streetSecs }
   legs {
     ... on PlanWalkLeg {
@@ -1392,35 +1844,44 @@ const QUERY = `query Plan(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
   $fromStationId: String, $toStationId: String,
   $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int,
-  $modes: [Mode!], $bikeProfile: BikeProfileInput
+  $modes: [Mode!], $bikeProfile: BikeProfileInput, $fareProfile: FareProfileInput
 ) {
   raptor(
     fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
     fromStationId: $fromStationId, toStationId: $toStationId,
     date: $date, time: $time,
     windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs,
-    modes: $modes, bikeProfile: $bikeProfile
+    modes: $modes, bikeProfile: $bikeProfile, fareProfile: $fareProfile
   ) { ${PLAN_FRAGMENT} }
 }`;
 
-// Lazily fetch earlier/later alternatives for ONE leg (planIndex/legIndex into
-// the same routing result) — avoids computing alternatives for every leg/plan.
-const ALT_QUERY = `query Alts(
+// Lazily fetch earlier/later DEPARTURES for the transit legs of the current
+// result. Re-runs raptor (same inputs) and reads previousDepartures/nextDepartures
+// on each transit leg; results are matched back by tripId so a leg is found
+// regardless of plan order. `count` is symmetric (prev == next).
+const DEP_ALT_FIELDS = `
+  tripId start end scheduledStart scheduledEnd realtime
+  transferRisk { reliability }
+  trip { headsign route { shortName mode } }
+`;
+const DEP_QUERY = `query Deps(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
   $date: String, $time: String, $windowMinutes: Int, $walkRadiusSecs: Int,
-  $modes: [Mode!],
-  $planIndex: Int!, $legIndex: Int!, $prevCount: Int!, $nextCount: Int!
+  $modes: [Mode!], $count: Int!
 ) {
-  legAlternatives(
+  raptor(
     fromLat: $fromLat, fromLng: $fromLng, toLat: $toLat, toLng: $toLng,
     date: $date, time: $time,
-    windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs,
-    modes: $modes,
-    planIndex: $planIndex, legIndex: $legIndex,
-    prevCount: $prevCount, nextCount: $nextCount
+    windowMinutes: $windowMinutes, walkRadiusSecs: $walkRadiusSecs, modes: $modes
   ) {
-    previous { start end reliability }
-    next     { start end reliability }
+    legs {
+      __typename
+      ... on PlanTransitLeg {
+        tripId
+        previousDepartures(count: $count) { ${DEP_ALT_FIELDS} }
+        nextDepartures(count: $count)     { ${DEP_ALT_FIELDS} }
+      }
+    }
   }
 }`;
 
@@ -1445,7 +1906,9 @@ document.querySelectorAll('#view-toggle button').forEach(b =>
   b.addEventListener('click', () => setMobileView(b.dataset.view)));
 
 // ── State ─────────────────────────────────────────────────────
-const DEFAULT_ALT_COUNT = 1, DEPARTURE_STEP = 3;
+// Departures picker: fetch up to 2 each side when a leg's panel is opened, then
+// grow by DEPARTURE_STEP on "show more". detectHeadway lives in maas.js.
+const DEFAULT_DEP_COUNT = 2, DEPARTURE_STEP = 4;
 const state = {
   plans: [],
   grouping: 'departure',        // 'departure' | 'none' | 'arrival'
@@ -1455,7 +1918,8 @@ const state = {
   openStops: new Set(),         // `${planIdx}:${legIdx}` of itinerary legs with in-between stops expanded
   legLayers: [],
   queryVars: null,              // routing inputs of the current result (for lazy alternatives)
-  altCache: new Map(),          // `${planIdx}:${legIdx}` -> { prev:[], next:[], prevCount, nextCount, loading }
+  depCache: new Map(),          // tripId -> { prev:[], next:[], count, loading, error } (per-line departures)
+  collapsedDeps: new Set(),     // `${planIdx}:${legIdx}` of transit legs whose departures panel the user explicitly collapsed (panels are open by default when a leg is surfaced)
   picker: null,                 // active per-leg route picker, or null (see openPicker)
 };
 
@@ -1813,6 +2277,107 @@ el('now-btn').addEventListener('click', () => {
   doSyncUrl();
 });
 
+// ── Fare profile (client-side preferences) ────────────────────
+// Persisted in localStorage as a small blob. Injected into the raptor /
+// onboardRaptor query as the `fareProfile` variable. Field names match the
+// GraphQL FareProfileInput (camelCase). Only non-default fields are sent, so an
+// unset profile sends `null` and the server applies its own default (adult, no
+// products). See docs/superpowers/specs/2026-07-10-transit-pricing-design.md A.1.
+const FARE_PROFILE_KEY = 'maas.fareProfile.v1';
+const FARE_BOOL_FIELDS = {
+  'fare-stib-sub':       'stibSubscription',
+  'fare-delijn-sub':     'delijnSubscription',
+  'fare-tec-sub':        'tecSubscription',
+  'fare-sncb-sub':       'sncbSubscription',
+  'fare-sncb-trainplus': 'sncbTrainPlus',
+  'fare-delijn-10':      'delijn10Journey',
+  'fare-tec-6':          'tec6Journey',
+};
+
+// Read the UI controls into a plain profile object (category + travelClass +
+// all booleans).
+function readFareControls() {
+  const p = {
+    passengerCategory: el('fare-category').value || 'ADULT',
+    travelClass: el('fare-class').value || 'SECOND',
+  };
+  for (const [id, field] of Object.entries(FARE_BOOL_FIELDS)) p[field] = !!el(id).checked;
+  return p;
+}
+
+// The GraphQL variable: send only fields that differ from the default (ADULT,
+// 2nd class, no products). Returns null when the profile is entirely default, so
+// an anonymous query stays byte-identical to the pre-feature behavior.
+function fareProfileVar() {
+  const p = readFareControls();
+  const out = {};
+  if (p.passengerCategory && p.passengerCategory !== 'ADULT') out.passengerCategory = p.passengerCategory;
+  if (p.travelClass && p.travelClass !== 'SECOND') out.travelClass = p.travelClass;
+  for (const field of Object.values(FARE_BOOL_FIELDS)) if (p[field]) out[field] = true;
+  return Object.keys(out).length ? out : null;
+}
+
+// Short human summary shown in the collapsed card header (e.g. "Adult · SNCB
+// subscription · +1"). Empty string when the profile is entirely default.
+function fareSummary() {
+  const p = readFareControls();
+  const bits = [];
+  const CAT = { ADULT: null, YOUNG: 'Young', SENIOR: 'Senior', BIM: 'BIM' };
+  if (CAT[p.passengerCategory]) bits.push(CAT[p.passengerCategory]);
+  if (p.travelClass === 'FIRST') bits.push('1st class');
+  const LBL = {
+    stibSubscription: 'STIB subscription', delijnSubscription: 'De Lijn subscription',
+    tecSubscription: 'TEC subscription', sncbSubscription: 'SNCB subscription',
+    sncbTrainPlus: 'Train+', delijn10Journey: 'De Lijn 10-journey',
+    tec6Journey: 'TEC 6-journey',
+  };
+  for (const field of Object.values(FARE_BOOL_FIELDS)) if (p[field]) bits.push(LBL[field]);
+  if (!bits.length) return '';
+  if (bits.length <= 2) return bits.join(' · ');
+  return bits.slice(0, 1).join('') + ' · +' + (bits.length - 1);
+}
+
+function updateFareSummary() { el('fare-summary').textContent = fareSummary(); }
+
+function saveFareProfile() {
+  try { localStorage.setItem(FARE_PROFILE_KEY, JSON.stringify(readFareControls())); } catch (_) {}
+}
+
+function applyFareProfile(p) {
+  el('fare-category').value = (p && p.passengerCategory) || 'ADULT';
+  el('fare-class').value = (p && p.travelClass) || 'SECOND';
+  for (const [id, field] of Object.entries(FARE_BOOL_FIELDS)) el(id).checked = !!(p && p[field]);
+}
+
+function loadFareProfile() {
+  let p = null;
+  try { const s = localStorage.getItem(FARE_PROFILE_KEY); if (s) p = JSON.parse(s); } catch (_) {}
+  applyFareProfile(p);
+  updateFareSummary();
+}
+
+// Re-run the active search so prices reflect the new profile, but only when a
+// route is already set (both endpoints present) and the query is not in manual
+// mode. Otherwise just refresh the query preview.
+function fareProfileChanged() {
+  saveFareProfile();
+  updateFareSummary();
+  renderQuery();
+  if (!queryManual() && fromSearch.getLat() != null && toSearch.getLat() != null) runQuery();
+}
+
+el('fare-head').addEventListener('click', () => {
+  const collapsed = el('fare-card').classList.toggle('collapsed');
+  el('fare-head').setAttribute('aria-expanded', String(!collapsed));
+});
+el('fare-reset').addEventListener('click', (e) => {
+  e.stopPropagation();
+  applyFareProfile(null);
+  fareProfileChanged();
+});
+el('fare-body').addEventListener('change', fareProfileChanged);
+loadFareProfile();
+
 // ── Run query ─────────────────────────────────────────────────
 async function runQuery() {
   const fromLat = fromSearch.getLat();
@@ -1840,12 +2405,12 @@ async function runQuery() {
   const walkRadiusSecs = parseInt(el('adv-walk-radius').value, 10) || null;
   const modes          = selectedModes();
   const vars = { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs,
-                 modes: modes.length ? modes : null, bikeProfile: null };
+                 modes: modes.length ? modes : null, bikeProfile: null, fareProfile: fareProfileVar() };
 
   // Zero-cost station hub: when a dropdown station was selected, pass its id so
   // routing treats all its platforms as zero-walk access/egress. The station ids
-  // stay OUT of `vars`/`state.queryVars` so per-leg alt fetches keep using only
-  // coordinates (ALT_QUERY does not declare these variables).
+  // stay OUT of `vars`/`state.queryVars` so the lazy departures fetch (DEP_QUERY)
+  // keeps using only coordinates (it does not declare these variables).
   const fromStationId = fromSearch.getStationId();
   const toStationId   = toSearch.getStationId();
   const sendVars = {
@@ -1877,9 +2442,11 @@ async function runQuery() {
     const data = await gql(queryToSend, varsToSend);
     state.plans = data.raptor || [];
     state.queryVars = vars;          // reused by lazy per-leg alternative fetches
-    state.altCache.clear();
+    state.depCache.clear();
+    state.collapsedDeps.clear();
     state.picker = null;
     state.selectedLegIdxMap.clear();
+    resetExtendPaging();
     if (state.selectedIdx >= state.plans.length) {
       state.selectedIdx = -1;
     }
@@ -1910,6 +2477,7 @@ function fillQueryBoxes() {
     walkRadiusSecs: parseInt(el('adv-walk-radius').value, 10) || null,
     modes: modes.length ? modes : null,
     bikeProfile: null,
+    fareProfile: fareProfileVar(),
   };
   el('query-vars').value = JSON.stringify(vars, null, 2);
 }
@@ -1932,26 +2500,39 @@ document.addEventListener('change', renderQuery);
 setManualMode(false); // initial render of the auto-mode query/vars
 
 // Lazily load (and cache) earlier/later alternatives for one leg, then re-render.
-async function loadAlternatives(planIdx, legIdx, prevCount, nextCount) {
-  if (!state.queryVars) return;
-  const key = planIdx + ':' + legIdx;
-  const entry = state.altCache.get(key) || { prev: [], next: [], prevCount: 0, nextCount: 0, loading: false };
+// Lazily fetch prev/next departures for ALL transit legs of the current result,
+// keyed by tripId (a line is shared across plans, so one fetch serves every card).
+// `count` grows as the user expands. Re-runs raptor with the original inputs.
+async function loadDepartures(tripId, count) {
+  if (!state.queryVars || !tripId) return;
+  const entry = state.depCache.get(tripId) || { prev: [], next: [], count: 0, loading: false };
+  if (entry.loading || (entry.count >= count && !entry.error)) return;
   entry.loading = true;
-  state.altCache.set(key, entry);
+  state.depCache.set(tripId, entry);
   try {
-    const data = await gql(ALT_QUERY, {
-      ...state.queryVars, planIndex: planIdx, legIndex: legIdx, prevCount, nextCount,
+    const v = state.queryVars;
+    const data = await gql(DEP_QUERY, {
+      fromLat: v.fromLat, fromLng: v.fromLng, toLat: v.toLat, toLng: v.toLng,
+      date: v.date, time: v.time, windowMinutes: v.windowMinutes,
+      walkRadiusSecs: v.walkRadiusSecs, modes: v.modes, count,
     });
-    const a = data.legAlternatives || { previous: [], next: [] };
-    entry.prev = a.previous || [];
-    entry.next = a.next || [];
-    entry.prevCount = prevCount;
-    entry.nextCount = nextCount;
+    // Fold every transit leg of every plan into the cache (one fetch, many legs).
+    (data?.raptor || []).forEach(p => (p.legs || []).forEach(l => {
+      if (l && l.__typename === 'PlanTransitLeg' && l.tripId) {
+        const e = state.depCache.get(l.tripId) || { prev: [], next: [], count: 0, loading: false };
+        e.prev = l.previousDepartures || [];
+        e.next = l.nextDepartures || [];
+        e.count = count;
+        e.error = undefined;
+        state.depCache.set(l.tripId, e);
+      }
+    }));
   } catch (err) {
     entry.error = err.message;
   } finally {
-    entry.loading = false;
-    state.altCache.set(key, entry);
+    const e = state.depCache.get(tripId) || entry;
+    e.loading = false;
+    state.depCache.set(tripId, e);
     renderList();
   }
 }
@@ -2617,6 +3198,241 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 }
 
 // ── Connection card (always renders for any transit leg) ──────
+// ── Previous / next departures ────────────────────────────────
+// (detectHeadway is defined in maas.js so it can be unit-tested in isolation.)
+
+// Re-plan the whole journey to leave in time for a chosen departure of this line.
+// The engine has no "board exactly trip X" input, so we re-issue the raptor query
+// with `time` nudged to the chosen boarding minute (and a tight window) and show
+// the fresh itinerary. `depSecs` is seconds since midnight of the query date.
+async function replanFromDeparture(depSecs) {
+  if (!state.queryVars) return;
+  const v = state.queryVars;
+  const secs = ((depSecs % 86400) + 86400) % 86400;   // wrap next-day back to wall clock
+  const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+  const vars = { ...v, time: hh + ':' + mm, windowMinutes: Math.max(v.windowMinutes || 0, 30) };
+  el('plans-list').replaceChildren(mkEl('p', 'status-msg', 'Re-planning for ' + hh + ':' + mm + '…'));
+  try {
+    const data = await gql(QUERY, vars);
+    state.plans = data.raptor || [];
+    state.queryVars = vars;
+    state.depCache.clear();
+    state.collapsedDeps.clear();
+    state.picker = null;
+    state.selectedLegIdxMap.clear();
+    resetExtendPaging();
+    state.selectedIdx = state.plans.length ? 0 : -1;
+    el('time').value = hh + ':' + mm;                  // reflect the shift in the form
+    renderList();
+    renderAllPlansOnMap();
+  } catch (err) {
+    el('plans-list').replaceChildren(mkEl('p', 'status-msg error', 'Error: ' + err.message));
+  }
+}
+
+// ── Extend search window (earlier / later) ────────────────────
+// The raptor query is a RANGE query over [time, time + windowMinutes], so a
+// result is a bundle of plans spanning that window. These helpers re-query an
+// adjacent window and MERGE the fresh plans into the current list (deduped,
+// re-sorted), letting the user page earlier/later without losing state.
+
+// A plan's departure/arrival, matching how cards read them (seconds since the
+// query-date midnight; may exceed 86400 for next-day).
+function planDeparture(p) { return p.legs?.[0]?.start ?? p.start; }
+function planArrival(p)   { return p.end; }
+
+// Stable identity for dedup: same departure + arrival + leg shape is the same
+// journey regardless of which window surfaced it.
+function planKey(p) {
+  const legs = (p.legs || []).map(l =>
+    l.__typename === 'PlanTransitLeg'
+      ? 'T:' + (l.tripId || '') + ':' + l.start + ':' + l.end
+      : 'W:' + (l.streetMode || 'FOOT') + ':' + l.start + ':' + l.end
+  ).join('|');
+  return planDeparture(p) + '>' + planArrival(p) + '#' + legs;
+}
+
+const EXTEND_WINDOW_MIN = 30;   // window width for each earlier/later page
+
+// Merge `extra` plans into state.plans, deduped by planKey, re-sorted by
+// departure (then arrival). Preserves existing plan objects (and their in-flight
+// per-plan UI state keyed by plan index is rebuilt on renderList). Returns the
+// count of genuinely new plans added.
+function mergePlans(extra) {
+  const seen = new Set(state.plans.map(planKey));
+  let added = 0;
+  extra.forEach(p => { const k = planKey(p); if (!seen.has(k)) { seen.add(k); state.plans.push(p); added++; } });
+  if (added) {
+    // Keep the currently-selected plan selected across the re-sort.
+    const selKey = state.selectedIdx >= 0 ? planKey(state.plans[state.selectedIdx]) : null;
+    state.plans.sort((a, b) => (planDeparture(a) - planDeparture(b)) || (planArrival(a) - planArrival(b)));
+    state.selectedIdx = selKey ? state.plans.findIndex(p => planKey(p) === selKey) : -1;
+    // Index-keyed UI caches (leg selection, collapsed departures) no longer line
+    // up after a re-sort, so clear them; depCache is keyed by tripId and survives.
+    state.selectedLegIdxMap.clear();
+    state.collapsedDeps.clear();
+  }
+  return added;
+}
+
+let extendBusy = false;
+const extendExhausted = { earlier: false, later: false };
+// A fresh routing result re-opens paging in both directions.
+function resetExtendPaging() { extendExhausted.earlier = false; extendExhausted.later = false; }
+
+// dir: 'earlier' searches a window ending just before the current earliest
+// departure; 'later' searches a window starting just after the current latest.
+async function extendWindow(dir) {
+  if (extendBusy || !state.queryVars || !state.plans.length) return;
+  const v = state.queryVars;
+  const deps = state.plans.map(planDeparture);
+  const anchor = dir === 'earlier'
+    ? Math.min(...deps) - EXTEND_WINDOW_MIN * 60   // window [earliest - W, earliest)
+    : Math.max(...deps) + 60;                       // window (latest, latest + W]
+  const secs = ((anchor % 86400) + 86400) % 86400;  // wrap next-day back to wall clock
+  const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
+  const vars = { ...v, time: hh + ':' + mm, windowMinutes: EXTEND_WINDOW_MIN };
+
+  extendBusy = true;
+  renderExtendButtons(dir);   // reflect the loading state on the clicked button
+  try {
+    const data = await gql(QUERY, vars);
+    const fresh = data.raptor || [];
+    const added = mergePlans(fresh);
+    // No new plans in that direction (empty response or all duplicates) → stop
+    // offering to page further that way.
+    if (!added) extendExhausted[dir] = true;
+  } catch (err) {
+    el('error-msg').textContent = 'Could not extend results: ' + err.message;
+    el('error-msg').style.display = 'block';
+  } finally {
+    extendBusy = false;
+    renderList();
+    renderAllPlansOnMap();
+  }
+}
+
+// Show/label/enable the earlier & later buttons around the plan list. `loadingDir`
+// (optional) marks the button currently fetching.
+function renderExtendButtons(loadingDir) {
+  const eb = el('extend-earlier'), lb = el('extend-later');
+  if (!eb || !lb) return;
+  const active = state.plans.length > 0 && !state.picker;
+  [['earlier', eb, '↑', 'Earlier trips'], ['later', lb, '↓', 'Later trips']].forEach(([dir, btn, arrow, label]) => {
+    const show = active && !extendExhausted[dir];
+    btn.hidden = !show;
+    if (!show) return;
+    const loading = loadingDir === dir;
+    btn.disabled = extendBusy;
+    btn.replaceChildren(
+      mkEl('span', 'ex-arrow', arrow),
+      mkEl('span', null, loading ? 'Loading…' : label),
+    );
+    btn.onclick = e => { e.stopPropagation(); extendWindow(dir); };
+  });
+}
+
+// Departures panel for the open transit leg: a compact toggle that, when open,
+// shows the previous departure + the next few (with a headway summary when the
+// service is regular), expandable to the full list, each selectable to re-plan.
+function renderDepartures(leg, planIdx, legIdx) {
+  const block = mkEl('div', 'conn-block');
+  const key      = planIdx + ':' + legIdx;
+  // Departures are surfaced by default when a leg's connection is shown; the user
+  // may collapse a given panel (tracked in collapsedDeps), and it stays collapsed
+  // until re-opened. This makes prev/next departures discoverable on expand.
+  const expanded = !state.collapsedDeps.has(key);
+  const cache    = leg.tripId ? state.depCache.get(leg.tripId) : null;
+
+  // Only fetch once the panel is open (collapsed panels do no network work).
+  if (expanded && leg.tripId &&
+      (!cache || (cache.count < DEFAULT_DEP_COUNT && !cache.loading && !cache.error))) {
+    loadDepartures(leg.tripId, DEFAULT_DEP_COUNT);
+  }
+
+  // Toggle header.
+  const toggle = mkEl('button', 'dep-toggle' + (expanded ? ' open' : ''));
+  toggle.appendChild(mkEl('span', 'dep-toggle-lbl', 'Departures'));
+  toggle.appendChild(mkChev());
+  toggle.addEventListener('click', e => {
+    e.stopPropagation();
+    if (state.collapsedDeps.has(key)) state.collapsedDeps.delete(key); else state.collapsedDeps.add(key);
+    renderList();
+  });
+  block.appendChild(toggle);
+
+  if (!expanded) return block;
+
+  if (!cache || cache.loading) {
+    block.appendChild(mkEl('div', 'dep-note', 'Loading departures…'));
+    return block;
+  }
+  if (cache.error) {
+    block.appendChild(mkEl('div', 'dep-note err', 'Could not load departures.'));
+    return block;
+  }
+
+  const prev = cache.prev || [], next = cache.next || [];
+  if (!prev.length && !next.length) {
+    block.appendChild(mkEl('div', 'dep-note', 'No other departures found for this line.'));
+    return block;
+  }
+
+  // Headway is judged over prev + current + next gaps, so include the used time.
+  const prevSorted = [...prev].sort((a, b) => a.start - b.start);   // ascending
+  const times = [...prevSorted.map(d => d.start), leg.start, ...next.map(d => d.start)];
+  const head  = detectHeadway(times);
+
+  // Summary line: regular → "every N minutes (upcoming times, excl. current)".
+  const summary = mkEl('div', 'dep-summary');
+  if (head.regular) {
+    const upcoming = next.map(d => fmtTime(d.start));
+    summary.appendChild(mkEl('span', 'dep-every', 'every ' + head.everyMins + ' minutes'));
+    if (upcoming.length) summary.appendChild(mkEl('span', 'dep-times', '(' + upcoming.join(', ') + ')'));
+  } else {
+    summary.appendChild(mkEl('span', 'dep-every', 'irregular service'));
+    const listed = [...prevSorted, ...next].map(d => fmtTime(d.start));
+    if (listed.length) summary.appendChild(mkEl('span', 'dep-times', listed.join(', ')));
+  }
+  block.appendChild(summary);
+
+  // Selectable rows: previous departure, the current (used, not selectable), then
+  // the upcoming ones. Selecting re-plans the journey for that departure.
+  const list = mkEl('div', 'dep-list');
+  const mkRow = (dep, { current = false } = {}) => {
+    const row = mkEl('button', 'dep-opt' + (current ? ' current' : ''));
+    row.appendChild(mkTimeEl('span', 'dep-opt-t', dep.start));
+    const dmin = Math.round((dep.start - leg.start) / 60);
+    row.appendChild(mkEl('span', 'dep-opt-d',
+      current ? 'current' : (dmin <= 0 ? Math.abs(dmin) + ' min earlier' : dmin + ' min later')));
+    if (dep.transferRisk?.reliability != null && !current) {
+      const rs = mkEl('span', 'dep-opt-r'); rs.dataset.rel = relClass(dep.transferRisk.reliability);
+      rs.textContent = relPct(dep.transferRisk.reliability);
+      row.appendChild(rs);
+    }
+    if (current) row.disabled = true;
+    else row.addEventListener('click', e => { e.stopPropagation(); replanFromDeparture(dep.start); });
+    return row;
+  };
+  // Regular service already reads as a headway in the summary, so the row list
+  // omits the currently-chosen departure (spec) and just offers the alternatives
+  // to re-plan from. Irregular service lists every time, marking the current one.
+  prevSorted.forEach(d => list.appendChild(mkRow(d)));
+  if (!head.regular) list.appendChild(mkRow({ start: leg.start }, { current: true }));
+  next.forEach(d => list.appendChild(mkRow(d)));
+  block.appendChild(list);
+
+  // Grow the window on demand.
+  const more = mkEl('button', 'dep-more', 'Show more departures');
+  more.disabled = !!cache.loading;
+  more.addEventListener('click', e => { e.stopPropagation(); loadDepartures(leg.tripId, cache.count + DEPARTURE_STEP); });
+  block.appendChild(more);
+
+  return block;
+}
+
 function renderConnection(leg, planIdx, legIdx) {
   const r = leg.transferRisk;
 
@@ -2641,75 +3457,7 @@ function renderConnection(leg, planIdx, legIdx) {
   }
   conn.appendChild(head);
 
-  // Lazily-loaded alternatives for this leg (fetched per-leg, not for the whole plan).
-  const key   = planIdx + ':' + legIdx;
-  const cache = state.altCache.get(key);
-  if (!cache && !(cache && cache.loading)) {
-    loadAlternatives(planIdx, legIdx, DEFAULT_ALT_COUNT, DEFAULT_ALT_COUNT);
-  }
-  const prevDeps = cache?.prev || [];
-  const nextDeps = cache?.next || [];
-
-  const block = mkEl('div', 'conn-block');
-  const lbl   = mkEl('div', 'conn-lbl');
-  lbl.textContent = cache && !cache.loading
-    ? 'Earlier & later departures — chance the journey still works if you swap to one'
-    : 'Loading alternative departures…';
-  block.appendChild(lbl);
-
-  // Not-implemented notice (hidden, revealed on click)
-  const notImpl = mkEl('div');
-  notImpl.style.cssText = 'display:none;font-size:11px;color:var(--ds-rel-low);margin:0 0 8px;padding:5px 9px;background:var(--ds-rel-low-soft);border-radius:6px;';
-  notImpl.textContent = 'Switching departures is not yet implemented — the reliability shown is for changing this leg only.';
-  block.appendChild(notImpl);
-
-  const feeder = mkEl('div', 'feeder');
-
-  // A single departure option: time + swap-reliability donut + delta vs planned.
-  const mkOption = (dep, { planned = false } = {}) => {
-    const btn = mkEl('button', 'fopt' + (planned ? ' planned' : ''));
-    btn.appendChild(mkTimeEl('span', 'fopt-time', dep.start));
-    const rel = planned ? r?.reliability : dep.reliability;
-    if (rel != null) {
-      const fr = mkEl('span', 'fopt-rel');
-      const rs = mkEl('span'); rs.dataset.rel = relClass(rel);
-      rs.appendChild(mkDonut(rel));
-      rs.appendChild(document.createTextNode(relPct(rel)));
-      fr.appendChild(rs);
-      btn.appendChild(fr);
-    }
-    const deltaMins = Math.round((dep.start - leg.start) / 60);
-    btn.appendChild(mkEl('span', 'fopt-delta',
-      planned ? 'planned'
-              : (deltaMins <= 0 ? '−' + Math.abs(deltaMins) + ' min earlier'
-                                : '+' + deltaMins + ' min later')));
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      if (!planned) notImpl.style.display = 'block';
-    });
-    return btn;
-  };
-
-  const mkLoadMore = (label, onClick) => {
-    const b = mkEl('button', 'fopt-more');
-    b.textContent = label;
-    b.disabled = !!cache?.loading;
-    b.addEventListener('click', e => { e.stopPropagation(); onClick(); });
-    return b;
-  };
-
-  // Load earlier (top) → earlier departures (closest last) → planned →
-  // later departures → load later (bottom).
-  feeder.appendChild(mkLoadMore('↑ earlier', () =>
-    loadAlternatives(planIdx, legIdx, (cache?.prevCount || DEFAULT_ALT_COUNT) + DEPARTURE_STEP, cache?.nextCount || DEFAULT_ALT_COUNT)));
-  [...prevDeps].reverse().forEach(dep => feeder.appendChild(mkOption(dep)));
-  feeder.appendChild(mkOption({ start: leg.start }, { planned: true }));
-  nextDeps.forEach(dep => feeder.appendChild(mkOption(dep)));
-  feeder.appendChild(mkLoadMore('↓ later', () =>
-    loadAlternatives(planIdx, legIdx, cache?.prevCount || DEFAULT_ALT_COUNT, (cache?.nextCount || DEFAULT_ALT_COUNT) + DEPARTURE_STEP)));
-
-  block.appendChild(feeder);
-  conn.appendChild(block);
+  conn.appendChild(renderDepartures(leg, planIdx, legIdx));
 
   if (r?.nextDeparture != null) {
     const foot = mkEl('div', 'conn-foot');
@@ -2730,6 +3478,17 @@ function renderConnection(leg, planIdx, legIdx) {
 }
 
 // ── Trip card ─────────────────────────────────────────────────
+// Which leg's connection detail (incl. its departures panel) is surfaced when a
+// card is expanded. An explicit choice — including an explicit collapse to -1 via
+// a second click on the open leg — is stored in selectedLegIdxMap and honoured.
+// When the user has NOT touched a leg yet (no map entry), default to the FIRST
+// transit leg so departures are discoverable on expand without a manual click.
+function resolveOpenLegIdx(plan, idx) {
+  if (state.selectedLegIdxMap.has(idx)) return state.selectedLegIdxMap.get(idx);
+  const i = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg');
+  return i;
+}
+
 // Shared leg-click handler used by both ungrouped cards and grouped option rows.
 function buildLegHandler(plan, idx, isOpen, openLegIdx) {
   return (e, clickedLeg) => {
@@ -2794,6 +3553,109 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
   return detail;
 }
 
+// Compact price badge for a plan header. Returns null when fares are disabled
+// (plan.price null). cappedEuros shown as €X.XX; a non-empty unknownOperators
+// list marks the amount a lower bound (adds " + ?" plus a tooltip of the
+// unpriced operators), or just "?" when nothing at all is priced.
+function mkPriceBadge(price) {
+  if (!price) return null;
+  const unknown = price.unknownOperators || [];
+  const fullyUnpriced = unknown.length > 0 && (price.knownEuros || 0) <= 0;
+  const el = mkEl('span', 'rc-price' + (unknown.length ? ' partial' : ''));
+  if (fullyUnpriced) {
+    el.appendChild(mkEl('span', 'q', '?'));
+  } else {
+    el.appendChild(document.createTextNode('€' + (price.cappedEuros || 0).toFixed(2)));
+    if (unknown.length) {
+      el.appendChild(document.createTextNode(' + '));
+      el.appendChild(mkEl('span', 'q', '?'));
+    }
+  }
+  if (unknown.length) el.title = 'plus unpriced: ' + unknown.join(', ');
+  el.setAttribute('role', 'button');
+  el.setAttribute('tabindex', '0');
+  el.title = (el.title ? el.title + ' — ' : '') + 'Show fare breakdown';
+  el.addEventListener('click', (ev) => { ev.stopPropagation(); openFareBreakdown(price, el); });
+  el.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); ev.stopPropagation(); openFareBreakdown(price, el); }
+  });
+  return el;
+}
+
+// ── Fare breakdown popup ──────────────────────────────────────
+// A small dismissable card anchored below a clicked price badge. Renders the
+// price.breakdown "shopping list": each item "<description> .... €<euros>",
+// covered items (coverage != null) as "<description> - covered by <coverage>
+// €0.00", and a Total = cappedEuros. Unpriced operators are noted below.
+function closeFareBreakdown() {
+  const pop = el('fb-pop');
+  pop.hidden = true; pop.innerHTML = '';
+  el('fb-backdrop').classList.remove('open');
+}
+
+function openFareBreakdown(price, anchor) {
+  if (!price) return;
+  const pop = el('fb-pop');
+  pop.innerHTML = '';
+
+  const head = mkEl('div', 'fb-head');
+  head.appendChild(mkEl('span', 'fb-t', 'Fare breakdown'));
+  const x = mkEl('button', 'fb-x'); x.type = 'button'; x.setAttribute('aria-label', 'Close');
+  x.textContent = '×';
+  x.addEventListener('click', closeFareBreakdown);
+  head.appendChild(x);
+  pop.appendChild(head);
+
+  const items = price.breakdown || [];
+  if (items.length) {
+    const list = mkEl('div', 'fb-list');
+    for (const it of items) {
+      const covered = it.coverage != null;
+      const row = mkEl('div', 'fb-item' + (covered ? ' covered' : ''));
+      const desc = mkEl('span', 'fb-desc');
+      desc.appendChild(document.createTextNode(it.description || it.operator || 'Ticket'));
+      if (covered) desc.appendChild(mkEl('span', 'fb-cov', 'covered by ' + it.coverage));
+      row.appendChild(desc);
+      row.appendChild(mkEl('span', 'fb-dots'));
+      row.appendChild(mkEl('span', 'fb-amt', '€' + (it.euros || 0).toFixed(2)));
+      list.appendChild(row);
+    }
+    pop.appendChild(list);
+  } else {
+    pop.appendChild(mkEl('div', 'fb-empty', 'No fare details available for this journey.'));
+  }
+
+  const total = mkEl('div', 'fb-total');
+  total.appendChild(mkEl('span', 'fb-tl', 'Total'));
+  total.appendChild(mkEl('span', 'fb-dots'));
+  total.appendChild(mkEl('span', 'fb-amt', '€' + (price.cappedEuros || 0).toFixed(2)));
+  pop.appendChild(total);
+
+  const unknown = price.unknownOperators || [];
+  if (unknown.length) {
+    pop.appendChild(mkEl('div', 'fb-unknown', 'Plus unpriced operators: ' + unknown.join(', ')));
+  }
+
+  el('fb-backdrop').classList.add('open');
+  pop.hidden = false;
+
+  // Position below the anchor, clamped to the viewport.
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let left = r.left;
+  if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+  if (left < 8) left = 8;
+  let top = r.bottom + 6;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - ph - 6);
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+}
+
+el('fb-backdrop').addEventListener('click', closeFareBreakdown);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !el('fb-pop').hidden) { closeFareBreakdown(); }
+});
+
 function renderTripCard(plan, idx, isOpen) {
   const card = mkEl('div', 'rc' + (isOpen ? ' best' : ''));
   card.id = 'plan-card-' + idx;
@@ -2809,6 +3671,8 @@ function renderTripCard(plan, idx, isOpen) {
   const tag = planTag(state.plans, plan);
   if (tag) head.appendChild(mkEl('span', 'rc-tag', tag));
   else if (BIKE_MODES.has(plan.mode) || CAR_MODES.has(plan.mode)) head.appendChild(mkEl('span', 'rc-tag', MODE_LABEL[plan.mode] || plan.mode));
+  const priceEl = mkPriceBadge(plan.price);
+  if (priceEl) head.appendChild(priceEl);
   if (rel < 1) {
     const relEl = mkEl('span', 'rc-rel'); relEl.dataset.rel = relClass(rel);
     relEl.appendChild(mkEl('span', 'bead'));
@@ -2839,7 +3703,7 @@ function renderTripCard(plan, idx, isOpen) {
   }
 
   // ribbon
-  const openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
+  const openLegIdx = isOpen ? resolveOpenLegIdx(plan, idx) : -1;
   const openLeg    = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
   const onLeg      = buildLegHandler(plan, idx, isOpen, openLegIdx);
   const ribWrap    = mkEl('div', 'rc-ribbon');
@@ -2928,10 +3792,12 @@ function renderOptionRow(plan, idx, mode, pos) {
     time.appendChild(document.createTextNode(fmtTime(s)));
     const mk = mkDayMark(s); if (mk) time.appendChild(mk); }
   lead.appendChild(time);
+  const priceEl = mkPriceBadge(plan.price);
+  if (priceEl) lead.appendChild(priceEl);
   if (rel < 1) lead.appendChild(mkRelChip(rel));
   row.appendChild(lead);
 
-  const openLegIdx = state.selectedLegIdxMap.get(idx) ?? -1;
+  const openLegIdx = isOpen ? resolveOpenLegIdx(plan, idx) : -1;
   const openLeg = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
   const onLeg = buildLegHandler(plan, idx, isOpen, openLegIdx);
   row.appendChild(renderRibbon(plan, openLeg, onLeg));
@@ -2983,7 +3849,7 @@ function renderGroupCard(group, mode, isFirst) {
 
 // ── Render list ───────────────────────────────────────────────
 function renderList() {
-  if (state.picker) { renderPicker(); return; }
+  if (state.picker) { renderExtendButtons(); renderPicker(); return; }
   el('plans-panel').classList.remove('rp-active');
   const listEl = el('plans-list');
   listEl.replaceChildren();
@@ -2991,6 +3857,7 @@ function renderList() {
     ? state.plans.length + ' option' + (state.plans.length === 1 ? '' : 's')
     : '';
   el('group-toggle').style.display = state.plans.length ? '' : 'none';
+  renderExtendButtons();
 
   if (!state.plans.length) {
     listEl.appendChild(mkEl('p', 'status-msg', 'No results found.'));
@@ -3096,11 +3963,11 @@ const STATION_BACKUPS_QUERY = `query Backups(
 const LIVE_ONBOARD_QUERY = `query Onboard(
   $tripId: String!, $fromStopId: String,
   $toLat: Float!, $toLng: Float!,
-  $date: String, $time: String, $walkRadiusSecs: Int
+  $date: String, $time: String, $walkRadiusSecs: Int, $fareProfile: FareProfileInput
 ) {
   onboardRaptor(onboardOrigin: { tripId: $tripId, fromStopId: $fromStopId },
          toLat: $toLat, toLng: $toLng, date: $date, time: $time,
-         walkRadiusSecs: $walkRadiusSecs) {
+         walkRadiusSecs: $walkRadiusSecs, fareProfile: $fareProfile) {
     ${PLAN_FRAGMENT}
   }
 }`;
@@ -3859,7 +4726,7 @@ async function fetchSwitchAlternatives(leg) {
     const data = await gql(LIVE_ONBOARD_QUERY, {
       tripId: leg.tripId, fromStopId: leg.from?.stopId || null,
       toLat: v.toLat, toLng: v.toLng, date: v.date || null, time: v.time || null,
-      walkRadiusSecs: v.walkRadiusSecs,
+      walkRadiusSecs: v.walkRadiusSecs, fareProfile: fareProfileVar(),
     });
     if (!live.plan) return;               // exited mid-flight
     const onward = transitLegsOf(live.plan).slice(transitLegsOf(live.plan).indexOf(leg)).map(l => l.tripId);
@@ -4564,6 +5431,71 @@ fillDateTimeIfEmpty();
 doSyncUrl();
 const _p = readUrl();
 if (_p.has('fromLat') && _p.has('toLat')) runQuery();
+
+// ── Share view (QR code + copyable link) ──────────────────────
+// The URL is already kept in sync with app state on every change (doSyncUrl),
+// so location.href round-trips the current view via loadFromUrl on the target
+// device. We re-sync once on open to catch any not-yet-flushed control state.
+// The QR is rendered fully client-side (window.QRCode, no network).
+(function () {
+  const btn = el('share-btn');
+  const modal = el('share-modal');
+  if (!btn || !modal) return;
+  const closeBtn = el('share-close');
+  const qrHost = el('share-qr');
+  const urlInput = el('share-url');
+  const copyBtn = el('share-copy');
+  let copyTimer = null;
+
+  function openShare() {
+    doSyncUrl();
+    const url = location.href;
+    urlInput.value = url;
+    try {
+      qrHost.innerHTML = window.QRCode.svg(url, { border: 2 });
+    } catch (e) {
+      qrHost.textContent = 'Link too long to encode as a QR code.';
+    }
+    modal.classList.add('open');
+    btn.classList.add('active');
+  }
+  function closeShare() {
+    modal.classList.remove('open');
+    btn.classList.remove('active');
+  }
+
+  btn.addEventListener('click', () => {
+    if (modal.classList.contains('open')) closeShare(); else openShare();
+  });
+  closeBtn.addEventListener('click', closeShare);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeShare(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal.classList.contains('open')) closeShare();
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    const text = urlInput.value;
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (_) { /* fall through to legacy path */ }
+    if (!ok) {
+      urlInput.focus();
+      urlInput.select();
+      try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    }
+    copyBtn.textContent = ok ? 'Copied' : 'Copy failed';
+    copyBtn.classList.toggle('done', ok);
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      copyBtn.textContent = 'Copy';
+      copyBtn.classList.remove('done');
+    }, 1600);
+  });
+}());
 
 // ── PWA: service worker + install affordance ───────────────────
 (function () {

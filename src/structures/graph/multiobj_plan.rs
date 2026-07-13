@@ -208,6 +208,8 @@ impl Graph {
                 probability: 1.0,
             }],
             expected_end: end,
+            // Street-only plan: no transit boardings, so no fare.
+            price: None,
         })
         .map(|mut plan| {
             if let PlanLeg::Walk(leg) = &mut plan.legs[0] {

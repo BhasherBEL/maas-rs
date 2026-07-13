@@ -92,7 +92,7 @@ Phase order matters: OSM (phase 0) runs first so GTFS stops (phase 1) can snap t
   - `representatives.rs` / `path_distribution.rs` / `platform_reach.rs` / `edge_index.rs` / `street_enrich.rs` / `latency_profile.rs` — Pareto-front trimming, post-hoc time-moment aggregation, platform connector reachability, R-tree edge snapping, walk-leg enrichment with alternatives, query latency profiler.
   - `realtime_match.rs` — STIB waiting-times → scheduled-arrival matching (`best_match`).
   - `transit.rs` / `railway.rs` — public transit accessors; SNCB railway topology cache (build-time).
-- **`src/structures/cost/`** — multi-objective cost model: `axis.rs` (the cost axes + dominance), `mode_axes.rs` (per-mode active axes), `variance.rs` (reliability variance from signals/turns/etc.). Plus `mode.rs` (`RoutingMode` + burden hierarchy), `bike_profile.rs`/`bike_attrs.rs`/`surface_speed.rs`/`graph/bike_cost.rs` (kinematic bike model), `street_time.rs` (stochastic access/egress log-normal model), `delay.rs` (`DelayCDF`, scenario bags), `address.rs` (`AddressIndex`), `realtime.rs` (`RealtimeIndex`).
+- **`src/structures/cost/`** — multi-objective cost model: `axis.rs` (the cost axes + dominance), `mode_axes.rs` (per-mode active axes), `variance.rs` (reliability variance from signals/turns/etc.). Plus `mode.rs` (`RoutingMode` + burden hierarchy), `bike_profile.rs`/`bike_attrs.rs`/`surface_speed.rs`/`graph/bike_cost.rs` (kinematic bike model), `street_time.rs` (stochastic access/egress log-normal model), `delay.rs` (`DelayCDF`, scenario bags), `address.rs` (`AddressIndex`), `realtime.rs` (`RealtimeIndex`), `fares.rs` (multi-operator fare model + `price` cost axis).
 - **`src/ingestion/`** — parses inputs into nodes/edges:
   - `osm/` — PBF parse (`pbf.rs`), bike classification (`bike_class.rs`), DEM elevation sampling + RDP smoothing (`elevation.rs`, `elevation_smooth.rs`, `lambert.rs`), platform indexing (`platforms.rs`).
   - `gtfs/` — generic GTFS (`gtfs.rs`) plus `sncb.rs` (rail: snaps stops to OSM railway topology) and `stib.rs` (tram/metro: peak-hour bike-allowance rules).
@@ -109,6 +109,7 @@ Phase order matters: OSM (phase 0) runs first so GTFS stops (phase 1) can snap t
 - `raptor` — ranked multi-modal plans from/to coordinates (date/time optional).
 - `raptorExplain` — plans plus every candidate's drop/filter reason + access metadata (debugging).
 - `onboardRaptor` — re-plan from aboard a running trip (stay-on / alight-transfer / alight-walk).
+- `raptor` / `raptorExplain` / `onboardRaptor` take an optional `fareProfile` argument (subscriptions, cards, passenger category, Brupass); each `Plan` then carries a `price` (`PlanPrice`: known/capped euros + any unpriced operators).
 - `legAlternatives` — per-leg walk/bike/drive Pareto alternatives and prev/next departures.
 - `liveRefresh` — realtime overlay for a client-selected journey (no re-routing).
 - `stationBackups` — same-station backup departures scored by catch-reliability.

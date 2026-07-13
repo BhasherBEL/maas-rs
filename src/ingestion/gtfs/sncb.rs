@@ -371,6 +371,125 @@ pub fn load_gtfs_sncb(
     Ok(())
 }
 
+// ── SNCB fare model (operator-specific fare interpretation) ────────────────────
+
+/// Build the SNCB `OperatorModel` from its `distance_base_per_km` config block.
+///
+/// This is the SNCB-specific fare interpretation: the distance-tariff shape
+/// selection (`bracketed` exact 2026 2nd-class / `band` legacy piecewise /
+/// `linear` inert), the 1st-class multiplier bands + rounding tiers, the SNCB
+/// peak-window/discount/cap rule set (`SncbTimeRules`), and the airport special-OD
+/// fare. It composes the operator-agnostic tariff/rule PRIMITIVES that live in
+/// `structures::cost::fares` (`DistanceTariff`, `SncbTimeRules`); only the SNCB
+/// choice of which primitive and which constants is co-located here.
+///
+/// Returns the model plus the uppercased airport-station tokens (an OD touching
+/// such a station prices at the fixed airport fare), which the caller stores on
+/// the `OperatorFare`. `cents` converts an optional euro amount to integer cents.
+pub fn build_sncb_operator(
+    op: &crate::structures::FareOperatorConfig,
+    cents: impl Fn(Option<f64>) -> u32,
+) -> (crate::structures::cost::OperatorModel, Vec<String>) {
+    use crate::structures::cost::{DistanceTariff, OperatorModel, SncbTimeRules};
+
+    let airport_station_names: Vec<String> = op
+        .airport_station_names
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .collect();
+
+    let mut windows = [(0u32, 0u32); 2];
+    let n = op.peak_windows.len().min(2);
+    windows[..n].copy_from_slice(&op.peak_windows[..n]);
+    let rules = SncbTimeRules {
+        peak_windows: windows,
+        n_peak_windows: n as u8,
+        weekend_discount_adult: op.weekend_discount_adult.unwrap_or(0.0),
+        weekend_discount_reduced: op.weekend_discount_reduced.unwrap_or(0.0),
+        train_plus_offpeak_discount: op.train_plus_offpeak_discount.unwrap_or(0.0),
+        train_plus_peak_cap_adult: op
+            .train_plus_peak_cap_adult_euros
+            .map(|e| cents(Some(e)))
+            .unwrap_or(u32::MAX),
+        train_plus_peak_cap_reduced: op
+            .train_plus_peak_cap_reduced_euros
+            .map(|e| cents(Some(e)))
+            .unwrap_or(u32::MAX),
+    };
+    // Tariff-distance clamp + floor (shared by both shapes).
+    let min_km = op.min_km.unwrap_or(3);
+    let max_km = op.max_km.unwrap_or(118);
+    let floor_cents = op.floor_euros.map(|e| cents(Some(e))).unwrap_or(260);
+    // Default to the EXACT published 2026 2nd-class BRACKETED model; `band` (legacy
+    // piecewise placeholder) and `linear` remain as inert alternatives. 1st-class
+    // multiplier bands default to the documented SNCB shape ([36,51] /
+    // [1.40,1.50,1.60]), inert here.
+    let mut fc_thresholds = [36u32, 51u32];
+    for (i, t) in op.first_class_thresholds.iter().take(2).enumerate() {
+        fc_thresholds[i] = *t;
+    }
+    let mut fc_coeffs = [1.40f64, 1.50, 1.60];
+    for (i, c) in op.first_class_coefficients.iter().take(3).enumerate() {
+        fc_coeffs[i] = *c;
+    }
+    // 1st-class rounding tiers (EUR → cents). Defaults: round to 0.10 below 25 EUR,
+    // 0.50 in [25,50], 1 EUR above 50 (half up).
+    let mut fc_round_thresholds = [2500u32, 5000u32];
+    for (i, t) in op.first_class_round_thresholds.iter().take(2).enumerate() {
+        fc_round_thresholds[i] = (*t * 100.0).round() as u32;
+    }
+    let mut fc_round_grids = [10u32, 50u32, 100u32];
+    for (i, gr) in op.first_class_round_grids.iter().take(3).enumerate() {
+        fc_round_grids[i] = (*gr * 100.0).round() as u32;
+    }
+    let tariff = match op.distance_tariff.as_deref() {
+        Some("linear") => DistanceTariff::Linear {
+            intercept_cents: op.intercept_euros.unwrap_or(0.0) * 100.0,
+            slope_cents_per_km: op.slope_euros_per_km.unwrap_or(0.0) * 100.0,
+            min_km,
+            max_km,
+            floor_cents,
+        },
+        Some("band") => {
+            let mut thresholds = [36u32, 51u32];
+            for (i, t) in op.band_thresholds.iter().take(2).enumerate() {
+                thresholds[i] = *t;
+            }
+            let mut coeffs = [1.40f64, 1.50, 1.60];
+            for (i, c) in op.band_coefficients.iter().take(3).enumerate() {
+                coeffs[i] = *c;
+            }
+            DistanceTariff::Band {
+                per_km_rate_cents: op.per_km_rate.unwrap_or(0.0) * 100.0,
+                thresholds,
+                coeffs,
+                min_km,
+                max_km,
+                floor_cents,
+            }
+        }
+        // "bracketed" or unset ⇒ the exact 2026 2nd-class model.
+        _ => DistanceTariff::Bracketed {
+            a_cents_per_km: op.a_euros_per_km.unwrap_or(0.0) * 100.0,
+            b_cents: op.b_euros.unwrap_or(0.0) * 100.0,
+            floor_cents,
+            min_km,
+            cap_from_km: op.cap_from_km.unwrap_or(116),
+            cap_km: op.cap_km.unwrap_or(118),
+            first_class_thresholds: fc_thresholds,
+            first_class_coeffs: fc_coeffs,
+            first_class_round_thresholds: fc_round_thresholds,
+            first_class_round_grids: fc_round_grids,
+        },
+    };
+    let model = OperatorModel::DistanceBasePerKm {
+        tariff,
+        rules,
+        airport_od_cents: op.airport_od_euros.map(|e| cents(Some(e))).unwrap_or(0),
+    };
+    (model, airport_station_names)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

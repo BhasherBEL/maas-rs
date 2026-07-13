@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#1c64f2">
+<title>MaaS Travel-Time Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+/* ── Design-system tokens (shared with index.html; kept in sync) ─────────── */
+:root {
+  --bg:        #f6f7f9;
+  --panel:     #ffffff;
+  --panel-2:   #fafbfc;
+  --border:    #e3e6eb;
+  --fg:        #1c2025;
+  --fg-2:      #54606b;
+  --fg-3:      #8a95a1;
+  --accent:    #1c64f2;
+  --accent-2:  #e0ecff;
+  --danger:    #d92d20;
+  --radius:    8px;
+  --radius-s:  6px;
+  --ds-bg:        oklch(0.978 0.004 95);
+  --ds-surface:   #ffffff;
+  --ds-surface-2: oklch(0.967 0.005 95);
+  --ds-surface-3: oklch(0.945 0.006 95);
+  --ds-line:      oklch(0.905 0.006 95);
+  --ds-ink:       oklch(0.255 0.012 70);
+  --ds-ink-2:     oklch(0.46 0.012 70);
+  --ds-ink-3:     oklch(0.62 0.009 70);
+  --ds-accent:      oklch(0.52 0.085 205);
+  --ds-accent-soft: oklch(0.95 0.022 205);
+  --ds-radius:    11px;
+  --ds-radius-sm: 7px;
+  --ds-shadow-md: 0 2px 6px oklch(0.4 0.02 70 / 0.08), 0 8px 24px oklch(0.4 0.02 70 / 0.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:       #0e1116;
+    --panel:    #161a21;
+    --panel-2:  #1c2129;
+    --border:   #262c36;
+    --fg:       #e6e9ee;
+    --fg-2:     #aab2bd;
+    --fg-3:     #6c7682;
+    --accent:   #5e8bff;
+    --accent-2: #1a2a4a;
+    --ds-bg:        #0e1116;
+    --ds-surface:   #161a21;
+    --ds-surface-2: #1c2129;
+    --ds-surface-3: #232a34;
+    --ds-line:      #2b323d;
+    --ds-ink:       #e6e9ee;
+    --ds-ink-2:     #b7c0cc;
+    --ds-ink-3:     #8a95a1;
+    --ds-accent:      #6f9bff;
+    --ds-accent-soft: #1a2a4a;
+    --ds-shadow-md: 0 2px 6px rgba(0,0,0,.55), 0 8px 24px rgba(0,0,0,.5);
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--ds-bg); color: var(--ds-ink); }
+body {
+  font: 13.5px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  display: flex; flex-direction: column;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+input, select { font: inherit; color: inherit; }
+a { color: var(--ds-accent); }
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+header .logo { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; flex: 1; }
+header .logo .dot { color: var(--accent); }
+header a.head-btn, header button.head-btn {
+  padding: 5px 10px; background: transparent; border: 1px solid var(--border);
+  border-radius: var(--radius-s); font-size: 12px; color: var(--fg-2); text-decoration: none;
+}
+header a.head-btn:hover, header button.head-btn:hover { background: var(--panel-2); color: var(--fg); }
+header button.head-btn.active { color: var(--accent); border-color: var(--accent); }
+
+/* ── Share view (QR + link) — mirrors index.html ─────────────────────────── */
+.modal-backdrop {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
+  z-index: 9000; align-items: center; justify-content: center; padding: 24px;
+}
+.modal-backdrop.open { display: flex; }
+.modal {
+  background: var(--panel); border-radius: 10px; box-shadow: var(--ds-shadow-md);
+  width: 100%; max-width: 540px; max-height: 88vh; display: flex; flex-direction: column;
+  border: 1px solid var(--border);
+}
+.modal-head {
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px;
+}
+.modal-head .title { flex: 1; font-weight: 600; font-size: 14px; }
+.modal-head .close { background: none; border: none; font-size: 18px; color: var(--fg-3); padding: 0 4px; }
+.modal-body { padding: 14px 16px; overflow-y: auto; }
+.share-modal { max-width: 380px; }
+.share-qr {
+  display: flex; align-items: center; justify-content: center;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px; margin: 2px auto 12px; width: min(240px, 68vw);
+}
+.share-qr svg { width: 100%; height: auto; display: block; }
+.share-link { display: flex; gap: 8px; align-items: stretch; }
+.share-url {
+  flex: 1; min-width: 0; padding: 7px 9px; font-size: 12px;
+  color: var(--fg-2); background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+}
+.share-copy {
+  flex: none; padding: 7px 12px; font-size: 12px; font-weight: 600;
+  color: var(--accent); background: var(--accent-2);
+  border: 1px solid var(--accent); border-radius: var(--radius-s);
+  cursor: pointer; white-space: nowrap;
+}
+.share-copy:hover { filter: brightness(1.04); }
+.share-copy.done { color: #fff; background: var(--accent); }
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+.main { display: flex; flex: 1; overflow: hidden; position: relative; }
+#sidebar {
+  width: 340px; flex-shrink: 0;
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 16px;
+  border-right: 1px solid var(--border); background: var(--panel);
+  overflow-y: auto;
+}
+#map { flex: 1; min-width: 0; }
+
+@media (prefers-color-scheme: dark) {
+  .leaflet-container { background: #0a0d12; }
+  .leaflet-tile { filter: invert(1) hue-rotate(180deg) brightness(.95) contrast(.92); }
+  .leaflet-control-attribution { background: rgba(20,20,20,.7) !important; color: #aaa !important; }
+  .leaflet-control-attribution a { color: #6cf !important; }
+}
+/* The heat canvas must not be tinted by the dark tile filter. */
+.tt-heat-canvas { filter: none !important; }
+
+/* ── Controls ────────────────────────────────────────────────────────────── */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > label.lbl {
+  font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+  color: var(--ds-ink-3);
+}
+.hint { font-size: 11px; color: var(--ds-ink-3); }
+
+.tt-input, .tt-row input, .tt-row select {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--ds-surface-2); color: var(--ds-ink);
+  border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm);
+  outline: none;
+}
+.tt-input:focus, .tt-row input:focus, .tt-row select:focus {
+  border-color: var(--ds-accent);
+  box-shadow: 0 0 0 3px var(--ds-accent-soft);
+}
+.tt-row { display: flex; gap: 8px; }
+.tt-row > .field { flex: 1; }
+
+.tt-slider {
+  width: 100%; height: 4px; margin: 8px 0;
+  -webkit-appearance: none; appearance: none;
+  background: var(--ds-surface-3); border-radius: 999px; outline: none; cursor: pointer;
+}
+.tt-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ds-accent); border: 2px solid var(--ds-surface); cursor: pointer;
+}
+.tt-slider::-moz-range-thumb {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ds-accent); border: 2px solid var(--ds-surface); cursor: pointer;
+}
+.tt-slider:focus { box-shadow: 0 0 0 3px var(--ds-accent-soft); }
+#cell-val { color: var(--ds-ink-2); font-variant-numeric: tabular-nums; }
+
+.addr-wrap { position: relative; }
+.addr-drop {
+  display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 1200;
+  margin-top: 4px;
+  background: var(--ds-surface); border: 1px solid var(--ds-line);
+  border-radius: var(--ds-radius-sm); box-shadow: var(--ds-shadow-md);
+  max-height: 260px; overflow-y: auto;
+}
+.addr-row { padding: 8px 10px; cursor: pointer; border-bottom: 1px solid var(--ds-line); }
+.addr-row:last-child { border-bottom: none; }
+.addr-row:hover { background: var(--ds-accent-soft); }
+
+/* ── Travel-mode grid (mirrors index.html's #modes-grid) ─────────────────── */
+.modes-subhead { display: flex; align-items: center; margin: 0 0 8px; }
+.msh-actions { display: flex; gap: 6px; }
+.msh-actions button {
+  font-size: 11px; font-weight: 600; color: var(--fg-2); cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 2px 12px;
+}
+.msh-actions button:hover { color: var(--fg); }
+#modes-grid {
+  display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 6px;
+}
+.mg-corner { }
+.mg-col, .mg-row {
+  font-size: 10px; font-weight: 700; letter-spacing: .04em; cursor: pointer;
+  background: none; border: none; padding: 2px 4px; color: var(--fg-2);
+  border-radius: 6px; line-height: 1.15;
+}
+.mg-col { text-transform: uppercase; text-align: center; align-self: end; padding-bottom: 4px; }
+.mg-row { text-align: left; white-space: nowrap; font-size: 13px; font-weight: 700;
+  color: var(--fg); display: flex; align-items: center; }
+.mg-col:hover, .mg-row:hover { color: var(--ds-accent); }
+.mode-cell {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 42px; border-radius: 10px; cursor: pointer;
+  background: var(--panel); color: transparent; border: 1px solid var(--border);
+}
+.mode-cell.active { background: var(--accent); border-color: transparent; }
+.mode-cell.active::after { content: '✓'; color: #fff; font-size: 16px; font-weight: 700; }
+.mode-cell.disabled {
+  cursor: default; pointer-events: none;
+  background: repeating-linear-gradient(-45deg,
+    transparent 0 4px, color-mix(in srgb, var(--fg-3) 70%, transparent) 4px 6.5px);
+  border: 1px solid var(--border);
+}
+.modes-caption { margin: 10px 0 0; font-size: 11px; color: var(--fg-2); line-height: 1.35; }
+
+/* ── Segmented toggle ────────────────────────────────────────────────────── */
+.seg { display: inline-flex; border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm); overflow: hidden; }
+.seg button {
+  padding: 7px 14px; background: var(--ds-surface-2); border: none;
+  color: var(--ds-ink-2); font-size: 12px;
+}
+.seg button + button { border-left: 1px solid var(--ds-line); }
+.seg button.active { background: var(--ds-accent); color: #fff; }
+
+#compute {
+  padding: 10px 14px; font-size: 13px; font-weight: 600;
+  background: var(--ds-accent); color: #fff;
+  border: none; border-radius: var(--ds-radius-sm);
+}
+#compute:hover { filter: brightness(1.06); }
+#compute:disabled { opacity: .6; cursor: default; }
+
+#status { font-size: 12px; color: var(--ds-ink-2); min-height: 1.2em; }
+#status.err { color: var(--danger); }
+
+/* ── Click-to-route popup ──────────────────────────────────────────────────
+   Leaflet builds .leaflet-popup-content-wrapper; retheme it to the --ds-* system
+   so the itinerary reads in both light and dark mode. */
+.tt-route-popup .leaflet-popup-content-wrapper {
+  background: var(--ds-surface); color: var(--ds-ink);
+  border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm);
+  box-shadow: var(--ds-shadow-md);
+}
+.tt-route-popup .leaflet-popup-content { margin: 10px 12px; font-size: 12.5px; }
+.tt-route-popup .leaflet-popup-tip { background: var(--ds-surface); border: 1px solid var(--ds-line); }
+.tt-route-popup a.leaflet-popup-close-button { color: var(--ds-ink-3); }
+.tt-route-status { color: var(--ds-ink-2); }
+.tt-route-status.err { color: var(--danger); }
+.tt-route-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.tt-route-dur { font-size: 16px; font-weight: 700; color: var(--ds-ink); }
+.tt-route-arr { font-size: 11.5px; color: var(--ds-ink-3); }
+.tt-route-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 5px; }
+.tt-route-arrow { color: var(--ds-ink-3); }
+.tt-route-walk { color: var(--ds-ink-2); white-space: nowrap; }
+.tt-route-line {
+  display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 999px;
+  font-weight: 700; font-size: 11.5px; background: var(--ds-surface-3); color: var(--ds-ink);
+  white-space: nowrap;
+}
+.tt-route-to { color: var(--ds-ink-2); white-space: nowrap; }
+
+/* ── Legend ──────────────────────────────────────────────────────────────── */
+.legend {
+  position: absolute; bottom: 18px; right: 18px; z-index: 1000;
+  padding: 10px 12px;
+  background: var(--ds-surface); color: var(--ds-ink);
+  border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm);
+  box-shadow: var(--ds-shadow-md);
+  font-size: 11px;
+}
+.legend .title { font-weight: 600; margin-bottom: 6px; }
+.legend .bar {
+  height: 10px; width: 160px; border-radius: 3px;
+  background: linear-gradient(90deg, #16a34a 0%, #eab308 50%, #dc2626 100%);
+}
+.legend .ends { display: flex; justify-content: space-between; margin-top: 4px; color: var(--ds-ink-3); }
+
+/* ── Mobile (parity with index.html's @media max-width:760px) ────────────── */
+@media (max-width: 760px) {
+  header { gap: 8px; padding: 8px 10px; }
+  header .logo { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header a.head-btn { padding: 8px 12px; font-size: 13px; flex-shrink: 0; }
+
+  /* Stack the sidebar above the map; both scroll with the page. */
+  .main { flex-direction: column; overflow: visible; }
+  #sidebar {
+    width: 100%; flex-shrink: 1;
+    border-right: none; border-bottom: 1px solid var(--border);
+    overflow-y: visible;
+  }
+  #map { flex: none; height: 55vh; min-height: 320px; width: 100%; }
+
+  /* Bigger touch targets on the mode/seg controls. */
+  .mode-cell { min-height: 48px; }
+  .seg button { padding: 10px 16px; font-size: 13px; }
+  .msh-actions button { padding: 6px 14px; font-size: 12px; }
+
+  /* Keep the legend out of Leaflet's zoom/attribution controls. */
+  .legend {
+    bottom: 10px; left: 10px; right: auto; padding: 8px 10px; font-size: 10px;
+  }
+  .legend .bar { width: 110px; height: 8px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">MaaS <span class="dot">·</span> Travel-Time Map</div>
+  <button id="share-btn" class="head-btn" type="button" title="Share this view (QR code + link)" aria-label="Share this view">⧉ Share</button>
+  <a class="head-btn" href="/">Trip planner</a>
+</header>
+
+<div class="main">
+  <aside id="sidebar">
+    <div class="field addr-wrap">
+      <label class="lbl" for="center-input">Center</label>
+      <input class="tt-input" id="center-input" type="text" autocomplete="off"
+             placeholder="Search address or lat, lng — or right-click the map">
+      <div class="addr-drop" id="addr-drop"></div>
+      <div class="hint">Right-click the map to set the center (or drag the marker); left-click a point to route there.</div>
+    </div>
+
+    <div class="tt-row">
+      <div class="field">
+        <label class="lbl" for="date">Date</label>
+        <input id="date" type="date">
+      </div>
+      <div class="field">
+        <label class="lbl" for="time">Time</label>
+        <input id="time" type="time">
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="lbl" for="max-min">Max time (minutes)</label>
+      <input id="max-min" type="number" min="1" max="240" step="5" value="30">
+    </div>
+
+    <div class="field">
+      <label class="lbl">Modes</label>
+      <div class="modes-subhead">
+        <div class="msh-actions">
+          <button id="modes-all" type="button">All</button>
+          <button id="modes-none" type="button">None</button>
+        </div>
+      </div>
+      <div id="modes-grid" role="group" aria-label="Travel modes"></div>
+      <p class="modes-caption">Every valid pairing is a cell — striped cells aren’t possible (you can’t take a car onto the train).</p>
+    </div>
+
+    <div class="field">
+      <label class="lbl">Aggregation</label>
+      <div class="seg" role="group">
+        <button id="agg-best" type="button">Best</button>
+        <button id="agg-avg" type="button">Average</button>
+      </div>
+      <div class="hint">Aggregation applies across the departure window below.</div>
+    </div>
+
+    <div class="field">
+      <label class="lbl" for="win-min">Window (min)</label>
+      <input id="win-min" type="number" min="0" max="240" step="5" value="30">
+      <div class="hint">Best / average arrival over the next N minutes of departures; 0 = a single departure.</div>
+    </div>
+
+    <div class="field">
+      <label class="lbl" for="cell-m">Cell size (m) · <span id="cell-val">200</span></label>
+      <input id="cell-m" class="tt-slider" type="range" min="10" max="1000" step="10" value="200">
+      <div class="hint">Smaller = finer heatmap; very small values are auto-capped on large maps.</div>
+    </div>
+
+    <button id="compute" type="button">Compute</button>
+    <div id="status"></div>
+  </aside>
+
+  <div id="map"></div>
+
+  <div class="legend">
+    <div class="title">Travel time</div>
+    <div class="bar"></div>
+    <div class="ends"><span>near (0)</span><span id="legend-max">30 min</span></div>
+  </div>
+</div>
+
+<!-- Share view: QR code + copyable link for the current URL -->
+<div id="share-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Share this view">
+  <div class="modal share-modal">
+    <div class="modal-head">
+      <div class="title">Share this view</div>
+      <button class="close" id="share-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="hint">Scan this code to open this map on another device, or copy the link.</p>
+      <div id="share-qr" class="share-qr" aria-hidden="false"></div>
+      <div class="share-link">
+        <input id="share-url" class="share-url" type="text" readonly aria-label="Shareable link">
+        <button id="share-copy" class="share-copy" type="button">Copy</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/maas.js"></script>
+<!-- Self-contained QR encoder (attaches window.QRCode; no network/CDN). -->
+<script type="module" src="/static/js/vendor/qr.mjs"></script>
+<script type="module" src="/static/js/travel-map.mjs"></script>
+</body>
+</html>

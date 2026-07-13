@@ -15,6 +15,22 @@ use crate::{
 
 use super::{Graph, raptor_access::StreetProfile};
 
+/// One transit boarding of a FINISHED plan, in forward (origin→destination) order,
+/// with everything the post-hoc fare pass needs to price it: the pattern + stop
+/// positions (SNCB zone-to-zone distance), the compact board/alight stops (airport /
+/// Brussels-zone detection), the resolved route (operator lookup), and the scheduled
+/// boarding time (SNCB time bucket + ticket windows).
+#[derive(Clone, Copy)]
+struct PostHocBoarding {
+    pattern: usize,
+    board_pos: usize,
+    alight_pos: usize,
+    board_stop: usize,
+    alight_stop: usize,
+    route_id: usize,
+    board_time: u32,
+}
+
 // ── Pass-3 tightening source selection (validation scaffolding) ───────────────
 //
 // The plan-tightening bounds are produced either by the full backward RAPTOR
@@ -229,6 +245,7 @@ impl Graph {
                 probability: 1.0,
             }],
             expected_end: end,
+            price: None,
         }
     }
 
@@ -280,6 +297,612 @@ impl Graph {
             return None;
         }
         Some(plan)
+    }
+
+    /// Convert a label's carried `PriceValue` into the user-facing `PlanPrice`,
+    /// or `None` when the fares feature is disabled (so the Plan carries no price
+    /// field, byte-identical to pre-feature output). `capped_euros == known_euros`
+    /// this increment (day/journey caps come later, spec §9). Each nonzero
+    /// `unknown[slot]` names its operator (with the boarding count) so an
+    /// unpriceable operator is surfaced rather than hidden.
+    pub(super) fn plan_price_of(
+        &self,
+        price: &crate::structures::cost::PriceValue,
+        breakdown: Vec<crate::structures::plan::FareBreakdownItem>,
+        brupass_savings_cents: u32,
+    ) -> Option<crate::structures::plan::PlanPrice> {
+        if !self.raptor.fare_model.enabled {
+            return None;
+        }
+        // The Brupass cap (post-hoc, in the breakdown) lowers the whole in-zone
+        // multi-operator total by `brupass_savings_cents`; apply the SAME reduction to
+        // the numeric known/capped totals so they equal the breakdown sum.
+        let known_euros =
+            price.known_cents.saturating_sub(brupass_savings_cents) as f64 / 100.0;
+        // Display-time SNCB per-journey cap (Train+ peak): the RAW spend is carried
+        // in dominance (spec §9 soundness); display applies `min(raw_sncb, cap)` to
+        // the SNCB portion only. `capped = known − sncb_spend + min(sncb_spend, cap)`.
+        // With no cap in force (`sncb_cap_cents == u32::MAX`) this equals `known`.
+        let capped_sncb = price.sncb_spend_cents.min(price.sncb_cap_cents);
+        let capped_cents = price
+            .known_cents
+            .saturating_sub(price.sncb_spend_cents)
+            .saturating_add(capped_sncb)
+            .saturating_sub(brupass_savings_cents);
+        let capped_euros = capped_cents as f64 / 100.0;
+        let mut unknown_operators = Vec::new();
+        for (slot, &count) in price.unknown.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let name = self
+                .raptor
+                .unknown_operator_names
+                .get(slot)
+                .cloned()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("unknown_{slot}"));
+            unknown_operators.push(if count > 1 {
+                format!("{name} x{count}")
+            } else {
+                name
+            });
+        }
+        Some(crate::structures::plan::PlanPrice {
+            known_euros,
+            capped_euros,
+            unknown_operators,
+            sncb_fare_km: (price.sncb_run_m > 0).then(|| price.sncb_run_m as f64 / 1000.0),
+            breakdown,
+        })
+    }
+
+    /// Collect the plan's transit boardings by walking the arena parent chain from
+    /// the destination label `start_id` back to the root, then reversing to forward
+    /// order. Mirrors `reconstruct`'s trace walk but keeps only what the post-hoc
+    /// fare pass needs. Transfer (footpath) traces are skipped — they carry no fare.
+    fn collect_posthoc_boardings(&self, arena: &[Label], start_id: u32) -> Vec<PostHocBoarding> {
+        let mut boardings = Vec::new();
+        let mut cur = start_id;
+        while cur != u32::MAX {
+            let node = &arena[cur as usize];
+            let trace = node.trace;
+            if !trace.is_transit() && !trace.is_transfer() {
+                break; // reached the source / root
+            }
+            if trace.is_transit() {
+                let p = trace.pattern as usize;
+                let t = trace.trip as usize;
+                let bp = trace.boarded_at as usize;
+                let ap = trace.alighted_at as usize;
+                let pat_stops = self.raptor.transit_idx_pattern_stops[p]
+                    .of(&self.raptor.transit_pattern_stops);
+                let n_trips = self.raptor.transit_patterns[p].num_trips as usize;
+                let times = self.raptor.transit_idx_pattern_stop_times[p]
+                    .of(&self.raptor.transit_pattern_stop_times);
+                let board_stop = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
+                let alight_stop = self.raptor.transit_node_to_stop[pat_stops[ap].0] as usize;
+                let route_id = self.raptor.transit_patterns[p].route.0 as usize;
+                // Scheduled departure of the boarded trip at the boarding stop — the
+                // exact `board_time` the in-search accrual used (ticket window + bucket).
+                let board_time = times[bp * n_trips + t].departure;
+                boardings.push(PostHocBoarding {
+                    pattern: p,
+                    board_pos: bp,
+                    alight_pos: ap,
+                    board_stop,
+                    alight_stop,
+                    route_id,
+                    board_time,
+                });
+            }
+            cur = node.parent;
+        }
+        boardings.reverse();
+        boardings
+    }
+
+    /// Price a FIXED boarding sequence forward through the fare model, EXACTLY (no
+    /// ε-bucketing), with a fresh `PriceValue`. Every operator pays its own ticket.
+    /// This is the post-hoc analogue of the in-search accrual, walked over the settled
+    /// legs (no dominance, no back-out/refund beyond the SNCB run recompute the model
+    /// already does). The Brupass CAP is a separate post-pass applied by
+    /// `plan_price_posthoc` / `build_breakdown` (see `apply_brupass_cap`); it never
+    /// enters this per-operator accrual.
+    fn price_boardings(
+        &self,
+        boardings: &[PostHocBoarding],
+        weekday: u8,
+        fare_profile: crate::structures::cost::FareProfile,
+    ) -> crate::structures::cost::PriceValue {
+        use crate::structures::cost::{KnownEurosEpsilon, OperatorModel, PriceValue};
+        // Post-hoc prices EXACTLY: identity ε-bucketing so cents are not quantized to
+        // the in-search 10-cent tiers. The operators/zones are shared by reference via
+        // clone (cheap: run once per kept plan); only the ε knob is overridden.
+        let mut fm = self.raptor.fare_model.clone();
+        fm.known_euros_epsilon = KnownEurosEpsilon { a: 0.0, b: 0.0 };
+        let ctx = crate::structures::cost::FareContext { profile: fare_profile, weekday };
+        let mut price = PriceValue::ZERO;
+        for b in boardings.iter() {
+            let Some(&op) = self.raptor.operator_fare_of_route.get(b.route_id) else {
+                continue;
+            };
+            let board_time = b.board_time;
+            fm.charge_board(&mut price, op, board_time, &ctx);
+            // SNCB per-km + airport OD accrual for this ride's alight (the search
+            // recomputes the whole run per alight; here the leg's alight is final).
+            if let crate::structures::cost::OperatorFareId::Modeled {
+                model: OperatorModel::DistanceBasePerKm { tariff, rules, airport_od_cents },
+            } = op
+            {
+                let prior_free_m = price.sncb_run_m as f64;
+                let run_board_stop = if price.sncb_run_board_stop == u32::MAX {
+                    price.sncb_run_board_stop = b.board_stop as u32;
+                    b.board_stop
+                } else {
+                    price.sncb_run_board_stop as usize
+                };
+                let run_m = self.sncb_fare_distance_m(
+                    run_board_stop,
+                    b.alight_stop,
+                    b.pattern,
+                    b.board_pos,
+                    b.alight_pos,
+                    prior_free_m,
+                );
+                fm.accrue_sncb_km(&mut price, tariff, run_m, &rules, &ctx, board_time);
+                if airport_od_cents > 0 {
+                    let is_airport = self
+                        .raptor
+                        .sncb_airport_stop
+                        .get(b.alight_stop)
+                        .copied()
+                        .unwrap_or(false)
+                        || self
+                            .raptor
+                            .sncb_airport_stop
+                            .get(b.board_stop)
+                            .copied()
+                            .unwrap_or(false);
+                    if is_airport {
+                        fm.apply_sncb_airport_od(&mut price, airport_od_cents);
+                    }
+                }
+            }
+        }
+        price
+    }
+
+    /// Human display name of the operator for a boarding's route (the agency name,
+    /// e.g. "STIB", "SNCB", "De Lijn", "TEC"), or an empty string if unknown.
+    fn operator_display_name(&self, route_id: usize) -> String {
+        self.raptor
+            .transit_routes
+            .get(route_id)
+            .and_then(|r| self.raptor.transit_agencies.get(r.agency_id.0 as usize))
+            .map(|a| a.name.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// A short label for an SNCB stop used in the fare-breakdown OD description:
+    /// its agglomeration zone name if it is in one, else the stop's own name.
+    fn sncb_stop_label(&self, stop: usize) -> String {
+        use crate::structures::cost::Agglomeration;
+        match self.raptor.sncb_stop_zone.get(stop).copied().unwrap_or(Agglomeration::None) {
+            Agglomeration::Brussels => "Brussels".to_string(),
+            Agglomeration::Antwerpen => "Antwerpen".to_string(),
+            Agglomeration::None => self
+                .raptor
+                .transit_stop_names
+                .get(stop)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Build the itemized fare "shopping list" for a FIXED boarding sequence, replaying
+    /// the SAME charge decisions as `price_boardings` and attributing each `known_cents`
+    /// delta to a logical ticket. Consecutive same-ticket boardings collapse into one
+    /// item: a STIB/De Lijn time-window is ONE ticket across its window (later in-window
+    /// boards ride on it, no new item); a contiguous SNCB run is ONE item (base + per-km,
+    /// capped at run end). Subscription/pass-covered boardings emit a €0.00 item with
+    /// `coverage` set. Finally the Brupass CAP post-pass (`apply_brupass_cap`) collapses
+    /// the PAID in-zone multi-operator items into one Brupass item when that is cheaper.
+    /// Returns the items plus the Brupass SAVINGS in cents (0 when no cap fired) so the
+    /// caller can lower the plan's known/capped total consistently. The sum of item euros
+    /// (SNCB + Brupass caps applied) equals `capped_euros`.
+    fn build_breakdown(
+        &self,
+        boardings: &[PostHocBoarding],
+        weekday: u8,
+        fare_profile: crate::structures::cost::FareProfile,
+    ) -> (Vec<crate::structures::plan::FareBreakdownItem>, u32) {
+        use crate::structures::cost::{
+            KnownEurosEpsilon, OperatorFareId, OperatorModel, PriceValue, TravelClass,
+            TimeWindowOperator,
+        };
+        use crate::structures::plan::FareBreakdownItem;
+
+        let mut fm = self.raptor.fare_model.clone();
+        fm.known_euros_epsilon = KnownEurosEpsilon { a: 0.0, b: 0.0 };
+        let ctx = crate::structures::cost::FareContext { profile: fare_profile, weekday };
+        let mut price = PriceValue::ZERO;
+        let mut items: Vec<FareBreakdownItem> = Vec::new();
+        // Sparse Brupass-cap tags for PAID tickets only: `(item_index, operator_key,
+        // board_stop)`. The post-pass reads each tagged item's FINAL euros, tests its
+        // board stop for Brussels-zone membership, and collapses the paid in-zone
+        // multi-operator group into one Brupass item when that is cheaper. Covered /
+        // subscription / within-window items are left untagged (never replaced).
+        let mut paid_tags: Vec<(usize, String, usize)> = Vec::new();
+
+        // Index into `items` of the open SNCB run item (base+per-km accrue onto it),
+        // and the OD stops of that run so its description can be finalized.
+        let mut sncb_item: Option<usize> = None;
+        let mut sncb_board_stop = 0usize;
+        // Cumulative RAW SNCB spend recorded when the open run's item was created, so
+        // each SNCB item gets ITS run's raw delta (not the journey-cumulative total,
+        // which would double-count across multiple SNCB runs). The per-JOURNEY cap
+        // (Train+ peak) is applied to the SNCB group as a whole in a post-pass.
+        let mut sncb_spend_at_open: u32 = 0;
+        // Indices of all SNCB run items, for the group-cap post-pass.
+        let mut sncb_item_indices: Vec<usize> = Vec::new();
+
+        // Finalize the currently-open SNCB run item: set its raw run spend (the
+        // cumulative delta since the run's item opened) + its OD description. The
+        // journey cap is applied to the SNCB group after the whole walk.
+        let finalize_sncb = |items: &mut Vec<FareBreakdownItem>,
+                             sncb_item: &mut Option<usize>,
+                             price: &PriceValue,
+                             spend_at_open: u32,
+                             board_stop: usize,
+                             alight_stop: usize| {
+            if let Some(idx) = sncb_item.take() {
+                let run_raw = price.sncb_spend_cents.saturating_sub(spend_at_open);
+                let class = match fare_profile.travel_class {
+                    TravelClass::First => "1st class",
+                    TravelClass::Second => "2nd class",
+                };
+                items[idx].euros = run_raw as f64 / 100.0;
+                items[idx].description = format!(
+                    "SNCB {} {}->{}",
+                    class,
+                    self.sncb_stop_label(board_stop),
+                    self.sncb_stop_label(alight_stop)
+                );
+            }
+        };
+
+        for b in boardings.iter() {
+            let Some(&op) = self.raptor.operator_fare_of_route.get(b.route_id) else {
+                continue;
+            };
+            let board_time = b.board_time;
+            let display = self.operator_display_name(b.route_id);
+
+            let before_known = price.known_cents;
+            let before_sncb_spend = price.sncb_spend_cents;
+            let was_sncb_active = price.sncb_active;
+            fm.charge_board(&mut price, op, board_time, &ctx);
+
+            match op {
+                OperatorFareId::Modeled {
+                    model: OperatorModel::DistanceBasePerKm { tariff, rules, airport_od_cents },
+                } => {
+                    // A non-contiguous re-entry (run was reset) starts a new SNCB item.
+                    if !was_sncb_active {
+                        finalize_sncb(
+                            &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                            sncb_board_stop, b.alight_stop,
+                        );
+                        // The raw SNCB spend before THIS run's base charge — the run's
+                        // item euros are measured from here.
+                        sncb_spend_at_open = before_sncb_spend;
+                        sncb_board_stop = b.board_stop;
+                        sncb_item = Some(items.len());
+                        sncb_item_indices.push(items.len());
+                        // A PAID SNCB run feeds the Brupass cap (in-zone tested on the
+                        // run's boarding stop); a subscription run does not.
+                        if !fare_profile.sncb_subscription {
+                            paid_tags.push((items.len(), "SNCB".to_string(), b.board_stop));
+                        }
+                        items.push(FareBreakdownItem {
+                            operator: display.clone(),
+                            description: "SNCB".to_string(),
+                            euros: 0.0,
+                            coverage: fare_profile.sncb_subscription.then(|| "SNCB subscription".to_string()),
+                        });
+                    }
+                    let prior_free_m = price.sncb_run_m as f64;
+                    let run_board_stop = if price.sncb_run_board_stop == u32::MAX {
+                        price.sncb_run_board_stop = b.board_stop as u32;
+                        b.board_stop
+                    } else {
+                        price.sncb_run_board_stop as usize
+                    };
+                    let run_m = self.sncb_fare_distance_m(
+                        run_board_stop,
+                        b.alight_stop,
+                        b.pattern,
+                        b.board_pos,
+                        b.alight_pos,
+                        prior_free_m,
+                    );
+                    fm.accrue_sncb_km(&mut price, tariff, run_m, &rules, &ctx, board_time);
+                    if airport_od_cents > 0 {
+                        let is_airport = self
+                            .raptor
+                            .sncb_airport_stop
+                            .get(b.alight_stop)
+                            .copied()
+                            .unwrap_or(false)
+                            || self
+                                .raptor
+                                .sncb_airport_stop
+                                .get(b.board_stop)
+                                .copied()
+                                .unwrap_or(false);
+                        if is_airport {
+                            fm.apply_sncb_airport_od(&mut price, airport_od_cents);
+                        }
+                    }
+                    // If this alight ended the run (airport OD closes it), finalize now.
+                    if !price.sncb_active {
+                        let desc_alight = b.alight_stop;
+                        if airport_od_cents > 0
+                            && (self.raptor.sncb_airport_stop.get(b.alight_stop).copied().unwrap_or(false)
+                                || self.raptor.sncb_airport_stop.get(b.board_stop).copied().unwrap_or(false))
+                        {
+                            if let Some(idx) = sncb_item.take() {
+                                // Airport OD is a flat fare that has no per-journey cap;
+                                // its euros are the run's raw spend delta.
+                                let run_raw =
+                                    price.sncb_spend_cents.saturating_sub(sncb_spend_at_open);
+                                items[idx].euros = run_raw as f64 / 100.0;
+                                items[idx].description = "SNCB airport".to_string();
+                            }
+                        } else {
+                            finalize_sncb(
+                                &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                                sncb_board_stop, desc_alight,
+                            );
+                        }
+                    }
+                }
+                OperatorFareId::Modeled {
+                    model: OperatorModel::TimeWindowFlat { operator, .. },
+                } => {
+                    // Any non-SNCB board ends a contiguous SNCB run.
+                    finalize_sncb(
+                        &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                        sncb_board_stop, b.alight_stop,
+                    );
+                    let (subscribed, op_name, single_desc, card_desc, card_held) = match operator {
+                        TimeWindowOperator::Stib => (
+                            fare_profile.stib_subscription,
+                            "STIB",
+                            "STIB single (90 min)",
+                            "STIB single (90 min)",
+                            false,
+                        ),
+                        TimeWindowOperator::Delijn => (
+                            fare_profile.delijn_subscription,
+                            "De Lijn",
+                            "De Lijn single (60 min)",
+                            "De Lijn 10-journey card",
+                            fare_profile.delijn_10_journey,
+                        ),
+                    };
+                    let charged = price.known_cents.saturating_sub(before_known);
+                    if subscribed {
+                        items.push(FareBreakdownItem {
+                            operator: op_name.to_string(),
+                            description: format!("{op_name} (subscription)"),
+                            euros: 0.0,
+                            coverage: Some(format!("{op_name} subscription")),
+                        });
+                    } else if charged > 0 {
+                        // A fresh ticket was bought (window was inactive): a PAID ticket
+                        // that feeds the Brupass cap (in-zone on this board's stop).
+                        paid_tags.push((items.len(), op_name.to_string(), b.board_stop));
+                        items.push(FareBreakdownItem {
+                            operator: op_name.to_string(),
+                            description: if card_held { card_desc } else { single_desc }.to_string(),
+                            euros: charged as f64 / 100.0,
+                            coverage: None,
+                        });
+                    } else {
+                        // Within the active window: rides on the ticket already bought.
+                        items.push(FareBreakdownItem {
+                            operator: op_name.to_string(),
+                            description: format!("{op_name} (same ticket, within window)"),
+                            euros: 0.0,
+                            coverage: Some(format!("{op_name} ticket")),
+                        });
+                    }
+                }
+                OperatorFareId::Modeled {
+                    model: OperatorModel::TimeWindowFlatTiered { is_express, .. },
+                } => {
+                    finalize_sncb(
+                        &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                        sncb_board_stop, b.alight_stop,
+                    );
+                    let charged = price.known_cents.saturating_sub(before_known);
+                    let tier = if is_express { "express" } else { "classic" };
+                    let product = if fare_profile.tec_6_journey {
+                        format!("TEC {tier} 6-journey")
+                    } else {
+                        format!("TEC {tier} single")
+                    };
+                    if fare_profile.tec_subscription {
+                        items.push(FareBreakdownItem {
+                            operator: "TEC".to_string(),
+                            description: "TEC (subscription)".to_string(),
+                            euros: 0.0,
+                            coverage: Some("TEC subscription".to_string()),
+                        });
+                    } else {
+                        // A PAID TEC ticket feeds the Brupass cap (in-zone on this board).
+                        paid_tags.push((items.len(), "TEC".to_string(), b.board_stop));
+                        items.push(FareBreakdownItem {
+                            operator: "TEC".to_string(),
+                            description: product,
+                            euros: charged as f64 / 100.0,
+                            coverage: None,
+                        });
+                    }
+                }
+                OperatorFareId::Unknown { .. } => {
+                    finalize_sncb(
+                        &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                        sncb_board_stop, b.alight_stop,
+                    );
+                    // An unmodeled operator: price unknown, surface it as an item.
+                    items.push(FareBreakdownItem {
+                        operator: if display.is_empty() { "Unknown".to_string() } else { display },
+                        description: "fare not modeled".to_string(),
+                        euros: 0.0,
+                        coverage: Some("price unknown".to_string()),
+                    });
+                }
+            }
+        }
+        // Finalize any still-open SNCB run at journey end.
+        if let Some(&last) = boardings.last() {
+            finalize_sncb(
+                &mut items, &mut sncb_item, &price, sncb_spend_at_open,
+                sncb_board_stop, last.alight_stop,
+            );
+        }
+
+        // Apply the per-JOURNEY SNCB cap (Train+ peak) to the SNCB item group as a
+        // whole, matching `capped_euros = known - sncb_spend + min(sncb_spend, cap)`.
+        // The SNCB items collectively must sum to `min(total_sncb_raw, cap)`. Any
+        // reduction is taken off the LAST SNCB item so the earlier per-run euros stay
+        // exact; airport-OD items are uncapped (their spend is the flat fare and the
+        // cap sentinel is u32::MAX, so `min` is a no-op). Non-SNCB items are untouched.
+        if price.sncb_cap_cents != u32::MAX && !sncb_item_indices.is_empty() {
+            let total_raw: u32 = price.sncb_spend_cents;
+            let capped_total = total_raw.min(price.sncb_cap_cents);
+            if capped_total < total_raw {
+                // Distribute the capped total across the SNCB items, front to back,
+                // spilling the reduction onto the trailing items.
+                let mut remaining = capped_total;
+                for &idx in &sncb_item_indices {
+                    let raw = (items[idx].euros * 100.0).round() as u32;
+                    let give = raw.min(remaining);
+                    items[idx].euros = give as f64 / 100.0;
+                    remaining = remaining.saturating_sub(give);
+                }
+            }
+        }
+
+        // Brupass CAP post-pass. Brupass is not a user option: it is an automatic cap on
+        // the Brussels multi-operator fare. Collect the PAID items whose boarding stop is
+        // in the Brussels flat zone (SNCB items now carry their FINAL, SNCB-capped euros).
+        // If those in-zone items span 2+ DISTINCT operators, the traveller could buy ONE
+        // Brupass covering them; cap their sum at `brupass_cents`, replacing them with a
+        // single Brupass item, but ONLY when Brupass is strictly cheaper. Subscription /
+        // covered / within-window legs are untagged, so they never count nor get replaced.
+        let brupass_savings = self.apply_brupass_cap(&mut items, &paid_tags);
+        (items, brupass_savings)
+    }
+
+    /// The Brupass cap over a built breakdown (see `build_breakdown`'s post-pass).
+    /// `paid_tags` are `(item_index, operator_key, board_stop)` for the PAID tickets.
+    /// Returns the SAVINGS in cents (`sum_in_zone − brupass_cents`, `0` when the cap does
+    /// not fire) so the caller can lower the plan's known/capped total to match. When it
+    /// fires: the in-zone paid items become €0 with `coverage = Some("Brupass")` and one
+    /// `Brupass (Brussels)` item priced at `brupass_cents` is inserted at the earliest
+    /// in-zone item's position.
+    fn apply_brupass_cap(
+        &self,
+        items: &mut Vec<crate::structures::plan::FareBreakdownItem>,
+        paid_tags: &[(usize, String, usize)],
+    ) -> u32 {
+        use crate::structures::cost::Agglomeration;
+        use crate::structures::plan::FareBreakdownItem;
+        let brupass_cents = self.raptor.fare_model.brupass_cents;
+        if brupass_cents == 0 {
+            return 0;
+        }
+        // Paid items whose boarding stop is in the Brussels flat zone.
+        let in_zone: Vec<&(usize, String, usize)> = paid_tags
+            .iter()
+            .filter(|(_, _, stop)| {
+                self.raptor.sncb_stop_zone.get(*stop).copied().unwrap_or(Agglomeration::None)
+                    == Agglomeration::Brussels
+            })
+            .collect();
+        // Need 2+ DISTINCT operators for a genuine Brussels multi-operator journey.
+        let mut distinct_ops: Vec<&str> = in_zone.iter().map(|(_, op, _)| op.as_str()).collect();
+        distinct_ops.sort_unstable();
+        distinct_ops.dedup();
+        if distinct_ops.len() < 2 {
+            return 0;
+        }
+        // Sum of the individual in-zone tickets Brupass would replace (final, SNCB-capped
+        // euros), in cents.
+        let sum_cents: u32 = in_zone
+            .iter()
+            .map(|(idx, _, _)| (items[*idx].euros * 100.0).round() as u32)
+            .sum();
+        // Only cap when Brupass is strictly cheaper than paying each in-zone ticket.
+        if brupass_cents >= sum_cents {
+            return 0;
+        }
+        // Fire: zero the replaced items (annotate coverage) and insert one Brupass item at
+        // the earliest replaced item's slot so it reads before the covered legs.
+        let mut replaced: Vec<usize> = in_zone.iter().map(|(idx, _, _)| *idx).collect();
+        replaced.sort_unstable();
+        let insert_at = replaced[0];
+        for &idx in &replaced {
+            items[idx].euros = 0.0;
+            items[idx].coverage = Some("Brupass".to_string());
+        }
+        items.insert(
+            insert_at,
+            FareBreakdownItem {
+                operator: "Brupass".to_string(),
+                description: "Brupass (Brussels)".to_string(),
+                euros: brupass_cents as f64 / 100.0,
+                coverage: None,
+            },
+        );
+        sum_cents.saturating_sub(brupass_cents)
+    }
+
+    /// Price a FINISHED plan post-hoc: walk its transit legs (via the arena chain
+    /// from the destination label `start_id`) in order and re-run the fare model over
+    /// the fixed sequence, EXACT cents, no dominance. Returns `None` when fares are
+    /// disabled (byte-identical pre-feature output).
+    ///
+    /// Every operator pays its own ticket; the Brupass CAP is then applied
+    /// automatically as a post-pass in `build_breakdown` (`apply_brupass_cap`): when a
+    /// plan's PAID (non-subscription) boardings whose stops are in the Brussels flat
+    /// zone span 2+ DISTINCT operators, their sum is capped at `brupass_cents` (one
+    /// Brupass), but only when Brupass is strictly cheaper. Its savings are folded back
+    /// into the numeric known/capped totals so they equal the breakdown sum.
+    ///
+    /// This REPLACES the in-search-carried price: the search is now price-blind and
+    /// the returned plan set is identical whether fares are on or off; price is only
+    /// an annotation computed here.
+    pub(super) fn plan_price_posthoc(
+        &self,
+        arena: &[Label],
+        start_id: u32,
+        weekday: u8,
+        fare_profile: crate::structures::cost::FareProfile,
+    ) -> Option<crate::structures::plan::PlanPrice> {
+        if !self.raptor.fare_model.enabled {
+            return None;
+        }
+        let boardings = self.collect_posthoc_boardings(arena, start_id);
+        // Every operator pays its own ticket; the Brupass cap is a breakdown post-pass.
+        let price = self.price_boardings(&boardings, weekday, fare_profile);
+        let (breakdown, brupass_savings) =
+            self.build_breakdown(&boardings, weekday, fare_profile);
+        self.plan_price_of(&price, breakdown, brupass_savings)
     }
 
     const EXTREME_RISK_RELIABILITY: f32 = 0.10;
@@ -465,8 +1088,13 @@ impl Graph {
                 // The destination-stop label this candidate was built from; its arena
                 // chain is the EXACT journey (no grid re-lookup → no bucket drift).
                 let cell = best_stop * n_states + dest_sidx;
-                let chosen =
-                    Self::pick_label(&labels[k].cell(cell), buckets, b as u8, departure_stamp, arena);
+                let chosen = Self::pick_label(
+                    &labels[k].cell(cell),
+                    buckets,
+                    b as u8,
+                    departure_stamp,
+                    arena,
+                );
 
                 // Drop candidates whose arena chain carries no transit leg BEFORE
                 // committing `bucket_best` or reconstructing. Committing first let a
@@ -727,6 +1355,11 @@ impl Graph {
                 // The expected (mean) arrival must never precede the deterministic
                 // realtime arrival the legs actually show.
                 let expected_end = expected_end.max(arrival);
+                // Price the finished plan post-hoc by re-walking its transit legs
+                // through the fare model (present only when fares are enabled). The
+                // SEARCH is price-blind; price is an annotation, not a dominance axis.
+                let price = chosen
+                    .and_then(|l| self.plan_price_posthoc(arena, l.arena_id, weekday, mc.fare_profile));
                 let plan = Plan {
                     legs: Self::merge_consecutive_walks(legs),
                     start: departure,
@@ -735,6 +1368,7 @@ impl Graph {
                     access_alternatives: vec![],
                     arrival_distribution,
                     expected_end,
+                    price,
                 };
 
                 if let Some(ref mut sink) = debug_sink {
@@ -891,6 +1525,8 @@ impl Graph {
         stamp: u32,
         arena: &[Label],
     ) -> Option<Label> {
+        // The search is price-blind (price is annotated post-hoc), so reconstruction
+        // selects exactly as the pre-feature engine did.
         // Primary: first current-stamp member in bucket `b` (order-sensitive `find`).
         for i in 0..set.count() {
             let sm = set.summary_at(i);
@@ -2294,6 +2930,41 @@ mod tests {
     use super::*;
     use crate::structures::delay::{DelayCDF, ScenarioBag};
 
+    #[test]
+    fn plan_price_of_none_when_fares_disabled() {
+        use crate::structures::cost::PriceValue;
+        let g = Graph::new(); // fare_model default = disabled
+        let p = PriceValue { known_cents: 210, ..PriceValue::ZERO };
+        assert!(
+            g.plan_price_of(&p, Vec::new(), 0).is_none(),
+            "disabled fares surface no Plan.price (byte-identical output)"
+        );
+    }
+
+    #[test]
+    fn plan_price_of_populates_known_and_unknown_when_enabled() {
+        use crate::structures::cost::{FareModel, KnownEurosEpsilon, PriceValue};
+        let mut g = Graph::new();
+        g.raptor.fare_model = FareModel {
+            enabled: true,
+            known_euros_epsilon: KnownEurosEpsilon::default(),
+            operators: Vec::new(),
+            agglomerations: Vec::new(),
+            ..FareModel::default()
+        };
+        // Slot labels are the display-cased agency names (as stored by
+        // `rebuild_operator_fare_lookup`), surfaced verbatim in the badge tooltip.
+        g.raptor.unknown_operator_names = vec!["De Lijn".into(), "TEC".into()];
+        let mut unknown = [0u8; 4];
+        unknown[0] = 2; // two De Lijn boardings
+        unknown[1] = 1; // one TEC boarding
+        let p = PriceValue { known_cents: 420, unknown, ..PriceValue::ZERO };
+        let price = g.plan_price_of(&p, Vec::new(), 0).expect("enabled fares populate Plan.price");
+        assert_eq!(price.known_euros, 4.20);
+        assert_eq!(price.capped_euros, 4.20, "cap == known this increment");
+        assert_eq!(price.unknown_operators, vec!["De Lijn x2".to_string(), "TEC".to_string()]);
+    }
+
     /// `chain_has_transit` is the exact pre-reconstruct predicate that gates the
     /// `bucket_best` commit: a candidate is committed and reconstructed only if its
     /// arena parent chain carries ≥1 transit trace. It must match "reconstruct emits
@@ -2608,6 +3279,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: end,
+            price: None,
         }
     }
 
@@ -2890,6 +3562,7 @@ mod tests {
             from_station_id: None,
             to_station_id: None,
             profile_latency: None,
+            fare_profile: None,
         };
 
         eprintln!("SMOKE stop_count={}", g.raptor.transit_stop_to_node.len());

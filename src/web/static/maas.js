@@ -100,6 +100,27 @@ function fmtDelta(secs) {
   return sign + fmtDuration(Math.abs(secs));
 }
 
+// ── Departure headway ─────────────────────────────────────────
+// Consecutive departure gaps are "regular" when every gap is within this ratio of
+// the median gap (tolerates realtime jitter / minor timetable rounding).
+const REGULAR_GAP_TOLERANCE = 0.2;
+
+// Detect a regular headway from a list of departure times (seconds since
+// midnight). Returns { regular:true, everyMins } when every consecutive gap is
+// within REGULAR_GAP_TOLERANCE of the median gap, else { regular:false }. Needs
+// >= 3 times to judge an interval. Input order is irrelevant (sorted internally).
+function detectHeadway(times) {
+  const t = [...times].sort((a, b) => a - b);
+  if (t.length < 3) return { regular: false };
+  const gaps = [];
+  for (let i = 1; i < t.length; i++) gaps.push(t[i] - t[i - 1]);
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  if (median <= 0) return { regular: false };
+  const regular = gaps.every(g => Math.abs(g - median) <= median * REGULAR_GAP_TOLERANCE);
+  return regular ? { regular: true, everyMins: Math.round(median / 60) } : { regular: false };
+}
+
 // ── Mode helpers ──────────────────────────────────────────────
 const _MODE_COLOR = {
   Bus: '#e65100', Tramway: '#558b2f', Subway: '#6a1b9a',

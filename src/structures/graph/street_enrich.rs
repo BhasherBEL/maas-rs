@@ -434,6 +434,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: 900,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(
@@ -513,6 +514,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: alight + 90,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(
@@ -570,6 +572,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: 400,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(
@@ -607,6 +610,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: 400,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(
@@ -646,6 +650,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: 900,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(
@@ -688,6 +693,7 @@ mod tests {
                 probability: 1.0,
             }],
             expected_end: alight + 90,
+            price: None,
         };
         let mut plans = vec![plan];
         g.enrich_street_legs(

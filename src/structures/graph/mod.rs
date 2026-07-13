@@ -31,6 +31,7 @@ mod realtime_match;
 mod representatives;
 mod street_enrich;
 mod transit;
+mod travel_map;
 
 pub use bike_cost::{BikeCost, PrevCtx};
 pub use platform_reach::ConnectorReach;
@@ -39,6 +40,7 @@ pub use raptor_cch::CchAccess;
 pub use raptor_route::{OnboardRide, OnboardSeed, QueryEndpoints};
 pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 pub use transit::StationBackup;
+pub use travel_map::{TravelAggregation, TravelCell};
 
 /// A routing terminal: either an exact graph node, or a point projected onto the
 /// interior of an edge between nodes `a` and `b` (used by edge-aware snapping so a
@@ -383,6 +385,30 @@ impl Graph {
         self.raptor.balance = b;
     }
 
+    /// Install the transit-pricing model and rebuild its route→operator lookup.
+    /// The lookup rebuild reads `transit_routes`/`transit_agencies`, so this must
+    /// run after the transit index is populated (it is, in `apply_routing_defaults`).
+    pub fn set_fare_model(&mut self, m: crate::structures::cost::FareModel) {
+        self.raptor.fare_model = m;
+        self.raptor.rebuild_operator_fare_lookup();
+        // Tag each stop with its SNCB flat-agglomeration membership (Appendix A.2)
+        // before the per-km precompute, which collapses in-zone segments to 0 km.
+        // No-op when fares are disabled or no zones are configured.
+        self.rebuild_sncb_stop_zones();
+        // Tag airport stops for the SNCB special-OD override (Appendix A.2). No-op
+        // when fares are disabled or no SNCB airport tokens/override are configured.
+        self.rebuild_sncb_airport_stops();
+        // Rebuild the SNCB per-km precompute now that the operator lookup and the
+        // stop-zone tags exist. No-op (and no rail-Dijkstra sweep) when fares are
+        // disabled or no SNCB operator is modeled — keeping the disabled path
+        // zero-cost.
+        self.rebuild_sncb_railway_km();
+        // Reference-node zone-collapse tables for the FIXED zone-to-zone SNCB fare
+        // (Appendix A.2, corrected). No-op when fares are disabled, no zones are
+        // configured, or no SNCB operator is modeled.
+        self.rebuild_sncb_zone_refs();
+    }
+
     /// `BikeCost` built from the graph's configured default profile.
     pub(super) fn default_bike_cost(&self) -> BikeCost {
         BikeCost::new(self.raptor.bike_profile)
@@ -434,6 +460,18 @@ impl Graph {
 
     pub fn set_max_window_secs(&mut self, secs: u32) {
         self.raptor.max_window_secs = secs;
+    }
+
+    pub fn set_travel_map_grid_step_m(&mut self, meters: f64) {
+        self.raptor.travel_map_grid_step_m = meters;
+    }
+
+    pub fn set_travel_map_max_cells(&mut self, cells: u64) {
+        self.raptor.travel_map_max_cells = cells;
+    }
+
+    pub fn set_travel_map_window_sample_secs(&mut self, secs: u32) {
+        self.raptor.travel_map_window_sample_secs = secs;
     }
 
     pub fn set_max_snap_distance_m(&mut self, meters: u32) {

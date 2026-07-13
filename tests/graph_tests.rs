@@ -159,6 +159,7 @@ fn raptor_modes_ep(
         am,
         &BikeCost::new(BikeProfile::default()),
         Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     )
 }
 
@@ -1211,6 +1212,7 @@ fn station_query(from_station: Option<&str>, to_station: Option<&str>) -> RouteQ
         from_station_id: from_station.map(|s| s.to_string()),
         to_station_id: to_station.map(|s| s.to_string()),
         profile_latency: None,
+        fare_profile: None,
     }
 }
 
@@ -1474,6 +1476,7 @@ fn offset_station_query() -> RouteQuery {
         from_station_id: Some(HUB_ORIG.to_string()),
         to_station_id: Some(HUB_DEST.to_string()),
         profile_latency: None,
+        fare_profile: None,
     }
 }
 
@@ -1596,6 +1599,7 @@ fn intra_member_terminal_query() -> RouteQuery {
         from_station_id: None,
         to_station_id: Some(HUB_DEST.to_string()),
         profile_latency: None,
+        fare_profile: None,
     }
 }
 
@@ -1719,6 +1723,7 @@ fn intra_member_origin_query() -> RouteQuery {
         from_station_id: Some(HUB_ORIG.to_string()),
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     }
 }
 
@@ -2274,6 +2279,1219 @@ fn two_route_raptor_graph_with_bikes(
     enable_contraction(&mut g);
 
     (g, osm_origin, osm_dest)
+}
+
+// ── Brupass (Appendix A.3) end-to-end ─────────────────────────────────────────
+
+/// A Brussels flat zone (Agglomeration::Brussels) box covering the two-route test
+/// graph's stops (all at lat 50.000, lng ~4.00-4.04), so every boarding is in-zone.
+fn brussels_zone_over_two_route() -> maas_rs::structures::cost::AgglomerationZone {
+    use maas_rs::structures::LatLng;
+    use maas_rs::structures::cost::{Agglomeration, AgglomerationZone};
+    AgglomerationZone {
+        zone: Agglomeration::Brussels,
+        polygon: vec![
+            LatLng { latitude: 49.95, longitude: 3.95 },
+            LatLng { latitude: 49.95, longitude: 4.10 },
+            LatLng { latitude: 50.05, longitude: 4.10 },
+            LatLng { latitude: 50.05, longitude: 3.95 },
+        ],
+        reference: None,
+    }
+}
+
+/// The two-route graph, re-wired so route 0 is STIB (agency 0) and route 1 is
+/// De Lijn (agency 1), with a Brussels flat zone over all stops and a fare model
+/// carrying STIB (2.40), De Lijn (3.00) and a Brupass placeholder (`brupass_cents`).
+/// A STIB→De Lijn journey uses TWO in-zone operators.
+fn two_operator_brussels_graph(brupass_cents: u32) -> (Graph, NodeID, NodeID) {
+    use maas_rs::structures::cost::{
+        FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel, TimeWindowOperator,
+    };
+    let (mut g, origin, dest) = two_route_raptor_graph();
+    // Two agencies; re-point the tram route (1) to De Lijn so the journey spans two
+    // distinct in-zone operators.
+    g.raptor.transit_agencies = vec![
+        AgencyInfo { name: "STIB".into(), url: String::new(), timezone: String::new() },
+        AgencyInfo { name: "De Lijn".into(), url: String::new(), timezone: String::new() },
+    ];
+    g.raptor.transit_routes[1].agency_id = AgencyId(1);
+
+    let model = FareModel {
+        enabled: true,
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![
+            OperatorFare {
+                name: "STIB".into(),
+                model: OperatorModel::TimeWindowFlat {
+                    ticket_cents: 240,
+                    card_cents: None,
+                    validity_secs: 5400,
+                    operator: TimeWindowOperator::Stib,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            },
+            OperatorFare {
+                name: "De Lijn".into(),
+                model: OperatorModel::TimeWindowFlat {
+                    ticket_cents: 300,
+                    card_cents: Some(220),
+                    validity_secs: 3600,
+                    operator: TimeWindowOperator::Delijn,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            },
+        ],
+        agglomerations: vec![brussels_zone_over_two_route()],
+        brupass_cents,
+        brupass_validity_secs: 3600,
+    };
+    g.set_fare_model(model);
+    (g, origin, dest)
+}
+
+/// Route a two-operator (STIB→De Lijn) in-zone journey with the given fare profile
+/// and return the minimum `known_euros` across the returned two-transit plans.
+fn min_two_transit_price(
+    g: &Graph,
+    origin: NodeID,
+    dest: NodeID,
+    profile: maas_rs::structures::cost::FareProfile,
+) -> f64 {
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let plans = g.raptor_tuned_rt_modes_ep(
+        origin,
+        dest,
+        8 * 3600 + 3000,
+        0,
+        0x7F,
+        10 * 60,
+        &buckets,
+        g.raptor.arrival_slack_secs,
+        g.raptor.unrestricted_transfers,
+        g.raptor.use_cch_access,
+        &RealtimeIndex::new(),
+        &ActiveModes::default(),
+        &BikeCost::new(BikeProfile::default()),
+        None,
+        profile,
+    );
+    plans
+        .iter()
+        .filter(|p| transit_leg_count(p) == 2)
+        .filter_map(|p| p.price.as_ref().map(|pr| pr.known_euros))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// The two-operator (STIB→De Lijn) Brussels graph but with ALL stops moved OUT of
+/// the Brussels zone (empty `agglomerations`), so no in-zone Brupass cap can fire.
+/// Used to assert the plain two-ticket baseline.
+fn two_operator_no_zone_graph() -> (Graph, NodeID, NodeID) {
+    let (mut g, origin, dest) = two_operator_brussels_graph(260);
+    let mut model = g.raptor.fare_model.clone();
+    model.agglomerations = Vec::new(); // no Brussels zone → no in-zone boardings
+    g.set_fare_model(model);
+    (g, origin, dest)
+}
+
+#[test]
+fn brupass_cap_applies_automatically_for_two_operator_in_zone_journey() {
+    // Brupass is NOT a user option: it is an automatic cap. STIB (2.40) + De Lijn
+    // (3.00) = 5.40 for two separate tickets; because both boardings are in the
+    // Brussels zone on 2 DISTINCT operators, and the 2.60 Brupass is cheaper, the
+    // in-zone multi-operator sum is capped at 2.60. With no Brussels zone the same
+    // journey pays 5.40 (nothing to cap).
+    let profile = maas_rs::structures::cost::FareProfile::default();
+
+    let (g_zone, o, d) = two_operator_brussels_graph(260);
+    let capped = min_two_transit_price(&g_zone, o, d, profile);
+    assert!(
+        (capped - 2.60).abs() < 1e-9,
+        "one Brupass caps both in-zone operators at 2.60, got {capped}"
+    );
+
+    let (g_nozone, o2, d2) = two_operator_no_zone_graph();
+    let baseline = min_two_transit_price(&g_nozone, o2, d2, profile);
+    assert!((baseline - 5.40).abs() < 1e-9, "two separate tickets cost 5.40, got {baseline}");
+    assert!(capped < baseline, "Brupass cap must be cheaper for a 2-operator in-zone trip");
+}
+
+/// The cheapest two-transit plan's fare breakdown for a profile.
+fn min_two_transit_breakdown(
+    g: &Graph,
+    origin: NodeID,
+    dest: NodeID,
+    profile: maas_rs::structures::cost::FareProfile,
+) -> Vec<maas_rs::structures::plan::FareBreakdownItem> {
+    let buckets = ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges);
+    let plans = g.raptor_tuned_rt_modes_ep(
+        origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60, &buckets,
+        g.raptor.arrival_slack_secs, g.raptor.unrestricted_transfers, g.raptor.use_cch_access,
+        &RealtimeIndex::new(), &ActiveModes::default(), &BikeCost::new(BikeProfile::default()),
+        None, profile,
+    );
+    plans
+        .iter()
+        .filter(|p| transit_leg_count(p) == 2)
+        .filter_map(|p| p.price.as_ref())
+        .min_by(|a, b| a.capped_euros.partial_cmp(&b.capped_euros).unwrap())
+        .map(|pr| pr.breakdown.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn breakdown_two_separate_tickets_when_brupass_dearer() {
+    // Brupass dearer than two tickets (10.00 > 5.40): the cap does NOT fire, so the
+    // breakdown keeps the two individual paid items summing to 5.40 (no Brupass item).
+    let (g, origin, dest) = two_operator_brussels_graph(1000);
+    let profile = maas_rs::structures::cost::FareProfile::default();
+    let items = min_two_transit_breakdown(&g, origin, dest, profile);
+    assert!(!items.iter().any(|i| i.operator == "Brupass"), "no Brupass item: {items:?}");
+    let paid: Vec<_> = items.iter().filter(|i| i.euros > 0.0).collect();
+    assert_eq!(paid.len(), 2, "two separate paid tickets: {items:?}");
+    let sum: f64 = items.iter().map(|i| i.euros).sum();
+    assert!((sum - 5.40).abs() < 1e-9, "breakdown sums to 5.40, got {sum}");
+    // Operators are named.
+    assert!(items.iter().any(|i| i.operator == "STIB"));
+    assert!(items.iter().any(|i| i.operator == "De Lijn"));
+}
+
+#[test]
+fn breakdown_brupass_one_item_covered_legs_annotated() {
+    // Brupass cap fires automatically: ONE Brupass item (2.60) replaces both in-zone
+    // operators' tickets; the replaced legs become €0 items with coverage "Brupass".
+    // The sum equals the capped total (2.60).
+    let (g, origin, dest) = two_operator_brussels_graph(260);
+    let profile = maas_rs::structures::cost::FareProfile::default();
+    let items = min_two_transit_breakdown(&g, origin, dest, profile);
+    let brupass_items: Vec<_> = items.iter().filter(|i| i.operator == "Brupass").collect();
+    assert_eq!(brupass_items.len(), 1, "exactly one Brupass item: {items:?}");
+    assert!((brupass_items[0].euros - 2.60).abs() < 1e-9, "Brupass costs 2.60");
+    assert!(brupass_items[0].coverage.is_none(), "the Brupass item itself is paid (coverage None)");
+    // At least one replaced leg annotated with the Brupass coverage reason.
+    assert!(
+        items.iter().any(|i| i.coverage.as_deref() == Some("Brupass") && i.euros == 0.0),
+        "a replaced in-zone leg is annotated: {items:?}"
+    );
+    let sum: f64 = items.iter().map(|i| i.euros).sum();
+    assert!((sum - 2.60).abs() < 1e-9, "breakdown sums to the Brupass price 2.60, got {sum}");
+}
+
+#[test]
+fn breakdown_one_stib_ticket_across_windowed_transfer() {
+    // Both STIB boardings share one 90-min ticket: ONE paid item (2.10) plus a covered
+    // within-window item; the sum equals capped (2.10).
+    let (g, origin, dest) = two_route_stib_graph();
+    let plans = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60);
+    let priced = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 2)
+        .and_then(|p| p.price.as_ref())
+        .expect("a priced two-transit plan");
+    let paid: Vec<_> = priced.breakdown.iter().filter(|i| i.euros > 0.0).collect();
+    assert_eq!(paid.len(), 1, "one STIB ticket bought: {:?}", priced.breakdown);
+    assert!((paid[0].euros - 2.10).abs() < 1e-9);
+    assert!(
+        priced.breakdown.iter().any(|i| i.coverage.is_some() && i.euros == 0.0),
+        "the second windowed board is covered by the same ticket: {:?}",
+        priced.breakdown
+    );
+    let sum: f64 = priced.breakdown.iter().map(|i| i.euros).sum();
+    assert!((sum - 2.10).abs() < 1e-9, "breakdown sums to 2.10, got {sum}");
+}
+
+#[test]
+fn brupass_single_operator_in_zone_unchanged() {
+    // Only ONE distinct operator in-zone (both boardings STIB): the Brupass cap needs
+    // 2+ distinct in-zone operators, so it does NOT fire. The plan prices on the plain
+    // STIB rule — one 90-min ticket shared across the windowed transfer (2.40) — and
+    // carries no Brupass item, even with a cheap (2.60) Brupass configured.
+    let (mut g, origin, dest) = two_operator_brussels_graph(260);
+    // Re-point route 1 back to STIB (agency 0) so both legs are the same operator, then
+    // rebuild the fare lookup so route 1 charges the STIB model (not the stale De Lijn).
+    g.raptor.transit_routes[1].agency_id = AgencyId(0);
+    let model = g.raptor.fare_model.clone();
+    g.set_fare_model(model);
+    let profile = maas_rs::structures::cost::FareProfile::default();
+    let min = min_two_transit_price(&g, origin, dest, profile);
+    // Two STIB boardings: one 90-min ticket if the transfer is within the window (2.40),
+    // otherwise two STIB tickets (4.80). Either way NO Brupass (single operator in-zone).
+    assert!(
+        (min - 2.40).abs() < 1e-9 || (min - 4.80).abs() < 1e-9,
+        "single-operator in-zone journey stays on STIB tickets, no Brupass, got {min}"
+    );
+    let items = min_two_transit_breakdown(&g, origin, dest, profile);
+    assert!(!items.iter().any(|i| i.operator == "Brupass"), "no Brupass for one operator: {items:?}");
+}
+
+#[test]
+fn brupass_dearer_not_forced_over_cheaper_tickets() {
+    // If the Brupass price is HIGHER than the two individual in-zone tickets (10.00 >
+    // 5.40), the cap must NOT fire: the plan keeps the two-ticket total (5.40).
+    let (g, origin, dest) = two_operator_brussels_graph(1000); // 10.00 EUR Brupass
+    let profile = maas_rs::structures::cost::FareProfile::default();
+    let min = min_two_transit_price(&g, origin, dest, profile);
+    assert!(
+        (min - 5.40).abs() < 1e-9,
+        "a dearer Brupass must not displace the cheaper two-ticket plan, got {min}"
+    );
+}
+
+#[test]
+fn brupass_ignores_subscription_covered_leg() {
+    // A subscription makes an operator's legs €0 (coverage set). Those legs are NOT
+    // counted toward the Brupass multi-operator sum and are NOT replaced. With a STIB
+    // subscription, only De Lijn (3.00) is a PAID in-zone operator → a single distinct
+    // paid operator → the Brupass cap does NOT fire; the total is just 3.00.
+    let (g, origin, dest) = two_operator_brussels_graph(260);
+    let profile = maas_rs::structures::cost::FareProfile {
+        stib_subscription: true,
+        ..Default::default()
+    };
+    let min = min_two_transit_price(&g, origin, dest, profile);
+    assert!(
+        (min - 3.00).abs() < 1e-9,
+        "subscription STIB leg is free and uncounted; only De Lijn (3.00) is paid, got {min}"
+    );
+    let items = min_two_transit_breakdown(&g, origin, dest, profile);
+    assert!(!items.iter().any(|i| i.operator == "Brupass"), "no Brupass with one paid operator: {items:?}");
+    // The STIB leg is present as a €0 subscription-covered item, untouched by Brupass.
+    assert!(
+        items.iter().any(|i| i.operator == "STIB" && i.euros == 0.0
+            && i.coverage.as_deref() == Some("STIB subscription")),
+        "STIB subscription item preserved (not Brupass-covered): {items:?}"
+    );
+}
+
+// ── Transit pricing (fares) end-to-end ────────────────────────────────────────
+
+/// A STIB `time_window_flat` fare model: 2.10 EUR ticket, 90-minute window.
+fn stib_fare_model() -> maas_rs::structures::cost::FareModel {
+    use maas_rs::structures::cost::{FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel};
+    FareModel {
+        enabled: true,
+        // Disable euro bucketing so the exact 210-cent ticket price is asserted.
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![OperatorFare {
+            name: "STIB".into(),
+            model: OperatorModel::TimeWindowFlat {
+                ticket_cents: 210,
+                card_cents: None,
+                validity_secs: 5400,
+                operator: maas_rs::structures::cost::TimeWindowOperator::Stib,
+            },
+            express_route_names: Vec::new(),
+            express_route_prefixes: Vec::new(),
+            express_single_cents: 0,
+            express_card6_cents: 0,
+            express_card6_reduced_cents: 0,
+            airport_station_names: Vec::new(),
+        }],
+        agglomerations: Vec::new(),
+        ..FareModel::default()
+    }
+}
+
+/// The two-route graph (bus A→B 09:00, tram C→D 09:30) with agency 0 named STIB,
+/// so both boardings are STIB. The bus and tram board 30 min apart (< 90-min
+/// window), so the whole journey costs ONE ticket. `set_fare_model` runs after
+/// `build_raptor_index`, matching production ordering (`apply_routing_defaults`).
+fn two_route_stib_graph() -> (Graph, NodeID, NodeID) {
+    let (mut g, origin, dest) = two_route_raptor_graph();
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "STIB".into(),
+        url: String::new(),
+        timezone: String::new(),
+    }]);
+    g.set_fare_model(stib_fare_model());
+    (g, origin, dest)
+}
+
+#[test]
+fn fares_charge_one_stib_ticket_across_a_windowed_transfer() {
+    let (g, origin, dest) = two_route_stib_graph();
+    let plans = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60);
+    // The two-transit STIB journey (bus + tram): both boardings share one ticket
+    // because they fall within the 90-minute window, so known price is 2.10 EUR.
+    let priced = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 2)
+        .expect("a two-transit bus+tram plan");
+    let price = priced.price.as_ref().expect("fares enabled ⇒ Plan.price populated");
+    assert!(
+        (price.known_euros - 2.10).abs() < 1e-9,
+        "one STIB ticket for both windowed boardings; got {}",
+        price.known_euros
+    );
+    assert_eq!(price.capped_euros, price.known_euros, "cap == known this increment");
+    assert!(
+        price.unknown_operators.is_empty(),
+        "both legs are modeled (STIB), so no unknown operators"
+    );
+}
+
+#[test]
+fn fares_disabled_yields_no_price_and_same_plans() {
+    // Byte-identity of the disabled path: the SAME graph without fares enabled must
+    // return the same set of plans (by mode/start/end/leg-count) and no Plan.price.
+    let (with_fares, origin, dest) = two_route_stib_graph();
+    let (without_fares, o2, d2) = two_route_raptor_graph(); // no agency, fares off
+    let start = 8 * 3600 + 3000;
+
+    let on = with_fares.raptor(origin, dest, start, 0, 0x7F, 10 * 60);
+    let off = without_fares.raptor(o2, d2, start, 0, 0x7F, 10 * 60);
+
+    // The fares-off graph must carry no price at all.
+    assert!(
+        off.iter().all(|p| p.price.is_none()),
+        "disabled fares surface no Plan.price"
+    );
+    // The plan STRUCTURE (mode/start/end/leg-count) is identical with fares on vs off
+    // — the price axis adds a field but does not change which plans are returned here.
+    let sig = |ps: &[maas_rs::structures::plan::Plan]| {
+        let mut v: Vec<_> = ps
+            .iter()
+            .map(|p| (p.mode, p.start, p.end, p.legs.len()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sig(&on),
+        sig(&off),
+        "enabling fares must not change which plans are returned (only add price)"
+    );
+}
+
+// ── SNCB per-km fares (Increment 2) ───────────────────────────────────────────
+
+fn sncb_fare_model() -> maas_rs::structures::cost::FareModel {
+    use maas_rs::structures::cost::{FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel};
+    FareModel {
+        enabled: true,
+        // No euro bucketing so exact base + per-km cents are asserted.
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![OperatorFare {
+            name: "SNCB".into(),
+            model: OperatorModel::DistanceBasePerKm {
+                tariff: sncb_test_tariff(),
+                rules: sncb_test_rules(),
+                airport_od_cents: 0,
+            },
+            express_route_names: Vec::new(),
+            express_route_prefixes: Vec::new(),
+            express_single_cents: 0,
+            express_card6_cents: 0,
+            express_card6_reduced_cents: 0,
+            airport_station_names: Vec::new(),
+        }],
+        agglomerations: Vec::new(),
+        ..FareModel::default()
+    }
+}
+
+/// SNCB test tariff: the EXACT published 2026 2nd-class BRACKETED model
+/// (a = 0.168546 EUR/km, b = 1.451226 EUR, floor 2.6151 EUR = 262 c, min 3 km,
+/// cap ≥116 km → 118 km). The end-to-end tests compute their expected fare by
+/// calling `sncb_test_tariff().fare_cents(d_km)`, so they assert the routing plumbs
+/// the right railway distance into the tariff rather than hardcoding a formula.
+fn sncb_test_tariff() -> maas_rs::structures::cost::DistanceTariff {
+    maas_rs::structures::cost::DistanceTariff::Bracketed {
+        a_cents_per_km: 16.8546,
+        b_cents: 145.1226,
+        floor_cents: 262,
+        min_km: 3,
+        cap_from_km: 116,
+        cap_km: 118,
+        first_class_thresholds: [36, 51],
+        first_class_coeffs: [1.40, 1.50, 1.60],
+        first_class_round_thresholds: [2500, 5000],
+        first_class_round_grids: [10, 50, 100],
+    }
+}
+
+/// SNCB time rules with no peak windows/discounts (so fare tests assert the raw
+/// base+per-km, matching the pre-time-bucket expectations).
+fn sncb_test_rules() -> maas_rs::structures::cost::SncbTimeRules {
+    maas_rs::structures::cost::SncbTimeRules {
+        peak_windows: [(0, 0); 2],
+        n_peak_windows: 0,
+        weekend_discount_adult: 0.0,
+        weekend_discount_reduced: 0.0,
+        train_plus_offpeak_discount: 0.0,
+        train_plus_peak_cap_adult: u32::MAX,
+        train_plus_peak_cap_reduced: u32::MAX,
+    }
+}
+
+/// A single SNCB pattern over 3 stops laid on a straight rail chain, with a
+/// railway topology whose nodes coincide with the stop coordinates. Returns the
+/// graph (fare model installed) plus the expected railway metres between the
+/// first stop and stops 1 and 2 (cumulative).
+fn sncb_three_stop_graph() -> Graph {
+    let mut g = Graph::new();
+    // Three SNCB stations along a meridian. ~1113 m per 0.01 deg latitude.
+    let s0 = g.add_node(transit_stop("Gare 0", 50.00, 4.00));
+    let s1 = g.add_node(transit_stop("Gare 1", 50.10, 4.00));
+    let s2 = g.add_node(transit_stop("Gare 2", 50.30, 4.00));
+
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "SNCB".into(),
+        url: String::new(),
+        timezone: String::new(),
+    }]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "IC".into(),
+        route_long_name: "InterCity".into(),
+        route_type: RouteType::Rail,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+
+    let ss = g.transit_pattern_stops_len();
+    g.extend_transit_pattern_stops(&[s0, s1, s2]);
+    g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 3 });
+    g.push_transit_pattern(PatternInfo {
+        route: RouteId(0),
+        num_trips: 1,
+    });
+    g.build_raptor_index();
+
+    // Railway topology: a straight chain whose nodes sit exactly on the stops, so
+    // snapping is exact and railway distance == the stop-to-stop haversine.
+    let rail: Vec<(f64, f64)> = vec![(50.00, 4.00), (50.10, 4.00), (50.30, 4.00)];
+    let d01 = LatLng { latitude: 50.00, longitude: 4.00 }
+        .dist(LatLng { latitude: 50.10, longitude: 4.00 }) as u32;
+    let d12 = LatLng { latitude: 50.10, longitude: 4.00 }
+        .dist(LatLng { latitude: 50.30, longitude: 4.00 }) as u32;
+    let adj = vec![
+        vec![(1usize, d01)],
+        vec![(0usize, d01), (2usize, d12)],
+        vec![(1usize, d12)],
+    ];
+    g.store_railway_graph(rail, adj);
+
+    // Installing the fare model triggers the SNCB railway-km precompute.
+    g.set_fare_model(sncb_fare_model());
+    g
+}
+
+#[test]
+fn sncb_railway_km_precompute_is_cumulative_and_monotonic() {
+    let g = sncb_three_stop_graph();
+    let cum = &g.raptor.sncb_pattern_cum_railway_m[0];
+    assert_eq!(cum.len(), 3, "one cumulative entry per pattern stop");
+    assert_eq!(cum[0], 0.0, "cumulative distance starts at zero");
+    // Monotonic non-decreasing.
+    assert!(cum[1] >= cum[0] && cum[2] >= cum[1], "cumulative array is monotonic");
+
+    // Compare against the direct stop-to-stop railway distances (== haversine here,
+    // since the rail nodes coincide with the stops).
+    let d01 = LatLng { latitude: 50.00, longitude: 4.00 }
+        .dist(LatLng { latitude: 50.10, longitude: 4.00 });
+    let d12 = LatLng { latitude: 50.10, longitude: 4.00 }
+        .dist(LatLng { latitude: 50.30, longitude: 4.00 });
+    assert!((cum[1] - d01).abs() < 5.0, "cum[1] ≈ rail d(0,1)");
+    assert!((cum[2] - (d01 + d12)).abs() < 5.0, "cum[2] ≈ rail d(0,1)+d(1,2)");
+}
+
+#[test]
+fn sncb_railway_km_falls_back_to_haversine_on_disconnected_rail() {
+    // Same stops, but a railway topology with NO edges: every segment is
+    // unreachable over rail, so the precompute must fall back to the haversine
+    // straight line between the two stop coordinates rather than panic.
+    let mut g = Graph::new();
+    let s0 = g.add_node(transit_stop("Gare 0", 50.00, 4.00));
+    let s1 = g.add_node(transit_stop("Gare 1", 50.10, 4.00));
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "SNCB".into(),
+        url: String::new(),
+        timezone: String::new(),
+    }]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "IC".into(),
+        route_long_name: "InterCity".into(),
+        route_type: RouteType::Rail,
+        agency_id: AgencyId(0),
+        route_color: None,
+        route_text_color: None,
+    }]);
+    let ss = g.transit_pattern_stops_len();
+    g.extend_transit_pattern_stops(&[s0, s1]);
+    g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+    g.push_transit_pattern(PatternInfo {
+        route: RouteId(0),
+        num_trips: 1,
+    });
+    g.build_raptor_index();
+    // Two isolated rail nodes at the stops: no adjacency edges.
+    g.store_railway_graph(vec![(50.00, 4.00), (50.10, 4.00)], vec![vec![], vec![]]);
+    g.set_fare_model(sncb_fare_model());
+
+    let cum = &g.raptor.sncb_pattern_cum_railway_m[0];
+    let hav = LatLng { latitude: 50.00, longitude: 4.00 }
+        .dist(LatLng { latitude: 50.10, longitude: 4.00 });
+    assert!(
+        (cum[1] - hav).abs() < 5.0,
+        "disconnected rail falls back to haversine; got {} vs {}",
+        cum[1],
+        hav
+    );
+}
+
+#[test]
+fn sncb_precompute_skipped_when_fares_disabled() {
+    let mut g = sncb_three_stop_graph();
+    // Re-install a disabled fare model: the precompute must clear itself and do
+    // no rail-Dijkstra work (byte-identical disabled path).
+    g.set_fare_model(maas_rs::structures::cost::FareModel::default());
+    assert!(
+        g.raptor.sncb_pattern_cum_railway_m.is_empty(),
+        "disabled fares skip the SNCB railway-km precompute entirely"
+    );
+}
+
+/// A routable single-SNCB-train graph: one pattern over three stations A→B→C on a
+/// straight rail chain, so a rider boards once at A and alights at C, riding two
+/// hops on the same ticket. Returns `(graph, origin_osm, dest_osm, railway_m_AC)`
+/// where `railway_m_AC` is the total railway distance A→C used by the per-km fare.
+fn sncb_routable_graph() -> (Graph, NodeID, NodeID, f64) {
+    let mut g = Graph::new();
+
+    // OSM access/egress nodes near the boarding and alighting stations.
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.300, 4.000));
+
+    // Three SNCB stations along a meridian.
+    let stop_a = g.add_node(transit_stop("Gare A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Gare B", 50.100, 4.001));
+    let stop_c = g.add_node(transit_stop("Gare C", 50.300, 4.001));
+
+    // Snap edges origin↔A and dest↔C (foot access/egress).
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        g.add_edge(stop, EdgeData::Street(StreetEdgeData {
+            origin: stop, destination: osm, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+        g.add_edge(osm, EdgeData::Street(StreetEdgeData {
+            origin: osm, destination: stop, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_c, osm_dest, 72);
+
+    // Transit edges A→B and B→C on the same route.
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 11_100,
+    }));
+    g.add_edge(stop_b, EdgeData::Transit(TransitEdgeData {
+        origin: stop_b, destination: stop_c, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 1, len: 1 }, length: 22_200,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "SNCB".into(), url: String::new(), timezone: String::new(),
+    }]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "IC".into(), route_long_name: "InterCity".into(),
+        route_type: RouteType::Rail, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0),
+        bikes_allowed: None,
+    }]);
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600, arrival: 9 * 3600 + 600, service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 1, destination_stop_sequence: 2,
+            departure: 9 * 3600 + 600, arrival: 9 * 3600 + 1200, service_id: ServiceId(0),
+        },
+    ]);
+
+    // One pattern: [A, B, C], one trip, column-major stop times.
+    let ss = g.transit_pattern_stops_len();
+    g.extend_transit_pattern_stops(&[stop_a, stop_b, stop_c]);
+    g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 3 });
+    let ts = g.transit_pattern_trips_len();
+    g.push_transit_pattern_trip(TripId(0));
+    g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+    let sts = g.transit_pattern_stop_times_len();
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600, ..Default::default() });
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1200, departure: 9 * 3600 + 1200, ..Default::default() });
+    g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 3 });
+    g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+
+    // Rail chain coincident with the stops so railway distance == haversine.
+    let coords = [(50.000, 4.001), (50.100, 4.001), (50.300, 4.001)];
+    let rail: Vec<(f64, f64)> = coords.to_vec();
+    let d01 = LatLng { latitude: coords[0].0, longitude: coords[0].1 }
+        .dist(LatLng { latitude: coords[1].0, longitude: coords[1].1 });
+    let d12 = LatLng { latitude: coords[1].0, longitude: coords[1].1 }
+        .dist(LatLng { latitude: coords[2].0, longitude: coords[2].1 });
+    let adj = vec![
+        vec![(1usize, d01 as u32)],
+        vec![(0usize, d01 as u32), (2usize, d12 as u32)],
+        vec![(1usize, d12 as u32)],
+    ];
+    g.store_railway_graph(rail, adj);
+    g.set_fare_model(sncb_fare_model());
+
+    (g, osm_origin, osm_dest, d01 + d12)
+}
+
+#[test]
+fn sncb_end_to_end_charges_base_plus_per_km() {
+    let (g, origin, dest, railway_m) = sncb_routable_graph();
+    let plans = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60);
+    let priced = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 1)
+        .expect("a single-SNCB-train plan A→C");
+    let price = priced.price.as_ref().expect("fares enabled ⇒ Plan.price populated");
+
+    // Expected: the bracketed tariff of the full A→C railway distance.
+    let expected = sncb_test_tariff().fare_cents(railway_m / 1000.0) as f64 / 100.0;
+    assert!(
+        (price.known_euros - expected).abs() < 0.02,
+        "SNCB price should be the bracketed tariff of the railway distance: got {} expected ~{}",
+        price.known_euros,
+        expected
+    );
+    assert!(
+        price.unknown_operators.is_empty(),
+        "SNCB is modeled, so no unknown operators"
+    );
+}
+
+/// The `sncb_routable_graph`, but with a Brussels flat zone covering stops B and
+/// C (both at lat 50.10 / 50.30) so the B→C railway segment is collapsed to 0 km.
+/// Returns `(graph, origin, dest, railway_m_AB)` where `railway_m_AB` is the only
+/// chargeable railway distance (A→B); B→C is intra-zone and adds nothing.
+fn sncb_zoned_routable_graph() -> (Graph, NodeID, NodeID, f64) {
+    use maas_rs::structures::LatLng;
+    use maas_rs::structures::cost::{
+        Agglomeration, AgglomerationZone, FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel,
+    };
+    let (mut g, origin, dest, _railway_ac) = sncb_routable_graph();
+    // A zone box covering B (50.10) and C (50.30) but NOT A (50.00).
+    let zone = AgglomerationZone {
+        zone: Agglomeration::Brussels,
+        polygon: vec![
+            LatLng { latitude: 50.05, longitude: 3.90 },
+            LatLng { latitude: 50.05, longitude: 4.10 },
+            LatLng { latitude: 50.40, longitude: 4.10 },
+            LatLng { latitude: 50.40, longitude: 3.90 },
+        ],
+        reference: None,
+    };
+    let model = FareModel {
+        enabled: true,
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![OperatorFare {
+            name: "SNCB".into(),
+            model: OperatorModel::DistanceBasePerKm {
+                tariff: sncb_test_tariff(),
+                rules: sncb_test_rules(),
+                airport_od_cents: 0,
+            },
+            express_route_names: Vec::new(),
+            express_route_prefixes: Vec::new(),
+            express_single_cents: 0,
+            express_card6_cents: 0,
+            express_card6_reduced_cents: 0,
+            airport_station_names: Vec::new(),
+        }],
+        agglomerations: vec![zone],
+        ..FareModel::default()
+    };
+    g.set_fare_model(model);
+    // Only A→B is chargeable now (B, C are both in-zone).
+    let coords = [(50.000, 4.001), (50.100, 4.001)];
+    let d_ab = LatLng { latitude: coords[0].0, longitude: coords[0].1 }
+        .dist(LatLng { latitude: coords[1].0, longitude: coords[1].1 });
+    (g, origin, dest, d_ab)
+}
+
+#[test]
+fn sncb_end_to_end_zone_to_station_is_fixed() {
+    use maas_rs::structures::cost::Agglomeration;
+    // A(free) → C(Brussels): the corrected spec (Appendix A.2) prices the SNCB fare
+    // as base + per-km × the FIXED zone-to-station distance from A to the Brussels
+    // reference node, NOT the pattern-dependent along-path distance. This exercises
+    // the full routing/pricing path; the exact distance is read from the graph's own
+    // reference-node table so the test is robust to the ref-station choice.
+    let (g, origin, dest, _railway_m_ab) = sncb_zoned_routable_graph();
+    assert_eq!(g.raptor.sncb_stop_zone[0], Agglomeration::None, "A outside zone");
+    assert_eq!(g.raptor.sncb_stop_zone[1], Agglomeration::Brussels, "B in zone");
+    assert_eq!(g.raptor.sncb_stop_zone[2], Agglomeration::Brussels, "C in zone");
+
+    // The fixed zone-to-station fare distance A(0) → any Brussels station, via the
+    // graph's own zone-collapse lookup (Brussels board B(1) → free A(0), symmetric).
+    let d_fixed = g.sncb_fare_distance_m(0, 2, 0, 0, 2, 0.0);
+    assert!(d_fixed > 0.0, "A→Brussels has a real fixed distance");
+
+    let plans = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60);
+    let priced = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 1)
+        .expect("a single-SNCB-train plan A→C");
+    let price = priced.price.as_ref().expect("fares enabled ⇒ Plan.price populated");
+
+    // The bracketed tariff of the fixed zone-to-station distance.
+    let expected = sncb_test_tariff().fare_cents(d_fixed / 1000.0) as f64 / 100.0;
+    assert!(
+        (price.known_euros - expected).abs() < 0.02,
+        "zoned SNCB price is the bracketed tariff of the fixed zone distance: got {} expected ~{}",
+        price.known_euros,
+        expected
+    );
+    // Regression guard: the reference distance is a real multi-km rail distance, so
+    // the priced fare must be clearly ABOVE base (the live bug collapsed it to base).
+    assert!(
+        price.known_euros > 2.60,
+        "zone->station fare must exceed base (ref distance must be non-zero): got {}",
+        price.known_euros
+    );
+}
+
+// ── SNCB airport special-OD (fixed 7.90 override) ─────────────────────────────
+
+/// An SNCB fare model with the fixed airport special-OD override wired: base 2.50,
+/// per-km 0.11, airport OD 7.90, station-name token "Airport". A ride whose board
+/// OR alight stop name contains "AIRPORT" prices at the flat 7.90, not base+per-km.
+fn sncb_airport_fare_model() -> maas_rs::structures::cost::FareModel {
+    use maas_rs::structures::cost::{FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel};
+    FareModel {
+        enabled: true,
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![OperatorFare {
+            name: "SNCB".into(),
+            model: OperatorModel::DistanceBasePerKm {
+                tariff: sncb_test_tariff(),
+                rules: sncb_test_rules(),
+                airport_od_cents: 790,
+            },
+            express_route_names: Vec::new(),
+            express_route_prefixes: Vec::new(),
+            express_single_cents: 0,
+            express_card6_cents: 0,
+            express_card6_reduced_cents: 0,
+            // Config compiles these uppercased; the tagger uppercases the stop name.
+            airport_station_names: vec!["AIRPORT".into()],
+        }],
+        agglomerations: Vec::new(),
+        ..FareModel::default()
+    }
+}
+
+/// The `sncb_routable_graph` topology, but station C is the airport station
+/// ("Brussels Airport-Zaventem") and the airport fare model is installed, so an
+/// A→C SNCB ride is an airport OD. Returns `(graph, origin_osm, dest_osm)`.
+fn sncb_airport_routable_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.300, 4.000));
+    let stop_a = g.add_node(transit_stop("Gare A", 50.000, 4.001));
+    let stop_b = g.add_node(transit_stop("Gare B", 50.100, 4.001));
+    // The airport station: its name contains the "Airport" token.
+    let stop_c = g.add_node(transit_stop("Brussels Airport-Zaventem", 50.300, 4.001));
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        g.add_edge(stop, EdgeData::Street(StreetEdgeData {
+            origin: stop, destination: osm, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+        g.add_edge(osm, EdgeData::Street(StreetEdgeData {
+            origin: osm, destination: stop, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+    };
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_c, osm_dest, 72);
+
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_b, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 11_100,
+    }));
+    g.add_edge(stop_b, EdgeData::Transit(TransitEdgeData {
+        origin: stop_b, destination: stop_c, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 1, len: 1 }, length: 22_200,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_agencies(vec![AgencyInfo {
+        name: "SNCB".into(), url: String::new(), timezone: String::new(),
+    }]);
+    g.add_transit_routes(vec![RouteInfo {
+        route_short_name: "IC".into(), route_long_name: "InterCity".into(),
+        route_type: RouteType::Rail, agency_id: AgencyId(0),
+        route_color: None, route_text_color: None,
+    }]);
+    g.add_transit_trips(vec![TripInfo {
+        trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0),
+        bikes_allowed: None,
+    }]);
+    g.add_transit_departures(vec![
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600, arrival: 9 * 3600 + 600, service_id: ServiceId(0),
+        },
+        TripSegment {
+            trip_id: TripId(0), origin_stop_sequence: 1, destination_stop_sequence: 2,
+            departure: 9 * 3600 + 600, arrival: 9 * 3600 + 1200, service_id: ServiceId(0),
+        },
+    ]);
+
+    let ss = g.transit_pattern_stops_len();
+    g.extend_transit_pattern_stops(&[stop_a, stop_b, stop_c]);
+    g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 3 });
+    let ts = g.transit_pattern_trips_len();
+    g.push_transit_pattern_trip(TripId(0));
+    g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+    let sts = g.transit_pattern_stop_times_len();
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600, ..Default::default() });
+    g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1200, departure: 9 * 3600 + 1200, ..Default::default() });
+    g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 3 });
+    g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+
+    let coords = [(50.000, 4.001), (50.100, 4.001), (50.300, 4.001)];
+    let rail: Vec<(f64, f64)> = coords.to_vec();
+    let d01 = LatLng { latitude: coords[0].0, longitude: coords[0].1 }
+        .dist(LatLng { latitude: coords[1].0, longitude: coords[1].1 });
+    let d12 = LatLng { latitude: coords[1].0, longitude: coords[1].1 }
+        .dist(LatLng { latitude: coords[2].0, longitude: coords[2].1 });
+    let adj = vec![
+        vec![(1usize, d01 as u32)],
+        vec![(0usize, d01 as u32), (2usize, d12 as u32)],
+        vec![(1usize, d12 as u32)],
+    ];
+    g.store_railway_graph(rail, adj);
+    g.set_fare_model(sncb_airport_fare_model());
+
+    (g, osm_origin, osm_dest)
+}
+
+#[test]
+fn sncb_airport_stop_is_tagged_by_name_token() {
+    let (g, _o, _d) = sncb_airport_routable_graph();
+    // Only the airport-named station (compact stop 2) is tagged; A and B are not.
+    assert!(!g.raptor.sncb_airport_stop.is_empty(), "airport tags built when fares on");
+    assert!(!g.raptor.sncb_airport_stop[0], "Gare A is not an airport");
+    assert!(!g.raptor.sncb_airport_stop[1], "Gare B is not an airport");
+    assert!(g.raptor.sncb_airport_stop[2], "Brussels Airport-Zaventem is tagged");
+}
+
+#[test]
+fn sncb_airport_od_prices_fixed_7_90_end_to_end() {
+    // An SNCB journey A→(airport) prices at the fixed 7.90 special-OD fare, NOT the
+    // bracketed distance tariff (which would be ~6.80 for the ~33 km ride). This
+    // proves the override is wired into routing, not just the fare engine.
+    let (g, origin, dest) = sncb_airport_routable_graph();
+    let plans = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 10 * 60);
+    let priced = plans
+        .iter()
+        .find(|p| transit_leg_count(p) == 1)
+        .expect("a single-SNCB-train plan A→airport");
+    let price = priced.price.as_ref().expect("fares enabled ⇒ Plan.price populated");
+    assert!(
+        (price.known_euros - 7.90).abs() < 1e-9,
+        "airport OD must be the fixed 7.90, got {}",
+        price.known_euros
+    );
+    assert!(price.unknown_operators.is_empty(), "SNCB is modeled");
+}
+
+#[test]
+fn sncb_airport_stops_cleared_when_fares_disabled() {
+    let (mut g, _o, _d) = sncb_airport_routable_graph();
+    g.set_fare_model(maas_rs::structures::cost::FareModel::default());
+    assert!(
+        g.raptor.sncb_airport_stop.is_empty(),
+        "disabled fares clear the airport tags (zero work)"
+    );
+}
+
+// ── Defect A: carried fare credit must survive dominance at a shared hub ───────
+
+/// A combined STIB + SNCB fare model (STIB 2.10/90min, SNCB the bracketed 2026
+/// 2nd-class distance tariff), bucketing disabled so exact cents are asserted.
+fn stib_sncb_fare_model() -> maas_rs::structures::cost::FareModel {
+    use maas_rs::structures::cost::{FareModel, KnownEurosEpsilon, OperatorFare, OperatorModel};
+    FareModel {
+        enabled: true,
+        known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+        operators: vec![
+            OperatorFare {
+                name: "STIB".into(),
+                model: OperatorModel::TimeWindowFlat {
+                    ticket_cents: 210,
+                    card_cents: None,
+                    validity_secs: 5400,
+                    operator: maas_rs::structures::cost::TimeWindowOperator::Stib,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            },
+            OperatorFare {
+                name: "SNCB".into(),
+                model: OperatorModel::DistanceBasePerKm {
+                    tariff: sncb_test_tariff(),
+                    rules: sncb_test_rules(),
+                    airport_od_cents: 0,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            },
+        ],
+        agglomerations: Vec::new(),
+        ..FareModel::default()
+    }
+}
+
+/// Two competing access paths to a shared hub H, then a shared SNCB continuation
+/// H→D. Both access options reach H at the SAME time on the SAME round so they
+/// collide in the H Pareto cell:
+///   - SNCB access:  A →(rail 10 km)→ H   → known 250 + 110 = 360, sncb_active.
+///   - STIB access:  P →(flat)→        H   → known 210, no SNCB credit.
+/// The cheaper STIB label (210 < 360) would prune the SNCB label at H if carried
+/// fare state were ignored (defect A). But the pruned SNCB label keeps a paid
+/// SNCB base credit, so continuing H →(rail 10 km)→ D re-uses it (no second base):
+///   - SNCB-contiguous plan finishes 250 + 110 + 110 = 470  (single base).
+///   - STIB-then-SNCB plan finishes  210 + 250 + 110 = 570  (second base paid).
+/// The engine must RETAIN the 470 plan. Returns `(graph, origin, dest)`.
+fn shared_hub_two_access_graph() -> (Graph, NodeID, NodeID) {
+    let mut g = Graph::new();
+
+    // OSM access nodes. Origin sits between the SNCB station A and the STIB stop P
+    // so both are reachable on foot; H and D each get an egress/transfer OSM node.
+    let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
+    let osm_hub = g.add_node(osm_node("hub", 50.150, 4.000));
+    let osm_dest = g.add_node(osm_node("dest", 50.300, 4.000));
+
+    // SNCB stations along a meridian: A (board), H (hub), D (dest). ~1113 m / 0.01°.
+    let stop_a = g.add_node(transit_stop("Gare A", 50.000, 4.001));
+    let stop_h = g.add_node(transit_stop("Gare H", 50.100, 4.001));
+    let stop_d = g.add_node(transit_stop("Gare D", 50.300, 4.001));
+    // STIB stop P (access) near the origin. Both the SNCB rail leg and the STIB
+    // leg TERMINATE at the same physical hub stop `stop_h`, so the two access
+    // labels land in the SAME Pareto cell and genuinely compete on dominance.
+    let stop_p = g.add_node(transit_stop("Arret P", 50.000, 3.999));
+
+    let add_snap = |g: &mut Graph, stop: NodeID, osm: NodeID, m: usize| {
+        g.add_edge(stop, EdgeData::Street(StreetEdgeData {
+            origin: stop, destination: osm, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+        g.add_edge(osm, EdgeData::Street(StreetEdgeData {
+            origin: osm, destination: stop, length: m, partial: true,
+            foot: true, bike: false, car: false, attrs: BikeAttrs::road_default(),
+            elev_delta: 0, surface_speed: 100, var_gen: VarGen::NONE,
+        }));
+    };
+    // Origin can reach both the SNCB station A and the STIB stop P.
+    add_snap(&mut g, stop_a, osm_origin, 72);
+    add_snap(&mut g, stop_p, osm_origin, 72);
+    // Hub: the shared SNCB/STIB stop H snaps to the hub OSM node.
+    add_snap(&mut g, stop_h, osm_hub, 72);
+    add_snap(&mut g, stop_d, osm_dest, 72);
+
+    // Transit edges (needed for reconstruct's timetable lookup). Route ids:
+    //   0 = SNCB A→H, 1 = SNCB H→D, 2 = STIB P→H.
+    g.add_edge(stop_a, EdgeData::Transit(TransitEdgeData {
+        origin: stop_a, destination: stop_h, route_id: RouteId(0),
+        timetable_segment: TimetableSegment { start: 0, len: 1 }, length: 11_100,
+    }));
+    g.add_edge(stop_h, EdgeData::Transit(TransitEdgeData {
+        origin: stop_h, destination: stop_d, route_id: RouteId(1),
+        timetable_segment: TimetableSegment { start: 1, len: 1 }, length: 22_200,
+    }));
+    g.add_edge(stop_p, EdgeData::Transit(TransitEdgeData {
+        origin: stop_p, destination: stop_h, route_id: RouteId(2),
+        timetable_segment: TimetableSegment { start: 2, len: 1 }, length: 11_100,
+    }));
+
+    g.add_transit_services(vec![all_days_service()]);
+    g.add_transit_agencies(vec![
+        AgencyInfo { name: "SNCB".into(), url: String::new(), timezone: String::new() },
+        AgencyInfo { name: "STIB".into(), url: String::new(), timezone: String::new() },
+    ]);
+    g.add_transit_routes(vec![
+        RouteInfo { route_short_name: "IC1".into(), route_long_name: "A-H".into(),
+            route_type: RouteType::Rail, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None },
+        RouteInfo { route_short_name: "IC2".into(), route_long_name: "H-D".into(),
+            route_type: RouteType::Rail, agency_id: AgencyId(0),
+            route_color: None, route_text_color: None },
+        RouteInfo { route_short_name: "M".into(), route_long_name: "P-H".into(),
+            route_type: RouteType::Bus, agency_id: AgencyId(1),
+            route_color: None, route_text_color: None },
+    ]);
+    g.add_transit_trips(vec![
+        TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(1), service_id: ServiceId(0), bikes_allowed: None },
+        TripInfo { trip_headsign: None, route_id: RouteId(2), service_id: ServiceId(0), bikes_allowed: None },
+    ]);
+    // Timings: both accesses arrive H at 09:10; the H→D train departs 09:12.
+    g.add_transit_departures(vec![
+        TripSegment { trip_id: TripId(0), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600, arrival: 9 * 3600 + 600, service_id: ServiceId(0) },
+        TripSegment { trip_id: TripId(1), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600 + 720, arrival: 9 * 3600 + 1320, service_id: ServiceId(0) },
+        // STIB arrives H at 09:09 — strictly EARLIER than the SNCB access (09:10),
+        // so the cheaper STIB label genuinely dominates the SNCB label on the
+        // (arrival ↓, bucket ↑) axis and, absent the credit buy-back, would prune it.
+        TripSegment { trip_id: TripId(2), origin_stop_sequence: 0, destination_stop_sequence: 1,
+            departure: 9 * 3600, arrival: 9 * 3600 + 540, service_id: ServiceId(0) },
+    ]);
+
+    // Pattern 0: SNCB A→H.
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_a, stop_h]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(0));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600, ..Default::default() });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(0), num_trips: 1 });
+    }
+    // Pattern 1: SNCB H→D.
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_h, stop_d]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(1));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 720, departure: 9 * 3600 + 720, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 1320, departure: 9 * 3600 + 1320, ..Default::default() });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(1), num_trips: 1 });
+    }
+    // Pattern 2: STIB P→H (terminates at the shared hub stop H).
+    {
+        let ss = g.transit_pattern_stops_len();
+        g.extend_transit_pattern_stops(&[stop_p, stop_h]);
+        g.push_transit_idx_pattern_stops(Lookup { start: ss, len: 2 });
+        let ts = g.transit_pattern_trips_len();
+        g.push_transit_pattern_trip(TripId(2));
+        g.push_transit_idx_pattern_trips(Lookup { start: ts, len: 1 });
+        let sts = g.transit_pattern_stop_times_len();
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
+        g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 540, departure: 9 * 3600 + 540, ..Default::default() });
+        g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 2 });
+        g.push_transit_pattern(PatternInfo { route: RouteId(2), num_trips: 1 });
+    }
+
+    g.build_raptor_index();
+    enable_contraction(&mut g);
+
+    // Rail chain A-H-D coincident with the SNCB stops (railway == haversine).
+    let coords = [(50.000, 4.001), (50.100, 4.001), (50.300, 4.001)];
+    let rail: Vec<(f64, f64)> = coords.to_vec();
+    let d_ah = LatLng { latitude: coords[0].0, longitude: coords[0].1 }
+        .dist(LatLng { latitude: coords[1].0, longitude: coords[1].1 });
+    let d_hd = LatLng { latitude: coords[1].0, longitude: coords[1].1 }
+        .dist(LatLng { latitude: coords[2].0, longitude: coords[2].1 });
+    let adj = vec![
+        vec![(1usize, d_ah as u32)],
+        vec![(0usize, d_ah as u32), (2usize, d_hd as u32)],
+        vec![(1usize, d_hd as u32)],
+    ];
+    g.store_railway_graph(rail, adj);
+    g.set_fare_model(stib_sncb_fare_model());
+
+    (g, osm_origin, osm_dest)
+}
+
+#[test]
+fn demoted_price_shared_hub_plan_set_is_price_blind() {
+    // The DEMOTION property on the former "defect A" OD: price no longer influences
+    // the search, so a strictly-earlier-arriving STIB label at the shared hub H
+    // dominates the SNCB label on (arrival ↓, bucket ↑) exactly as it would with
+    // fares off. The returned plan set (mode/start/end/leg-count) must therefore be
+    // IDENTICAL with fares enabled vs disabled — the cheaper single-base SNCB plan is
+    // no longer surfaced by an in-search price axis (that was the ~9% drop the data
+    // justified). Any plan that IS returned is priced correctly post-hoc.
+    let (mut g, origin, dest) = shared_hub_two_access_graph();
+    let with = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 30 * 60);
+    // Same graph, fares off: turn the master switch off (topology unchanged).
+    g.raptor.fare_model.enabled = false;
+    let without = g.raptor(origin, dest, 8 * 3600 + 3000, 0, 0x7F, 30 * 60);
+
+    let sig = |ps: &[maas_rs::structures::plan::Plan]| {
+        let mut v: Vec<_> = ps.iter().map(|p| (p.mode, p.start, p.end, p.legs.len())).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sig(&with),
+        sig(&without),
+        "price is demoted: the search is price-blind, so the plan set is identical on/off"
+    );
+    // Fares-off carries no price; fares-on annotates every returned plan post-hoc.
+    assert!(without.iter().all(|p| p.price.is_none()), "fares off ⇒ no Plan.price");
+
+    // Whatever two-transit plan surfaces (the earlier STIB-then-SNCB one) is priced
+    // correctly post-hoc: STIB 2.10 + one SNCB ticket of the H→D distance.
+    let h = LatLng { latitude: 50.100, longitude: 4.001 };
+    let d = LatLng { latitude: 50.300, longitude: 4.001 };
+    let hd_km = h.dist(d) / 1000.0;
+    let expected = 2.10 + sncb_test_tariff().fare_cents(hd_km) as f64 / 100.0;
+    let priced_two = with
+        .iter()
+        .filter(|p| transit_leg_count(p) == 2)
+        .filter_map(|p| p.price.as_ref().map(|pr| pr.known_euros))
+        .next();
+    if let Some(price) = priced_two {
+        assert!(
+            (price - expected).abs() < 0.05,
+            "the returned two-transit plan is priced correctly post-hoc: got {price}, expected {expected}"
+        );
+    }
 }
 
 // ── Unrestricted (MCR) inter-stop transfers ───────────────────────────────────
@@ -7879,6 +9097,7 @@ fn raptor_explain_supports_bike_modes() {
         &am,
         &BikeCost::new(BikeProfile::default()),
         None,
+        maas_rs::structures::cost::FareProfile::default(),
     );
     assert!(!res.access.fell_back_to_walk_only);
     assert!(res.plans.iter().any(|p| transit_leg_count(p) == 2));
@@ -8317,6 +9536,7 @@ fn transit_access_egress_multiobj_alternatives_and_leave_by() {
         from_station_id: None,
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     };
     let plans = route(&g, &q, &RealtimeIndex::new()).expect("route should succeed");
 
@@ -8628,6 +9848,7 @@ fn t4_explain_drop_gate_identical() {
         from_station_id: None,
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     };
 
     let before = route_explain(&g, &q, &RealtimeIndex::new()).expect("pre-drop explain");
@@ -8801,6 +10022,7 @@ fn transit_enrich_drop_gate() {
         from_station_id: None,
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     };
 
     let before: Vec<_> = ods
@@ -8881,6 +10103,7 @@ fn all_modes_drop_gate_identical() {
         from_station_id: None,
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     };
 
     let all_modes = [
@@ -9780,6 +11003,7 @@ fn lat_lng_route_unchanged_by_onboard_path() {
         from_station_id: None,
         to_station_id: None,
         profile_latency: None,
+        fare_profile: None,
     };
     let dbg =
         |ps: &[maas_rs::structures::plan::Plan]| ps.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>();
@@ -11321,6 +12545,7 @@ fn explain_two_pass_matches_prod_on_far_egress() {
         &am,
         &bike,
         None,
+        maas_rs::structures::cost::FareProfile::default(),
     );
 
     // The far-egress fastest arrival is discovered by the explain (debug) path.
@@ -11610,6 +12835,7 @@ fn cch_flag_flips_access_set_via_explain() {
             o, d, 32400, 0, 0x7F, 10 * 60, &buckets, 900,
             g.raptor.unrestricted_transfers, g.raptor.use_cch_access,
             &rt, &am, &bike, None,
+            maas_rs::structures::cost::FareProfile::default(),
         )
     };
 
@@ -12453,6 +13679,7 @@ fn forward_extension_finds_next_day_early_trip() {
         &am,
         &bike,
         Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     );
     assert!(
         !has_transit_leg(&base),
@@ -12476,6 +13703,7 @@ fn forward_extension_finds_next_day_early_trip() {
         &am,
         &bike,
         Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     );
     assert!(
         has_transit_leg(&fixed),
@@ -12576,6 +13804,7 @@ fn forward_extension_does_not_leak_past_window_on_empty_tail() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         // (a) No plan may leak into the in-day gap (window_end, 86400): the crossing
         // filter still blocks a same-day-clock departure past the window. A next-day
@@ -12620,6 +13849,7 @@ fn forward_extension_does_not_leak_past_window_on_empty_tail() {
         &am,
         &bike,
         Some(&ep),
+        maas_rs::structures::cost::FareProfile::default(),
     );
     assert!(
         has_transit_leg(&served),
@@ -12684,6 +13914,7 @@ fn single_departure_wrapper_pollutes_nothing_appends_next_day_at_evening() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         let wrapped = g.raptor_tuned_rt_overnight_modes(
             origin,
@@ -12700,6 +13931,7 @@ fn single_departure_wrapper_pollutes_nothing_appends_next_day_at_evening() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
 
         // Every same-day plan is preserved byte-identical (no pollution / reorder-drop).
@@ -12791,6 +14023,7 @@ fn overnight_wrappers_are_byte_identical_for_daytime_queries() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         let wrapped = g.raptor_range_tuned_rt_overnight_modes(
             origin,
@@ -12808,6 +14041,7 @@ fn overnight_wrappers_are_byte_identical_for_daytime_queries() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         assert_eq!(
             format!("{base:?}"),
@@ -12833,6 +14067,7 @@ fn overnight_wrappers_are_byte_identical_for_daytime_queries() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         let swrapped = g.raptor_tuned_rt_overnight_modes(
             origin,
@@ -12849,6 +14084,7 @@ fn overnight_wrappers_are_byte_identical_for_daytime_queries() {
             &am,
             &bike,
             Some(&ep),
+            maas_rs::structures::cost::FareProfile::default(),
         );
         assert_eq!(
             format!("{sbase:?}"),

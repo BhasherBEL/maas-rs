@@ -1166,6 +1166,91 @@ pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
     (date - epoch).num_days().max(0) as u32
 }
 
+// ── TEC fare model (operator-specific fare interpretation) ─────────────────────
+//
+// TEC arrives through the generic GTFS path (matched by agency name), so its
+// fare specifics — the classic/express tier split and the route-name express
+// classification rule — are co-located here with the generic/TEC ingestor,
+// composing the operator-agnostic `TimeWindowFlatTiered` primitive in
+// `structures::cost::fares`.
+
+/// The compiled TEC operator: the CLASSIC-tier `OperatorModel` template, the
+/// uppercased express-route classification tokens/prefixes, and the EXPRESS-tier
+/// price triple (single, 6-journey, 6-journey reduced) in cents. A route classified
+/// express at lookup build swaps the express prices into the template.
+pub struct TecOperator {
+    pub model: crate::structures::cost::OperatorModel,
+    pub express_route_names: Vec<String>,
+    pub express_route_prefixes: Vec<String>,
+    pub express_single_cents: u32,
+    pub express_card6_cents: u32,
+    pub express_card6_reduced_cents: u32,
+}
+
+/// Build a `time_window_flat_tiered` `OperatorModel` (TEC) from its config block.
+/// The compiled template carries the CLASSIC tier and `is_express = false`; the
+/// per-route tier is resolved later at operator-lookup build via
+/// [`tec_route_is_express`], which swaps the express prices in when a route matches.
+/// `cents` converts an optional euro amount to integer cents.
+pub fn build_tec_operator(
+    op: &crate::structures::FareOperatorConfig,
+    cents: impl Fn(Option<f64>) -> u32,
+) -> TecOperator {
+    use crate::structures::cost::OperatorModel;
+    let express_route_names: Vec<String> = op
+        .express_route_names
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .collect();
+    let express_route_prefixes: Vec<String> = op
+        .express_route_prefixes
+        .iter()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .collect();
+    // Template tier; `is_express` filled per route at lookup build.
+    let model = OperatorModel::TimeWindowFlatTiered {
+        is_express: false,
+        single_cents: cents(op.classic_single_euros),
+        card6_cents: cents(op.classic_card6_euros),
+        card6_reduced_cents: cents(op.classic_card6_reduced_euros),
+    };
+    TecOperator {
+        model,
+        express_route_names,
+        express_route_prefixes,
+        express_single_cents: cents(op.express_single_euros),
+        express_card6_cents: cents(op.express_card6_euros),
+        express_card6_reduced_cents: cents(op.express_card6_reduced_euros),
+    }
+}
+
+/// TEC express-route classification: `true` when a route's `route_short_name` or
+/// `route_long_name` contains any configured express token (uppercased substring
+/// match) OR its `route_short_name` starts with any configured express prefix
+/// (e.g. "E" ⇒ E12, E45). The prefix match is intentionally short-name-only:
+/// many classic routes carry an E-initial destination in `route_long_name`
+/// (Eupen, Eghezée, Esneux) and must not be misclassified as express.
+/// Config-driven (project policy) — both lists empty ⇒ never express (all
+/// classic). Resolves a `TimeWindowFlatTiered` template's per-route `is_express`
+/// at lookup build.
+pub fn tec_route_is_express(
+    route: &super::RouteInfo,
+    express_names: &[String],
+    express_prefixes: &[String],
+) -> bool {
+    if express_names.is_empty() && express_prefixes.is_empty() {
+        return false;
+    }
+    let short = route.route_short_name.to_ascii_uppercase();
+    let long = route.route_long_name.to_ascii_uppercase();
+    express_names
+        .iter()
+        .any(|n| short.contains(n.as_str()) || long.contains(n.as_str()))
+        || express_prefixes
+            .iter()
+            .any(|p| short.starts_with(p.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,5 +1740,148 @@ mod tests {
         };
         assert!(sp.is_active(300, SUN)); // added beats out-of-range check
         assert!(!sp.is_active(250, MON)); // in-range but between end_date and added date
+    }
+
+    // --- TEC express classification by route-number prefix "E" ---
+
+    fn route_named(short: &str) -> RouteInfo {
+        route_named_long(short, "")
+    }
+
+    fn route_named_long(short: &str, long: &str) -> RouteInfo {
+        RouteInfo {
+            agency_id: AgencyId(0),
+            route_type: RouteType::Other(-1),
+            route_short_name: short.to_string(),
+            route_long_name: long.to_string(),
+            route_color: None,
+            route_text_color: None,
+        }
+    }
+
+    #[test]
+    fn tec_express_prefix_classifies_and_prices() {
+        use crate::structures::cost::{FareContext, KnownEurosEpsilon, OperatorFareId, PriceValue};
+        // TEC config: classic 2.80 / express 5.50, express by prefix "E".
+        let op = crate::structures::FareOperatorConfig {
+            name: "LETEC".to_string(),
+            model: "time_window_flat_tiered".to_string(),
+            classic_single_euros: Some(2.80),
+            express_single_euros: Some(5.50),
+            classic_card6_euros: Some(2.23),
+            express_card6_euros: Some(4.40),
+            classic_card6_reduced_euros: Some(1.80),
+            express_card6_reduced_euros: Some(3.52),
+            express_route_names: vec![],
+            express_route_prefixes: vec!["E".to_string()],
+            ..Default::default()
+        };
+        let cents = |e: Option<f64>| (e.unwrap_or(0.0) * 100.0).round() as u32;
+        let tec = build_tec_operator(&op, cents);
+
+        // "E12" starts with the prefix -> express.
+        assert!(tec_route_is_express(
+            &route_named("E12"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+        // "12" and "132" do not start with "E" and contain no express name -> classic.
+        assert!(!tec_route_is_express(
+            &route_named("12"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+        assert!(!tec_route_is_express(
+            &route_named("132"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+        // Classic route whose long name starts with "E" (real letec.zip cases:
+        // Eupen, Eghezée, Esneux) must NOT match the prefix -> classic.
+        assert!(!tec_route_is_express(
+            &route_named_long("710", "Eupen - Kelmis"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+        assert!(!tec_route_is_express(
+            &route_named_long("42", "Esneux - Liège"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+
+        // Resolve each route's tier onto the template (mirroring the per-route
+        // lookup build in `RaptorIndex`: swap the express price set when express)
+        // and price a single boarding.
+        let priced = |route: &RouteInfo| -> u32 {
+            use crate::structures::cost::OperatorModel;
+            let is_express = tec_route_is_express(
+                route,
+                &tec.express_route_names,
+                &tec.express_route_prefixes,
+            );
+            let m = match tec.model {
+                OperatorModel::TimeWindowFlatTiered {
+                    single_cents,
+                    card6_cents,
+                    card6_reduced_cents,
+                    ..
+                } => {
+                    let (single_cents, card6_cents, card6_reduced_cents) = if is_express {
+                        (
+                            tec.express_single_cents,
+                            tec.express_card6_cents,
+                            tec.express_card6_reduced_cents,
+                        )
+                    } else {
+                        (single_cents, card6_cents, card6_reduced_cents)
+                    };
+                    OperatorModel::TimeWindowFlatTiered {
+                        is_express,
+                        single_cents,
+                        card6_cents,
+                        card6_reduced_cents,
+                    }
+                }
+                other => other,
+            };
+            let fm = crate::structures::cost::FareModel {
+                enabled: true,
+                known_euros_epsilon: KnownEurosEpsilon { a: 0.0, b: 0.0 },
+                operators: Vec::new(),
+                agglomerations: Vec::new(),
+                brupass_cents: 0,
+                brupass_validity_secs: 0,
+            };
+            let mut p = PriceValue::ZERO;
+            fm.charge_board(&mut p, OperatorFareId::Modeled { model: m }, 8 * 3600, &FareContext::DEFAULT);
+            p.known_cents
+        };
+        assert_eq!(priced(&route_named("E12")), 550, "E12 prices as express 5.50");
+        assert_eq!(priced(&route_named("12")), 280, "12 prices as classic 2.80");
+        assert_eq!(priced(&route_named("132")), 280, "132 prices as classic 2.80");
+        assert_eq!(
+            priced(&route_named_long("710", "Eupen - Kelmis")),
+            280,
+            "short 710 / long Eupen prices as classic 2.80"
+        );
+        assert_eq!(
+            priced(&route_named_long("42", "Esneux - Liège")),
+            280,
+            "short 42 / long Esneux prices as classic 2.80"
+        );
+
+        // The express_names substring path must still match long names, so a
+        // genuine "Express" line keeps its express tier.
+        let op_named = crate::structures::FareOperatorConfig {
+            express_route_names: vec!["EXPRESS".to_string()],
+            express_route_prefixes: vec![],
+            ..op.clone()
+        };
+        let tec_named = build_tec_operator(&op_named, cents);
+        assert!(tec_route_is_express(
+            &route_named_long("450", "Express Namur - Bruxelles"),
+            &tec_named.express_route_names,
+            &tec_named.express_route_prefixes
+        ));
     }
 }

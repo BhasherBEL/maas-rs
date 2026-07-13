@@ -377,6 +377,15 @@ pub fn apply_routing_defaults(
     if let Some(m) = routing.max_window_minutes {
         g.set_max_window_secs(m.saturating_mul(60));
     }
+    if let Some(v) = routing.travel_map_grid_step_m {
+        g.set_travel_map_grid_step_m(v);
+    }
+    if let Some(v) = routing.travel_map_max_cells {
+        g.set_travel_map_max_cells(v);
+    }
+    if let Some(v) = routing.travel_map_window_sample_secs {
+        g.set_travel_map_window_sample_secs(v);
+    }
     if let Some(m) = routing.max_snap_distance_m {
         g.set_max_snap_distance_m(m);
     }
@@ -418,6 +427,9 @@ pub fn apply_routing_defaults(
     }
     if let Some(b) = routing.balance {
         g.set_balance(b);
+    }
+    if let Some(fares) = &routing.fares {
+        g.set_fare_model(fares.to_fare_model());
     }
     // Build + persist the all-mode (union) contracted graph. On a restore it is already
     // present (deserialized from graph.bin, seg_index rebuilt in load_graph), so the

@@ -41,6 +41,35 @@ fn is_stib_peak_hour(secs: u32) -> bool {
     (H7..H9).contains(&secs) || (H16..H1830).contains(&secs)
 }
 
+// ── Time-window fare model (STIB / De Lijn operator-specific interpretation) ────
+
+/// Build a `time_window_flat` `OperatorModel` (STIB or De Lijn) from its config
+/// block. Both STIB and De Lijn are flat-ticket, transfer-window operators; this
+/// selects the independent ticket-window state (`TimeWindowOperator`, absent ⇒
+/// STIB) and carries the single-ticket + optional N-journey card price. It only
+/// composes the operator-agnostic `TimeWindowFlat` PRIMITIVE that lives in
+/// `structures::cost::fares`; the STIB/De Lijn choice of window operator and card
+/// price is co-located here with these operators' ingestor. `cents` converts an
+/// optional euro amount to integer cents.
+pub fn build_time_window_operator(
+    op: &crate::structures::FareOperatorConfig,
+    cents: impl Fn(Option<f64>) -> u32,
+) -> crate::structures::cost::OperatorModel {
+    use crate::structures::cost::{OperatorModel, TimeWindowOperator};
+    let operator = match op.time_window_operator.as_deref() {
+        Some(s) if s.eq_ignore_ascii_case("delijn") || s.eq_ignore_ascii_case("de lijn") => {
+            TimeWindowOperator::Delijn
+        }
+        _ => TimeWindowOperator::Stib,
+    };
+    OperatorModel::TimeWindowFlat {
+        ticket_cents: cents(op.ticket_euros),
+        card_cents: op.card_euros.map(|e| cents(Some(e))),
+        validity_secs: op.validity_secs.unwrap_or(0),
+        operator,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_stib_peak_hour;

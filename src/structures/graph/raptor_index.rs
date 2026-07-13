@@ -227,6 +227,31 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_max_window_secs")]
     pub max_window_secs: u32,
 
+    /// Travel-time-map (isochrone) sampling grid step, in METRES. The one-to-many
+    /// reachability query samples the bounding box the centre can reach on a lat/lng
+    /// grid whose cell edge is this many metres; smaller = finer heatmap, more cells,
+    /// slower. Runtime tuning (like `max_window_secs`): NOT serialized, applied from
+    /// config at startup, so changing it needs no schema bump.
+    #[serde(skip, default = "RaptorIndex::default_travel_map_grid_step_m")]
+    pub travel_map_grid_step_m: f64,
+
+    /// Travel-time-map safety cap: the maximum number of grid cells the isochrone
+    /// fill may generate. A fine per-query grid step over a large (e.g. 60-min
+    /// transit) reachable box could otherwise produce millions of cells → OOM /
+    /// huge payload. When the candidate cell count exceeds this, the step is
+    /// coarsened upward before generating cells. Runtime tuning: NOT serialized,
+    /// applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_travel_map_max_cells")]
+    pub travel_map_max_cells: u64,
+
+    /// Travel-time-map departure-window sample interval, in SECONDS. When a
+    /// `travelTimeMap` query supplies a departure window, the isochrone is evaluated
+    /// at departures spaced this many seconds apart across the window and aggregated
+    /// per cell (BEST = min, AVERAGE = mean). Larger = fewer passes, faster, coarser.
+    /// Runtime tuning: NOT serialized, applied from config at startup.
+    #[serde(skip, default = "RaptorIndex::default_travel_map_window_sample_secs")]
+    pub travel_map_window_sample_secs: u32,
+
     #[serde(skip, default = "RaptorIndex::default_max_snap_distance_m")]
     pub max_snap_distance_m: u32,
 
@@ -325,6 +350,99 @@ pub struct RaptorIndex {
     /// from config at startup.
     #[serde(skip, default = "RaptorIndex::default_balance")]
     pub balance: crate::structures::cost::BalanceWeights,
+
+    /// Transit-pricing model (price as an in-search Pareto dominance axis).
+    /// Tuning, not derived data — `#[serde(skip)]` like `epsilon`/`cost_weights`,
+    /// so it is NOT in graph.bin and needs no schema bump; set from config at
+    /// build time. `enabled = false` (the default) makes every fare code path a
+    /// no-op, byte-identical to pre-feature routing.
+    #[serde(skip, default)]
+    pub fare_model: crate::structures::cost::FareModel,
+
+    /// Runtime lookup RouteId → `OperatorFareId`, parallel to `transit_routes`,
+    /// derived from `agency.name`. Rebuilt in `build_runtime_indices` (on build
+    /// AND on load), so it is `#[serde(skip)]` (no schema bump). Empty when fares
+    /// are disabled or the index is unbuilt.
+    #[serde(skip, default)]
+    pub operator_fare_of_route: Vec<crate::structures::cost::OperatorFareId>,
+
+    /// Reverse of the `unknown[]` slot assignment: `unknown_operator_names[slot]`
+    /// is the normalized agency name mapped to that unmodeled-operator slot, for
+    /// naming `PlanPrice.unknown_operators`. Built alongside `operator_fare_of_route`.
+    #[serde(skip, default)]
+    pub unknown_operator_names: Vec<String>,
+
+    /// Per-pattern cumulative railway distance (metres) from the pattern's first
+    /// stop to each of its stops, parallel to `transit_idx_pattern_stops`. Empty
+    /// `Vec` for non-SNCB patterns (or every pattern when fares are disabled). The
+    /// per-km SNCB fare between board and alight positions is then
+    /// `per_km × (cum[alight] - cum[board])`, O(1) at alight. Derived data,
+    /// `#[serde(skip)]`: rebuilt on load from `railway_adj` + pattern stops (both
+    /// serialized) by `Graph::rebuild_sncb_railway_km`, which `set_fare_model`
+    /// invokes (via `apply_routing_defaults`, run on every startup path including
+    /// restore, after `load_graph`), so no `graph.bin` schema bump. The cumulative
+    /// distance excludes flat-agglomeration in-zone segments (Appendix A.2, using
+    /// `sncb_stop_zone`). Built only for SNCB-modeled
+    /// patterns and only when `fare_model.enabled` is true — the rail-Dijkstra
+    /// sweep is skipped entirely otherwise, keeping the disabled path zero-cost.
+    #[serde(skip, default)]
+    pub sncb_pattern_cum_railway_m: Vec<Vec<f64>>,
+
+    /// SNCB flat-agglomeration membership per compact stop index (spec Appendix
+    /// A.2), parallel to `transit_stop_to_node`. `Agglomeration::None` for every
+    /// stop outside all zones (the common case) and for every stop when fares are
+    /// disabled or no zones are configured. Derived data, `#[serde(skip)]`: rebuilt
+    /// on both build and load by `Graph::rebuild_sncb_stop_zones`, which
+    /// `set_fare_model` invokes (via `apply_routing_defaults` — run on every
+    /// startup path, restore included, AFTER `load_graph`), by point-in-polygon over
+    /// the config-driven `fare_model.agglomerations` polygons (stored in the
+    /// serde-skipped `fare_model`, applied from config at startup), so NO graph.bin
+    /// schema bump. Two stops in the SAME non-`None` zone have zero chargeable
+    /// railway distance between them, which is how each agglomeration collapses to
+    /// one SNCB fare node (`rebuild_sncb_railway_km`).
+    #[serde(skip, default)]
+    pub sncb_stop_zone: Vec<crate::structures::cost::Agglomeration>,
+
+    /// Airport special-OD membership per compact stop index (spec Appendix A.2):
+    /// `true` for a stop whose (harmonized) name contains any configured SNCB
+    /// `airport_station_names` token (e.g. "Airport"/"Luchthaven"). An SNCB journey
+    /// whose boarding OR alighting stop is an airport prices at the fixed
+    /// `airport_od_cents` instead of base+per-km. Parallel to `transit_stop_to_node`.
+    /// `false` everywhere when fares are disabled, no SNCB operator carries airport
+    /// tokens, or the airport override is zero. Derived data, `#[serde(skip)]`:
+    /// rebuilt on both build and load by `Graph::rebuild_sncb_airport_stops` (invoked
+    /// from `set_fare_model`), so NO graph.bin schema bump. Empty when unbuilt/off.
+    #[serde(skip, default)]
+    pub sncb_airport_stop: Vec<bool>,
+
+    /// Reference-node zone collapse for the SNCB zone-to-zone fare (spec Appendix
+    /// A.2, corrected). `sncb_ref_to_stop[z]` is the railway distance (metres) from
+    /// zone `z`'s reference node to every compact SNCB stop (single-source Dijkstra
+    /// over `railway_adj`), parallel to the agglomeration order in
+    /// `fare_model.agglomerations`; `f64::INFINITY` for an unreachable / unsnappable
+    /// stop. The per-km fare distance from a zone board to a free-station alight (or
+    /// vice-versa) is one O(1) lookup here, so it is FIXED per (zone, station) and
+    /// independent of the pattern/boarding station. Derived data, `#[serde(skip)]`:
+    /// rebuilt on both build and load by `Graph::rebuild_sncb_zone_refs` (invoked from
+    /// `set_fare_model`). Empty when fares are off, no zones are configured, or no
+    /// SNCB operator is modeled.
+    #[serde(skip, default)]
+    pub sncb_ref_to_stop: Vec<Vec<f64>>,
+
+    /// Reference-to-reference railway distance (metres) between agglomeration zones
+    /// for the SNCB zone-to-zone fare: `sncb_ref_to_ref[zi][zj]`, both indices in the
+    /// `fare_model.agglomerations` order. Any Brussels station → any Antwerpen station
+    /// charges per-km for exactly this fixed distance. `f64::INFINITY` when a ref pair
+    /// is unreachable. Derived, `#[serde(skip)]`: rebuilt with `sncb_ref_to_stop`.
+    #[serde(skip, default)]
+    pub sncb_ref_to_ref: Vec<Vec<f64>>,
+
+    /// The chosen reference RAILWAY-NODE index for each configured agglomeration
+    /// (parallel to `fare_model.agglomerations`); `None` when no reference could be
+    /// resolved (empty zone, no railway topology). Provenance/debug for the
+    /// zone-collapse tables above. Derived, `#[serde(skip)]`.
+    #[serde(skip, default)]
+    pub sncb_zone_ref_node: Vec<Option<usize>>,
 }
 
 impl Default for RaptorIndex {
@@ -398,6 +516,9 @@ impl RaptorIndex {
             use_cch_access: Self::default_use_cch_access(),
             profile_latency: Self::default_profile_latency(),
             max_window_secs: Self::default_max_window_secs(),
+            travel_map_grid_step_m: Self::default_travel_map_grid_step_m(),
+            travel_map_max_cells: Self::default_travel_map_max_cells(),
+            travel_map_window_sample_secs: Self::default_travel_map_window_sample_secs(),
             max_snap_distance_m: Self::default_max_snap_distance_m(),
             edge_snap_radius_m: Self::default_edge_snap_radius_m(),
             bike_profile: crate::structures::BikeProfile::default(),
@@ -415,6 +536,15 @@ impl RaptorIndex {
             alt_max_share_factor: Self::default_alt_max_share_factor(),
             systematic_cv: Self::default_systematic_cv(),
             balance: Self::default_balance(),
+            fare_model: crate::structures::cost::FareModel::default(),
+            operator_fare_of_route: Vec::new(),
+            unknown_operator_names: Vec::new(),
+            sncb_pattern_cum_railway_m: Vec::new(),
+            sncb_stop_zone: Vec::new(),
+            sncb_airport_stop: Vec::new(),
+            sncb_ref_to_stop: Vec::new(),
+            sncb_ref_to_ref: Vec::new(),
+            sncb_zone_ref_node: Vec::new(),
         }
     }
 
@@ -477,6 +607,24 @@ impl RaptorIndex {
 
     pub fn default_max_window_secs() -> u32 {
         24 * 3600
+    }
+
+    /// Default isochrone grid step (metres): ~300 m cells give a smooth city-scale
+    /// heatmap while keeping a 30-min walk+transit box to a few thousand cells.
+    pub fn default_travel_map_grid_step_m() -> f64 {
+        300.0
+    }
+
+    /// Default isochrone cell cap: bounds the fill to ~150k cells so a fine
+    /// per-query grid step over a large reachable box coarsens rather than OOMs.
+    pub fn default_travel_map_max_cells() -> u64 {
+        150_000
+    }
+
+    /// Default isochrone window sample interval (seconds): one departure every
+    /// 10 minutes across the window, bounding the number of forward passes.
+    pub fn default_travel_map_window_sample_secs() -> u32 {
+        600
     }
 
     pub fn default_max_snap_distance_m() -> u32 {
@@ -575,6 +723,157 @@ impl RaptorIndex {
             .map(|(i, s)| (s.clone(), i))
             .collect();
         self.rebuild_station_lookups();
+        self.rebuild_operator_fare_lookup();
+    }
+
+    /// Normalize an agency name for fare-config matching: uppercased, trimmed.
+    /// Feeds spell the operator inconsistently (case/whitespace) but the token
+    /// itself ("STIB", "SNCB") is stable, so a case-insensitive trim suffices.
+    fn normalize_agency_name(name: &str) -> String {
+        name.trim().to_ascii_uppercase()
+    }
+
+    /// True if the configured operator token `op_token` (already normalized)
+    /// identifies the agency named `agency_name` (already normalized). The GTFS
+    /// feeds spell some operators as slash/whitespace-joined multi-brand strings
+    /// (real example: `NMBS/SNCB` for what config keys as `SNCB`), so an exact
+    /// string compare silently fails to match (defect B: SNCB priced as unknown).
+    /// Matching is therefore token-based: `op_token` matches if it equals the whole
+    /// name OR appears as one of the name's `/`- or whitespace-delimited tokens.
+    /// This is config-driven — no agency literal is hardcoded in the logic.
+    fn agency_matches_operator(agency_name: &str, op_token: &str) -> bool {
+        if agency_name == op_token {
+            return true;
+        }
+        agency_name
+            .split(|c: char| c == '/' || c.is_whitespace())
+            .any(|tok| tok == op_token)
+    }
+
+    /// Build the RouteId → `OperatorFareId` lookup from `fare_model` + the route→
+    /// agency links. Runtime-only (`#[serde(skip)]`), rebuilt on build and load.
+    /// A route whose agency name matches a modeled operator resolves to that
+    /// operator's model; every other route is `Unknown`, with unmodeled agencies
+    /// deterministically assigned a stable `unknown[]` slot (`0..N_OP`). No-op
+    /// (empty vector) when fares are disabled, so the boarding path stays untouched.
+    pub fn rebuild_operator_fare_lookup(&mut self) {
+        use crate::structures::cost::{N_OP, OperatorFareId};
+        if !self.fare_model.enabled {
+            self.operator_fare_of_route = Vec::new();
+            self.unknown_operator_names = Vec::new();
+            return;
+        }
+        // Normalized modeled-operator token → its compiled model, in config order.
+        let modeled: Vec<(String, crate::structures::cost::OperatorModel)> = self
+            .fare_model
+            .operators
+            .iter()
+            .map(|op| (Self::normalize_agency_name(&op.name), op.model))
+            .collect();
+        // Track which modeled operators matched at least one agency, for a startup
+        // warning on any operator that matches ZERO agencies (defect B guard).
+        let mut op_matched = vec![false; modeled.len()];
+        // Deterministic slot assignment for unmodeled agency names, first-seen order.
+        let mut unknown_slot: HashMap<String, usize> = HashMap::new();
+        let mut next_slot = 0usize;
+        let mut slot_names: Vec<String> = vec![String::new(); N_OP];
+
+        let mut lookup = Vec::with_capacity(self.transit_routes.len());
+        for route in &self.transit_routes {
+            // Original (un-normalized) agency name, used verbatim as the display
+            // label for an unpriced-operator badge (e.g. `De Lijn`, `NMBS/SNCB`,
+            // `LETEC`), so the tooltip matches the normal-case shown elsewhere in
+            // the UI rather than the internal uppercased matching key.
+            let display_name = self
+                .transit_agencies
+                .get(route.agency_id.0 as usize)
+                .map(|a| a.name.trim().to_string())
+                .unwrap_or_default();
+            let agency_name = Self::normalize_agency_name(&display_name);
+            // First modeled operator whose token identifies this agency wins
+            // (config order). Token-based so `SNCB` matches `NMBS/SNCB`.
+            let matched = modeled
+                .iter()
+                .position(|(tok, _)| Self::agency_matches_operator(&agency_name, tok));
+            let id = if let Some(i) = matched {
+                op_matched[i] = true;
+                // Resolve a TEC-tier template's `is_express` for THIS route from the
+                // config route-name classification list (project policy: no hardcode).
+                let model = match modeled[i].1 {
+                    crate::structures::cost::OperatorModel::TimeWindowFlatTiered {
+                        single_cents,
+                        card6_cents,
+                        card6_reduced_cents,
+                        ..
+                    } => {
+                        let opf = &self.fare_model.operators[i];
+                        let is_express = crate::ingestion::gtfs::tec_route_is_express(
+                            route,
+                            &opf.express_route_names,
+                            &opf.express_route_prefixes,
+                        );
+                        // The template carries the CLASSIC tier; swap in the express
+                        // price set for a route classified express.
+                        let (single_cents, card6_cents, card6_reduced_cents) = if is_express {
+                            (
+                                opf.express_single_cents,
+                                opf.express_card6_cents,
+                                opf.express_card6_reduced_cents,
+                            )
+                        } else {
+                            (single_cents, card6_cents, card6_reduced_cents)
+                        };
+                        crate::structures::cost::OperatorModel::TimeWindowFlatTiered {
+                            is_express,
+                            single_cents,
+                            card6_cents,
+                            card6_reduced_cents,
+                        }
+                    }
+                    other => other,
+                };
+                OperatorFareId::Modeled { model }
+            } else {
+                let name_for_slot = display_name.clone();
+                let slot = *unknown_slot.entry(agency_name).or_insert_with(|| {
+                    let s = next_slot.min(N_OP - 1);
+                    next_slot += 1;
+                    // First name mapped to this slot names it (later names sharing a
+                    // clamped slot keep the first, a documented approximation).
+                    if slot_names[s].is_empty() {
+                        slot_names[s] = name_for_slot;
+                    }
+                    s
+                });
+                OperatorFareId::Unknown { slot }
+            };
+            lookup.push(id);
+        }
+        self.operator_fare_of_route = lookup;
+        self.unknown_operator_names = slot_names;
+
+        // Guard against silent fare inertness (defect B): warn on any configured
+        // fare operator that matched ZERO agencies, so a feed renaming its agency
+        // (which would make that operator price as unknown) is caught at startup.
+        let unmatched: Vec<&str> = modeled
+            .iter()
+            .zip(&op_matched)
+            .filter(|(_, m)| !**m)
+            .map(|((tok, _), _)| tok.as_str())
+            .collect();
+        if !unmatched.is_empty() {
+            let available: Vec<String> = self
+                .transit_agencies
+                .iter()
+                .map(|a| a.name.clone())
+                .collect();
+            tracing::warn!(
+                "fares: configured operator(s) {:?} matched NO agency — their fares \
+                 are inert (routes price as unknown). Available agency names: {:?}",
+                unmatched,
+                available,
+            );
+        }
     }
 
     /// Derive the station lookup maps from the serialized `transit_stations`.
@@ -778,6 +1077,168 @@ mod tests {
         let err = idx.validate().unwrap_err();
         assert!(err.contains("stop_patterns"), "unexpected error: {err}");
         assert!(err.contains("rebuild"), "no rebuild hint: {err}");
+    }
+
+    fn route(agency: u16) -> crate::ingestion::gtfs::RouteInfo {
+        crate::ingestion::gtfs::RouteInfo {
+            route_short_name: "r".into(),
+            route_long_name: "route".into(),
+            route_type: gtfs_structures::RouteType::Bus,
+            agency_id: crate::ingestion::gtfs::AgencyId(agency),
+            route_color: None,
+            route_text_color: None,
+        }
+    }
+
+    fn agency(name: &str) -> crate::ingestion::gtfs::AgencyInfo {
+        crate::ingestion::gtfs::AgencyInfo {
+            name: name.into(),
+            url: String::new(),
+            timezone: String::new(),
+        }
+    }
+
+    #[test]
+    fn operator_fare_lookup_resolves_modeled_and_unknown() {
+        use crate::structures::cost::{
+            FareModel, KnownEurosEpsilon, OperatorFare, OperatorFareId, OperatorModel,
+        };
+        let mut idx = RaptorIndex::new();
+        // Agencies: 0 = STIB (modeled), 1 = De Lijn, 2 = TEC (both unmodeled).
+        idx.transit_agencies = vec![agency("STIB"), agency("De Lijn"), agency("TEC")];
+        // Routes: r0→STIB, r1→De Lijn, r2→TEC, r3→De Lijn (same unknown slot as r1).
+        idx.transit_routes = vec![route(0), route(1), route(2), route(1)];
+        idx.fare_model = FareModel {
+            enabled: true,
+            known_euros_epsilon: KnownEurosEpsilon::default(),
+            operators: vec![OperatorFare {
+                // Lowercase in config: normalization must still match "STIB".
+                name: "stib".into(),
+                model: OperatorModel::TimeWindowFlat {
+                    ticket_cents: 210,
+                    card_cents: None,
+                    validity_secs: 5400,
+                    operator: crate::structures::cost::TimeWindowOperator::Stib,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            }],
+            agglomerations: Vec::new(),
+            ..FareModel::default()
+        };
+        idx.rebuild_operator_fare_lookup();
+
+        assert!(matches!(
+            idx.operator_fare_of_route[0],
+            OperatorFareId::Modeled { .. }
+        ));
+        let (s1, s2, s3) = match (
+            idx.operator_fare_of_route[1],
+            idx.operator_fare_of_route[2],
+            idx.operator_fare_of_route[3],
+        ) {
+            (
+                OperatorFareId::Unknown { slot: a },
+                OperatorFareId::Unknown { slot: b },
+                OperatorFareId::Unknown { slot: c },
+            ) => (a, b, c),
+            _ => panic!("unmodeled routes must resolve to Unknown"),
+        };
+        assert_ne!(s1, s2, "distinct unmodeled operators get distinct slots");
+        assert_eq!(s1, s3, "same unmodeled operator reuses its slot");
+        // Slot label is the original-case agency name (display form), not the
+        // uppercased internal matching key.
+        assert_eq!(idx.unknown_operator_names[s1], "De Lijn");
+        assert_eq!(idx.unknown_operator_names[s2], "TEC");
+    }
+
+    #[test]
+    fn sncb_operator_matches_slashed_agency_name() {
+        // Defect B regression: the real SNCB GTFS agency is named "NMBS/SNCB", but
+        // config keys it as "SNCB". An exact-string match silently failed, pricing
+        // trains as an UNKNOWN operator. Token-based matching must resolve it to the
+        // modeled SNCB fare, not to Unknown.
+        use crate::structures::cost::{
+            FareModel, KnownEurosEpsilon, OperatorFare, OperatorFareId, OperatorModel,
+        };
+        let mut idx = RaptorIndex::new();
+        idx.transit_agencies = vec![agency("NMBS/SNCB")];
+        idx.transit_routes = vec![route(0)];
+        idx.fare_model = FareModel {
+            enabled: true,
+            known_euros_epsilon: KnownEurosEpsilon::default(),
+            operators: vec![OperatorFare {
+                name: "SNCB".into(),
+                model: OperatorModel::DistanceBasePerKm {
+                    tariff: crate::structures::cost::DistanceTariff::Band {
+                        per_km_rate_cents: 12.40,
+                        thresholds: [36, 51],
+                        coeffs: [1.40, 1.50, 1.60],
+                        min_km: 3,
+                        max_km: 118,
+                        floor_cents: 260,
+                    },
+                    rules: crate::structures::cost::SncbTimeRules {
+                        peak_windows: [(0, 0); 2],
+                        n_peak_windows: 0,
+                        weekend_discount_adult: 0.0,
+                        weekend_discount_reduced: 0.0,
+                        train_plus_offpeak_discount: 0.0,
+                        train_plus_peak_cap_adult: u32::MAX,
+                        train_plus_peak_cap_reduced: u32::MAX,
+                    },
+                    airport_od_cents: 0,
+                },
+                express_route_names: Vec::new(),
+                express_route_prefixes: Vec::new(),
+                express_single_cents: 0,
+                express_card6_cents: 0,
+                express_card6_reduced_cents: 0,
+                airport_station_names: Vec::new(),
+            }],
+            agglomerations: Vec::new(),
+            ..FareModel::default()
+        };
+        idx.rebuild_operator_fare_lookup();
+        assert!(
+            matches!(
+                idx.operator_fare_of_route[0],
+                OperatorFareId::Modeled {
+                    model: OperatorModel::DistanceBasePerKm { .. }
+                }
+            ),
+            "SNCB fare must resolve against the 'NMBS/SNCB' agency (not treated as unknown)"
+        );
+    }
+
+    #[test]
+    fn agency_matches_operator_token_rules() {
+        // Whole-string and any-token matches; a non-token substring does NOT match.
+        assert!(RaptorIndex::agency_matches_operator("SNCB", "SNCB"));
+        assert!(RaptorIndex::agency_matches_operator("NMBS/SNCB", "SNCB"));
+        assert!(RaptorIndex::agency_matches_operator("NMBS/SNCB", "NMBS"));
+        // Whitespace is also a token delimiter (a multi-word brand name).
+        assert!(RaptorIndex::agency_matches_operator("DE LIJN", "LIJN"));
+        // Substring-but-not-token must NOT match (guards against loose matching):
+        // "SNCB" is not a `/`- or whitespace-delimited token of "SNCBX".
+        assert!(!RaptorIndex::agency_matches_operator("SNCBX", "SNCB"));
+    }
+
+    #[test]
+    fn operator_fare_lookup_empty_when_disabled() {
+        let mut idx = RaptorIndex::new();
+        idx.transit_agencies = vec![agency("STIB")];
+        idx.transit_routes = vec![route(0)];
+        // fare_model default is disabled.
+        idx.rebuild_operator_fare_lookup();
+        assert!(
+            idx.operator_fare_of_route.is_empty(),
+            "disabled fares build no lookup (zero hot-loop overhead)"
+        );
     }
 
     #[test]
