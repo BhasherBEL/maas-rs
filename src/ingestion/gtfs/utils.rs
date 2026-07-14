@@ -43,7 +43,6 @@ impl<T: Eq + Hash + Clone> IdMapper<T, usize> {
         self.to_string.is_empty()
     }
 
-    /// The original ids in index order (index `i` is the id that maps to `i`).
     pub fn strings(&self) -> &[T] {
         &self.to_string
     }
@@ -66,18 +65,9 @@ pub fn display_route_type(route_type: RouteType) -> &'static str {
     }
 }
 
-/// Harmonize an all-caps feed display name (STIB-style "GARE DU NORD") to title
-/// case so it matches mixed-case feeds (SNCB/DeLijn "Bruxelles-Nord"). Names that
-/// already contain any lowercase ASCII letter are returned UNCHANGED — only fully
-/// upper-cased names are touched, which makes this idempotent.
-///
-/// Title-casing uppercases the first alphabetic char of each part and lowercases
-/// the rest, splitting on hyphens and apostrophes ("ST-GILLES" -> "St-Gilles").
-/// Common French/Dutch particles are kept lowercase ("GARE DU NORD" -> "Gare du
-/// Nord") UNLESS they are the first whitespace word, which is always capitalized
-/// ("DE BROUCKERE" -> "De Brouckere"). This is display only and never feeds the
-/// dedup/grouping normalization, which keys on parent ids and its own lowercase
-/// name folding.
+/// Title-cases all-caps feed display names (STIB "GARE DU NORD" -> "Gare du Nord") to
+/// match mixed-case feeds. Names already containing a lowercase letter are left unchanged
+/// (keeps this idempotent). Display only; never feeds dedup/grouping normalization.
 pub fn harmonize_display_name(name: &str) -> String {
     const PARTICLES: &[&str] = &[
         "de", "du", "des", "d", "la", "le", "les", "l", "un", "une", "a", "au", "aux", "et", "en",
@@ -155,8 +145,6 @@ mod tests {
     use super::*;
     use gtfs_structures::RouteType;
 
-    // ── IdMapper ──────────────────────────────────────────────────────────────
-
     #[test]
     fn idmapper_first_insert_returns_zero() {
         let mut m: IdMapper<String, usize> = IdMapper::new();
@@ -195,12 +183,9 @@ mod tests {
     fn idmapper_get_does_not_require_mut() {
         let mut m: IdMapper<String, usize> = IdMapper::new();
         m.get_or_insert("a".to_string());
-        // get() takes &self, not &mut self — this should compile with an immutable ref
         let r: &IdMapper<String, usize> = &m;
         assert_eq!(r.get(&"a".to_string()), Some(0));
     }
-
-    // ── display_route_type ────────────────────────────────────────────────────
 
     #[test]
     fn display_route_type_all_variants() {
@@ -218,8 +203,6 @@ mod tests {
         assert_eq!(display_route_type(RouteType::Other(-1)), "Other");
         assert_eq!(display_route_type(RouteType::Other(999)), "Other");
     }
-
-    // ── harmonize_display_name ────────────────────────────────────────────────
 
     #[test]
     fn harmonize_caps_with_particle() {
@@ -280,8 +263,6 @@ mod tests {
         assert_eq!(harmonize_display_name("GARE DU NORD"), "Gare du Nord");
         assert_eq!(harmonize_display_name("MERODE"), "Merode");
     }
-
-    // ── sec_to_time ───────────────────────────────────────────────────────────
 
     #[test]
     fn sec_to_time_midnight() {

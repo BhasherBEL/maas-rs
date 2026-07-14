@@ -9,8 +9,6 @@ use crate::structures::{
 
 use super::{Graph, MAX_TRANSFER_DISTANCE_M, StationInfo, StationLine};
 
-/// Display ordering rank for a transport-mode label: Rail, then Subway/Metro,
-/// Tram, Bus, then everything else (resolved alphabetically by the label itself).
 fn mode_rank(mode: &str) -> u8 {
     match mode {
         "Rail" => 0,
@@ -21,9 +19,6 @@ fn mode_rank(mode: &str) -> u8 {
     }
 }
 
-/// Natural/numeric-aware sort key for a line `short_name`: all-digit names sort
-/// numerically and before any name containing non-digits ("5" < "61" < "81" <
-/// "M1"); non-numeric names sort lexically among themselves. Fully deterministic.
 fn natural_key(short_name: &str) -> (u8, u64, String) {
     if !short_name.is_empty() && short_name.bytes().all(|b| b.is_ascii_digit()) {
         (0, short_name.parse::<u64>().unwrap_or(u64::MAX), String::new())
@@ -45,23 +40,9 @@ impl Graph {
         self.build_edge_index();
     }
 
-    /// Restore the FIFO (non-overtaking) precondition that `scan_route`'s
-    /// `partition_point` boarding cutoff relies on. Patterns are grouped purely by
-    /// stop sequence and sorted by their stop-0 departure, but when an express
-    /// overtakes a stopping trip between two stops a mid-stop departure column
-    /// becomes non-monotonic, and `partition_point` (a binary search assuming a
-    /// sorted column) can skip a feasible/optimal trip.
-    ///
-    /// This splits each pattern into the minimum-ish number of sub-routes such that
-    /// every per-stop DEPARTURE column is non-decreasing within a sub-route, using a
-    /// greedy first-fit chain decomposition over trips in stop-0 order: append a trip
-    /// to the first chain whose last trip is `<=` it at EVERY stop (so the column
-    /// stays non-decreasing), else open a new chain. Each chain becomes its own
-    /// pattern. Non-overtaking patterns yield a single chain → identical output, so
-    /// the transform is idempotent and transparent to everything downstream
-    /// (scan_route, stop→pattern membership, segment timetables, shapes, realtime
-    /// trip resolution): a trip still lives in exactly one pattern, with its columns
-    /// intact. Must run before the other build steps, which read the split patterns.
+    /// INVARIANT: `scan_route`'s `partition_point` boarding cutoff requires each
+    /// per-stop departure column be non-decreasing (FIFO); splits patterns so no
+    /// express overtakes a stopping trip. Must run before build steps that read them.
     fn split_overtaking_patterns(&mut self) {
         let r = &mut self.raptor;
         let n_patterns = r.transit_patterns.len();
@@ -176,10 +157,6 @@ impl Graph {
         }
     }
 
-    /// Precompute, per pattern and per inter-stop segment, the transit edge's
-    /// `timetable_segment` by scanning `g.edges` while the full graph is present. Plan
-    /// reconstruction reads this instead of `self.edges[..]`, so transit legs survive the
-    /// node-contraction drop of the interior-node arrays.
     fn build_pattern_segment_timetables(&mut self) {
         use crate::ingestion::gtfs::TimetableSegment;
         use crate::structures::EdgeData;
@@ -237,14 +214,8 @@ impl Graph {
         }
     }
 
-    /// Group compact stops into physical stations by their (non-empty)
-    /// `parent_station`; stops without one each form a standalone station. The
-    /// station id is the shared parent value (or the lone stop's `stop_id`),
-    /// coord is the member centroid (mean), and operators are the distinct agency
-    /// names of the patterns serving any member. Reads `parent_station` from the
-    /// (still-present) interior nodes, so it must run at build time before any
-    /// node-array drop. Requires `build_stop_patterns` first (operators read
-    /// `transit_idx_stop_patterns`).
+    /// Must run before any node-array drop (reads interior `parent_station`) and
+    /// after `build_stop_patterns` (reads `transit_idx_stop_patterns`).
     fn build_station_index(&mut self) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let mut stations: Vec<StationInfo> = Vec::new();
@@ -376,10 +347,6 @@ impl Graph {
         }
     }
 
-    /// Inverts `transit_stop_transfers` to produce `transit_stop_reverse_transfers`:
-    /// for each compact target stop `t`, the list of `(source_compact, walk_secs)`
-    /// pairs such that walking from `source` reaches `t` in `walk_secs` seconds.
-    /// Used by the backward RAPTOR pass for reverse footpath relaxation.
     fn build_reverse_transfers(&mut self) {
         let n_stops = self.raptor.transit_stop_to_node.len();
         let mut reverse_map: Vec<Vec<(usize, u32)>> = vec![Vec::new(); n_stops];

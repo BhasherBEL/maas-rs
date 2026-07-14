@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "maas-rs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-graphql",

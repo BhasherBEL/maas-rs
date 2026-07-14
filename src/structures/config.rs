@@ -5,58 +5,38 @@ use gtfs_structures::RouteType;
 use serde::Deserialize;
 
 use crate::ingestion::cache::SourceLocation;
+use crate::ingestion::osm::DemProjection;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub build: BuildConfig,
+    #[serde(default)]
     pub default_routing: RoutingDefaultConfig,
     #[serde(default)]
     pub server: ServerConfig,
-    /// Background auto-update of remote GTFS feeds. Absent ⇒ disabled.
     #[serde(default)]
     pub auto_update: Option<AutoUpdateConfig>,
-    /// Realtime delay feeds (GTFS-RT + custom STIB). Absent ⇒ disabled.
     #[serde(default)]
     pub realtime: Option<RealtimeConfig>,
-    /// Minimum log level: trace | debug | info | warn | error  (default: info)
+    /// trace | debug | info | warn | error
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RealtimeConfig {
-    /// When false (or the section is absent) no realtime polling runs.
     #[serde(default)]
     pub enabled: bool,
-    /// Seconds between poll cycles across all feeds. The steady-state request
-    /// rate is `(Σ feed.requests_per_poll) / poll_interval_secs`; the shipped
-    /// default keeps it under the gateway's ~8 req/min and ~12k req/day quota
-    /// (see [`RealtimeConfig::request_rate`]).
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    /// Per-request HTTP timeout for realtime polls.
     #[serde(default = "default_rt_timeout_secs")]
     pub request_timeout_secs: u64,
-    /// A vehicle position is considered stale after this many seconds (unix time
-    /// comparison). Routing and the live UI fall back to schedule interpolation
-    /// when the position is absent or older than this window.
     #[serde(default = "default_vehicle_position_max_age_secs")]
     pub vehicle_position_max_age_secs: u64,
-    /// A realtime snapshot older than this many seconds is considered STALE and is
-    /// NOT applied to routing — the router falls back to schedule-only for that
-    /// query. Guards against a feed outage (the poller keeps the last good index
-    /// with no TTL of its own) serving hours-old delays and cancellations forever.
-    /// The poller stamps every published snapshot with this value; the routing
-    /// consumer boundary enforces it against wall-clock `now`.
+    /// Snapshots older than this are STALE and dropped from routing (fall back to schedule-only), so a feed outage can't serve stale delays forever.
     #[serde(default = "default_index_max_age_secs")]
     pub index_max_age_secs: u64,
-    /// How long (seconds) the poller retains a TRACKED journey's last-known live
-    /// delay after the feed stops reporting it. STIB waiting-times only predict
-    /// upcoming departures, so once a user boards, their vehicle leaves the feed
-    /// window and its delay would vanish. The poller keeps a cross-cycle sticky
-    /// cache of `(trip, stop) → delay` and evicts entries older than this TTL.
-    /// The sticky delay is exposed ONLY to the live-refresh overlay (a tracked
-    /// journey), never to routing/planning. Defaults to ~24h.
+    /// Sticky TTL for a TRACKED journey's last-known delay; exposed ONLY to the live-refresh overlay, never to routing/planning.
     #[serde(default = "default_tracked_delay_ttl_secs")]
     pub tracked_delay_ttl_secs: u64,
     #[serde(default)]
@@ -87,18 +67,14 @@ fn default_tracked_delay_ttl_secs() -> u64 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RateLimitConfig {
-    /// Consecutive throttle responses (HTTP 403 "out of quota" or 429) before the
-    /// fetcher backs off and all feeds skip until a probe succeeds.
+    /// Consecutive throttle responses (403/429) before the fetcher backs off until a probe succeeds.
     #[serde(
         default = "default_failure_threshold",
         alias = "consecutive_429_threshold"
     )]
     pub consecutive_failure_threshold: u32,
-    /// While backed off, at most one probe request is issued per this interval.
     #[serde(default = "default_throttled_interval_secs")]
     pub throttled_min_interval_secs: u64,
-    /// Documented gateway quota ceilings, used to warn at startup (and gate in
-    /// tests) if the configured cadence would exceed them.
     #[serde(default = "default_max_requests_per_min")]
     pub max_requests_per_min: u32,
     #[serde(default = "default_max_requests_per_day")]
@@ -135,7 +111,6 @@ fn default_max_requests_per_day() -> u32 {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum RealtimeFeedConfig {
-    /// Generic GTFS-Realtime protobuf trip-update feed (SNCB, TEC).
     #[serde(rename = "gtfs-rt")]
     GtfsRt {
         name: String,
@@ -143,7 +118,6 @@ pub enum RealtimeFeedConfig {
         #[serde(default)]
         headers: HashMap<String, String>,
     },
-    /// Custom STIB / MIVB waiting-times feed.
     #[serde(rename = "stib")]
     Stib {
         name: String,
@@ -156,10 +130,7 @@ pub enum RealtimeFeedConfig {
 }
 
 impl RealtimeFeedConfig {
-    /// Number of HTTP requests one poll of this feed issues to the gateway. A
-    /// GTFS-RT feed is a single GET; a STIB feed fetches waiting-times plus, when
-    /// configured, vehicle-positions — two requests. Miscounting the STIB feed as
-    /// one was the arithmetic root of the original quota overshoot.
+    /// HTTP requests one poll issues: STIB counts waiting-times plus, when configured, vehicle-positions (two). Miscounting drives quota overshoot.
     pub fn requests_per_poll(&self) -> u32 {
         match self {
             RealtimeFeedConfig::GtfsRt { .. } => 1,
@@ -178,9 +149,6 @@ impl RealtimeFeedConfig {
 }
 
 impl RealtimeConfig {
-    /// Steady-state request rate implied by the configured cadence, as
-    /// `(requests_per_minute, requests_per_day)`, counting each feed's per-poll
-    /// request count. Used for the startup quota warning and the quota test.
     pub fn request_rate(&self) -> (f64, f64) {
         let interval = self.poll_interval_secs.max(1) as f64;
         let per_cycle: u32 = self.feeds.iter().map(|f| f.requests_per_poll()).sum();
@@ -188,8 +156,6 @@ impl RealtimeConfig {
         (per_sec * 60.0, per_sec * 86_400.0)
     }
 
-    /// True when the configured cadence stays within the documented gateway
-    /// quota (`rate_limit.max_requests_per_min` and `_per_day`).
     pub fn within_quota(&self) -> bool {
         let (per_min, per_day) = self.request_rate();
         per_min <= self.rate_limit.max_requests_per_min as f64
@@ -199,14 +165,17 @@ impl RealtimeConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AutoUpdateConfig {
-    /// When false (or the section is absent) no background updates run.
     #[serde(default)]
     pub enabled: bool,
-    /// Cron schedule. Standard 5-field (e.g. "0 5 * * *") or 6-field (leading seconds).
+    /// Cron: 5-field or 6-field (leading seconds).
+    #[serde(default = "default_schedule")]
     pub schedule: String,
-    /// Directory for downloaded feeds and the hash sidecar.
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
+}
+
+fn default_schedule() -> String {
+    "0 5 * * *".to_string()
 }
 
 fn default_cache_dir() -> String {
@@ -219,6 +188,14 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_graphql_max_depth")]
+    pub graphql_max_depth: usize,
+    #[serde(default = "default_graphql_max_complexity")]
+    pub graphql_max_complexity: usize,
+    #[serde(default = "default_graphiql_enabled")]
+    pub graphiql_enabled: bool,
+    #[serde(default)]
+    pub tiles: TilesConfig,
 }
 
 impl Default for ServerConfig {
@@ -226,16 +203,57 @@ impl Default for ServerConfig {
         ServerConfig {
             host: default_host(),
             port: default_port(),
+            graphql_max_depth: default_graphql_max_depth(),
+            graphql_max_complexity: default_graphql_max_complexity(),
+            graphiql_enabled: default_graphiql_enabled(),
+            tiles: TilesConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TilesConfig {
+    #[serde(default = "default_tile_url")]
+    pub url: String,
+    #[serde(default = "default_tile_attribution")]
+    pub attribution: String,
+}
+
+impl Default for TilesConfig {
+    fn default() -> Self {
+        TilesConfig {
+            url: default_tile_url(),
+            attribution: default_tile_attribution(),
         }
     }
 }
 
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_port() -> u16 {
-    3000
+    8000
+}
+
+fn default_graphql_max_depth() -> usize {
+    15
+}
+
+fn default_graphql_max_complexity() -> usize {
+    1000
+}
+
+fn default_graphiql_enabled() -> bool {
+    false
+}
+
+fn default_tile_url() -> String {
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png".to_string()
+}
+
+fn default_tile_attribution() -> String {
+    "© OpenStreetMap contributors".to_string()
 }
 
 fn default_log_level() -> String {
@@ -245,29 +263,35 @@ fn default_log_level() -> String {
 #[derive(Debug, Deserialize)]
 pub struct BuildConfig {
     pub inputs: Vec<Ingestor>,
+    #[serde(default = "default_output")]
     pub output: String,
+    /// `None` falls back to `auto_update.cache_dir` (back-compat).
+    #[serde(default)]
+    pub cache_dir: Option<String>,
     #[serde(default = "default_osm_output")]
     pub osm_output: String,
-    /// Optional GeoTIFF DEM for bike elevation cost/time (e.g. "path:data/dem.tif").
-    #[serde(default)]
-    pub elevation: Option<String>,
-    /// Ramer–Douglas–Peucker vertical tolerance (meters) used to denoise each way's
-    /// DEM elevation profile at ingestion, before deriving per-segment ascent. Sub-ε
-    /// blips collapse to zero ascent; real climbs ≥ ε are preserved. Default 4.0 m.
+    #[serde(default = "default_address_output")]
+    pub address_output: String,
+    /// RDP vertical tolerance (m) denoising DEM elevation at ingest. Baked; re-tuning requires a rebuild.
     #[serde(default = "default_elevation_smoothing_epsilon")]
     pub elevation_smoothing_epsilon: f64,
-    /// OSM `surface=*` → bike cruise-speed factor (relative to asphalt = 1.0),
-    /// baked per-edge at ingest. Absent / sparse ⇒ the compiled-in table; an
-    /// unlisted or untagged surface uses the unknown default (0.90). Re-tuning
-    /// requires a graph rebuild (the factor is baked, like elevation smoothing).
+    /// OSM `surface=*` → bike cruise-speed factor (asphalt = 1.0), baked per-edge. Re-tuning requires a rebuild.
     #[serde(default)]
     pub surface_speed_factors: crate::structures::SurfaceSpeedFactors,
     #[serde(default)]
     pub delay_models: Vec<DelayModelConfig>,
 }
 
+fn default_output() -> String {
+    "graph.bin".to_string()
+}
+
 fn default_osm_output() -> String {
     "osm.bin".to_string()
+}
+
+fn default_address_output() -> String {
+    "address.bin".to_string()
 }
 
 fn default_elevation_smoothing_epsilon() -> f64 {
@@ -307,8 +331,10 @@ pub enum Ingestor {
     GtfsStib(GtfsGenericIngestor),
     #[serde(rename = "gtfs/sncb")]
     GtfsSncb(GtfsSncbIngestor),
-    #[serde(rename = "best/add")]
-    BeStAdd(BeStAddIngestor),
+    #[serde(rename = "address/bestadd")]
+    AddressBestAdd(BeStAddIngestor),
+    #[serde(rename = "dem/belgian-lambert-2008")]
+    DemBelgianLambert2008(DemIngestor),
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,10 +364,6 @@ pub struct GtfsSncbIngestor {
     pub headers: HashMap<String, String>,
 }
 
-/// BeST-Add Belgian address feed (FULL XML zip from FPS BOSA). Ingested into a
-/// sibling [`crate::structures::AddressIndex`] (not the routing graph), so it runs
-/// on its own phase (default 2) outside the OSM/GTFS graph build. The download is
-/// age-gated and safely skippable — see `services::build::load_or_build_address_index`.
 #[derive(Debug, Deserialize)]
 pub struct BeStAddIngestor {
     #[serde(default = "default_bestadd_name")]
@@ -356,214 +378,157 @@ fn default_bestadd_name() -> String {
     "bestadd".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
+pub struct DemIngestor {
+    #[serde(default = "default_dem_name")]
+    pub name: String,
+    pub url: String,
+    pub phase: Option<u8>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+
+fn default_dem_name() -> String {
+    "dem".to_string()
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RoutingDefaultConfig {
-    /// Minimum walk-radius (seconds) used for access/egress stop search.
-    /// When absent, the compiled-in default (600 s = 10 min) is used.
     #[serde(default)]
     pub min_access_secs: Option<u32>,
-    /// Pedestrian walking speed in m/s. When absent, defaults to 1.2 m/s (4.32 km/h).
     #[serde(default)]
     pub walking_speed_mps: Option<f64>,
-    /// Radius (meters) within which a parent-less ("orphan") GTFS stop may be merged
-    /// into a physical station during ingestion when their normalized names match
-    /// EXACTLY and they belong to the SAME operator/feed. That exact-name + same-feed
-    /// match is a strong signal, so it tolerates a larger spread (big interchanges)
-    /// while genuinely distinct same-named stops (>250 m apart) stay separate. A
-    /// future fuzzy/cross-operator matcher should use its own, tighter value. When
-    /// absent, defaults to 250 m.
+    /// Radius (m) for merging an orphan GTFS stop into a station: only on EXACT normalized-name match AND same operator/feed.
     #[serde(default)]
     pub station_merge_radius_m: Option<f64>,
-    /// Cycling speed in m/s. When absent, defaults to 4.2 m/s (~15 km/h).
     #[serde(default)]
     pub cycling_speed_mps: Option<f64>,
-    /// Driving speed in m/s. When absent, defaults to 11.0 m/s (~40 km/h).
     #[serde(default)]
     pub driving_speed_mps: Option<f64>,
-    /// Access-radius floor (seconds) for bike/car modes. When absent, 1200 s.
     #[serde(default)]
     pub vehicle_access_secs: Option<u32>,
-    /// Fraction of the crow-flies (walk-time) trip the bike/car access budget grows to,
-    /// above the floor. When absent, 0.06.
+    /// Fraction of crow-flies walk-time the bike/car access budget grows to, above the floor.
     #[serde(default)]
     pub vehicle_access_fraction: Option<f64>,
-    /// Ceiling (seconds) on the dynamic bike/car access budget. When absent, 2700 s.
     #[serde(default)]
     pub vehicle_access_max_secs: Option<u32>,
-    /// Reliability bucket edges (sorted, strictly increasing, each in (0,1)) used to
-    /// quantize plan reliability. When absent, defaults to [0.50, 0.80, 0.95].
+    /// Sorted, strictly increasing, each in (0,1).
     #[serde(default)]
     pub reliability_bucket_edges: Option<Vec<f32>>,
-    /// Arrival-time slack (seconds) added to the fastest expected arrival when pruning,
-    /// widening the explored band so safer-but-slower plans survive. Default 900 s.
     #[serde(default)]
     pub arrival_slack_secs: Option<u32>,
-    /// When true, inter-stop transfers are found by a live per-round multi-source
-    /// bounded foot-Dijkstra (MCR) over the contracted graph instead of the precomputed
-    /// ≤1 km table, so >1 km inter-stop walks are discovered. Default false.
+    /// True ⇒ inter-stop transfers use a live bounded foot-Dijkstra (MCR) instead of the ≤1 km table, finding >1 km walks.
     #[serde(default)]
     pub unrestricted_transfers: Option<bool>,
-    /// When true, foot access/egress stop discovery uses the exact CCH one-to-many
-    /// instead of the radius-bounded two-pass foot Dijkstra. Requires a built `cch`;
-    /// falls back to the two-pass path when absent. Default false.
+    /// True ⇒ exact CCH one-to-many access/egress; requires a built `cch`, else falls back to two-pass foot Dijkstra.
     #[serde(default)]
     pub use_cch_access: Option<bool>,
-    /// When true, a range/window query emits a per-phase wall-clock decomposition
-    /// (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/range/
-    /// departure counts) as one structured log line. Purely additive observability
-    /// — never changes routing behavior or results. Per-query `profileLatency`
-    /// (GraphQL `raptor` argument) overrides this default. Absent ⇒ false.
+    /// Per-query `profileLatency` overrides this default.
     #[serde(default)]
     pub profile_latency: Option<bool>,
-    /// When true (default), the exact foot-access CCH is built (or loaded from
-    /// `cch.bin`) at startup so the per-query `useCchAccess` flag has a live index to
-    /// dispatch to. When false, `g.cch` stays `None` and the CCH seam always falls back
-    /// to the two-pass foot Dijkstra. Absent ⇒ true.
+    /// True ⇒ build/load the foot-access CCH at startup; false ⇒ `g.cch` stays `None` and access falls back to two-pass Dijkstra.
     #[serde(default)]
     pub prepare_cch_access: Option<bool>,
-    /// Upper bound on the `windowMinutes` query argument (Range-RAPTOR window).
-    /// Requests above it are clamped. When absent, defaults to 1440 (24 h).
+    /// Upper bound on `windowMinutes`; larger requests are clamped.
     #[serde(default)]
     pub max_window_minutes: Option<u32>,
-    /// Maximum distance (meters) a query coordinate may snap to the street
-    /// network; farther queries are rejected. When absent, defaults to 10000.
+    /// Max snap distance (m) to the street network; farther queries are rejected.
     #[serde(default)]
     pub max_snap_distance_m: Option<u32>,
-    /// Travel-time-map (isochrone) sampling grid step, in metres. Smaller = finer
-    /// heatmap, more cells, slower. When absent, defaults to 300.
     #[serde(default)]
     pub travel_map_grid_step_m: Option<f64>,
-    /// Travel-time-map safety cap on total grid cells. When a (possibly
-    /// per-query overridden) grid step would produce more cells than this over
-    /// the reachable bounding box, the step is coarsened so the output stays
-    /// bounded. When absent, defaults to 150000.
+    /// Cap on total isochrone grid cells; a step producing more is coarsened.
     #[serde(default)]
     pub travel_map_max_cells: Option<u64>,
-    /// Travel-time-map departure-window sample interval, in seconds. When a
-    /// `travelTimeMap` query supplies a window, the isochrone is evaluated at
-    /// departures spaced this many seconds apart. When absent, defaults to 600.
     #[serde(default)]
     pub travel_map_window_sample_secs: Option<u32>,
-    /// Default bike cost profile. Absent ⇒ compiled-in BRouter trekking defaults.
     #[serde(default)]
     pub bike_profile: Option<crate::structures::BikeProfile>,
-    /// Stochastic street-time model for access/egress. Absent ⇒ compiled-in defaults.
     #[serde(default)]
     pub street_time: Option<crate::structures::StreetTimeModel>,
     /// RCSP distance budget multiplier δ: the search may explore paths up to
-    /// (1+δ)·shortest-distance. Absent ⇒ compiled-in default (0.5).
+    /// (1+δ)·shortest-distance.
     #[serde(default)]
     pub distance_budget: Option<f64>,
-    /// Per-axis ε-dominance tuning. Absent ⇒ compiled-in defaults.
     #[serde(default)]
     pub epsilon: Option<EpsilonConfig>,
-    /// Bike grid-bucketing cell-size coefficients per metre of origin→dest
-    /// straight-line distance, on the CyclewayDeficit and Dplus diversity axes
-    /// (cell = k·D). Bound the per-node Pareto frontier while preserving the
-    /// cycleway/climb span. `0` disables bucketing on that axis. Absent ⇒ defaults.
+    /// Bike grid-bucketing cell-size coefficients per metre of origin→dest distance, on
+    /// the CyclewayDeficit and Dplus axes (cell = k·D). `0` disables bucketing.
     #[serde(default)]
     pub bike_bucket_cyc_k: Option<f64>,
     #[serde(default)]
     pub bike_bucket_dpl_k: Option<f64>,
-    /// Drive grid-bucketing cell-size coefficient per metre of origin→dest
-    /// straight-line distance, on the Variance selection axis (cell = k·D). Bounds
-    /// the per-node Pareto frontier on long direct drive legs. `0` disables
-    /// bucketing. Absent ⇒ compiled-in default.
+    /// Drive grid-bucketing coefficient per metre of origin→dest distance, on the
+    /// Variance axis (cell = k·D). `0` disables bucketing.
     #[serde(default)]
     pub drive_bucket_var_k: Option<f64>,
-    /// Walk grid-bucketing cell-size coefficient per metre of origin→dest
-    /// straight-line distance, on the Surface selection axis (cell = k·D). Bounds
-    /// the per-node Pareto frontier on long direct walk legs. `0` disables
-    /// bucketing. Absent ⇒ compiled-in default.
+    /// Walk grid-bucketing coefficient per metre of origin→dest distance, on the
+    /// Surface axis (cell = k·D). `0` disables bucketing.
     #[serde(default)]
     pub walk_bucket_surf_k: Option<f64>,
-    /// Whether D+ is a bike selection axis. Absent ⇒ compiled default (false: D+ is
-    /// displayed-only; Time already prices climbing via the gradient power model).
+    /// Whether D+ is a bike selection axis (default false: displayed-only; Time already
+    /// prices climbing via the gradient power model).
     #[serde(default)]
     pub bike_select_dplus: Option<bool>,
-    /// Variance-generator σ model (signals/elevators/crossings). Absent ⇒ defaults.
     #[serde(default)]
     pub variance_model: Option<crate::structures::cost::VarianceModel>,
-    /// Per-axis surface roughness and comfort-stress weights. Absent ⇒ defaults.
     #[serde(default)]
     pub cost_weights: Option<crate::structures::cost::CostWeights>,
-    /// Number of diverse representatives kept from the multi-objective front.
-    /// Absent ⇒ compiled-in default (6).
     #[serde(default)]
     pub representatives_k: Option<usize>,
-    /// ADGW limited-sharing threshold for bike/car alternatives. Absent ⇒ default (0.6).
     #[serde(default)]
     pub alt_max_share_factor: Option<f64>,
-    /// Systematic coefficient of variation added to a chosen path's time variance
-    /// so long legs do not collapse to false precision. Absent ⇒ default (0.05).
+    /// Systematic coefficient of variation added to a chosen path's time variance so
+    /// long legs do not collapse to false precision.
     #[serde(default)]
     pub systematic_cv: Option<f64>,
-    /// Per-axis weights selecting the highlighted "balanced" representative.
-    /// Absent ⇒ compiled-in defaults. Touches presentation only, never the search.
+    /// Selects the highlighted "balanced" representative. Presentation only, never the
+    /// search.
     #[serde(default)]
     pub balance: Option<crate::structures::cost::BalanceWeights>,
-    /// Transit-pricing model (price as an in-search Pareto dominance axis).
-    /// Absent ⇒ feature off (byte-identical to pre-feature routing). The single
-    /// master switch is `fares.enabled`; there are no per-piece feature flags.
+    /// Transit pricing. `fares.enabled` is THE master switch; absent/false ⇒ routing is
+    /// byte-identical to pre-feature (price axis, dominance, and output all gone).
     #[serde(default)]
     pub fares: Option<FaresConfig>,
-    /// Pedestrian vertical-connector (stairs/elevator/ramp) cost model, used by the
-    /// Stage B1 connector-coverage measurement to report the extra walk time a
-    /// vertical-access path adds. Absent ⇒ compiled-in defaults. (B1 does not charge
-    /// this in routing.)
+    /// Pedestrian vertical-connector cost model, used only by the Stage B1
+    /// connector-coverage measurement; B1 does not charge this in routing.
     #[serde(default)]
     pub connector_cost: Option<ConnectorCostConfig>,
-    /// Address search: distance (km) within which a candidate keeps its full geo
-    /// score around the map focus point. Absent ⇒ 2.0.
     #[serde(default)]
     pub address_geo_offset_km: Option<f64>,
-    /// Address search: distance (km) at which the geo score has decayed to half;
-    /// the exponential scale is derived as `(half - offset)/ln(2)`. Absent ⇒ 5.0.
+    /// Distance (km) at which the geo score has decayed to half; the exponential scale
+    /// is `(half - offset)/ln(2)`.
     #[serde(default)]
     pub address_geo_half_score_km: Option<f64>,
-    /// Address search: floor on the geo decay so a far but exact text match is
-    /// never fully buried. Absent ⇒ 0.1.
+    /// Floor on the geo decay so a far but exact text match is never fully buried.
     #[serde(default)]
     pub address_geo_floor: Option<f64>,
-    /// Address search: text factor for a prefix-only token match relative to an
-    /// exact alias token (exact = 1.0). Absent ⇒ 0.6.
+    /// Text factor for a prefix-only token match relative to an exact alias token
+    /// (exact = 1.0).
     #[serde(default)]
     pub address_prefix_token_weight: Option<f64>,
-    /// Address search: multiplicative boost when a number token exactly equals a
-    /// record's house number, ranking it above a prefix house-number match.
-    /// Absent ⇒ 1.5.
     #[serde(default)]
     pub address_house_number_boost: Option<f64>,
-    /// Address search: run the typo-tolerant fuzzy fallback only when the exact /
-    /// prefix pass covered fewer than this many streets. Absent ⇒ 5.
+    /// Run the fuzzy fallback only when the exact/prefix pass covered fewer than this
+    /// many streets.
     #[serde(default)]
     pub address_fuzzy_trigger_k: Option<usize>,
-    /// Address search: minimum query-token length (chars) to allow 1 edit of fuzzy
-    /// tolerance; below it a token is never fuzzed. Absent ⇒ 3.
+    /// Minimum query-token length (chars) to allow 1 fuzzy edit.
     #[serde(default)]
     pub address_fuzzy_min_len_1typo: Option<usize>,
-    /// Address search: minimum query-token length (chars) to allow 2 edits of fuzzy
-    /// tolerance. Absent ⇒ 8.
+    /// Minimum query-token length (chars) to allow 2 fuzzy edits.
     #[serde(default)]
     pub address_fuzzy_min_len_2typos: Option<usize>,
-    /// Address search: text factor for a token matched only via the fuzzy fallback,
-    /// below the prefix weight so corrected matches rank under literal ones.
-    /// Absent ⇒ 0.4.
     #[serde(default)]
     pub address_fuzzy_token_weight: Option<f64>,
-    /// Address index build: divergence epsilon (meters) for a building's box
-    /// coordinates. BeST stores each apartment/box as its own address row at one
-    /// house number; when those rows sit within this radius they are one entrance,
-    /// so the box coordinates collapse to the building centroid. Beyond it (a rare
-    /// multi-entrance building) each box keeps its own coordinate so box-level
-    /// precision is not lost. Absent ⇒ 5.0.
+    /// Divergence epsilon (m) for a building's box coordinates: BeST stores each box as
+    /// its own row at one house number; rows within this radius collapse to the building
+    /// centroid, farther ones keep per-box coordinates.
     #[serde(default)]
     pub address_box_coord_epsilon_m: Option<f64>,
 }
 
 impl RoutingDefaultConfig {
-    /// Build the address-search tuning, starting from the researched compiled-in
-    /// defaults and overriding only the fields present in config.
     pub fn to_address_search_params(&self) -> crate::structures::AddressSearchParams {
         let mut p = crate::structures::AddressSearchParams::default();
         if let Some(v) = self.address_geo_offset_km {
@@ -596,16 +561,12 @@ impl RoutingDefaultConfig {
         p
     }
 
-    /// Build-time representative-coordinate divergence epsilon (meters) for the
-    /// address index, from `address_box_coord_epsilon_m`. Absent ⇒ 5.0.
     pub fn address_box_coord_epsilon_m(&self) -> f64 {
         self.address_box_coord_epsilon_m
             .unwrap_or(crate::structures::DEFAULT_BOX_COORD_EPSILON_M)
     }
 }
 
-/// Config view of the pedestrian connector cost model. Absent fields fall back to
-/// the compiled-in `ConnectorCost::default()` values.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConnectorCostConfig {
     #[serde(default)]
@@ -618,8 +579,7 @@ pub struct ConnectorCostConfig {
     pub relocation_fallback_secs: Option<f64>,
 }
 
-/// Per-axis ε-dominance tuning: `ε_i = a_i + b_i·value`. Absent fields keep these
-/// defaults. Converted to `cost::Epsilon` for the multi-objective search.
+/// Per-axis ε-dominance tuning: `ε_i = a_i + b_i·value`.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct EpsilonConfig {
@@ -671,8 +631,8 @@ impl EpsilonConfig {
     }
 }
 
-/// ε-bucket params for the euro (known-cents) price axis, shaped like `epsilon.*`
-/// (`a + b * value`). `a` is an absolute cent width, `b` a relative fraction.
+/// ε-bucket for the price axis, shaped like `epsilon.*` (`a + b * value`); `a` is an
+/// absolute cent width, `b` a relative fraction.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct KnownEurosEpsilonConfig {
     #[serde(default)]
@@ -681,30 +641,25 @@ pub struct KnownEurosEpsilonConfig {
     pub b: f64,
 }
 
-/// One fare-modeled operator, keyed by normalized `agency.name`. `model` selects
-/// the marginal-fare function. Fields not used by the selected model deserialize
-/// leniently and are ignored.
+/// One fare-modeled operator, keyed by normalized `agency.name`. `model` selects the
+/// marginal-fare function; fields the selected model does not use are ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FareOperatorConfig {
-    /// Normalized agency name key (e.g. "STIB").
     pub name: String,
     /// Model tag: `time_window_flat` (STIB / De Lijn), `time_window_flat_tiered`
     /// (TEC classic/express), or `distance_base_per_km` (SNCB).
     pub model: String,
-    // --- time_window_flat (STIB / De Lijn) ---
     #[serde(default)]
     pub ticket_euros: Option<f64>,
     #[serde(default)]
     pub validity_secs: Option<u32>,
-    /// Per-journey price of a held N-journey card (De Lijn 10-journey). Selected
-    /// by the `delijn10Journey` profile flag; absent ⇒ card == single price.
+    /// Per-journey price of a held N-journey card, selected by the `delijn10Journey`
+    /// profile flag; absent ⇒ card == single price.
     #[serde(default)]
     pub card_euros: Option<f64>,
-    /// Which time-window operator (`stib` | `delijn`) — selects the independent
-    /// ticket-window state. Absent ⇒ `stib`.
+    /// `stib` | `delijn`; selects the independent ticket-window state.
     #[serde(default)]
     pub time_window_operator: Option<String>,
-    // --- time_window_flat_tiered (TEC) ---
     #[serde(default)]
     pub classic_single_euros: Option<f64>,
     #[serde(default)]
@@ -723,14 +678,15 @@ pub struct FareOperatorConfig {
     #[serde(default)]
     pub express_route_names: Vec<String>,
     /// Route-name PREFIXES marking an EXPRESS route (an uppercased
-    /// `route_short_name` ONLY that starts with any of these; long-name matching is
-    /// intentionally excluded to avoid misclassifying E-initial destination names
-    /// like Eupen/Eghezée/Esneux). TEC express lines are those whose route number
-    /// starts with "E" (e.g. E12), which this rule expresses without hardcoding the
-    /// letter in Rust.
+    /// `route_short_name` ONLY that starts with any of these, immediately followed by
+    /// a digit; long-name matching is intentionally excluded to avoid misclassifying
+    /// E-initial destination names like Eupen/Eghezée/Esneux). TEC express is NOT
+    /// detected this way: express lines are the "(Express)"-named ones, matched via
+    /// the "Express" marker in `express_route_names` (the "E" number prefix would
+    /// wrongly catch regional/urban E-lines like E20 or bare "E").
     #[serde(default)]
     pub express_route_prefixes: Vec<String>,
-    // --- distance_base_per_km (SNCB) ---
+    // distance_base_per_km (SNCB)
     /// Base single-fare-of-distance model. `bracketed` (default, the EXACT published
     /// 2026 SNCB 2nd-class tariff), `band` (a legacy piecewise placeholder), or
     /// `linear` (an inert linear-fit alternative). Absent ⇒ `bracketed`.
@@ -1020,7 +976,30 @@ impl Ingestor {
             Ingestor::OsmPbf(_) => "osm/pbf",
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.name,
             Ingestor::GtfsSncb(c) => &c.name,
-            Ingestor::BeStAdd(c) => &c.name,
+            Ingestor::AddressBestAdd(c) => &c.name,
+            Ingestor::DemBelgianLambert2008(c) => &c.name,
+        }
+    }
+
+    /// Filename used for the download cache of a REMOTE source. Local `path:` sources
+    /// resolve directly to their path and never touch this, so they keep a fixed
+    /// per-type name; remote sources get an 8-hex hash of the PRE-interpolation url
+    /// (so `${VAR}`/`${file:}` secrets never enter the path) mixed in, ensuring two
+    /// different urls never collide and a changed url re-downloads instead of silently
+    /// reusing stale bytes.
+    pub fn cache_filename(&self) -> String {
+        let (stem, ext) = match self {
+            Ingestor::OsmPbf(_) => ("osm".to_string(), "pbf"),
+            Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => (c.name.clone(), "zip"),
+            Ingestor::GtfsSncb(c) => (c.name.clone(), "zip"),
+            Ingestor::AddressBestAdd(c) => (c.name.clone(), "zip"),
+            Ingestor::DemBelgianLambert2008(c) => (c.name.clone(), "tif"),
+        };
+        let url = self.url();
+        if url.starts_with("path:") {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}.{}.{ext}", crate::ingestion::cache::short_hash(url))
         }
     }
 
@@ -1029,7 +1008,8 @@ impl Ingestor {
             Ingestor::OsmPbf(c) => &c.url,
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.url,
             Ingestor::GtfsSncb(c) => &c.url,
-            Ingestor::BeStAdd(c) => &c.url,
+            Ingestor::AddressBestAdd(c) => &c.url,
+            Ingestor::DemBelgianLambert2008(c) => &c.url,
         }
     }
 
@@ -1038,7 +1018,8 @@ impl Ingestor {
             Ingestor::OsmPbf(c) => &c.headers,
             Ingestor::GtfsGeneric(c) | Ingestor::GtfsStib(c) => &c.headers,
             Ingestor::GtfsSncb(c) => &c.headers,
-            Ingestor::BeStAdd(c) => &c.headers,
+            Ingestor::AddressBestAdd(c) => &c.headers,
+            Ingestor::DemBelgianLambert2008(c) => &c.headers,
         }
     }
 
@@ -1058,16 +1039,113 @@ impl Ingestor {
             Ingestor::OsmPbf(i) => i.phase.unwrap_or(0),
             Ingestor::GtfsGeneric(i) | Ingestor::GtfsStib(i) => i.phase.unwrap_or(1),
             Ingestor::GtfsSncb(i) => i.phase.unwrap_or(1),
-            Ingestor::BeStAdd(i) => i.phase.unwrap_or(2),
+            Ingestor::AddressBestAdd(i) => i.phase.unwrap_or(2),
+            Ingestor::DemBelgianLambert2008(i) => i.phase.unwrap_or(0),
         }
     }
+
+    /// The single build phase each ingestor type is wired for. OSM/DEM feed the
+    /// osm.bin phase (0), GTFS the graph phase (1), address the address.bin phase (2).
+    /// Overriding `phase:` to any other value silently corrupts the cache (an input
+    /// baked into an artifact whose fingerprint never hashes it, or an input hashed
+    /// but never ingested), so a non-matching value is rejected at config load.
+    fn expected_phase(&self) -> u8 {
+        match self {
+            Ingestor::OsmPbf(_) | Ingestor::DemBelgianLambert2008(_) => 0,
+            Ingestor::GtfsGeneric(_) | Ingestor::GtfsStib(_) | Ingestor::GtfsSncb(_) => 1,
+            Ingestor::AddressBestAdd(_) => 2,
+        }
+    }
+
+    fn explicit_phase(&self) -> Option<u8> {
+        match self {
+            Ingestor::OsmPbf(i) => i.phase,
+            Ingestor::GtfsGeneric(i) | Ingestor::GtfsStib(i) => i.phase,
+            Ingestor::GtfsSncb(i) => i.phase,
+            Ingestor::AddressBestAdd(i) => i.phase,
+            Ingestor::DemBelgianLambert2008(i) => i.phase,
+        }
+    }
+
+    fn validate_phase(&self) -> Result<(), String> {
+        if let Some(p) = self.explicit_phase()
+            && p != self.expected_phase()
+        {
+            return Err(format!(
+                "ingestor '{}' has unsupported phase {p} (only {} is supported for this ingestor type); \
+                 an out-of-range phase silently corrupts the build cache",
+                self.label(),
+                self.expected_phase()
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn dem_projection(&self) -> Option<DemProjection> {
+        match self {
+            Ingestor::DemBelgianLambert2008(_) => Some(DemProjection::BelgianLambert2008),
+            _ => None,
+        }
+    }
+
+    pub fn address_kind(&self) -> Option<AddressKind> {
+        match self {
+            Ingestor::AddressBestAdd(_) => Some(AddressKind::BeStAdd),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressKind {
+    BeStAdd,
 }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, String> {
         let content =
             fs::read_to_string(path).map_err(|e| format!("Failed to read config: {e}"))?;
-        serde_yaml_ng::from_str(&content).map_err(|e| format!("Failed to parse config: {e}"))
+        let mut config: Self = serde_yaml_ng::from_str(&content)
+            .map_err(|e| format!("Failed to parse config: {e}"))?;
+        config.apply_env_overrides();
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for input in &self.build.inputs {
+            input.validate_phase()?;
+        }
+        Ok(())
+    }
+
+    /// Directory for downloaded sources and build caches. Prefers `build.cache_dir`,
+    /// falling back to `auto_update.cache_dir` (for backward compatibility), then to
+    /// the `"cache"` default.
+    pub fn cache_dir(&self) -> String {
+        if let Some(dir) = &self.build.cache_dir {
+            return dir.clone();
+        }
+        self.auto_update
+            .as_ref()
+            .map(|a| a.cache_dir.clone())
+            .unwrap_or_else(default_cache_dir)
+    }
+
+    fn apply_env_overrides(&mut self) {
+        if let Ok(host) = std::env::var("MAAS_HOST") {
+            if !host.is_empty() {
+                self.server.host = host;
+            }
+        }
+        if let Ok(port) = std::env::var("MAAS_PORT") {
+            match port.parse::<u16>() {
+                Ok(port) => self.server.port = port,
+                Err(_) => {
+                    tracing::warn!("ignoring invalid MAAS_PORT '{port}' (not a u16)");
+                }
+            }
+        }
     }
 }
 
@@ -1079,8 +1157,34 @@ mod tests {
     #[test]
     fn server_config_defaults() {
         let cfg: ServerConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8000);
+        assert_eq!(cfg.graphql_max_depth, 15);
+        assert_eq!(cfg.graphql_max_complexity, 1000);
+        assert!(!cfg.graphiql_enabled);
+        assert_eq!(cfg.tiles.url, "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png");
+        assert_eq!(cfg.tiles.attribution, "© OpenStreetMap contributors");
+    }
+
+    #[test]
+    fn server_config_hardening_overrides() {
+        let yaml = r#"
+host: "0.0.0.0"
+port: 8000
+graphql_max_depth: 8
+graphql_max_complexity: 250
+graphiql_enabled: false
+tiles:
+  url: "https://tiles.example.com/{z}/{x}/{y}.png"
+  attribution: "© Example"
+"#;
+        let cfg: ServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.host, "0.0.0.0");
-        assert_eq!(cfg.port, 3000);
+        assert_eq!(cfg.graphql_max_depth, 8);
+        assert_eq!(cfg.graphql_max_complexity, 250);
+        assert!(!cfg.graphiql_enabled);
+        assert_eq!(cfg.tiles.url, "https://tiles.example.com/{z}/{x}/{y}.png");
+        assert_eq!(cfg.tiles.attribution, "© Example");
     }
 
     #[test]
@@ -1089,6 +1193,43 @@ mod tests {
         let cfg: ServerConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn env_vars_override_loaded_server_bind() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+server:
+  host: 127.0.0.1
+  port: 8000
+default_routing: {}
+"#;
+        let dir = std::env::temp_dir().join(format!("maas_env_override_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let baseline = Config::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(baseline.server.host, "127.0.0.1");
+        assert_eq!(baseline.server.port, 8000);
+
+        unsafe {
+            std::env::set_var("MAAS_HOST", "0.0.0.0");
+            std::env::set_var("MAAS_PORT", "9999");
+        }
+        let overridden = Config::load(path.to_str().unwrap()).unwrap();
+        unsafe {
+            std::env::remove_var("MAAS_HOST");
+            std::env::remove_var("MAAS_PORT");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(overridden.server.host, "0.0.0.0");
+        assert_eq!(overridden.server.port, 9999);
     }
 
     #[test]
@@ -1102,9 +1243,53 @@ build:
 default_routing: {}
 "#;
         let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(cfg.server.host, "0.0.0.0");
-        assert_eq!(cfg.server.port, 3000);
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.server.port, 8000);
         assert_eq!(cfg.build.elevation_smoothing_epsilon, 4.0);
+    }
+
+    #[test]
+    fn minimal_config_needs_only_build_inputs() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(cfg.build.output, "graph.bin", "output defaults to graph.bin");
+        assert_eq!(cfg.build.osm_output, "osm.bin");
+        assert_eq!(cfg.build.address_output, "address.bin");
+        assert!(cfg.default_routing.walking_speed_mps.is_none());
+        assert_eq!(cfg.server.port, 8000);
+        assert_eq!(cfg.build.inputs.len(), 1);
+    }
+
+    #[test]
+    fn address_output_parses_and_defaults() {
+        let without = r#"
+build:
+  inputs: []
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(without).unwrap();
+        assert_eq!(cfg.build.address_output, "address.bin");
+
+        let with = r#"
+build:
+  inputs: []
+  address_output: address.belgium.bin
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(with).unwrap();
+        assert_eq!(cfg.build.address_output, "address.belgium.bin");
+    }
+
+    #[test]
+    fn auto_update_schedule_defaults_when_absent() {
+        let yaml = "enabled: true";
+        let au: AutoUpdateConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(au.enabled);
+        assert_eq!(au.schedule, "0 5 * * *", "schedule defaults when omitted");
+        assert_eq!(au.cache_dir, "cache");
     }
 
     #[test]
@@ -1319,6 +1504,48 @@ headers:
     }
 
     #[test]
+    fn cache_dir_resolves_from_build_auto_update_or_default() {
+        let base = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+"#;
+        // Neither location set → default "cache".
+        let cfg: Config = serde_yaml_ng::from_str(base).unwrap();
+        assert_eq!(cfg.cache_dir(), "cache");
+
+        // Legacy: auto_update.cache_dir is honoured (backward compatibility).
+        let legacy = format!("{base}auto_update:\n  cache_dir: \"legacy_cache\"\n");
+        let cfg: Config = serde_yaml_ng::from_str(&legacy).unwrap();
+        assert_eq!(cfg.cache_dir(), "legacy_cache");
+
+        // New: build.cache_dir is honoured.
+        let build_only = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+  cache_dir: "build_cache"
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(build_only).unwrap();
+        assert_eq!(cfg.cache_dir(), "build_cache");
+
+        // Both set: build.cache_dir wins over auto_update.cache_dir.
+        let both = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/test.pbf"
+  cache_dir: "build_cache"
+auto_update:
+  cache_dir: "legacy_cache"
+"#;
+        let cfg: Config = serde_yaml_ng::from_str(both).unwrap();
+        assert_eq!(cfg.cache_dir(), "build_cache");
+    }
+
+    #[test]
     fn realtime_config_parses_both_feed_kinds() {
         let yaml = r#"
 enabled: true
@@ -1495,8 +1722,8 @@ feeds:
     }
 
     #[test]
-    fn shipped_config_yaml_has_stib_fares_enabled() {
-        let cfg = Config::load("config.yaml").expect("config.yaml must parse");
+    fn shipped_belgium_config_has_stib_fares_enabled() {
+        let cfg = Config::load("presets/belgium.yaml").expect("presets/belgium.yaml must parse");
         let fares = cfg
             .default_routing
             .fares
@@ -1546,8 +1773,8 @@ feeds:
     }
 
     #[test]
-    fn shipped_config_yaml_cadence_is_quota_safe() {
-        let cfg = Config::load("config.yaml").expect("config.yaml must parse");
+    fn shipped_belgium_config_cadence_is_quota_safe() {
+        let cfg = Config::load("presets/belgium.yaml").expect("presets/belgium.yaml must parse");
         if let Some(rt) = cfg.realtime.filter(|r| r.enabled && !r.feeds.is_empty()) {
             let (per_min, per_day) = rt.request_rate();
             assert!(
@@ -1558,6 +1785,15 @@ feeds:
                 rt.rate_limit.max_requests_per_day,
             );
         }
+    }
+
+    #[test]
+    fn shipped_generic_config_parses() {
+        let cfg = Config::load("config.yaml").expect("config.yaml must parse");
+        assert_eq!(cfg.build.output, "graph.bin", "generic output defaults to graph.bin");
+        assert!(cfg.default_routing.fares.is_none(), "generic config has no fares block");
+        assert!(cfg.realtime.is_none(), "generic config has no realtime block");
+        assert!(!cfg.build.inputs.is_empty(), "generic config has at least one input");
     }
 
     #[test]
@@ -1971,5 +2207,201 @@ fares:
         let a = CostVector::from_active(&[Axis::Time], &[100.0]);
         let b = CostVector::from_active(&[Axis::Time], &[101.0]);
         assert!(a.eps_dominates(&b, &eps), "time slack 2.0 covers a 1.0 gap");
+    }
+
+    #[test]
+    fn dem_ingestor_parses_phase_and_projection() {
+        let yaml = r#"
+ingestor: dem/belgian-lambert-2008
+url: "path:data/dem.tif"
+"#;
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(matches!(ing, Ingestor::DemBelgianLambert2008(_)));
+        assert_eq!(ing.phase(), 0);
+        assert_eq!(ing.label(), "dem");
+        assert!(matches!(
+            ing.dem_projection(),
+            Some(DemProjection::BelgianLambert2008)
+        ));
+    }
+
+    #[test]
+    fn dem_ingestor_honours_custom_name_and_phase() {
+        let yaml = r#"
+ingestor: dem/belgian-lambert-2008
+name: dtm20
+phase: 3
+url: "path:data/dem.tif"
+"#;
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(ing.label(), "dtm20");
+        assert_eq!(ing.phase(), 3);
+    }
+
+    #[test]
+    fn address_bestadd_ingestor_parses_tag_and_kind() {
+        let yaml = r#"
+ingestor: address/bestadd
+name: bestadd
+url: "path:data/bestadd.zip"
+"#;
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(matches!(ing, Ingestor::AddressBestAdd(_)));
+        assert_eq!(ing.phase(), 2);
+        assert_eq!(ing.label(), "bestadd");
+        assert_eq!(ing.cache_filename(), "bestadd.zip");
+        assert_eq!(ing.address_kind(), Some(AddressKind::BeStAdd));
+        assert!(ing.dem_projection().is_none());
+    }
+
+    #[test]
+    fn non_address_ingestor_has_no_address_kind() {
+        let yaml = r#"
+ingestor: osm/pbf
+url: "path:data/belgium.pbf"
+"#;
+        let ing: Ingestor = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(ing.address_kind(), None);
+    }
+
+    #[test]
+    fn cache_filename_is_slash_free_and_stable() {
+        let osm: Ingestor = serde_yaml_ng::from_str(
+            "ingestor: osm/pbf\nurl: \"https://example.com/x\"",
+        )
+        .unwrap();
+        assert_eq!(osm.label(), "osm/pbf");
+        assert!(osm.cache_filename().starts_with("osm."));
+        assert!(osm.cache_filename().ends_with(".pbf"));
+        assert!(!osm.cache_filename().contains('/'));
+
+        let dem: Ingestor = serde_yaml_ng::from_str(
+            "ingestor: dem/belgian-lambert-2008\nurl: \"https://example.com/d.tif\"",
+        )
+        .unwrap();
+        assert!(dem.cache_filename().starts_with("dem."));
+        assert!(dem.cache_filename().ends_with(".tif"));
+        assert!(!dem.cache_filename().contains('/'));
+
+        let stib: Ingestor = serde_yaml_ng::from_str(
+            "ingestor: gtfs/stib\nname: STIB\nurl: \"https://example.com/s\"",
+        )
+        .unwrap();
+        assert!(stib.cache_filename().starts_with("STIB."));
+        assert!(stib.cache_filename().ends_with(".zip"));
+    }
+
+    #[test]
+    fn cache_filename_local_path_is_fixed_name() {
+        let osm: Ingestor =
+            serde_yaml_ng::from_str("ingestor: osm/pbf\nurl: \"path:data/belgium.pbf\"").unwrap();
+        assert_eq!(osm.cache_filename(), "osm.pbf");
+        let stib: Ingestor =
+            serde_yaml_ng::from_str("ingestor: gtfs/stib\nname: STIB\nurl: \"path:data/s.zip\"")
+                .unwrap();
+        assert_eq!(stib.cache_filename(), "STIB.zip");
+    }
+
+    #[test]
+    fn cache_filename_differs_by_url_and_is_stable() {
+        let mk = |url: &str| -> Ingestor {
+            serde_yaml_ng::from_str(&format!("ingestor: osm/pbf\nurl: \"{url}\"")).unwrap()
+        };
+        let a = mk("https://example.com/luxembourg.pbf");
+        let b = mk("https://example.com/belgium.pbf");
+        assert_ne!(
+            a.cache_filename(),
+            b.cache_filename(),
+            "different remote urls must map to different cache files"
+        );
+        assert_eq!(
+            a.cache_filename(),
+            mk("https://example.com/luxembourg.pbf").cache_filename(),
+            "same remote url must be stable"
+        );
+    }
+
+    #[test]
+    fn cache_filename_hashes_pre_interpolation_url() {
+        let raw = mk_osm("https://example.com/${SECRET_TOKEN}/data.pbf");
+        assert!(
+            !raw.cache_filename().contains("SECRET_TOKEN"),
+            "cache filename must not leak the raw placeholder verbatim beyond the hash"
+        );
+        assert_eq!(
+            raw.cache_filename(),
+            mk_osm("https://example.com/${SECRET_TOKEN}/data.pbf").cache_filename(),
+            "hash is over the pre-interpolation url form and is stable"
+        );
+    }
+
+    fn mk_osm(url: &str) -> Ingestor {
+        serde_yaml_ng::from_str(&format!("ingestor: osm/pbf\nurl: \"{url}\"")).unwrap()
+    }
+
+    fn write_config(yaml: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir()
+            .join(format!("maas_cfg_phase_{}_{}", std::process::id(), rand_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        (path.clone(), path.to_str().unwrap().to_string())
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    #[test]
+    fn config_load_rejects_out_of_range_gtfs_phase() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: gtfs/generic
+      name: bus
+      url: "path:data/bus.zip"
+      phase: 2
+default_routing: {}
+"#;
+        let (_p, path) = write_config(yaml);
+        let err = Config::load(&path).unwrap_err();
+        assert!(
+            err.contains("phase"),
+            "unsupported phase must be rejected at load, got: {err}"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_default_phases() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: osm/pbf
+      url: "path:data/x.pbf"
+    - ingestor: gtfs/generic
+      name: bus
+      url: "path:data/bus.zip"
+    - ingestor: address/bestadd
+      url: "path:data/a.zip"
+default_routing: {}
+"#;
+        let (_p, path) = write_config(yaml);
+        assert!(Config::load(&path).is_ok());
+    }
+
+    #[test]
+    fn config_load_accepts_explicit_matching_phase() {
+        let yaml = r#"
+build:
+  inputs:
+    - ingestor: gtfs/generic
+      name: bus
+      url: "path:data/bus.zip"
+      phase: 1
+default_routing: {}
+"#;
+        let (_p, path) = write_config(yaml);
+        assert!(Config::load(&path).is_ok());
     }
 }

@@ -1,30 +1,12 @@
-//! Blocking HTTP fetcher with a shared rate limiter for realtime polling.
-//!
-//! All realtime feeds hit the same provider gateway (shared `BMC_PARTNER_KEY`,
-//! ~8 req/min / 12k/day). The gateway signals quota-exceeded with HTTP `403`
-//! ("Out of call volume quota"), and momentary rate breaches with `429`. One
-//! [`Fetcher`] paces every request through a single [`RateLimiter`]; a run of
-//! throttle responses (`403`/`429`) engages a backoff that makes all feeds
-//! **skip** their requests — issuing only one probe per `throttled_min_interval`
-//! until a request succeeds — instead of hammering the gateway. Runs in the
-//! poller's `spawn_blocking` context.
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::ingestion::secrets::interpolate;
 
-/// Outcome of a fetch attempt, so the poller can tell a throttle skip (silent,
-/// expected during a quota backoff) from a genuine failure it should log.
 #[derive(Debug)]
 pub enum FetchError {
-    /// No request was issued (limiter is backing off), or the gateway answered
-    /// with a throttle status (403/429). The poller skips this feed silently —
-    /// the limiter itself logs the throttle transition once per episode.
     Throttled,
-    /// A request was issued and failed for a non-throttle reason (network,
-    /// timeout, parse, or an unexpected status). The poller logs these.
     Failed(String),
 }
 
@@ -45,29 +27,19 @@ impl std::fmt::Display for FetchError {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitConfig {
-    /// Consecutive throttle responses (403/429) before all feeds start skipping.
     pub consecutive_failure_threshold: u32,
-    /// While throttled, at most one probe request is issued per this interval.
     pub throttled_min_interval: Duration,
 }
 
-/// Result of asking the limiter for permission to issue a request.
 enum Permit {
-    /// Go ahead and issue the request.
     Proceed,
-    /// Skip: throttled and still inside the current backoff window.
     Skip,
 }
 
 struct LimiterState {
-    /// When a request was last actually issued (a proceed/probe). Used to space
-    /// probes while throttled. A skip does not update it.
     last_request: Option<Instant>,
     consecutive_failures: u32,
     throttled: bool,
-    /// When the throttle body was last logged. The body WARN is rate-limited to
-    /// once per `throttled_min_interval` so a sustained 403 (even one persistently
-    /// failing feed among healthy ones) never storms the log.
     last_body_log: Option<Instant>,
 }
 
@@ -89,8 +61,6 @@ impl RateLimiter {
         }
     }
 
-    /// Decide whether to issue the next request. While throttled, all requests
-    /// are skipped except one probe per `throttled_min_interval`. Never sleeps.
     fn acquire(&self) -> Permit {
         let mut st = self.state.lock().unwrap();
         if st.throttled
@@ -103,9 +73,6 @@ impl RateLimiter {
         Permit::Proceed
     }
 
-    /// Record a throttle response (403/429). Increments the failure counter,
-    /// logs the gateway body once per episode (it distinguishes quota-exceeded
-    /// from an invalid key), and engages the throttle at the threshold.
     fn on_throttle(&self, status: u16, body: Option<&str>) {
         let mut st = self.state.lock().unwrap();
         st.consecutive_failures += 1;
@@ -151,7 +118,6 @@ impl RateLimiter {
     }
 }
 
-/// Shared blocking HTTP client honoring the rate limiter.
 pub struct Fetcher {
     limiter: RateLimiter,
     timeout: Duration,
@@ -165,10 +131,8 @@ impl Fetcher {
         }
     }
 
-    /// GET `url` with interpolated headers, returning the body bytes. The URL and
-    /// header values may contain `${VAR}`/`${file:}` secrets; resolved values are
-    /// never logged. Returns [`FetchError::Throttled`] when the limiter is backing
-    /// off or the gateway answers 403/429, so the caller skips silently.
+    /// The URL and header values may contain `${VAR}`/`${file:}` secrets; resolved
+    /// values must never be logged.
     pub fn get(
         &self,
         url: &str,
@@ -199,8 +163,24 @@ impl Fetcher {
                 self.limiter.on_throttle(status, body.as_deref());
                 Err(FetchError::Throttled)
             }
-            Err(e) => Err(FetchError::Failed(format!("realtime fetch failed: {e}"))),
+            Err(e) => Err(FetchError::Failed(format!(
+                "realtime fetch failed: {}",
+                redact_ureq_error(&e)
+            ))),
         }
+    }
+}
+
+// A ureq error's Display can embed the resolved (secret-bearing) URL, which must
+// never be logged. Drop everything from the first URL token onward.
+fn redact_ureq_error(e: &ureq::Error) -> String {
+    redact_url_in(&e.to_string())
+}
+
+fn redact_url_in(s: &str) -> String {
+    match s.find("http://").or_else(|| s.find("https://")) {
+        Some(i) => format!("{}<url redacted>", &s[..i]),
+        None => s.to_string(),
     }
 }
 
@@ -257,6 +237,14 @@ mod tests {
         assert!(!rl.is_throttled());
         assert_eq!(rl.state.lock().unwrap().consecutive_failures, 0);
         assert!(!rl.would_skip(), "throttle lifted → requests proceed again");
+    }
+
+    #[test]
+    fn redact_url_in_strips_secret_bearing_url() {
+        let leaked = "Network Error: https://gw.example/rt?subscription-key=SECRET for url";
+        let s = redact_url_in(leaked);
+        assert!(!s.contains("SECRET"), "key must not survive: {s}");
+        assert!(!s.contains("https://"), "no raw URL: {s}");
     }
 
     #[test]

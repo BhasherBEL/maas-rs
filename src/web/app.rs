@@ -7,8 +7,10 @@ use async_graphql::{
 use async_graphql_poem::GraphQL;
 use chrono::{Local, NaiveDate, NaiveTime};
 use poem::{
-    IntoResponse, Response, Result, Route, Server, get, handler, listener::TcpListener, web::Html,
+    EndpointExt, IntoResponse, Response, Result, Route, Server, get, handler,
+    listener::TcpListener, middleware::SizeLimit, web::Html,
 };
+use tokio::sync::Semaphore;
 
 use crate::{
     ingestion::realtime::ServiceAlert,
@@ -21,23 +23,82 @@ use crate::{
     },
 };
 
-/// Hot-swappable handle to the sibling Belgian address index, mirroring
-/// `SharedRealtime`/`SharedGraph` so a future feed reload can swap it atomically.
 pub type SharedAddressIndex = Arc<arc_swap::ArcSwap<AddressIndex>>;
 
-/// Opaque wrapper so `VehiclePositionMaxAgeSecs` has a unique `TypeId` in the schema
-/// context — prevents collision with any other `u64` data item.
+/// Opaque wrapper so this has a unique `TypeId` in the schema context, preventing
+/// collision with any other `u64` data item.
 struct VehiclePositionMaxAgeSecs(u64);
 
-// ---------------------------------------------------------------------------
-// GTFS catalogue types — used for initial data sync by the Flutter client
-// ---------------------------------------------------------------------------
+const HEAVY_QUERY_PERMITS: usize = 4;
+
+const HEAVY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Enforced ceiling on the GraphQL complexity limit regardless of the configured
+/// value. Guarantees a batch of aliased heavy fields is rejected even if the
+/// config value is raised.
+const MAX_COMPLEXITY_CEILING: usize = 2000;
+
+const MAX_WINDOW_MINUTES: i32 = 1440;
+const MAX_WALK_RADIUS_SECS: i32 = 3600;
+const MAX_ARRIVAL_SLACK_SECS: i32 = 7200;
+const MAX_TRAVEL_MAP_SECONDS: i32 = 4 * 3600;
+
+struct HeavyQueryLimiter(Arc<Semaphore>);
+
+fn reject_over(name: &str, value: i32, max: i32) -> Result<(), Error> {
+    if value > max {
+        return Err(Error::new(format!("{name} must be <= {max}")));
+    }
+    Ok(())
+}
+
+async fn run_heavy<T, F>(ctx: &Context<'_>, f: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    let sem = ctx.data::<HeavyQueryLimiter>()?.0.clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new("routing limiter unavailable"))?;
+    let mut handle = tokio::task::spawn_blocking(f);
+    match tokio::time::timeout(HEAVY_QUERY_TIMEOUT, &mut handle).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Error::new("routing query failed")),
+        Err(_) => {
+            tokio::spawn(async move {
+                let _ = handle.await;
+                drop(permit);
+            });
+            Err(Error::new("routing query timed out"))
+        }
+    }
+}
+
+#[derive(Clone, async_graphql::SimpleObject)]
+pub struct WebConfig {
+    pub tile_url: String,
+    pub tile_attribution: String,
+    pub graphiql_enabled: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            tile_url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png".to_string(),
+            tile_attribution: "© OpenStreetMap contributors".to_string(),
+            graphiql_enabled: false,
+        }
+    }
+}
 
 #[derive(SimpleObject)]
 struct GtfsStop {
     id: String,
     name: String,
     lat: f64,
+    #[graphql(name = "lng")]
     lon: f64,
     mode: String,
 }
@@ -46,18 +107,16 @@ struct GtfsStop {
 struct StationLine {
     mode: String,
     short_name: String,
-    /// Line colour as a 6-character hex string (no leading `#`), or `null`.
     color: Option<String>,
-    /// Line text colour as a 6-character hex string (no leading `#`), or `null`.
     text_color: Option<String>,
 }
 
-/// A geocoded Belgian address from the BeST-Add feed, returned by `searchAddresses`.
 #[derive(SimpleObject)]
 struct Address {
     id: String,
     label: String,
     lat: f64,
+    #[graphql(name = "lng")]
     lon: f64,
     street: String,
     house_number: String,
@@ -70,6 +129,7 @@ struct GtfsStation {
     id: String,
     name: String,
     lat: f64,
+    #[graphql(name = "lng")]
     lon: f64,
     operators: Vec<String>,
     modes: Vec<String>,
@@ -83,9 +143,7 @@ struct GtfsRoute {
     short_name: String,
     long_name: String,
     mode: String,
-    /// GTFS route colour as a 6-character hex string, or `null` if not defined.
     color: Option<String>,
-    /// GTFS route text colour as a 6-character hex string, or `null` if not defined.
     text_color: Option<String>,
 }
 
@@ -97,94 +155,66 @@ struct GtfsAgency {
     routes: Vec<GtfsRoute>,
 }
 
-// ---------------------------------------------------------------------------
-// raptorExplain debug types
-// ---------------------------------------------------------------------------
-
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+#[graphql(name = "CandidateStatus")]
 enum CandidateStatusGql {
-    /// Plan survived all filters and is in the final result.
     Kept,
-    /// This RAPTOR round produced no arrival improvement.
     NotImproving,
-    /// Plan reconstruction returned zero legs for this round.
     ReconstructionEmpty,
-    /// Dropped by the extreme-risk filter.
     ExtremeRisk,
-    /// Dominated in (departure↑, arrival↓, transfers↓) by another plan.
     ParetoDominated,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "PlanCandidate")]
 struct PlanCandidateGql {
-    /// RAPTOR round (0 = walk-only reach; transfer count = round - 1).
     round: i32,
-    /// Departure time of the RAPTOR pass that produced this candidate (seconds since midnight).
     origin_departure: i32,
-    /// The reconstructed plan. `null` for NOT_IMPROVING and RECONSTRUCTION_EMPTY.
     plan: Option<Plan>,
     status: CandidateStatusGql,
-    /// Index into `candidates` of the dominating plan. Set only when status is PARETO_DOMINATED.
     dominator_index: Option<i32>,
-    /// Dominator departs later than this plan (true = this plan had an earlier departure but still lost).
     dominator_departs_later: Option<bool>,
-    /// Dominator arrives earlier than this plan (true = this plan has a worse arrival time).
     dominator_arrives_earlier: Option<bool>,
-    /// Dominator uses fewer transfers than this plan.
     dominator_fewer_transfers: Option<bool>,
-    /// Dominator is more reliable (higher reliability bucket) than this plan.
     dominator_higher_reliability: Option<bool>,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "AccessInfo")]
 struct AccessInfoGql {
     walk_radius_secs: i32,
     walk_radius_meters: i32,
     origin_stops_found: i32,
     destination_stops_found: i32,
-    /// How many times the walk radius doubled before a result was found.
     access_attempts: i32,
-    /// True when transit routing failed and a walk-only plan was returned instead.
     fell_back_to_walk_only: bool,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "StopPathLeg")]
 struct StopPathLegGql {
-    /// `true` = transit leg on a scheduled route, `false` = walk.
     is_transit: bool,
-    /// Route short name for transit legs; empty string for walk legs.
     route_label: String,
-    /// Waypoints: boarding → intermediate stops → alighting (transit), or just endpoints (walk).
     geometry: Vec<PlanCoordinate>,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "StopReach")]
 struct StopReachGql {
     stop_idx: i32,
-    /// 0 = walk-access reach; k≥1 = reached after k transit legs.
     round: i32,
     arrival_secs: i32,
     lat: f64,
+    #[graphql(name = "lng")]
     lon: f64,
     name: String,
-    /// Ordered sequence of legs that RAPTOR followed from origin to this stop.
     path: Vec<StopPathLegGql>,
 }
 
-// ---------------------------------------------------------------------------
-// travelTimeMap (isochrone / one-to-many reachability) types
-// ---------------------------------------------------------------------------
-
-/// Per-cell aggregation across a departure window.
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
 #[graphql(name = "TravelAggregation")]
 enum TravelAggregationGql {
-    /// Best (minimum) travel time across the sampled departures ("if you time it
-    /// perfectly"). The default; matches a single-departure isochrone.
     Best,
-    /// Mean travel time across the sampled departures ("on an average departure").
-    /// Departures on which a cell is unreachable within `maxSeconds` count as
-    /// `maxSeconds`, so a sometimes-reachable cell reads as slower, not faster.
     Average,
 }
 
@@ -197,8 +227,6 @@ impl From<TravelAggregationGql> for crate::structures::TravelAggregation {
     }
 }
 
-/// One sampled reachability cell: a coordinate and the travel time (seconds) to
-/// reach it from the centre at the query departure.
 #[derive(SimpleObject)]
 struct TravelCell {
     lat: f64,
@@ -206,11 +234,8 @@ struct TravelCell {
     seconds: i32,
 }
 
-/// A travel-time map: sampled reachability cells plus the query echo the client
-/// needs to paint a green(0)->red(maxSeconds) heatmap.
 #[derive(SimpleObject)]
 struct TravelTimeMap {
-    /// Sampled cells reachable within `maxSeconds`; cells beyond it are omitted.
     cells: Vec<TravelCell>,
     max_seconds: i32,
     center_lat: f64,
@@ -219,17 +244,11 @@ struct TravelTimeMap {
 
 #[derive(SimpleObject)]
 struct RaptorExplainResult {
-    /// Same plans as the `raptor` query would return for identical parameters.
     plans: Vec<Plan>,
-    /// Every candidate considered across all RAPTOR rounds, including filtered ones.
     candidates: Vec<PlanCandidateGql>,
     access: AccessInfoGql,
-    /// All transit stops that received a RAPTOR label, tagged with the first
-    /// round they were reached.  Round 0 = access walk reach.
     stops_reached: Vec<StopReachGql>,
-    /// Snapped origin coordinates (the OSM node the router actually used).
     origin: PlanCoordinate,
-    /// Snapped destination coordinates.
     destination: PlanCoordinate,
 }
 
@@ -317,75 +336,45 @@ fn parse_date_time(
     Ok((parsed_date, parsed_time))
 }
 
-/// One earlier/later departure alternative for a single transit leg.
 #[derive(SimpleObject)]
 struct AltDeparture {
-    /// Boarding time of the alternative (seconds since midnight).
     start: i32,
-    /// Alighting time of the alternative (seconds since midnight).
     end: i32,
-    /// Outbound swap reliability: chance the rest of the journey still works if you
-    /// take this departure instead, everything else fixed. `null` when unscored.
     reliability: Option<f64>,
 }
 
-/// Earlier and later alternatives for one transit leg, computed on demand.
 #[derive(SimpleObject)]
 struct LegAlternatives {
     previous: Vec<AltDeparture>,
     next: Vec<AltDeparture>,
 }
 
-// ---------------------------------------------------------------------------
-// liveRefresh: stateless realtime overlay for a client-selected journey
-// ---------------------------------------------------------------------------
-
-/// One transit leg of the user's selected journey, identified by stable GTFS
-/// handles (not plan/leg indices) so the lookup is stable across polls.
 #[derive(InputObject)]
 struct LiveLegInput {
-    /// GTFS `trip_id` of the boarded vehicle.
     trip_id: String,
-    /// GTFS `stop_id` where the user boards.
     board_stop_id: String,
-    /// GTFS `stop_id` where the user alights.
     alight_stop_id: String,
 }
 
-/// A position aboard a transit trip, used to re-plan from the user's CURRENT
-/// onboard location. Supplied to `onboardRaptor` as the origin; the destination
-/// stays `toLat`/`toLng`.
 #[derive(async_graphql::InputObject)]
 struct OnboardOriginInput {
-    /// GTFS `trip_id` of the boarded vehicle.
     trip_id: String,
-    /// Optional GTFS `stop_id` of the last stop passed (advisory).
     from_stop_id: Option<String>,
-    /// Optional pattern position of the last stop passed (advisory).
     from_stop_seq: Option<i32>,
 }
 
-/// Realtime status of one selected leg. `NotFound` means a handle did not
-/// resolve against the live graph (unknown trip/stop, or the trip does not serve
-/// the two stops in order).
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+#[graphql(name = "LiveStatus")]
 enum LiveStatusGql {
-    /// No realtime information for this trip at the boarding stop.
     NoData,
-    /// Reported exactly on schedule at the boarding stop.
     OnTime,
-    /// Reported off schedule (see `delaySecs`).
     Delayed,
-    /// Reported CANCELED — the trip will not run.
     Canceled,
-    /// A handle did not resolve; times are `null`.
     NotFound,
 }
 
-/// A service alert that applies to a transit leg at the time of the query.
-/// `cause` and `effect` are human-readable strings derived from the GTFS-RT
-/// protobuf enum values; `null` when the feed omitted the field.
 #[derive(SimpleObject)]
+#[graphql(name = "LiveAlert")]
 struct LiveAlertGql {
     header: Option<String>,
     description: Option<String>,
@@ -393,7 +382,6 @@ struct LiveAlertGql {
     effect: Option<String>,
 }
 
-/// Convert a GTFS-RT `Cause` i32 to a human-readable string.
 fn cause_label(v: i32) -> &'static str {
     match v {
         1 => "UNKNOWN_CAUSE",
@@ -413,7 +401,6 @@ fn cause_label(v: i32) -> &'static str {
     }
 }
 
-/// Convert a GTFS-RT `Effect` i32 to a human-readable string.
 fn effect_label(v: i32) -> &'static str {
     match v {
         1 => "NO_SERVICE",
@@ -440,135 +427,78 @@ fn map_alert(alert: &ServiceAlert) -> LiveAlertGql {
     }
 }
 
-/// A realtime platform reassignment: the RT feed reports a different platform
-/// from the one in the static schedule. `from` is the scheduled platform code,
-/// `to` is the actual platform code as reported by the realtime feed.
 #[derive(SimpleObject)]
+#[graphql(name = "PlatformChange")]
 struct PlatformChangeGql {
     from: String,
     to: String,
 }
 
-/// Resolved position of the vehicle operating a transit leg, or `null` when the
-/// realtime index holds no position for that trip.
 #[derive(SimpleObject)]
+#[graphql(name = "LiveVehicle")]
 struct LiveVehicleGql {
     lat: f64,
     lng: f64,
-    /// Bearing in degrees clockwise from north, or `null` when not reported.
     bearing: Option<f64>,
-    /// Unix epoch seconds of the observation as reported by the realtime feed.
-    /// 0 when the feed provided no per-record timestamp.
     observed_at: i64,
-    /// True when `(now − observed_at) > vehicle_position_max_age_secs`.
     stale: bool,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "LiveLeg")]
 struct LiveLegGql {
-    /// Echo of the input `trip_id`.
     trip_id: String,
-    /// False when a handle did not resolve; all time fields are then `null`.
     found: bool,
     status: LiveStatusGql,
-    /// Realtime delay at the boarding stop (seconds, positive = late). 0 when no
-    /// data, canceled, or not found.
     delay_secs: i32,
-    /// Scheduled boarding time (seconds since midnight). `null` when not found.
     scheduled_start: Option<i32>,
-    /// Scheduled alighting time. `null` when not found.
     scheduled_end: Option<i32>,
-    /// Realtime boarding time = `scheduled_start + delay(trip, board)`. `null` when not found.
     realtime_start: Option<i32>,
-    /// Realtime alighting time = `scheduled_end + delay(trip, alight)`. `null` when not found.
     realtime_end: Option<i32>,
-    /// Latest known vehicle position for this trip, or `null` when not available.
     vehicle: Option<LiveVehicleGql>,
-    /// Service alerts currently active that are relevant to this leg (matching
-    /// trip or board/alight stop). Empty when none apply or the index holds no
-    /// alerts.
     alerts: Vec<LiveAlertGql>,
-    /// Realtime platform change at the boarding stop, or `null` when the RT feed
-    /// confirms the scheduled platform (or provides no platform info).
     platform_change_board: Option<PlatformChangeGql>,
-    /// Realtime platform change at the alighting stop, or `null` when confirmed
-    /// or unknown.
     platform_change_alight: Option<PlatformChangeGql>,
 }
 
 #[derive(SimpleObject)]
+#[graphql(name = "LiveTransfer")]
 struct LiveTransferGql {
-    /// Index (into `legs`) of the arriving (feeder) leg; the user boards `legs[fromLegIndex + 1]`.
     from_leg_index: i32,
-    /// Realtime arrival of the feeder leg at the transfer stop (seconds since midnight).
     realtime_arrival: i32,
-    /// Realtime departure of the boarded leg.
     realtime_departure: i32,
-    /// `realtime_departure − realtime_arrival`. Negative = the connection is broken.
     margin_secs: i32,
-    /// Probability of making the connection given the current realtime margin and the
-    /// feeder/boarding delay models. `null` when a leg is unresolved or the feeder
-    /// route type has no delay model.
     reliability: Option<f64>,
 }
 
-/// Realtime overlay of a client-selected journey. Computed purely by indexing the
-/// static schedule and the live `RealtimeIndex` by GTFS handles — no routing,
-/// no RAPTOR, no plan re-optimisation — so it is stable across polls.
 #[derive(SimpleObject)]
+#[graphql(name = "LivePlan")]
 struct LivePlanGql {
     legs: Vec<LiveLegGql>,
-    /// One entry per interior transfer where both adjacent legs resolved.
     transfers: Vec<LiveTransferGql>,
-    /// Realtime arrival at the final alighting stop (seconds since midnight).
-    /// `null` when the last leg did not resolve.
     eta: Option<i32>,
-    /// Scheduled arrival at the final alighting stop. `null` when unresolved.
     scheduled_eta: Option<i32>,
-    /// Unix seconds the realtime snapshot was generated (0 for the inert index).
     generated_at: i64,
 }
 
-/// One same-station backup departure: another trip leaving the same boarding
-/// stop and reaching the same alighting stop as the user's selected leg, possibly
-/// on a different route. Resolved purely by GTFS handle + the live `RealtimeIndex`,
-/// so it is stable across polls. Times are seconds since midnight.
 #[derive(SimpleObject)]
+#[graphql(name = "StationBackup")]
 struct StationBackupGql {
-    /// GTFS `trip_id` of the backup (a stable handle the client can act on).
     trip_id: String,
-    /// Echo of the boarding `stop_id` (same station as the selected leg).
     board_stop_id: String,
-    /// Echo of the alighting `stop_id` (same downstream place).
     alight_stop_id: String,
-    /// Route short name (line label), if known.
     route_short_name: Option<String>,
-    /// Route long name, if known.
     route_long_name: Option<String>,
-    /// Route mode string (e.g. `"Bus"`, `"Tram"`), if known.
     mode: Option<String>,
-    /// GTFS route colour as a 6-character hex string, or `null`.
     route_color: Option<String>,
-    /// True when this backup runs on the SAME route as the selected leg.
     same_line: bool,
-    /// Scheduled boarding time (seconds since midnight).
     scheduled_departure: i32,
-    /// Scheduled alighting time.
     scheduled_arrival: i32,
-    /// Realtime boarding time = scheduled + delay(trip, board). Equals scheduled
-    /// when there is no live data.
     realtime_departure: i32,
-    /// Realtime alighting time = scheduled + delay(trip, alight).
     realtime_arrival: i32,
-    /// Catch reliability of THIS backup given you are ready on the platform at
-    /// your original (realtime) departure time — the probability its own delay
-    /// distribution still lets it depart no earlier than that ready time. This is
-    /// per-backup catch probability, NOT whole-journey reliability. `null` when
-    /// the backup's route type has no delay model.
     reliability: Option<f64>,
 }
 
-/// Per-highway cost-factor overrides; every field optional (sparse merge).
 #[derive(InputObject, Default)]
 struct HighwayFactorsInput {
     trunk: Option<f64>,
@@ -654,8 +584,6 @@ impl HighwayFactorsInput {
     }
 }
 
-/// Passenger category (GraphQL enum). `YOUNG`/`SENIOR`/`BIM` are the "reduced"
-/// categories driving TEC reduced pricing and SNCB reductions/caps.
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Default)]
 enum PassengerCategoryInput {
     #[default]
@@ -677,7 +605,6 @@ impl PassengerCategoryInput {
     }
 }
 
-/// SNCB travel class (default `Second`). Affects ONLY SNCB fares.
 #[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq, Default)]
 enum TravelClassInput {
     #[default]
@@ -695,30 +622,16 @@ impl TravelClassInput {
     }
 }
 
-/// Pre-committed user fare profile: passenger category plus held products. FIXED
-/// per query, so every boarding's marginal fare is deterministic. An absent
-/// profile means "full single-ticket adult price, no products". All fields
-/// optional; camelCase in GraphQL (spec Appendix A.1).
 #[derive(InputObject, Default)]
 struct FareProfileInput {
-    /// `ADULT` | `YOUNG` | `SENIOR` | `BIM` (default `ADULT`).
     passenger_category: Option<PassengerCategoryInput>,
-    /// A subscription makes that operator's legs free (0).
     stib_subscription: Option<bool>,
     delijn_subscription: Option<bool>,
     tec_subscription: Option<bool>,
     sncb_subscription: Option<bool>,
-    /// SNCB Train+ advantage card.
     sncb_train_plus: Option<bool>,
-    /// De Lijn 10-journey card.
     delijn10_journey: Option<bool>,
-    /// TEC 6-journey card.
     tec6_journey: Option<bool>,
-    /// SNCB travel class (`SECOND` default | `FIRST`). Affects ONLY SNCB fares.
-    ///
-    /// NOTE: the Brussels multi-operator pass is NOT a user option. It is applied
-    /// automatically as a post-hoc cap on the Brussels multi-operator fare (see the
-    /// fare model's Brussels single-journey price in config).
     travel_class: Option<TravelClassInput>,
 }
 
@@ -738,9 +651,6 @@ impl FareProfileInput {
     }
 }
 
-/// Per-request bike cost profile override; every field optional. Provided fields
-/// overlay the graph's default `BikeProfile`, so a sparse object changes only
-/// what it names.
 #[derive(InputObject, Default)]
 struct BikeProfileInput {
     allow_steps: Option<bool>,
@@ -773,7 +683,6 @@ struct BikeProfileInput {
 }
 
 impl BikeProfileInput {
-    /// Overlay the provided fields onto a base profile.
     fn merge_into(
         self,
         mut base: crate::structures::BikeProfile,
@@ -877,15 +786,6 @@ fn map_vehicle(pos: &VehiclePos, now_unix_secs: u64, max_age_secs: u64) -> LiveV
     }
 }
 
-/// Detect a realtime platform reassignment for one scheduled stop.
-///
-/// Returns `Some(PlatformChangeGql { from, to })` when the RT feed reports a
-/// different platform-level stop for the same parent station as `scheduled_stop_id`,
-/// and both the scheduled and actual stop carry a `platform_code`.
-///
-/// Returns `None` when: the scheduled stop_id has no `_` suffix (not
-/// platform-level), no RT platform info is known, the actual stop is the same
-/// as scheduled, or either stop lacks a `platform_code`.
 fn detect_platform_change(
     graph: &crate::structures::Graph,
     rt: &RealtimeIndex,
@@ -909,8 +809,6 @@ fn detect_platform_change(
     })
 }
 
-/// Resolve each input leg against the static schedule + live index by GTFS handle
-/// only — no routing, no RAPTOR — so the overlay is stable across polls.
 fn live_refresh(
     graph: &crate::structures::Graph,
     rt: &RealtimeIndex,
@@ -920,7 +818,6 @@ fn live_refresh(
 ) -> LivePlanGql {
     use crate::structures::TripStatus;
 
-    // What a resolved leg contributes to transfers and the journey ETA.
     struct Resolved {
         trip: crate::ingestion::gtfs::TripId,
         realtime_start: i32,
@@ -932,7 +829,6 @@ fn live_refresh(
     let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(legs.len());
 
     for leg in legs {
-        // A handle (trip, stop, or board→alight order) failed to resolve.
         let unresolved = LiveLegGql {
             trip_id: leg.trip_id.clone(),
             found: false,
@@ -966,8 +862,6 @@ fn live_refresh(
         };
         let (sched_start, sched_end) = (sched_start as i32, sched_end as i32);
 
-        // Cancellation overrides any (possibly stale) per-stop delay: times stay
-        // scheduled and the delay reads 0. Otherwise shift each end by its own delay.
         let (status, delay_secs, realtime_start, realtime_end) =
             match rt.status_with_sticky(trip, board as u32) {
                 TripStatus::Canceled => (LiveStatusGql::Canceled, 0, sched_start, sched_end),
@@ -1020,7 +914,6 @@ fn live_refresh(
         }));
     }
 
-    // One transfer per interior boundary where both adjacent legs resolved.
     let mut transfers = Vec::new();
     for i in 0..resolved.len().saturating_sub(1) {
         let (Some(from), Some(to)) = (&resolved[i], &resolved[i + 1]) else {
@@ -1038,7 +931,7 @@ fn live_refresh(
         });
     }
 
-    // ETA tracks the LAST resolved leg, so a trailing unresolved leg never nulls it.
+    // ETA tracks the last RESOLVED leg, so a trailing unresolved leg never nulls it.
     let last = resolved.iter().rev().flatten().next();
     LivePlanGql {
         legs: out_legs,
@@ -1049,9 +942,6 @@ fn live_refresh(
     }
 }
 
-/// Chance of making a transfer given the realtime `margin`, scored with the same
-/// delay-model primitive plan alternatives use: the feeder leg's CDF vs the
-/// boarding leg's. `None` when either route type has no delay model.
 fn transfer_reliability(
     graph: &crate::structures::Graph,
     feeder_trip: crate::ingestion::gtfs::TripId,
@@ -1067,12 +957,6 @@ fn transfer_reliability(
     Some(feeder.prob_on_time_vs(board, margin) as f64)
 }
 
-/// Catch-probability of THIS backup given you are ready on the platform at your
-/// original (realtime) departure time — *not* whole-journey reliability. The
-/// backup actually departs at `scheduled_departure + D_backup`, so you catch it
-/// iff `D_backup ≥ −slack`, where `slack` is the backup's scheduled departure
-/// minus your ready time. Scored from the backup's OWN route-type delay
-/// distribution. `None` when that route type has no delay model.
 fn catch_reliability(
     graph: &crate::structures::Graph,
     backup_trip: crate::ingestion::gtfs::TripId,
@@ -1084,12 +968,6 @@ fn catch_reliability(
     Some(model.prob_at_least(-slack) as f64)
 }
 
-/// Resolve same-station backups for a selected transit leg by GTFS handle only —
-/// no routing — then layer the live `RealtimeIndex` on each backup's times and a
-/// catch-reliability score. Returns an empty list when a handle is unknown or the
-/// selected trip does not serve `board → alight` (never panics). Backups are
-/// ordered chronologically by *scheduled* departure (stable across polls), even
-/// though the displayed times are realtime.
 fn station_backups(
     graph: &crate::structures::Graph,
     rt: &RealtimeIndex,
@@ -1113,7 +991,6 @@ fn station_backups(
     let days = crate::ingestion::gtfs::date_to_days(date);
     let weekday = 1u8 << date.weekday().num_days_from_monday();
 
-    // The selected leg's realtime departure is the reference the user "missed".
     let orig_rt_departure = match graph.scheduled_trip_leg_times(orig_trip, board, alight) {
         Some((dep, _)) => dep as i32 + rt.delay(orig_trip, board as u32),
         None => return vec![],
@@ -1163,11 +1040,18 @@ impl QueryRoot {
         "pong"
     }
 
+    async fn web_config(&self, ctx: &Context<'_>) -> Result<WebConfig, Error> {
+        Ok(ctx.data::<WebConfig>()?.clone())
+    }
+
     async fn realtime_generated_at(&self, ctx: &Context<'_>) -> Result<i64, Error> {
         let rt = ctx.data::<SharedRealtime>()?.load_full();
         Ok(rt.generated_at)
     }
 
+    #[graphql(
+        complexity = "50 + child_complexity + (window_minutes.unwrap_or(0).max(0) as usize) / 10"
+    )]
     async fn raptor(
         &self,
         ctx: &Context<'_>,
@@ -1177,46 +1061,25 @@ impl QueryRoot {
         to_lng: f64,
         date: Option<String>,
         time: Option<String>,
-        // When provided and > 0, return all Pareto-optimal plans departing
-        // within this many minutes after `time` (Range-RAPTOR).
         window_minutes: Option<i32>,
-        // Override the default walk-radius (seconds) for access/egress stop
-        // search.  Falls back to the value in config.yaml (default 600 s).
         walk_radius_secs: Option<i32>,
-        // Arrival-slack (seconds): explore plans arriving up to this much after the
-        // fastest, surfacing safer-but-slower alternatives. Falls back to config (900 s).
         arrival_slack_secs: Option<i32>,
-        // When set, override the graph default for MCR uncapped inter-stop transfers
-        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
         unrestricted_transfers: Option<bool>,
-        // When set, override the graph default for exact CCH foot access/egress.
         use_cch_access: Option<bool>,
-        // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
-        // Finer edges surface more reliability-distinct alternatives. Falls back to config.
         reliability_bucket_edges: Option<Vec<f64>>,
-        // Travel modes the router may use. Defaults to [WALK, WALK_TRANSIT].
         modes: Option<Vec<Mode>>,
-        // Bike cost profile override; sparse fields overlay the graph default.
         bike_profile: Option<BikeProfileInput>,
-        // When true, direct walk/bike plans are built with the Deadline leg role.
         terminal_deadline: Option<bool>,
         from_station_id: Option<String>,
         to_station_id: Option<String>,
-        // When true, emit a per-phase wall-clock decomposition of this query
-        // (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/
-        // range/departure counts) as one structured log line. Purely additive
-        // observability — never changes routing behavior or results. Falls back
-        // to the graph default (config.yaml `profile_latency`, itself off by
-        // default) when omitted.
         profile_latency: Option<bool>,
-        // Pre-committed fare products (subscriptions, cards, passenger category,
-        // Brupass) scaling each operator's marginal fare. Applied: each returned
-        // plan's `price` is computed post-hoc from its boardings under this
-        // profile. Absent ⇒ default single-ticket pricing.
         fare_profile: Option<FareProfileInput>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+        reject_over("windowMinutes", window_minutes.unwrap_or(0), MAX_WINDOW_MINUTES)?;
+        reject_over("walkRadiusSecs", walk_radius_secs.unwrap_or(0), MAX_WALK_RADIUS_SECS)?;
+        reject_over("arrivalSlackSecs", arrival_slack_secs.unwrap_or(0), MAX_ARRIVAL_SLACK_SECS)?;
 
         let query = routing_raptor::RouteQuery {
             from_lat,
@@ -1243,14 +1106,14 @@ impl QueryRoot {
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
-        routing_raptor::route(graph.as_ref(), &query, rt.as_ref())
+        run_heavy(ctx, move || {
+            routing_raptor::route(graph.as_ref(), &query, rt.as_ref())
+        })
+        .await
     }
 
-    /// Re-plan from a position ABOARD a transit trip (between stops) to the
-    /// lat/lng destination, surfacing stay-on / alight-and-transfer /
-    /// alight-and-walk alternatives in one shot. Unlike `raptor`, there is no
-    /// `fromLat`/`fromLng` — the origin is the boarded `onboardOrigin` handle.
     #[allow(clippy::too_many_arguments)]
+    #[graphql(complexity = "50 + child_complexity")]
     async fn onboard_raptor(
         &self,
         ctx: &Context<'_>,
@@ -1259,29 +1122,19 @@ impl QueryRoot {
         to_lng: f64,
         date: Option<String>,
         time: Option<String>,
-        // Override the default walk-radius (seconds) for egress stop search.
-        // Falls back to the value in config.yaml (default 600 s).
         walk_radius_secs: Option<i32>,
-        // Arrival-slack (seconds): explore plans arriving up to this much after the
-        // fastest, surfacing safer-but-slower alternatives. Falls back to config (900 s).
         arrival_slack_secs: Option<i32>,
-        // When set, override the graph default for MCR uncapped inter-stop transfers
-        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
         unrestricted_transfers: Option<bool>,
-        // When set, override the graph default for exact CCH foot access/egress.
         use_cch_access: Option<bool>,
-        // Reliability bucket edges (sorted, strictly increasing, each in (0,1)).
         reliability_bucket_edges: Option<Vec<f64>>,
-        // Bike cost profile override; sparse fields overlay the graph default.
         bike_profile: Option<BikeProfileInput>,
-        // When true, direct walk/bike plans are built with the Deadline leg role.
         terminal_deadline: Option<bool>,
-        // Fare profile so onboard re-planning prices with the same options as the
-        // originating journey (categories, subscriptions, Train+, cards).
         fare_profile: Option<FareProfileInput>,
     ) -> Result<Vec<Plan>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+        reject_over("walkRadiusSecs", walk_radius_secs.unwrap_or(0), MAX_WALK_RADIUS_SECS)?;
+        reject_over("arrivalSlackSecs", arrival_slack_secs.unwrap_or(0), MAX_ARRIVAL_SLACK_SECS)?;
 
         let query = routing_raptor::RouteQuery {
             from_lat: 0.0,
@@ -1312,11 +1165,15 @@ impl QueryRoot {
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
-        routing_raptor::route(graph.as_ref(), &query, rt.as_ref())
+        run_heavy(ctx, move || {
+            routing_raptor::route(graph.as_ref(), &query, rt.as_ref())
+        })
+        .await
     }
 
-    /// Debug query: same parameters as `raptor`, but also returns every candidate plan
-    /// considered (with filter reasons) and the access walk metadata.
+    #[graphql(
+        complexity = "80 + child_complexity + (window_minutes.unwrap_or(0).max(0) as usize) / 10"
+    )]
     async fn raptor_explain(
         &self,
         ctx: &Context<'_>,
@@ -1329,21 +1186,19 @@ impl QueryRoot {
         window_minutes: Option<i32>,
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
-        // When set, override the graph default for MCR uncapped inter-stop transfers
-        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
         unrestricted_transfers: Option<bool>,
-        // When set, override the graph default for exact CCH foot access/egress.
         use_cch_access: Option<bool>,
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
         bike_profile: Option<BikeProfileInput>,
         terminal_deadline: Option<bool>,
-        // Fare profile, applied like `raptor`: each plan's `price` is computed
-        // post-hoc from its boardings under this profile.
         fare_profile: Option<FareProfileInput>,
     ) -> Result<RaptorExplainResult, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+        reject_over("windowMinutes", window_minutes.unwrap_or(0), MAX_WINDOW_MINUTES)?;
+        reject_over("walkRadiusSecs", walk_radius_secs.unwrap_or(0), MAX_WALK_RADIUS_SECS)?;
+        reject_over("arrivalSlackSecs", arrival_slack_secs.unwrap_or(0), MAX_ARRIVAL_SLACK_SECS)?;
 
         let query = routing_raptor::RouteQuery {
             from_lat,
@@ -1370,7 +1225,10 @@ impl QueryRoot {
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
-        let result = routing_raptor::route_explain(graph.as_ref(), &query, rt.as_ref())?;
+        let result = run_heavy(ctx, move || {
+            routing_raptor::route_explain(graph.as_ref(), &query, rt.as_ref())
+        })
+        .await?;
 
         Ok(RaptorExplainResult {
             plans: result.plans,
@@ -1409,12 +1267,10 @@ impl QueryRoot {
         })
     }
 
-    /// Lazily compute earlier/later departure alternatives for **one** transit leg
-    /// of one plan, instead of pre-computing them for every leg of every plan.
-    /// `plan_index` / `leg_index` address the leg within the deterministic result
-    /// of the same routing inputs the UI already issued. Returns only the data the
-    /// alternatives UI needs (boarding time, arrival, swap reliability).
     #[allow(clippy::too_many_arguments)]
+    #[graphql(
+        complexity = "50 + child_complexity + (window_minutes.unwrap_or(0).max(0) as usize) / 10"
+    )]
     async fn leg_alternatives(
         &self,
         ctx: &Context<'_>,
@@ -1427,10 +1283,7 @@ impl QueryRoot {
         window_minutes: Option<i32>,
         walk_radius_secs: Option<i32>,
         arrival_slack_secs: Option<i32>,
-        // When set, override the graph default for MCR uncapped inter-stop transfers
-        // (live per-round multi-source foot-Dijkstra). Lets MCR be A/B-tested per call.
         unrestricted_transfers: Option<bool>,
-        // When set, override the graph default for exact CCH foot access/egress.
         use_cch_access: Option<bool>,
         reliability_bucket_edges: Option<Vec<f64>>,
         modes: Option<Vec<Mode>>,
@@ -1441,6 +1294,9 @@ impl QueryRoot {
     ) -> Result<LegAlternatives, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         let (parsed_date, parsed_time) = parse_date_time(&date, &time)?;
+        reject_over("windowMinutes", window_minutes.unwrap_or(0), MAX_WINDOW_MINUTES)?;
+        reject_over("walkRadiusSecs", walk_radius_secs.unwrap_or(0), MAX_WALK_RADIUS_SECS)?;
+        reject_over("arrivalSlackSecs", arrival_slack_secs.unwrap_or(0), MAX_ARRIVAL_SLACK_SECS)?;
 
         let query = routing_raptor::RouteQuery {
             from_lat,
@@ -1467,7 +1323,11 @@ impl QueryRoot {
         };
 
         let rt = ctx.data::<SharedRealtime>()?.load_full();
-        let plans = routing_raptor::route(graph.as_ref(), &query, rt.as_ref())?;
+        let route_graph = graph.clone();
+        let plans = run_heavy(ctx, move || {
+            routing_raptor::route(route_graph.as_ref(), &query, rt.as_ref())
+        })
+        .await?;
 
         let plan = plans
             .get(plan_index.max(0) as usize)
@@ -1496,12 +1356,6 @@ impl QueryRoot {
         })
     }
 
-    /// Stateless realtime overlay for a client-selected journey. The client passes
-    /// the ordered transit legs by stable GTFS handles (`tripId` + board/alight
-    /// `stopId`) each poll; this resolves them against the static schedule and the
-    /// live `RealtimeIndex` WITHOUT re-running RAPTOR or re-optimising the plan, so
-    /// the result is keyed by trip/stop and stable across polls. `date` is accepted
-    /// for API consistency but unused: the `tripId` fully selects the stop-time column.
     async fn live_refresh(
         &self,
         ctx: &Context<'_>,
@@ -1522,14 +1376,6 @@ impl QueryRoot {
         Ok(live_refresh(graph.as_ref(), rt.as_ref(), &legs, now_unix_secs, max_age_secs))
     }
 
-    /// Same-station backups for one transit leg the user is on/selected, keyed by
-    /// stable GTFS handles (`tripId` + board/alight `stopId`). Returns every other
-    /// departure FROM THE SAME boarding stop reaching the SAME alighting stop —
-    /// including OTHER routes — each scored with catch-reliability against the live
-    /// `RealtimeIndex`. Stateless (no routing, no plan index), so it is stable
-    /// across polls; unknown handles resolve to an empty list, never a panic.
-    /// `beforeCount` earlier and `afterCount` later departures are returned,
-    /// ordered chronologically by scheduled departure.
     async fn station_backups(
         &self,
         ctx: &Context<'_>,
@@ -1555,13 +1401,8 @@ impl QueryRoot {
         ))
     }
 
-    /// Travel-time map (isochrone / one-to-many reachability). From `center` at the
-    /// given day + `time`, compute the travel time to reach many sampled points, so
-    /// the client can paint a continuous green(0)->red(maxSeconds) heatmap. Reuses
-    /// the RAPTOR forward pass + the exact one-to-many foot machinery (no separate
-    /// engine). When `windowEndTime` is set, the isochrone is evaluated across the
-    /// departure window `[time, windowEndTime]` and aggregated per cell by `aggregation`.
     #[allow(clippy::too_many_arguments)]
+    #[graphql(complexity = "100 + child_complexity + (max_seconds.max(0) as usize) / 60")]
     async fn travel_time_map(
         &self,
         ctx: &Context<'_>,
@@ -1570,21 +1411,11 @@ impl QueryRoot {
         date: Option<String>,
         time: Option<String>,
         max_seconds: i32,
-        // Allowed travel modes (same enum the router uses). Defaults to
-        // [WALK, WALK_TRANSIT]. Empty is rejected.
         modes: Option<Vec<Mode>>,
-        // Per-cell aggregation across the departure window. Defaults to BEST.
         aggregation: Option<TravelAggregationGql>,
-        // When set, evaluate over the departure window [time, windowEndTime]
-        // instead of a single departure.
         window_end_time: Option<String>,
-        // Grid cell edge in metres. Clamped to [10, 1000]; absent ⇒ the configured
-        // default (travel_map_grid_step_m). A safety cap coarsens it further if a
-        // fine step over a large area would produce too many cells.
         grid_step_m: Option<f64>,
-        // Override the CCH foot-access default (A/B). Falls back to graph default.
         use_cch_access: Option<bool>,
-        // Override MCR uncapped inter-stop transfers. Falls back to graph default.
         unrestricted_transfers: Option<bool>,
     ) -> Result<TravelTimeMap, Error> {
         use chrono::{Datelike, Timelike};
@@ -1596,6 +1427,7 @@ impl QueryRoot {
         if max_seconds <= 0 {
             return Err(Error::new("maxSeconds must be positive"));
         }
+        reject_over("maxSeconds", max_seconds, MAX_TRAVEL_MAP_SECONDS)?;
         let max_secs = max_seconds as u32;
 
         let am = match &modes {
@@ -1614,9 +1446,6 @@ impl QueryRoot {
         let slack = graph.raptor.arrival_slack_secs;
         let unrestricted = unrestricted_transfers.unwrap_or(graph.raptor.unrestricted_transfers);
         let use_cch = use_cch_access.unwrap_or(graph.raptor.use_cch_access);
-        // Per-query grid cell size: clamp to [10, 1000] m; absent ⇒ configured default.
-        // The graph fill applies a further safety cap (travel_map_max_cells) so a fine
-        // step over a large reachable box can never blow up the cell count.
         let grid_step = match grid_step_m {
             Some(v) => v.clamp(10.0, 1000.0),
             None => graph.raptor.travel_map_grid_step_m,
@@ -1635,17 +1464,21 @@ impl QueryRoot {
             None => None,
         };
 
-        let g = graph.as_ref();
-        let cells = match window_end {
-            Some(end) if end > start_time => g.travel_time_map_window(
-                center, start_time, end, days, weekday, max_secs, grid_step, agg, &am, &buckets,
-                slack, unrestricted, use_cch, rt.as_ref(), &bike,
-            ),
-            _ => g.travel_time_map(
-                center, start_time, days, weekday, max_secs, grid_step, &am, &buckets, slack,
-                unrestricted, use_cch, rt.as_ref(), &bike,
-            ),
-        };
+        let cells = run_heavy(ctx, move || {
+            let g = graph.as_ref();
+            let cells = match window_end {
+                Some(end) if end > start_time => g.travel_time_map_window(
+                    center, start_time, end, days, weekday, max_secs, grid_step, agg, &am, &buckets,
+                    slack, unrestricted, use_cch, rt.as_ref(), &bike,
+                ),
+                _ => g.travel_time_map(
+                    center, start_time, days, weekday, max_secs, grid_step, &am, &buckets, slack,
+                    unrestricted, use_cch, rt.as_ref(), &bike,
+                ),
+            };
+            Ok(cells)
+        })
+        .await?;
 
         Ok(TravelTimeMap {
             cells: cells
@@ -1662,8 +1495,6 @@ impl QueryRoot {
         })
     }
 
-    /// Returns every transit stop loaded from GTFS.
-    /// Used by the Flutter client for the initial data sync (stop search).
     async fn gtfs_stops(&self, ctx: &Context<'_>) -> Result<Vec<GtfsStop>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         Ok(graph
@@ -1679,9 +1510,6 @@ impl QueryRoot {
             .collect())
     }
 
-    /// Returns every deduped physical station (platforms grouped by GTFS
-    /// `parent_station`). Used by the client to offer zero-cost station-hub
-    /// origins/destinations (`fromStationId`/`toStationId` on `raptor`).
     async fn gtfs_stations(&self, ctx: &Context<'_>) -> Result<Vec<GtfsStation>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         Ok(graph
@@ -1708,12 +1536,6 @@ impl QueryRoot {
             .collect())
     }
 
-    /// Search the sibling Belgian address index (BeST-Add). Normalized
-    /// prefix/substring matching over street and municipality names in NL/FR/DE
-    /// (all spellings of one record are searchable). `limit` defaults to 10.
-    /// When both `focusLat` and `focusLng` are given (the map centre the user is
-    /// viewing), results are biased toward that point so the nearest match ranks
-    /// first; otherwise ranking is pure text relevance.
     async fn search_addresses(
         &self,
         ctx: &Context<'_>,
@@ -1744,14 +1566,11 @@ impl QueryRoot {
             .collect())
     }
 
-    /// CC-BY 4.0 attribution string that clients must display alongside results
-    /// derived from the BeST-Add address feed (FPS BOSA).
+    /// CC-BY 4.0 attribution clients must display alongside BeST-Add results.
     async fn address_attribution(&self) -> &'static str {
         ADDRESS_ATTRIBUTION
     }
 
-    /// Returns every transit agency with its routes loaded from GTFS.
-    /// Used by the Flutter client for the initial data sync (agency/route filter).
     async fn gtfs_agencies(&self, ctx: &Context<'_>) -> Result<Vec<GtfsAgency>, Error> {
         let graph = ctx.data::<SharedGraph>()?.load_full();
         Ok(graph
@@ -1788,8 +1607,7 @@ const MANIFEST: &str = include_str!("static/manifest.webmanifest");
 const ICON_SVG: &str = include_str!("static/icon.svg");
 const ICON_MASKABLE_SVG: &str = include_str!("static/icon-maskable.svg");
 
-// Live-journey persistence layer (sqlite-wasm + OPFS SAHPool VFS). The SAHPool
-// VFS runs on the main thread and needs NO COOP/COEP headers, so none are set.
+// SAHPool VFS runs on the main thread and needs NO COOP/COEP headers, so none are set.
 const LIVE_DB_JS: &str = include_str!("static/js/live-db.mjs");
 const LIVE_STORE_JS: &str = include_str!("static/js/live-store.mjs");
 const LIVE_LOGIC_JS: &str = include_str!("static/js/live-logic.mjs");
@@ -1932,23 +1750,33 @@ pub fn build_schema_rt_full(
     vehicle_position_max_age_secs: u64,
 ) -> Schema<QueryRoot, EmptyMutation, EmptySubscription> {
     let address: SharedAddressIndex = Arc::new(arc_swap::ArcSwap::from_pointee(AddressIndex::default()));
-    build_schema_full(graph, realtime, vehicle_position_max_age_secs, address)
+    build_schema_full(graph, realtime, vehicle_position_max_age_secs, address, WebConfig::default(), None, None)
 }
 
-/// Build the schema with an explicit address index handle. Used by `server()` to
-/// inject the loaded BeST-Add index and by tests to inject synthetic data.
 pub fn build_schema_full(
     graph: SharedGraph,
     realtime: SharedRealtime,
     vehicle_position_max_age_secs: u64,
     address: SharedAddressIndex,
+    web_config: WebConfig,
+    max_depth: Option<usize>,
+    max_complexity: Option<usize>,
 ) -> Schema<QueryRoot, EmptyMutation, EmptySubscription> {
-    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+    let mut builder = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(graph)
         .data(realtime)
         .data(address)
+        .data(web_config)
         .data(VehiclePositionMaxAgeSecs(vehicle_position_max_age_secs))
-        .finish()
+        .data(HeavyQueryLimiter(Arc::new(Semaphore::new(HEAVY_QUERY_PERMITS))));
+    if let Some(depth) = max_depth {
+        builder = builder.limit_depth(depth);
+    }
+    let complexity = max_complexity
+        .map(|c| c.min(MAX_COMPLEXITY_CEILING))
+        .unwrap_or(MAX_COMPLEXITY_CEILING);
+    builder = builder.limit_complexity(complexity);
+    builder.finish()
 }
 
 pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<()> {
@@ -1963,24 +1791,34 @@ pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<
         .map(|r| r.vehicle_position_max_age_secs)
         .unwrap_or(120);
 
-    let cache_dir = config
-        .auto_update
-        .as_ref()
-        .map(|a| a.cache_dir.clone())
-        .unwrap_or_else(|| "cache".to_string());
+    let cache_dir = config.cache_dir();
+    let address_fp = crate::services::fingerprint::address_fingerprint(config.as_ref(), &cache_dir);
     let mut address_index = crate::services::build::load_or_build_address_index(
         &config.build,
         &cache_dir,
-        "address.bin",
+        &config.build.address_output,
         config.default_routing.address_box_coord_epsilon_m(),
+        &address_fp,
     );
     address_index.set_search_params(config.default_routing.to_address_search_params());
     let address: SharedAddressIndex = Arc::new(arc_swap::ArcSwap::from_pointee(address_index));
 
-    let schema = build_schema_full(graph, realtime, vp_max_age, address);
-    let app = Route::new()
-        .at("/graphql", GraphQL::new(schema))
-        .at("/graphiql", get(graphiql))
+    let web_config = WebConfig {
+        tile_url: config.server.tiles.url.clone(),
+        tile_attribution: config.server.tiles.attribution.clone(),
+        graphiql_enabled: config.server.graphiql_enabled,
+    };
+    let schema = build_schema_full(
+        graph,
+        realtime,
+        vp_max_age,
+        address,
+        web_config,
+        Some(config.server.graphql_max_depth),
+        Some(config.server.graphql_max_complexity),
+    );
+    let mut app = Route::new()
+        .at("/graphql", GraphQL::new(schema).with(SizeLimit::new(64 * 1024)))
         .at("/maas.js", get(maas_js_handler))
         .at("/static/js/live-db.mjs", get(live_db_js_handler))
         .at("/static/js/live-store.mjs", get(live_store_js_handler))
@@ -2002,6 +1840,10 @@ pub async fn server(graph: SharedGraph, config: Arc<Config>) -> std::io::Result<
         .at("/static/js/travel-map.mjs", get(travel_map_js_handler))
         .at("/travel_map", get(travel_map_page))
         .at("/", get(index_page));
+
+    if config.server.graphiql_enabled {
+        app = app.at("/graphiql", get(graphiql));
+    }
 
     let bind = format!("{}:{}", config.server.host, config.server.port);
     tracing::info!("serving on {bind}");
@@ -2035,7 +1877,6 @@ mod tests {
         let (d, t) = parse_date_time(&None, &None).unwrap();
         let now = Local::now().naive_local();
         assert_eq!(d, now.date());
-        // Time should be within a second of now
         let diff = (t - now.time()).num_seconds().abs();
         assert!(diff < 2, "time diff {diff}s too large");
     }

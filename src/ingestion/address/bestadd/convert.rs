@@ -7,9 +7,6 @@ const LAMBERT72_PROJ: &str = "+proj=lcc +lat_0=90 +lon_0=4.36748666666667 \
 
 const WGS84_PROJ: &str = "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs";
 
-/// Converts Belgian Lambert 72 (EPSG:31370) projected coordinates to WGS84.
-/// Holds the two `Proj` definitions so the projection is parsed once and reused
-/// across the millions of address points streamed from the BeST feed.
 pub struct Lambert72Converter {
     lambert: Proj,
     wgs84: Proj,
@@ -24,9 +21,8 @@ impl Lambert72Converter {
         Ok(Self { lambert, wgs84 })
     }
 
-    /// Converts a Lambert72 easting/northing (metres) to `(latitude, longitude)`
-    /// in WGS84 decimal degrees. proj4rs emits longlat in radians with (x=lon,
-    /// y=lat) axis order, so the output is converted to degrees and reordered.
+    /// proj4rs emits longlat in radians with (x=lon, y=lat) axis order, so the
+    /// output is converted to degrees and reordered to `(lat, lon)`.
     pub fn to_wgs84(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
         let mut point = (x, y, 0.0);
         proj4rs::transform::transform(&self.lambert, &self.wgs84, &mut point)

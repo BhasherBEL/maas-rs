@@ -1,18 +1,11 @@
-//! Representative selection (Phase 2): trim a Phase-1 ε-Pareto front of dozens of
-//! paths to ≤k diverse options by greedy max-min (farthest-point) selection in
-//! min-max-normalized objective space. Pure presentation-layer trimming — it reads
-//! only the already-computed `CostVector`s, never re-searches, and applies no
-//! inter-axis weighting (weights are Phase-5 presentation, not selection).
+//! Trim an ε-Pareto front to ≤k diverse options by greedy farthest-point
+//! selection in min-max-normalized objective space.
 
 use super::{Graph, multiobj::ParetoPath};
 use crate::structures::cost::{Axis, LegRole, RoutingMode};
 use crate::structures::{BikeCost, NodeID};
 
 impl Graph {
-    /// Run the multi-objective search for `mode` and trim the resulting ε-Pareto
-    /// front to `representatives_k` diverse options, comparing over `mode.axes()`.
-    /// Uses the graph's configured ε / distance-budget / cost-weights. Production-
-    /// shaped entry; no scalar routing path is replaced yet (that is Phase 5).
     pub fn multiobj_representatives(
         &self,
         origin: NodeID,
@@ -32,10 +25,8 @@ impl Graph {
         )
     }
 
-    /// As [`multiobj_representatives`], with an explicit `distance_budget`. Passing
-    /// `f64::INFINITY` skips the O(edges) `length_lower_bounds` precompute — right
-    /// for short access/egress legs where target pruning already bounds the local
-    /// search and the country-wide reverse-adjacency build would dominate runtime.
+    /// `distance_budget == f64::INFINITY` skips the O(edges) `length_lower_bounds`
+    /// precompute (right for short access/egress legs).
     pub(crate) fn multiobj_representatives_budgeted(
         &self,
         origin: NodeID,
@@ -62,18 +53,8 @@ impl Graph {
     }
 }
 
-/// Select up to `k` diverse representatives from `front`, comparing paths over the
-/// active `axes` only. Returns indices into `front`, deterministically.
-///
-/// Empty front or `k == 0` ⇒ empty. `front.len() <= k` ⇒ all indices in order.
-/// Otherwise: min-max normalize each active axis across the front, seed the chosen
-/// set with each axis' best (minimizer) point, then greedily add the path whose
-/// minimum normalized-Euclidean distance to the chosen set is largest, breaking
-/// ties by smallest index, until `k` are chosen.
-///
-/// When `k < axes.len()` only the first `k` axes' extrema (in `axes` order) are
-/// guaranteed seeded; with the default `k = 6 ≥ every mode's axis count` all
-/// per-axis extrema survive.
+/// Deterministic. Seeds the chosen set with each axis' minimizer (extrema), then
+/// greedily adds the max-min-distant path, breaking ties by smallest index.
 pub fn select_representatives(front: &[ParetoPath], k: usize, axes: &[Axis]) -> Vec<usize> {
     if front.is_empty() || k == 0 {
         return Vec::new();

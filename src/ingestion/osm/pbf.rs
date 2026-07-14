@@ -6,8 +6,8 @@ use std::{
 use osmpbf::{Element, ElementReader, RelMemberType, Way};
 
 use crate::ingestion::osm::{
-    Dem, bike_class, build_platform_index, effective_highway, elevation_smooth, is_platform_way,
-    parse_connector, parse_way_level,
+    ElevationSource, bike_class, build_platform_index, effective_highway, elevation_smooth,
+    is_platform_way, parse_connector, parse_way_level,
 };
 use crate::structures::cost::VarGen;
 use crate::structures::{
@@ -30,29 +30,21 @@ fn node_var_gen<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> VarGen {
 
 pub fn load_pbf_file(
     pbf_path: &str,
-    dem: Option<&Dem>,
+    dem: Option<&dyn ElevationSource>,
     smoothing_epsilon: f64,
     surface_speed_factors: &crate::structures::SurfaceSpeedFactors,
     g: &mut Graph,
 ) -> result::Result<(), osmpbf::Error> {
     let reader = ElementReader::from_path(pbf_path)?;
-    // Street nodes (validate_way ways): indexed into the snap KD-tree as today.
     let mut street_node_ids: HashSet<i64> = HashSet::new();
-    // Platform-way nodes (Stage B1): added as routable but kept OUT of the snap
-    // KD-tree so GTFS stop snapping is unchanged. A node shared with a street stays
-    // a street node (indexed).
+    // Platform-way nodes: routable but kept OUT of the snap KD-tree so GTFS stop
+    // snapping is unchanged. A node shared with a street stays a street node.
     let mut platform_only_node_ids: HashSet<i64> = HashSet::new();
-    // OSM nodes tagged public_transport=platform / railway=platform (not way refs):
-    // added unindexed so build_platform_index can expose them for B2a relocation.
     let mut platform_node_ids: HashSet<i64> = HashSet::new();
-    // Way IDs belonging to a bicycle route relation. In raw OSM, cycle-route
-    // membership lives on the relation, not the member ways, so we collect it
-    // here and feed it into `classify` when building edges.
+    // In raw OSM, cycle-route membership lives on the relation, not member ways.
     let mut cycle_route_ways: HashSet<i64> = HashSet::new();
-    // Way IDs that are members of a railway/public_transport=platform RELATION.
-    // These ways are typically untagged (all semantics on the relation), so they
-    // are not caught by is_platform_way. Collected here; a separate pass resolves
-    // their node refs into platform_only_node_ids so they register in the graph.
+    // Members of a platform RELATION: typically untagged (semantics on the
+    // relation), so not caught by is_platform_way; a later pass resolves their refs.
     let mut platform_relation_member_ways: HashSet<i64> = HashSet::new();
 
     reader.for_each(|element| match element {
@@ -96,9 +88,8 @@ pub fn load_pbf_file(
         _ => {}
     })?;
 
-    // Pass 1.5: resolve relation member-way node refs into platform_only_node_ids.
-    // PBF ordering (nodes→ways→relations) means member-way IDs are only known after
-    // pass 1 ends; a separate way-scan collects their node refs.
+    // PBF ordering (nodes→ways→relations): member-way IDs are only known after
+    // pass 1, so a separate way-scan collects their node refs.
     if !platform_relation_member_ways.is_empty() {
         let reader = ElementReader::from_path(pbf_path)?;
         reader.for_each(|element| {
@@ -109,7 +100,6 @@ pub fn load_pbf_file(
         })?;
     }
 
-    // A node on both a street and a platform is a street node (indexed).
     platform_only_node_ids.retain(|id| !street_node_ids.contains(id));
 
     let reader = ElementReader::from_path(pbf_path)?;
@@ -126,12 +116,8 @@ pub fn load_pbf_file(
                 node_vargen.insert(id, vg);
             }
         } else if platform_only_node_ids.contains(&id) {
-            // Platform-only node: routable but unindexed (snap-tree excluded).
             add_osm_node(g, id, lat, lon, false);
         } else if platform_node_ids.contains(&id) {
-            // Platform-tagged OSM node (public_transport=platform / railway=platform on a
-            // node): unindexed so GTFS snapping is unchanged, but registered in id_mapper
-            // so build_platform_index can expose it as a relocation target for B2a.
             add_osm_node(g, id, lat, lon, false);
         }
     })?;
@@ -142,9 +128,6 @@ pub fn load_pbf_file(
     let mut failed = 0;
     let mut n_cycleroute = 0;
     let mut n_platform = 0;
-    // Stage B1 auxiliary OSM data, collected by raw OSM id then resolved to graph
-    // NodeIDs after the pass. `osm_levels`: semantic storey per node (leveled ways).
-    // `osm_connectors`: directed pedestrian connector edges (stairs/elevator/ramp).
     let mut osm_levels: HashMap<i64, i16> = HashMap::new();
     let mut osm_connectors: HashMap<(i64, i64), Connector> = HashMap::new();
 
@@ -159,20 +142,16 @@ pub fn load_pbf_file(
 
         let node_ids = w.refs().collect::<Vec<_>>();
 
-        // Retain OSM level (semantic storey) on every node of a leveled way.
         if let Some(lvl) = parse_way_level(&tags) {
             for &id in &node_ids {
                 osm_levels.insert(id, lvl);
             }
         }
-        // Classify pedestrian vertical connectors from the highway tag.
         let connector = parse_connector(&tags);
 
         let (foot, bike, car, attrs_fwd, attrs_rev, surface_speed, seg_deltas) = if is_plat
             && !is_street
         {
-            // Platform way → walkable foot-only, flat. Strictly additive: bikes/cars
-            // never route across a platform; the GTFS stop snap is untouched.
             (
                 true,
                 false,
@@ -260,7 +239,6 @@ pub fn load_pbf_file(
         n_platform
     );
 
-    // Resolve raw OSM ids → graph NodeIDs for the level/connector maps.
     let to_nid = |id: i64| g.get_id(&format!("map#osm#{id}")).copied();
     let node_levels: HashMap<NodeID, i16> = osm_levels
         .into_iter()
@@ -282,29 +260,16 @@ pub fn load_pbf_file(
     Ok(())
 }
 
-/// True when the way is tagged as a bridge or tunnel (any value except `no`).
-/// Such ways get end-to-end linear elevation interpolation, because a DTM reads
-/// the valley floor / canopy under them and fabricates huge false climbs.
 fn way_is_bridge_or_tunnel(w: &Way) -> bool {
     w.tags().any(|(k, v)| {
         (k == "bridge" || k == "tunnel") && v != "no"
     })
 }
 
-/// Smoothed signed per-segment elevation delta (meters, `i16`) for each
-/// consecutive node pair along `node_ids`. Returns one entry per segment.
-///
-/// When the DEM is absent — or a node has no DEM sample — the affected deltas
-/// are `0`, preserving the no-elevation behavior. Otherwise the way's
-/// `(cumulative_distance, elevation)` profile is denoised once (RDP, vertical
-/// epsilon `smoothing_epsilon`; or straight linear interpolation for
-/// bridges/tunnels) and each segment's delta is the difference of the smoothed
-/// endpoint elevations, rounded to whole meters. Deltas telescope along the way,
-/// so they sum to `smoothed(last) − smoothed(first)`.
 fn smoothed_segment_deltas(
     g: &Graph,
     node_ids: &[i64],
-    dem: Option<&Dem>,
+    dem: Option<&dyn ElevationSource>,
     smoothing_epsilon: f64,
     is_structure: bool,
 ) -> Vec<i16> {
@@ -374,11 +339,7 @@ fn validate_way(way: &Way) -> bool {
     validate_way_tags(&tags)
 }
 
-/// Tag-slice core of [`validate_way`], extracted so it can be unit-tested
-/// without constructing an `osmpbf::Way`.
 fn validate_way_tags(tags: &[(&str, &str)]) -> bool {
-    // Resolve highway type: `highway` wins; fall back to `virtual:highway` for
-    // the foot-traversable pedestrian values already accepted below.
     let highway = effective_highway(tags);
     if !matches!(
         highway,
@@ -496,9 +457,6 @@ mod tests {
 
     #[test]
     fn platform_node_registered_in_graph_but_not_in_snap_tree() {
-        // A public_transport=platform OSM node must be added to the graph as an
-        // unindexed node so build_platform_index can resolve it via g.get_id(),
-        // but it must not pollute the snap KD-tree used for GTFS stop snapping.
         let mut g = Graph::new();
         add_osm_node(&mut g, 9001, 51.0, 4.0, false);
 
@@ -575,8 +533,6 @@ mod tests {
             "steps connector must be a foot-traversable edge bridging the two levels"
         );
     }
-
-    // --- virtual:highway fallback tests for validate_way_tags ---
 
     #[test]
     fn virtual_highway_footway_accepted_when_highway_absent() {

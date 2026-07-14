@@ -1,13 +1,6 @@
-//! Mode-parametrization of the cost engine: which axes are active per mode and
-//! how a single street edge maps to a `CostVector` for that mode. This folds the
-//! existing scalar `BikeCost::cost_factor` logic into the bike axes (Task 0.4).
-
 use crate::structures::cost::{Axis, CostVector, VarianceModel, edge_time_penalty, edge_variance};
 use crate::structures::{BikeCost, BikeProfile, HighwayClass, StreetEdgeData};
 
-/// Tunable per-axis weights for the deterministic cost vector. Serde-defaulted so
-/// a sparse config block keeps these values. Lifted from formerly-hardcoded
-/// constants so the cost model is fully config-driven.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CostWeights {
@@ -26,9 +19,6 @@ impl Default for CostWeights {
     }
 }
 
-/// Per-axis weights for the *balanced* presentation default. Read in exactly one
-/// place (`initial_cursor`) to pick the highlighted representative — never by the
-/// search or any dominance/pruning. Serde-defaulted so a sparse config keeps these.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct BalanceWeights {
@@ -85,10 +75,7 @@ impl RoutingMode {
         }
     }
 
-    /// Axes the Pareto front DOMINATES on. A subset of `axes()`: the rest are
-    /// carried in the cost vector and displayed, but never select routes. Bike uses
-    /// the three the user ranked (Time › CyclewayDeficit › D+) so the front stays
-    /// small enough to compute in full. Walk/Drive keep their whole axis set.
+    /// Front axes are a subset of `axes()`; the rest are carried but never select routes.
     pub fn front_axes(self) -> &'static [Axis] {
         match self {
             RoutingMode::Bike => &[Axis::Time, Axis::CyclewayDeficit, Axis::Dplus],
@@ -97,11 +84,7 @@ impl RoutingMode {
         }
     }
 
-    /// Front axes honoring the `bike_select_dplus` config flag: when false (default),
-    /// bike selection/dominance drops D+ (it stays in the cost vector, displayed only).
-    /// Rationale: once climbing is realistically slow (gradient power model), Time
-    /// already prices hills, so a separate "minimize D+ at any cost" axis only
-    /// manufactures absurd extremes (e.g. a 1.5 km walk to shave a few m of ascent).
+    /// When `bike_select_dplus` is false (default), bike selection drops D+.
     pub fn effective_front_axes(self, select_dplus: bool) -> &'static [Axis] {
         const BIKE_NO_DPLUS: [Axis; 2] = [Axis::Time, Axis::CyclewayDeficit];
         if self == RoutingMode::Bike && !select_dplus {
@@ -112,18 +95,8 @@ impl RoutingMode {
     }
 }
 
-/// Map a single directed street edge to a deterministic `CostVector` for `mode`.
-/// `incoming`/`this_dir` carry turn geometry for the Comfort axis (bike only).
-/// `speed_mps` is used by Walk and Drive to fill the Time axis via the same
-/// integer arithmetic as `Graph::edge_secs` (`length*1000 / speed_mms`, truncating),
-/// so the multi-objective engine is bit-identical to the scalar search.
-/// Bike Time stays kinematic (`edge_time`); push/dismount edges walk at `speed_mps`.
-/// Returns `None` for an impassable edge in this mode.
-///
-/// NOTE: D+ here is the per-edge positive ascent only, read from the DEM-denoised
-/// `elev_delta` baked at ingestion (per-way RDP smoothing). No in-search elevation
-/// hysteresis is added — the formerly path-coupled `BikeCost::elevation_step` term
-/// was unsound for label-setting and has been dropped from the D+ axis.
+/// Walk/Drive Time uses the same integer truncating arithmetic as `Graph::edge_secs`,
+/// so the engine is bit-identical to the scalar search. `None` for an impassable edge.
 pub fn edge_cost_vector(
     mode: RoutingMode,
     e: &StreetEdgeData,
@@ -195,10 +168,6 @@ fn surface_factor(e: &StreetEdgeData, w: &CostWeights) -> f64 {
     }
 }
 
-/// Walk and Drive Time is now filled from `speed_mps` via the same integer
-/// arithmetic as `Graph::edge_secs` (`length*1000 / (speed_mps*1000) as u32`,
-/// truncating division), so the multi-objective engine is bit-identical to the
-/// scalar search. Bike Time stays kinematic (`edge_time`), not speed×length.
 fn walk_vector(
     e: &StreetEdgeData,
     weights: &CostWeights,
@@ -563,17 +532,14 @@ mod tests {
 
     #[test]
     fn effective_front_axes_demotes_dplus_by_default() {
-        // Default (select_dplus = false): bike selects on Time + CyclewayDeficit only.
         assert_eq!(
             RoutingMode::Bike.effective_front_axes(false),
             &[Axis::Time, Axis::CyclewayDeficit]
         );
-        // With the flag on, D+ is restored as the third selection axis.
         assert_eq!(
             RoutingMode::Bike.effective_front_axes(true),
             &[Axis::Time, Axis::CyclewayDeficit, Axis::Dplus]
         );
-        // Walk/Drive are unaffected by the flag.
         assert_eq!(
             RoutingMode::Walk.effective_front_axes(false),
             RoutingMode::Walk.front_axes()
@@ -646,9 +612,6 @@ mod tests {
 
     #[test]
     fn bike_time_axis_grows_by_signal_only_corner_is_a_transition_cost() {
-        // The per-edge bike Time now carries only the signal delay; the turn/corner
-        // slow-down is a transition cost charged by the fold (`speed_change_secs`),
-        // not by `edge_cost_vector`, so a turn here does NOT change the per-edge Time.
         use crate::structures::{
             BikeAttrs, BikeProfile, HighwayClass, NodeID, StreetEdgeData, Surface,
             cost::{CostWeights, VarGen, edge_cost_vector, edge_time_penalty},
@@ -765,8 +728,6 @@ mod tests {
 
     #[test]
     fn bike_push_edge_time_uses_profile_push_speed() {
-        // A push edge is now timed at the profile's `push_speed_mps` (a property of
-        // pushing a loaded bike), independent of the passed cost speed.
         use crate::structures::{
             BikeAttrs, BikeProfile, HighwayClass, NodeID, StreetEdgeData, Surface,
             cost::{CostWeights, VarGen, edge_cost_vector},

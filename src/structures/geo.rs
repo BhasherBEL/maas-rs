@@ -62,7 +62,6 @@ mod tests {
 
     #[test]
     fn distance_brussels_to_amsterdam_approx_174km() {
-        // Brussels (50.85, 4.35) → Amsterdam (52.37, 4.90) ≈ 174 km
         let d = LatLng::distance(&[50.85, 4.35], &[52.37, 4.90]);
         assert!((d - 174_000.0).abs() < 5_000.0, "Expected ~174km, got {d}");
     }
@@ -100,7 +99,6 @@ mod tests {
 
     #[test]
     fn meters_to_degrees_one_degree_roundtrip() {
-        // 111_320 m ≈ 1 degree → sq_deg should be 1.0
         let sq = meters_to_degrees(111_320.0);
         assert!((sq - 1.0).abs() < 1e-6, "Expected 1.0 sq_deg, got {sq}");
     }
@@ -124,10 +122,8 @@ mod tests {
 
     #[test]
     fn degrees_to_meters_clamps_at_high_latitude() {
-        // At lat=80°, cos(80°) ≈ 0.174 < 0.5, so it should be clamped to 0.5
         let m_clamped = degrees_to_meters(1.0, 80.0);
-        let m_at_min = degrees_to_meters(1.0, 60.0); // cos(60°) = 0.5, exactly at boundary
-        // At lat=80° clamped to 0.5, result should equal lat=60°
+        let m_at_min = degrees_to_meters(1.0, 60.0);
         assert!(
             (m_clamped - m_at_min).abs() < 1.0,
             "{m_clamped} != {m_at_min}"

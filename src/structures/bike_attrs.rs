@@ -1,6 +1,4 @@
-//! Compact, serializable bike-routing attributes classified once at OSM ingest
-//! and stored per directed street edge. The per-request `BikeProfile` reads
-//! these to compute a cost without re-touching raw OSM tags.
+//! Bike-routing attributes classified once at OSM ingest, stored per directed edge.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,8 +36,6 @@ pub enum Surface {
     Unknown,
 }
 
-/// Per-directed-edge classification. Bit-flag booleans kept explicit for clarity;
-/// the struct is `Copy` and small (fits the existing `StreetEdgeData` budget).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BikeAttrs {
     pub highway: HighwayClass,
@@ -50,12 +46,12 @@ pub struct BikeAttrs {
     pub cycleroute: bool,
     pub bikeaccess: bool,
     pub footaccess: bool,
-    /// True when traversing this directed edge goes against a bike-relevant oneway.
+    /// True when this directed edge goes against a bike-relevant oneway.
     pub wrong_way: bool,
 }
 
 impl BikeAttrs {
-    /// `probablyGood` from BRouter: a paved-or-bike-friendly, not-explicitly-unpaved way.
+    /// `probablyGood` from BRouter: paved-or-bike-friendly and not explicitly unpaved.
     pub fn probably_good(&self) -> bool {
         let ispaved = matches!(self.surface, Surface::Paved);
         let isunpaved = matches!(self.surface, Surface::Unpaved);
@@ -69,7 +65,7 @@ impl BikeAttrs {
         )
     }
 
-    /// A neutral default used by non-OSM-built test graphs (treated as a plain road).
+    /// Neutral default (plain road) for non-OSM-built test graphs.
     pub fn road_default() -> Self {
         BikeAttrs {
             highway: HighwayClass::Road,

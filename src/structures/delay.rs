@@ -4,14 +4,12 @@ use crate::structures::MAX_SCENARIOS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DelayCDF {
-    /// Sorted bins: (delay_seconds, cumulative_probability).
-    /// Delay is signed: negative values represent early departures.
+    /// Sorted bins `(delay_seconds, cumulative_probability)`; delay signed (negative = early).
     pub bins: Vec<(i32, f32)>,
 }
 
 impl DelayCDF {
-    /// Returns P(delay ≤ budget_secs) using a step-CDF lookup.
-    /// `budget_secs` is the transfer margin (negative if you arrive after schedule).
+    /// P(delay ≤ budget_secs).
     pub fn prob_on_time(&self, budget_secs: i32) -> f32 {
         let pos = self
             .bins
@@ -19,9 +17,7 @@ impl DelayCDF {
         if pos == 0 { 0.0 } else { self.bins[pos - 1].1 }
     }
 
-    /// Probability mass per bin, derived from the cumulative bins as
-    /// `(delay_i, cum_i − cum_{i-1})`. The first jump is `cum_0`. Zero-mass
-    /// entries are skipped.
+    /// Probability mass per bin (CDF differences); zero-mass entries skipped.
     pub fn pmf(&self) -> impl Iterator<Item = (i32, f32)> + '_ {
         let mut prev = 0.0f32;
         self.bins.iter().filter_map(move |&(delay, cum)| {
@@ -31,10 +27,7 @@ impl DelayCDF {
         })
     }
 
-    /// Returns P(delay ≥ secs) — the upper-tail (survival) probability that the
-    /// actual delay is at least `secs` seconds. Complements [`prob_on_time`]
-    /// (which is P(delay ≤ budget)): on a normalized CDF,
-    /// `prob_at_least(s) == 1.0 − prob_on_time(s − 1)`.
+    /// P(delay ≥ secs), the upper tail.
     pub fn prob_at_least(&self, secs: i32) -> f32 {
         self.pmf()
             .filter(|&(delay, _)| delay >= secs)
@@ -42,12 +35,9 @@ impl DelayCDF {
             .sum()
     }
 
-    /// Probability of making a transfer given a `margin` of slack, accounting
-    /// for both this (feeder) delay distribution and the `board`ing vehicle's.
-    /// You board iff `D_feeder − D_board ≤ margin`, so assuming the two delays
-    /// are independent:
-    ///   `Σ_i mass_board(b_i) · P(D_feeder ≤ margin + b_i)`.
-    /// With no boarding model this collapses to `prob_on_time(margin)`.
+    /// P(transfer) with `margin` slack, folding in the boarding vehicle's delay:
+    /// board iff `D_feeder − D_board ≤ margin`, assuming independence. With no
+    /// boarding model collapses to `prob_on_time(margin)`.
     pub fn prob_on_time_vs(&self, board: Option<&DelayCDF>, margin: i32) -> f32 {
         match board {
             Some(b) if !b.bins.is_empty() => b
@@ -59,16 +49,12 @@ impl DelayCDF {
     }
 }
 
-/// Reliability values `>=` this collapse into the single CERTAIN bucket, so
-/// near-certain plans (0.999, 0.9999, …) don't each spawn a distinct alternative.
+/// Reliability values `>=` this collapse into the single CERTAIN bucket.
 pub const CERTAIN_THRESHOLD: f32 = 0.99;
 
-/// Quantizes a plan/label reliability into a small number of buckets so each stop
-/// keeps at most one label per bucket (see RAPTOR multi-criteria labels). Higher
-/// bucket index = more reliable.
 #[derive(Clone, Debug)]
 pub struct ReliabilityBuckets {
-    /// Sorted, strictly increasing edges in (0,1). The CERTAIN bucket (>=0.99) is
+    /// Sorted, strictly increasing edges in (0,1); the CERTAIN bucket (>=0.99) is
     /// implicit and always the highest index.
     edges: Vec<f32>,
 }
@@ -79,8 +65,7 @@ impl Default for ReliabilityBuckets {
     }
 }
 
-/// Returns true if `edges` is a valid bucket-edge list: non-empty, every value in
-/// the open interval (0,1), and strictly increasing.
+/// Non-empty, every value in (0,1), strictly increasing.
 pub fn valid_reliability_edges(edges: &[f32]) -> bool {
     !edges.is_empty()
         && edges.iter().all(|&e| e > 0.0 && e < 1.0)
@@ -94,8 +79,7 @@ impl ReliabilityBuckets {
         }
     }
 
-    /// Bucket index in `0..=edges.len()+1`. `0` = least reliable band,
-    /// `edges.len()+1` = CERTAIN (reliability >= 0.99).
+    /// Bucket index `0..=edges.len()+1`; `edges.len()+1` = CERTAIN (>= 0.99).
     #[inline]
     pub fn bucket(&self, reliability: f32) -> u8 {
         if reliability >= CERTAIN_THRESHOLD {
@@ -141,8 +125,7 @@ impl ScenarioBag {
         bag
     }
 
-    /// Creates a 2-scenario bag sorted by time ascending.
-    /// Falls back to `single()` when `hit_prob >= 1.0`.
+    /// 2-scenario bag sorted by time ascending; `single()` when `hit_prob >= 1.0`.
     pub fn with_scenarios(hit: u32, hit_prob: f32, miss: u32, miss_prob: f32) -> Self {
         if hit_prob >= 1.0 {
             return Self::single(hit);
@@ -186,7 +169,7 @@ impl ScenarioBag {
         }
     }
 
-    /// Expected arrival time (Σ prob_i * time_i). Returns f32::MAX when empty.
+    /// Expected arrival `Σ prob_i * time_i`; `f32::MAX` when empty.
     #[inline]
     pub fn expected(&self) -> f32 {
         if self.len == 0 {
@@ -198,19 +181,16 @@ impl ScenarioBag {
             .sum()
     }
 
-    /// Probability of the earliest (best-case) scenario.
     #[inline]
     pub fn hit_prob(&self) -> f32 {
         if self.len > 0 { self.data[0].prob } else { 0.0 }
     }
 
-    /// Returns the scenarios as a slice.
     #[inline]
     pub fn scenarios(&self) -> &[Scenario] {
         &self.data[..self.len as usize]
     }
 
-    /// Returns a new bag with all scenario times shifted by `delta`.
     pub fn shifted_by(&self, delta: u32) -> Self {
         let mut bag = *self;
         for i in 0..bag.len as usize {
@@ -224,7 +204,7 @@ impl ScenarioBag {
         self.len > 0
     }
 
-    /// Dominance via expected arrival instead of earliest.
+    /// Dominance via expected arrival, not earliest.
     #[inline]
     pub fn improves_on(&self, existing: &Self) -> bool {
         self.is_reached() && self.expected() < existing.expected()
@@ -245,14 +225,12 @@ impl ScenarioBag {
 mod tests {
     use super::*;
 
-    // ── ReliabilityBuckets ────────────────────────────────────────────────────
-
     #[test]
     fn bucket_collapses_certain() {
         let b = ReliabilityBuckets::new(&[0.50, 0.80, 0.95]);
-        assert_eq!(b.bucket(1.0), b.bucket(0.99)); // >=0.99 -> CERTAIN
+        assert_eq!(b.bucket(1.0), b.bucket(0.99));
         assert_eq!(b.bucket(0.995), b.bucket(0.99));
-        assert!(b.bucket(0.989) < b.bucket(0.99)); // just below certain is lower
+        assert!(b.bucket(0.989) < b.bucket(0.99));
     }
 
     #[test]
@@ -261,7 +239,6 @@ mod tests {
         assert!(b.bucket(0.10) < b.bucket(0.60));
         assert!(b.bucket(0.60) < b.bucket(0.90));
         assert!(b.bucket(0.90) < b.bucket(0.97));
-        // edge value falls in the upper band (>= edge)
         assert_eq!(b.bucket(0.50), b.bucket(0.79));
         assert_eq!(b.bucket(0.80), b.bucket(0.94));
     }
@@ -270,11 +247,8 @@ mod tests {
     fn bucket_handles_zero_and_default() {
         let b = ReliabilityBuckets::default();
         assert_eq!(b.bucket(0.0), 0);
-        // default edges [0.50,0.80,0.95] => CERTAIN index = 4
         assert_eq!(b.bucket(1.0), 4);
     }
-
-    // ── DelayCDF ──────────────────────────────────────────────────────────────
 
     fn make_cdf() -> DelayCDF {
         DelayCDF {
@@ -283,7 +257,6 @@ mod tests {
     }
 
     fn make_cdf_with_early() -> DelayCDF {
-        // Mirrors the subway model from config.yaml
         DelayCDF {
             bins: vec![
                 (-120, 0.01),
@@ -313,7 +286,6 @@ mod tests {
     #[test]
     fn cdf_budget_between_bins() {
         let cdf = make_cdf();
-        // 30s budget: only the 0s bin qualifies → cumprob 0.1
         assert_eq!(cdf.prob_on_time(30), 0.1);
     }
 
@@ -344,7 +316,7 @@ mod tests {
     #[test]
     fn cdf_negative_bins_below_leftmost_returns_zero() {
         let cdf = make_cdf_with_early();
-        assert_eq!(cdf.prob_on_time(-180), 0.0); // below first bin
+        assert_eq!(cdf.prob_on_time(-180), 0.0);
     }
 
     #[test]
@@ -357,17 +329,15 @@ mod tests {
     #[test]
     fn cdf_negative_bins_between_early_bins() {
         let cdf = make_cdf_with_early();
-        // Between -120 and -60 → step stays at 0.01
         assert_eq!(cdf.prob_on_time(-90), 0.01);
     }
 
     #[test]
     fn cdf_negative_budget_means_late_arrival() {
-        // margin < 0: you arrive after scheduled departure → very low probability
         let cdf = make_cdf_with_early();
-        assert_eq!(cdf.prob_on_time(-1), 0.02); // between -60 and 0 → -60 bin
-        assert_eq!(cdf.prob_on_time(-59), 0.02); // -60 ≤ -59, so -60 bin still applies
-        assert_eq!(cdf.prob_on_time(-61), 0.01); // -60 > -61, so only -120 bin applies
+        assert_eq!(cdf.prob_on_time(-1), 0.02);
+        assert_eq!(cdf.prob_on_time(-59), 0.02);
+        assert_eq!(cdf.prob_on_time(-61), 0.01);
     }
 
     #[test]
@@ -381,18 +351,16 @@ mod tests {
 
     #[test]
     fn prob_at_least_is_upper_tail() {
-        let cdf = make_cdf(); // bins (0,0.1),(60,0.5),(120,0.9),(300,1.0)
-        // pmf: (0,0.1),(60,0.4),(120,0.4),(300,0.1)
-        assert!((cdf.prob_at_least(0) - 1.0).abs() < 1e-6); // all mass at delay >= 0
-        assert!((cdf.prob_at_least(60) - 0.9).abs() < 1e-6); // drop the 0s bin
+        let cdf = make_cdf();
+        assert!((cdf.prob_at_least(0) - 1.0).abs() < 1e-6);
+        assert!((cdf.prob_at_least(60) - 0.9).abs() < 1e-6);
         assert!((cdf.prob_at_least(120) - 0.5).abs() < 1e-6);
         assert!((cdf.prob_at_least(300) - 0.1).abs() < 1e-6);
-        assert!((cdf.prob_at_least(301) - 0.0).abs() < 1e-6); // above the top bin
+        assert!((cdf.prob_at_least(301) - 0.0).abs() < 1e-6);
     }
 
     #[test]
     fn prob_at_least_complements_prob_on_time() {
-        // On a normalized CDF: P(D >= s) == 1 - P(D <= s-1).
         let cdf = make_cdf_with_early();
         for s in [-200, -120, -60, -1, 0, 1, 60, 120, 300, 1000] {
             let lhs = cdf.prob_at_least(s);
@@ -401,10 +369,7 @@ mod tests {
         }
     }
 
-    // ── pmf / prob_on_time_vs (two-delay convolution) ─────────────────────────
-
     fn make_bus_cdf() -> DelayCDF {
-        // Mirrors the bus model from config.yaml
         DelayCDF {
             bins: vec![
                 (-300, 0.03),
@@ -456,8 +421,6 @@ mod tests {
 
     #[test]
     fn prob_on_time_vs_late_boarding_vehicle_raises_reliability() {
-        // SUBWAY feeder, BUS boarding, 96s margin — the real-world case.
-        // Feeder-only gives exactly 0.22; convolving the (often-late) bus lifts it.
         let feeder = make_cdf_with_early();
         let board = make_bus_cdf();
         let merged = feeder.prob_on_time_vs(Some(&board), 96);
@@ -471,18 +434,14 @@ mod tests {
 
     #[test]
     fn prob_on_time_vs_early_boarding_vehicle_lowers_reliability() {
-        // A boarding vehicle that almost always leaves 2 min early eats the margin.
         let feeder = make_cdf_with_early();
         let early = DelayCDF {
             bins: vec![(-120, 0.9), (0, 1.0)],
         };
         let merged = feeder.prob_on_time_vs(Some(&early), 96);
-        // 0.9·P(feeder≤-24) + 0.1·P(feeder≤96) = 0.9·0.02 + 0.1·0.22 = 0.04
         assert!((merged - 0.04).abs() < 1e-6, "merged was {merged}");
         assert!(merged < feeder.prob_on_time(96));
     }
-
-    // ── ScenarioBag ───────────────────────────────────────────────────────────
 
     #[test]
     fn empty_bag_is_not_reached() {
@@ -507,7 +466,6 @@ mod tests {
 
     #[test]
     fn with_scenarios_hit_before_miss() {
-        // hit=500 (on-time), miss=700 (delayed)
         let bag = ScenarioBag::with_scenarios(500, 0.7, 700, 0.3);
         assert!(bag.is_reached());
         assert_eq!(bag.earliest(), 500);
@@ -522,10 +480,8 @@ mod tests {
 
     #[test]
     fn with_scenarios_miss_before_hit_sorts_by_time() {
-        // hit=700, miss=500 → sorted: first=500 (miss), second=700 (hit)
         let bag = ScenarioBag::with_scenarios(700, 0.3, 500, 0.7);
         assert_eq!(bag.earliest(), 500);
-        // data[0].prob is miss_prob = 0.7 (the earlier time)
         assert_eq!(bag.scenarios().len(), 2);
         assert_eq!(bag.scenarios()[0].time, 500);
         assert_eq!(bag.scenarios()[1].time, 700);
@@ -546,7 +502,6 @@ mod tests {
         let scenarios = shifted.scenarios();
         assert_eq!(scenarios[0].time, 600);
         assert_eq!(scenarios[1].time, 800);
-        // Probabilities unchanged
         assert!((scenarios[0].prob - 0.7).abs() < 1e-6);
     }
 

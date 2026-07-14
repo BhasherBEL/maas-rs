@@ -1,24 +1,14 @@
-//! Deterministic multi-objective cost vector. Fixed-width over `Axis` so a label
-//! is `Copy` and dominance is a tight loop. Probability NEVER lives here — see
-//! `cost::variance` for the post-hoc moment pair.
+//! Deterministic multi-objective cost vector. Probability NEVER lives here.
 
-/// The full universe of routing axes. A given mode activates a subset (see
-/// `cost::mode_axes`); inactive axes are held at 0.0 and ignored by callers, but
-/// dominance over the fixed array is still correct because 0 <= 0.
+/// A mode activates a subset of axes; inactive axes are held at 0.0. Dominance
+/// over the fixed array stays correct because 0 <= 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Axis {
-    /// Deterministic travel time (seconds), the spine axis present in every mode.
     Time,
-    /// Cumulative ascent (meters), free closed-form heuristic.
     Dplus,
-    /// Surface-roughness accumulation (unitless cost·meters).
     Surface,
-    /// Inverse cycleway exposure: meters NOT on bike infrastructure.
     CyclewayDeficit,
-    /// Time variance (seconds²), always active. Accumulates crossings/signals/
-    /// elevators (all modes), road-class exposure (all modes), and turns (bike).
-    /// Additive along a path; the user-facing expression is the `[p50,p95]`
-    /// bracket. NOT a probability — see `cost::variance::edge_variance`.
+    /// Time variance (seconds²), additive along a path. NOT a probability.
     Variance,
 }
 
@@ -88,10 +78,8 @@ impl CostVector {
         strict
     }
 
-    /// Weak (non-strict) dominance: `self <= other` on every axis, equality
-    /// allowed. Unlike [`dominates`], a tie on all axes counts as weak dominance.
-    /// Used for target pruning, where a completed destination label that merely
-    /// ties a partial label's lower bound already makes that partial useless.
+    /// Weak dominance: `self <= other` on every axis, an all-axis tie counts. Used
+    /// for target pruning where a tie already makes the partial label useless.
     #[inline]
     pub fn weakly_dominates(&self, other: &CostVector) -> bool {
         for i in 0..AXIS_COUNT {
@@ -111,9 +99,8 @@ impl CostVector {
         CostVector { v }
     }
 
-    /// Copy with only `axes` retained (others zeroed). Used to compute Pareto
-    /// dominance over a *subset* of axes — the core front — while the full vector
-    /// is still carried for display. Zeroed axes never constrain dominance (0 ≤ x).
+    /// Copy with only `axes` retained (others zeroed) for subset-axis dominance.
+    /// Zeroed axes never constrain dominance (0 <= x).
     #[inline]
     pub fn project(&self, axes: &[Axis]) -> CostVector {
         let mut v = [0.0; AXIS_COUNT];
@@ -124,8 +111,7 @@ impl CostVector {
     }
 }
 
-/// Per-axis ε = a_i + b_i·value (absolute floor + relative term, additive-leaning).
-/// Sourced from config; `uniform` is for tests only.
+/// Per-axis ε = a_i + b_i·value (absolute floor + relative term).
 #[derive(Debug, Clone, Copy)]
 pub struct Epsilon {
     a: [f64; AXIS_COUNT],
@@ -145,9 +131,9 @@ impl Epsilon {
 }
 
 impl CostVector {
-    /// ε-dominance: self dominates other after inflating self's allowance by ε on
-    /// EACH axis independently. `other.v[i] <= self.v[i] + (a_i + b_i*self.v[i])`
-    /// for all i, with at least one strict improvement (strict is measured pre-ε).
+    /// ε-dominance, per-axis independently (NO cross-axis borrowing):
+    /// `other.v[i] <= self.v[i] + (a_i + b_i*self.v[i])` for all i, with >=1 strict
+    /// improvement measured pre-ε.
     #[inline]
     pub fn eps_dominates(&self, other: &CostVector, eps: &Epsilon) -> bool {
         let mut strict = false;
@@ -223,8 +209,6 @@ mod tests {
             !a.eps_dominates(&b, &eps),
             "huge Time lead must not excuse Dplus loss"
         );
-        // A near-neighbour on Time (within ε) that is worse on Dplus *beyond* its
-        // own ε must survive: each axis is judged only against its own ε.
         let near = CostVector::from_active(&[Axis::Time, Axis::Dplus], &[100.0, 5.0]);
         let off_dplus = CostVector::from_active(&[Axis::Time, Axis::Dplus], &[101.0, 9.0]);
         assert!(

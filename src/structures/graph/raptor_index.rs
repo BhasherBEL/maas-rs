@@ -15,9 +15,7 @@ use crate::{
     },
 };
 
-/// One transit line (GTFS route) serving a station, with its display mode and
-/// colours. `color`/`text_color` are 6-character hex strings (no leading `#`),
-/// or `None` when the feed omits them. Distinct per `(mode, short_name, color)`.
+/// `color`/`text_color` are 6-char hex (no leading `#`), or `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StationLine {
     pub mode: String,
@@ -26,28 +24,19 @@ pub struct StationLine {
     pub text_color: Option<String>,
 }
 
-/// One physical transit station: a group of GTFS platforms collapsed by their
-/// shared (non-empty) `parent_station`. Stops lacking a parent each form their
-/// own standalone station.
+/// One physical transit station: GTFS platforms collapsed by shared non-empty
+/// `parent_station`; parent-less stops each form their own station.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationInfo {
-    /// Station id: the shared `parent_station` value, or the lone stop's `stop_id`.
+    /// Shared `parent_station`, or the lone stop's `stop_id`.
     pub id: String,
     pub name: String,
     pub lat_lng: LatLng,
-    /// Distinct operator (agency) names serving any member platform, sorted.
     pub operators: Vec<String>,
-    /// Distinct transport-mode labels (e.g. "Bus", "Tramway", "Subway") served by
-    /// any member platform, sorted. Derived after grouping from each member's
-    /// stop→pattern→route route_type via `display_route_type`.
     #[serde(default)]
     pub modes: Vec<String>,
-    /// Distinct lines (routes) serving any member platform, deduped by
-    /// `(mode, short_name, color)`. Grouped by mode (Rail, Subway, Tramway, Bus,
-    /// then others alphabetically) and naturally sorted by `short_name` within a mode.
     #[serde(default)]
     pub lines: Vec<StationLine>,
-    /// Compact stop indices of the member platforms, ascending.
     pub platform_stop_indices: Vec<usize>,
 }
 
@@ -78,46 +67,32 @@ pub struct RaptorIndex {
     pub transit_stop_to_node: Vec<NodeID>,
     pub transit_stops_tree: KdTree<f64, usize, [f64; 2]>,
 
-    /// Original GTFS `route_id` string per internal `RouteId` (index = `RouteId.0`).
-    /// Serialized — required to match realtime alert `route_id` fields, which carry
-    /// the raw GTFS string id. Parallel to `transit_routes`.
+    /// Must carry the raw GTFS string id to match realtime alert `route_id` fields.
     #[serde(default)]
     pub transit_route_ids: Vec<String>,
 
-    /// Original GTFS `trip_id` string per internal `TripId` (index = `TripId.0`).
-    /// Serialized — required to match realtime feeds, which key by string id.
     #[serde(default)]
     pub transit_trip_ids: Vec<String>,
-    /// Reverse of `transit_trip_ids`, derived at build/load time (not serialized).
     #[serde(skip)]
     pub trip_id_to_index: HashMap<String, TripId>,
 
-    /// Original GTFS `stop_id` string per compact stop index. Serialized so the
-    /// reverse map can be rebuilt at load without re-reading node data.
     #[serde(default)]
     pub transit_stop_ids: Vec<String>,
-    /// Reverse of `transit_stop_ids` (stop_id → compact stop index), derived.
     #[serde(skip)]
     pub stop_id_to_index: HashMap<String, usize>,
 
-    /// Display name per compact stop index (parallel to `transit_stop_ids`). Names
-    /// live only in `NodeData::TransitStop`, so this serialized copy is what plan and
-    /// explain reconstruction read after the interior-node drop empties `g.nodes`.
+    /// Serialized copy of stop names (originals live only in `NodeData::TransitStop`,
+    /// dropped by interior-node contraction).
     #[serde(default)]
     pub transit_stop_names: Vec<String>,
 
-    /// GTFS `platform_code` per compact stop index (parallel to `transit_stop_ids`).
     #[serde(default)]
     pub transit_stop_platform_codes: Vec<Option<String>>,
 
-    /// Deduped physical stations (grouped by `parent_station`). Source of truth;
-    /// the lookup maps below are derived in `build_runtime_indices`.
     #[serde(default)]
     pub transit_stations: Vec<StationInfo>,
-    /// compact stop index → station index, derived from `transit_stations`.
     #[serde(skip)]
     pub transit_stop_to_station: Vec<u32>,
-    /// station id → station index, derived from `transit_stations`.
     #[serde(skip)]
     pub station_id_to_index: HashMap<String, usize>,
 
@@ -126,14 +101,9 @@ pub struct RaptorIndex {
     #[serde(default)]
     pub transit_idx_stop_reverse_transfers: Vec<Lookup>,
 
-    /// Opt-in accuracy improvement for the S1 chain-sweep tightening: when `true`,
-    /// a long inter-leg transfer (> `MAX_TRANSFER_DISTANCE_M`, off the capped
-    /// reverse-footpath table) is tightened using the plan's own reconstructed
-    /// walk instead of being left untightened. This surfaces valid plans that the
-    /// legacy backward pass hides (its capped table produces no reverse label, so
-    /// the leg's bound is 0 and it is never re-timed). Default `false` keeps the
-    /// chain sweep byte-identical to the backward pass on every transfer; opt-in
-    /// pending product review. Runtime-only (not persisted).
+    /// When `true`, a long inter-leg transfer (> `MAX_TRANSFER_DISTANCE_M`, off the
+    /// capped reverse-footpath table) is tightened using the plan's own reconstructed
+    /// walk. Default `false` keeps the chain sweep byte-identical to the backward pass.
     #[serde(skip)]
     pub tighten_long_transfers: bool,
 
@@ -142,11 +112,9 @@ pub struct RaptorIndex {
     #[serde(default)]
     pub transit_pattern_shape_stop_idx: Vec<Vec<u32>>,
 
-    /// Per pattern, per inter-stop segment (index `s-1` for the edge stop `s-1`→`s`),
-    /// the transit edge's `timetable_segment`. Precomputed at build time from `g.edges`
-    /// so transit-leg plan reconstruction needs no `g` once the interior arrays are
-    /// dropped (node contraction). Empty unless built; reconstruction falls back to the
-    /// `g.edges` scan when empty (flag-off / pre-cutover graphs).
+    /// Per pattern, per inter-stop segment (index `s-1` for edge `s-1`→`s`), the
+    /// transit edge's `timetable_segment`. Empty unless built; reconstruction falls
+    /// back to the `g.edges` scan when empty.
     #[serde(default)]
     pub transit_pattern_segment_timetables: Vec<Vec<TimetableSegment>>,
 
@@ -161,10 +129,8 @@ pub struct RaptorIndex {
     #[serde(default = "RaptorIndex::default_walking_speed_mps")]
     pub walking_speed_mps: f64,
 
-    /// Build-time radius (meters) for merging parent-less GTFS stops into a
-    /// same-named physical station. Read during the GTFS ingestion phase by the
-    /// per-provider orphan-absorption preprocessor. Tuning param — not serialized,
-    /// set before the GTFS phase from config.yaml.
+    /// Radius (m) for merging parent-less GTFS stops into a same-named station.
+    /// Read during GTFS ingestion, so must be set before that phase.
     #[serde(skip, default = "RaptorIndex::default_station_merge_radius_m")]
     pub station_merge_radius_m: f64,
 
@@ -174,273 +140,154 @@ pub struct RaptorIndex {
     #[serde(skip, default = "RaptorIndex::default_driving_speed_mps")]
     pub driving_speed_mps: f64,
 
-    // Access-radius floor (seconds) used when a bike/car access or egress mode is
-    // active, so the search reaches a better-connected hub farther than the
-    // nearest stops instead of stopping at the first local result.
     #[serde(skip, default = "RaptorIndex::default_vehicle_access_secs")]
     pub vehicle_access_secs: u32,
 
-    // The vehicle (bike/car) access budget scales with trip length: a longer journey
-    // justifies riding farther to reach a better hub. Budget = crow-flies time ×
-    // `vehicle_access_fraction`, clamped to [`vehicle_access_secs`, `vehicle_access_max_secs`].
+    // Budget = crow-flies time × `vehicle_access_fraction`, clamped to
+    // [`vehicle_access_secs`, `vehicle_access_max_secs`].
     #[serde(skip, default = "RaptorIndex::default_vehicle_access_fraction")]
     pub vehicle_access_fraction: f64,
     #[serde(skip, default = "RaptorIndex::default_vehicle_access_max_secs")]
     pub vehicle_access_max_secs: u32,
 
-    // Runtime tuning params, applied from config.yaml at startup — not serialized,
-    // so adding them does not change the `graph.bin` (postcard) layout.
     #[serde(skip, default = "RaptorIndex::default_reliability_bucket_edges")]
     pub reliability_bucket_edges: Vec<f32>,
 
     #[serde(skip, default = "RaptorIndex::default_arrival_slack_secs")]
     pub arrival_slack_secs: u32,
 
-    /// When true, inter-stop transfers are found by a live, per-round, multi-source,
-    /// cutoff-bounded foot-Dijkstra over the contracted graph (MCR) instead of the
-    /// precomputed ≤`MAX_TRANSFER_DISTANCE_M` table — so journeys needing a >1 km walk
-    /// between stops are discovered. Runtime tuning (like `arrival_slack_secs`): NOT
-    /// serialized, so toggling it needs no schema bump. Default false.
+    /// When true, inter-stop transfers use a live per-round MCR foot-Dijkstra instead
+    /// of the precomputed ≤`MAX_TRANSFER_DISTANCE_M` table, discovering >1 km transfers.
     #[serde(skip, default = "RaptorIndex::default_unrestricted_transfers")]
     pub unrestricted_transfers: bool,
 
-    /// When true, foot access/egress stop discovery uses the exact Customizable
-    /// Contraction Hierarchy (`Graph::cch_access`/`cch_egress`) instead of the
-    /// radius-bounded two-pass foot Dijkstra — so every stop reachable on foot is
-    /// found regardless of the access radius. Requires a built `cch` (runtime-only,
-    /// `#[serde(skip)]`); when absent the flag silently falls back to the two-pass
-    /// path. Runtime tuning like `unrestricted_transfers`: NOT serialized, so
-    /// toggling it needs no schema bump. Default false.
+    /// When true, foot access/egress uses the exact CCH instead of the two-pass foot
+    /// Dijkstra. Requires a built `cch`; falls back to two-pass when absent.
     #[serde(skip, default = "RaptorIndex::default_use_cch_access")]
     pub use_cch_access: bool,
 
-    /// When true, a range/window query emits a per-phase wall-clock decomposition
-    /// (discovery / grid_alloc / forward / extract / backward, plus per-pass
-    /// probe/range/departure counts) as one structured log line. Purely additive
-    /// observability — never changes routing behavior or results. Per-query
-    /// `profileLatency` overrides this graph default. Runtime tuning like
-    /// `unrestricted_transfers`: NOT serialized, so toggling it needs no schema
-    /// bump. Default false.
     #[serde(skip, default = "RaptorIndex::default_profile_latency")]
     pub profile_latency: bool,
 
     #[serde(skip, default = "RaptorIndex::default_max_window_secs")]
     pub max_window_secs: u32,
 
-    /// Travel-time-map (isochrone) sampling grid step, in METRES. The one-to-many
-    /// reachability query samples the bounding box the centre can reach on a lat/lng
-    /// grid whose cell edge is this many metres; smaller = finer heatmap, more cells,
-    /// slower. Runtime tuning (like `max_window_secs`): NOT serialized, applied from
-    /// config at startup, so changing it needs no schema bump.
+    /// Isochrone sampling grid step, in METRES.
     #[serde(skip, default = "RaptorIndex::default_travel_map_grid_step_m")]
     pub travel_map_grid_step_m: f64,
 
-    /// Travel-time-map safety cap: the maximum number of grid cells the isochrone
-    /// fill may generate. A fine per-query grid step over a large (e.g. 60-min
-    /// transit) reachable box could otherwise produce millions of cells → OOM /
-    /// huge payload. When the candidate cell count exceeds this, the step is
-    /// coarsened upward before generating cells. Runtime tuning: NOT serialized,
-    /// applied from config at startup.
+    /// Safety cap on isochrone grid cells; the step is coarsened when exceeded.
     #[serde(skip, default = "RaptorIndex::default_travel_map_max_cells")]
     pub travel_map_max_cells: u64,
 
-    /// Travel-time-map departure-window sample interval, in SECONDS. When a
-    /// `travelTimeMap` query supplies a departure window, the isochrone is evaluated
-    /// at departures spaced this many seconds apart across the window and aggregated
-    /// per cell (BEST = min, AVERAGE = mean). Larger = fewer passes, faster, coarser.
-    /// Runtime tuning: NOT serialized, applied from config at startup.
+    /// Isochrone departure-window sample interval, in SECONDS.
     #[serde(skip, default = "RaptorIndex::default_travel_map_window_sample_secs")]
     pub travel_map_window_sample_secs: u32,
 
     #[serde(skip, default = "RaptorIndex::default_max_snap_distance_m")]
     pub max_snap_distance_m: u32,
 
-    // Edge-aware snapping: project a query coordinate onto the nearest *edge*
-    // (within `edge_snap_radius_m`) instead of the nearest node, so a point mid-way
-    // along a long straight edge isn't forced onto a distant end node. Runtime
-    // tuning — not serialized.
     #[serde(skip, default = "RaptorIndex::default_edge_snap_radius_m")]
     pub edge_snap_radius_m: f64,
 
-    // Default bike cost profile (BRouter trekking). Not serialized — applied from
-    // config.yaml at startup; a per-request override merges over it.
     #[serde(skip, default)]
     pub bike_profile: crate::structures::BikeProfile,
 
-    /// Stochastic street-time model for access/egress legs. Tuning, not derived
-    /// data — `#[serde(skip)]` like `bike_profile`, so it is NOT in graph.bin and
-    /// needs no schema bump; set from config at build time.
     #[serde(skip, default = "RaptorIndex::default_street_time")]
     pub street_time: crate::structures::StreetTimeModel,
 
     /// RCSP distance budget multiplier δ: paths up to (1+δ)·shortest are explored.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_distance_budget")]
     pub distance_budget: f64,
 
-    /// Per-axis ε-dominance thresholds for the multi-objective Pareto filter.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_epsilon")]
     pub epsilon: crate::structures::cost::Epsilon,
 
-    /// Bike grid-bucketing cell-size coefficients per meter of origin→dest
-    /// straight-line distance, on the CyclewayDeficit and Dplus diversity axes.
-    /// Cell size = k·D; `0.0` disables bucketing on that axis (strict no-op).
-    /// Bounds the per-node Pareto frontier while preserving the cycleway/climb
-    /// span. Tuning params — not serialized, applied from config at startup.
+    /// Bike bucketing cell-size coefficients per metre of origin→dest distance, on the
+    /// CyclewayDeficit and Dplus axes. Cell size = k·D; `0.0` disables bucketing.
     #[serde(skip, default = "RaptorIndex::default_bike_bucket_cyc_k")]
     pub bike_bucket_cyc_k: f64,
     #[serde(skip, default = "RaptorIndex::default_bike_bucket_dpl_k")]
     pub bike_bucket_dpl_k: f64,
 
-    /// Drive grid-bucketing cell-size coefficient per metre of origin→dest
-    /// straight-line distance, on the Variance selection axis. Cell size = k·D;
-    /// `0.0` disables bucketing (strict no-op). Variance is Time-decorrelated and
-    /// accumulates per-edge (signals/crossings), so on long direct drive legs it
-    /// lets a combinatorial number of near-duplicate routes survive the per-node
-    /// Pareto frontier; bucketing bounds the frontier while still preserving the
-    /// low↔high-variance span the user routes on. Tuning param — not serialized,
-    /// applied from config at startup.
+    /// Drive bucketing cell-size coefficient per metre of origin→dest distance, on the
+    /// Variance axis. Cell size = k·D; `0.0` disables bucketing.
     #[serde(skip, default = "RaptorIndex::default_drive_bucket_var_k")]
     pub drive_bucket_var_k: f64,
 
-    /// Walk grid-bucketing cell-size coefficient per metre of origin→dest
-    /// straight-line distance, on the Surface selection axis. Cell size = k·D;
-    /// `0.0` disables bucketing (strict no-op). Surface accumulates per-edge like
-    /// Variance and combines combinatorially with it on long direct walk legs;
-    /// bucketing bounds the per-node frontier while preserving the paved↔unpaved
-    /// span. Tuning param — not serialized, applied from config at startup.
+    /// Walk bucketing cell-size coefficient per metre of origin→dest distance, on the
+    /// Surface axis. Cell size = k·D; `0.0` disables bucketing.
     #[serde(skip, default = "RaptorIndex::default_walk_bucket_surf_k")]
     pub walk_bucket_surf_k: f64,
 
-    /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false: with the
-    /// gradient-aware power model climbing is already priced in Time, so a separate
-    /// "minimize D+ at any cost" axis only manufactures absurd extremes (a long walk to
-    /// shave a few m of ascent) and triples search cost. D+ stays a displayed stat.
+    /// Whether D+ (ascent) is a bike SELECTION/dominance axis. Default false.
     #[serde(skip, default = "RaptorIndex::default_bike_select_dplus")]
     pub bike_select_dplus: bool,
 
-    /// Tunable σ model for signal/elevator/crossing variance generators.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_variance_model")]
     pub variance_model: crate::structures::cost::VarianceModel,
 
-    /// Per-axis surface roughness and comfort-stress weights for the cost vector.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_cost_weights")]
     pub cost_weights: crate::structures::cost::CostWeights,
 
-    /// Number of diverse representatives kept from the multi-objective front.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_representatives_k")]
     pub representatives_k: usize,
 
     /// ADGW limited-sharing threshold: an alternative bike/car leg is dropped if it
-    /// shares more than this fraction of its length with a higher-ranked one. Tuning
-    /// param — applied at startup, not serialized. 0.6 mirrors GraphHopper's default.
+    /// shares more than this fraction of its length with a higher-ranked one.
     #[serde(skip, default = "RaptorIndex::default_alt_max_share_factor")]
     pub alt_max_share_factor: f64,
 
-    /// Systematic coefficient of variation for post-hoc path-time variance.
-    /// Tuning param — not serialized, applied from config at startup.
     #[serde(skip, default = "RaptorIndex::default_systematic_cv")]
     pub systematic_cv: f64,
 
-    /// Per-axis balanced-default weights. Tuning param — not serialized, applied
-    /// from config at startup.
     #[serde(skip, default = "RaptorIndex::default_balance")]
     pub balance: crate::structures::cost::BalanceWeights,
 
-    /// Transit-pricing model (price as an in-search Pareto dominance axis).
-    /// Tuning, not derived data — `#[serde(skip)]` like `epsilon`/`cost_weights`,
-    /// so it is NOT in graph.bin and needs no schema bump; set from config at
-    /// build time. `enabled = false` (the default) makes every fare code path a
-    /// no-op, byte-identical to pre-feature routing.
+    /// `enabled = false` (the default) makes every fare code path a no-op,
+    /// byte-identical to pre-feature routing.
     #[serde(skip, default)]
     pub fare_model: crate::structures::cost::FareModel,
 
-    /// Runtime lookup RouteId → `OperatorFareId`, parallel to `transit_routes`,
-    /// derived from `agency.name`. Rebuilt in `build_runtime_indices` (on build
-    /// AND on load), so it is `#[serde(skip)]` (no schema bump). Empty when fares
+    /// RouteId → `OperatorFareId`, parallel to `transit_routes`. Empty when fares
     /// are disabled or the index is unbuilt.
     #[serde(skip, default)]
     pub operator_fare_of_route: Vec<crate::structures::cost::OperatorFareId>,
 
-    /// Reverse of the `unknown[]` slot assignment: `unknown_operator_names[slot]`
-    /// is the normalized agency name mapped to that unmodeled-operator slot, for
-    /// naming `PlanPrice.unknown_operators`. Built alongside `operator_fare_of_route`.
+    /// `unknown_operator_names[slot]` is the normalized agency name for that
+    /// unmodeled-operator slot.
     #[serde(skip, default)]
     pub unknown_operator_names: Vec<String>,
 
-    /// Per-pattern cumulative railway distance (metres) from the pattern's first
-    /// stop to each of its stops, parallel to `transit_idx_pattern_stops`. Empty
-    /// `Vec` for non-SNCB patterns (or every pattern when fares are disabled). The
-    /// per-km SNCB fare between board and alight positions is then
-    /// `per_km × (cum[alight] - cum[board])`, O(1) at alight. Derived data,
-    /// `#[serde(skip)]`: rebuilt on load from `railway_adj` + pattern stops (both
-    /// serialized) by `Graph::rebuild_sncb_railway_km`, which `set_fare_model`
-    /// invokes (via `apply_routing_defaults`, run on every startup path including
-    /// restore, after `load_graph`), so no `graph.bin` schema bump. The cumulative
-    /// distance excludes flat-agglomeration in-zone segments (Appendix A.2, using
-    /// `sncb_stop_zone`). Built only for SNCB-modeled
-    /// patterns and only when `fare_model.enabled` is true — the rail-Dijkstra
-    /// sweep is skipped entirely otherwise, keeping the disabled path zero-cost.
+    /// Per-pattern cumulative railway distance (m) from the pattern's first stop to
+    /// each stop, parallel to `transit_idx_pattern_stops`. Per-km SNCB fare is
+    /// `per_km × (cum[alight] - cum[board])`. Rebuilt on load.
     #[serde(skip, default)]
     pub sncb_pattern_cum_railway_m: Vec<Vec<f64>>,
 
-    /// SNCB flat-agglomeration membership per compact stop index (spec Appendix
-    /// A.2), parallel to `transit_stop_to_node`. `Agglomeration::None` for every
-    /// stop outside all zones (the common case) and for every stop when fares are
-    /// disabled or no zones are configured. Derived data, `#[serde(skip)]`: rebuilt
-    /// on both build and load by `Graph::rebuild_sncb_stop_zones`, which
-    /// `set_fare_model` invokes (via `apply_routing_defaults` — run on every
-    /// startup path, restore included, AFTER `load_graph`), by point-in-polygon over
-    /// the config-driven `fare_model.agglomerations` polygons (stored in the
-    /// serde-skipped `fare_model`, applied from config at startup), so NO graph.bin
-    /// schema bump. Two stops in the SAME non-`None` zone have zero chargeable
-    /// railway distance between them, which is how each agglomeration collapses to
-    /// one SNCB fare node (`rebuild_sncb_railway_km`).
+    /// SNCB flat-agglomeration membership per compact stop, parallel to
+    /// `transit_stop_to_node`. Two stops in the SAME non-`None` zone have zero
+    /// chargeable railway distance between them. Rebuilt on load.
     #[serde(skip, default)]
     pub sncb_stop_zone: Vec<crate::structures::cost::Agglomeration>,
 
-    /// Airport special-OD membership per compact stop index (spec Appendix A.2):
-    /// `true` for a stop whose (harmonized) name contains any configured SNCB
-    /// `airport_station_names` token (e.g. "Airport"/"Luchthaven"). An SNCB journey
-    /// whose boarding OR alighting stop is an airport prices at the fixed
-    /// `airport_od_cents` instead of base+per-km. Parallel to `transit_stop_to_node`.
-    /// `false` everywhere when fares are disabled, no SNCB operator carries airport
-    /// tokens, or the airport override is zero. Derived data, `#[serde(skip)]`:
-    /// rebuilt on both build and load by `Graph::rebuild_sncb_airport_stops` (invoked
-    /// from `set_fare_model`), so NO graph.bin schema bump. Empty when unbuilt/off.
+    /// Airport special-OD membership per compact stop: an SNCB journey boarding OR
+    /// alighting at an airport prices at fixed `airport_od_cents`. Rebuilt on load.
     #[serde(skip, default)]
     pub sncb_airport_stop: Vec<bool>,
 
-    /// Reference-node zone collapse for the SNCB zone-to-zone fare (spec Appendix
-    /// A.2, corrected). `sncb_ref_to_stop[z]` is the railway distance (metres) from
-    /// zone `z`'s reference node to every compact SNCB stop (single-source Dijkstra
-    /// over `railway_adj`), parallel to the agglomeration order in
-    /// `fare_model.agglomerations`; `f64::INFINITY` for an unreachable / unsnappable
-    /// stop. The per-km fare distance from a zone board to a free-station alight (or
-    /// vice-versa) is one O(1) lookup here, so it is FIXED per (zone, station) and
-    /// independent of the pattern/boarding station. Derived data, `#[serde(skip)]`:
-    /// rebuilt on both build and load by `Graph::rebuild_sncb_zone_refs` (invoked from
-    /// `set_fare_model`). Empty when fares are off, no zones are configured, or no
-    /// SNCB operator is modeled.
+    /// `sncb_ref_to_stop[z]`: railway distance (m) from zone `z`'s reference node to
+    /// every compact SNCB stop, in `fare_model.agglomerations` order; `INFINITY` if
+    /// unreachable. Rebuilt on load.
     #[serde(skip, default)]
     pub sncb_ref_to_stop: Vec<Vec<f64>>,
 
-    /// Reference-to-reference railway distance (metres) between agglomeration zones
-    /// for the SNCB zone-to-zone fare: `sncb_ref_to_ref[zi][zj]`, both indices in the
-    /// `fare_model.agglomerations` order. Any Brussels station → any Antwerpen station
-    /// charges per-km for exactly this fixed distance. `f64::INFINITY` when a ref pair
-    /// is unreachable. Derived, `#[serde(skip)]`: rebuilt with `sncb_ref_to_stop`.
+    /// `sncb_ref_to_ref[zi][zj]`, both in `fare_model.agglomerations` order: fixed
+    /// per-km distance between any two zone reference nodes. `INFINITY` if unreachable.
     #[serde(skip, default)]
     pub sncb_ref_to_ref: Vec<Vec<f64>>,
 
-    /// The chosen reference RAILWAY-NODE index for each configured agglomeration
-    /// (parallel to `fare_model.agglomerations`); `None` when no reference could be
-    /// resolved (empty zone, no railway topology). Provenance/debug for the
-    /// zone-collapse tables above. Derived, `#[serde(skip)]`.
+    /// Chosen reference railway-node index per agglomeration; `None` if unresolved.
     #[serde(skip, default)]
     pub sncb_zone_ref_node: Vec<Option<usize>>,
 }
@@ -556,11 +403,6 @@ impl RaptorIndex {
         1.2
     }
 
-    /// Merge radius (m) for the EXACT normalized-name + SAME-operator/feed case
-    /// only. That match is a strong signal, so it tolerates the spread of big
-    /// interchanges (Gare du Nord surface↔metro ~95-123 m, Merode ~111 m) while
-    /// keeping genuinely distinct same-named STIB stops (>250 m apart) separate. A
-    /// future fuzzy or cross-operator matcher should use its own, tighter value.
     pub fn default_station_merge_radius_m() -> f64 {
         250.0
     }
@@ -570,19 +412,19 @@ impl RaptorIndex {
     }
 
     pub fn default_driving_speed_mps() -> f64 {
-        11.0 // ~40 km/h urban driving
+        11.0
     }
 
     pub fn default_vehicle_access_secs() -> u32 {
-        20 * 60 // 20 min floor: ~5 km by bike, ~13 km by car, to reach a real hub
+        20 * 60
     }
 
     pub fn default_vehicle_access_fraction() -> f64 {
-        0.06 // ~6% of the crow-flies (walk-time) trip: only long journeys grow past the floor
+        0.06
     }
 
     pub fn default_vehicle_access_max_secs() -> u32 {
-        45 * 60 // hard ceiling so a very long trip's access Dijkstra stays bounded
+        45 * 60
     }
 
     pub fn default_reliability_bucket_edges() -> Vec<f32> {
@@ -609,20 +451,14 @@ impl RaptorIndex {
         24 * 3600
     }
 
-    /// Default isochrone grid step (metres): ~300 m cells give a smooth city-scale
-    /// heatmap while keeping a 30-min walk+transit box to a few thousand cells.
     pub fn default_travel_map_grid_step_m() -> f64 {
         300.0
     }
 
-    /// Default isochrone cell cap: bounds the fill to ~150k cells so a fine
-    /// per-query grid step over a large reachable box coarsens rather than OOMs.
     pub fn default_travel_map_max_cells() -> u64 {
         150_000
     }
 
-    /// Default isochrone window sample interval (seconds): one departure every
-    /// 10 minutes across the window, bounding the number of forward passes.
     pub fn default_travel_map_window_sample_secs() -> u32 {
         600
     }
@@ -656,24 +492,14 @@ impl RaptorIndex {
     }
 
     pub fn default_drive_bucket_var_k() -> f64 {
-        // Variance is seconds², not metres, but the same "cell ∝ trip distance"
-        // shape keeps a roughly constant bucket count as distance (and therefore
-        // the accumulated signal/crossing count) grows. Calibrated on a synthetic
-        // repeated-diamond diagnostic (multiobj.rs tests) to bound the per-node
-        // frontier to a handful of representatives regardless of route length.
         0.05
     }
 
     pub fn default_walk_bucket_surf_k() -> f64 {
-        // Same rationale as `bike_bucket_cyc_k`: Surface is a length-scaled cost
-        // (metres × roughness factor), so cell size ∝ distance keeps the paved↔
-        // unpaved span while bounding the frontier on long direct walk legs.
         0.025
     }
 
     pub fn default_bike_select_dplus() -> bool {
-        // Off: A/B showed demoting D+ removes the long-walk-for-flatness extreme
-        // (push 1114→44 m) and makes the search 3–4× faster, with comparable diversity.
         false
     }
 
@@ -705,9 +531,7 @@ impl RaptorIndex {
         crate::structures::cost::BalanceWeights::default()
     }
 
-    /// Rebuild non-serialized runtime indices from serialized data. Must be
-    /// called after construction (build) and after deserialization (load), since
-    /// `trip_id_to_index` is `#[serde(skip)]`.
+    /// Rebuild non-serialized runtime indices. Call after build and after load.
     pub fn build_runtime_indices(&mut self) {
         self.trip_id_to_index = self
             .transit_trip_ids
@@ -726,21 +550,13 @@ impl RaptorIndex {
         self.rebuild_operator_fare_lookup();
     }
 
-    /// Normalize an agency name for fare-config matching: uppercased, trimmed.
-    /// Feeds spell the operator inconsistently (case/whitespace) but the token
-    /// itself ("STIB", "SNCB") is stable, so a case-insensitive trim suffices.
     fn normalize_agency_name(name: &str) -> String {
         name.trim().to_ascii_uppercase()
     }
 
-    /// True if the configured operator token `op_token` (already normalized)
-    /// identifies the agency named `agency_name` (already normalized). The GTFS
-    /// feeds spell some operators as slash/whitespace-joined multi-brand strings
-    /// (real example: `NMBS/SNCB` for what config keys as `SNCB`), so an exact
-    /// string compare silently fails to match (defect B: SNCB priced as unknown).
-    /// Matching is therefore token-based: `op_token` matches if it equals the whole
-    /// name OR appears as one of the name's `/`- or whitespace-delimited tokens.
-    /// This is config-driven — no agency literal is hardcoded in the logic.
+    /// Token-based match (both args pre-normalized): feeds spell some operators as
+    /// slash/whitespace-joined multi-brand strings (`NMBS/SNCB` for config's `SNCB`),
+    /// so an exact compare silently fails.
     fn agency_matches_operator(agency_name: &str, op_token: &str) -> bool {
         if agency_name == op_token {
             return true;
@@ -750,12 +566,9 @@ impl RaptorIndex {
             .any(|tok| tok == op_token)
     }
 
-    /// Build the RouteId → `OperatorFareId` lookup from `fare_model` + the route→
-    /// agency links. Runtime-only (`#[serde(skip)]`), rebuilt on build and load.
-    /// A route whose agency name matches a modeled operator resolves to that
-    /// operator's model; every other route is `Unknown`, with unmodeled agencies
-    /// deterministically assigned a stable `unknown[]` slot (`0..N_OP`). No-op
-    /// (empty vector) when fares are disabled, so the boarding path stays untouched.
+    /// Build the RouteId → `OperatorFareId` lookup. A route whose agency matches a
+    /// modeled operator resolves to its model; others get a stable `unknown[]` slot
+    /// (`0..N_OP`). No-op when fares are disabled.
     pub fn rebuild_operator_fare_lookup(&mut self) {
         use crate::structures::cost::{N_OP, OperatorFareId};
         if !self.fare_model.enabled {
@@ -763,42 +576,30 @@ impl RaptorIndex {
             self.unknown_operator_names = Vec::new();
             return;
         }
-        // Normalized modeled-operator token → its compiled model, in config order.
         let modeled: Vec<(String, crate::structures::cost::OperatorModel)> = self
             .fare_model
             .operators
             .iter()
             .map(|op| (Self::normalize_agency_name(&op.name), op.model))
             .collect();
-        // Track which modeled operators matched at least one agency, for a startup
-        // warning on any operator that matches ZERO agencies (defect B guard).
         let mut op_matched = vec![false; modeled.len()];
-        // Deterministic slot assignment for unmodeled agency names, first-seen order.
         let mut unknown_slot: HashMap<String, usize> = HashMap::new();
         let mut next_slot = 0usize;
         let mut slot_names: Vec<String> = vec![String::new(); N_OP];
 
         let mut lookup = Vec::with_capacity(self.transit_routes.len());
         for route in &self.transit_routes {
-            // Original (un-normalized) agency name, used verbatim as the display
-            // label for an unpriced-operator badge (e.g. `De Lijn`, `NMBS/SNCB`,
-            // `LETEC`), so the tooltip matches the normal-case shown elsewhere in
-            // the UI rather than the internal uppercased matching key.
             let display_name = self
                 .transit_agencies
                 .get(route.agency_id.0 as usize)
                 .map(|a| a.name.trim().to_string())
                 .unwrap_or_default();
             let agency_name = Self::normalize_agency_name(&display_name);
-            // First modeled operator whose token identifies this agency wins
-            // (config order). Token-based so `SNCB` matches `NMBS/SNCB`.
             let matched = modeled
                 .iter()
                 .position(|(tok, _)| Self::agency_matches_operator(&agency_name, tok));
             let id = if let Some(i) = matched {
                 op_matched[i] = true;
-                // Resolve a TEC-tier template's `is_express` for THIS route from the
-                // config route-name classification list (project policy: no hardcode).
                 let model = match modeled[i].1 {
                     crate::structures::cost::OperatorModel::TimeWindowFlatTiered {
                         single_cents,
@@ -812,8 +613,6 @@ impl RaptorIndex {
                             &opf.express_route_names,
                             &opf.express_route_prefixes,
                         );
-                        // The template carries the CLASSIC tier; swap in the express
-                        // price set for a route classified express.
                         let (single_cents, card6_cents, card6_reduced_cents) = if is_express {
                             (
                                 opf.express_single_cents,
@@ -838,8 +637,6 @@ impl RaptorIndex {
                 let slot = *unknown_slot.entry(agency_name).or_insert_with(|| {
                     let s = next_slot.min(N_OP - 1);
                     next_slot += 1;
-                    // First name mapped to this slot names it (later names sharing a
-                    // clamped slot keep the first, a documented approximation).
                     if slot_names[s].is_empty() {
                         slot_names[s] = name_for_slot;
                     }
@@ -852,9 +649,7 @@ impl RaptorIndex {
         self.operator_fare_of_route = lookup;
         self.unknown_operator_names = slot_names;
 
-        // Guard against silent fare inertness (defect B): warn on any configured
-        // fare operator that matched ZERO agencies, so a feed renaming its agency
-        // (which would make that operator price as unknown) is caught at startup.
+        // Warn on any configured fare operator that matched ZERO agencies.
         let unmatched: Vec<&str> = modeled
             .iter()
             .zip(&op_matched)
@@ -876,8 +671,6 @@ impl RaptorIndex {
         }
     }
 
-    /// Derive the station lookup maps from the serialized `transit_stations`.
-    /// Called on both build and load, mirroring the other runtime-index rebuilds.
     pub fn rebuild_station_lookups(&mut self) {
         self.station_id_to_index = self
             .transit_stations
@@ -896,39 +689,32 @@ impl RaptorIndex {
         }
     }
 
-    /// Compact platform stop indices for a GTFS station id, if known.
     pub fn station_platforms(&self, station_id: &str) -> Option<Vec<usize>> {
         let idx = *self.station_id_to_index.get(station_id)?;
         Some(self.transit_stations[idx].platform_stop_indices.clone())
     }
 
-    /// Compact stop index for a GTFS `stop_id` string, if known.
     pub fn stop_index_of(&self, stop_id: &str) -> Option<usize> {
         self.stop_id_to_index.get(stop_id).copied()
     }
 
-    /// Original GTFS `route_id` string for the route of an internal `TripId`, if known.
-    /// Returns `None` when either the trip or the route-id mapping is absent (e.g. on
-    /// old `graph.bin` files loaded before `transit_route_ids` was added).
     pub fn route_id_of_trip(&self, trip: TripId) -> Option<&str> {
         let route_idx = self.transit_trips.get(trip.0 as usize)?.route_id.0 as usize;
         self.transit_route_ids.get(route_idx).map(|s| s.as_str())
     }
 
-    /// Original GTFS `trip_id` string for an internal `TripId`, if known.
     pub fn trip_id_str(&self, trip: TripId) -> Option<&str> {
         self.transit_trip_ids
             .get(trip.0 as usize)
             .map(|s| s.as_str())
     }
 
-    /// Internal `TripId` for a GTFS `trip_id` string, if known.
     pub fn trip_index_of(&self, trip_id: &str) -> Option<TripId> {
         self.trip_id_to_index.get(trip_id).copied()
     }
 
-    /// Cross-reference check run after deserialization.  Returns an error if any index is
-    /// out-of-bounds, which indicates a stale or corrupt `graph.bin`.
+    /// Post-deserialization cross-reference check; an out-of-bounds index means a
+    /// stale or corrupt `graph.bin`.
     pub fn validate(&self) -> Result<(), String> {
         let n_services = self.transit_services.len();
         let n_routes = self.transit_routes.len();
@@ -1104,15 +890,12 @@ mod tests {
             FareModel, KnownEurosEpsilon, OperatorFare, OperatorFareId, OperatorModel,
         };
         let mut idx = RaptorIndex::new();
-        // Agencies: 0 = STIB (modeled), 1 = De Lijn, 2 = TEC (both unmodeled).
         idx.transit_agencies = vec![agency("STIB"), agency("De Lijn"), agency("TEC")];
-        // Routes: r0→STIB, r1→De Lijn, r2→TEC, r3→De Lijn (same unknown slot as r1).
         idx.transit_routes = vec![route(0), route(1), route(2), route(1)];
         idx.fare_model = FareModel {
             enabled: true,
             known_euros_epsilon: KnownEurosEpsilon::default(),
             operators: vec![OperatorFare {
-                // Lowercase in config: normalization must still match "STIB".
                 name: "stib".into(),
                 model: OperatorModel::TimeWindowFlat {
                     ticket_cents: 210,
@@ -1150,18 +933,12 @@ mod tests {
         };
         assert_ne!(s1, s2, "distinct unmodeled operators get distinct slots");
         assert_eq!(s1, s3, "same unmodeled operator reuses its slot");
-        // Slot label is the original-case agency name (display form), not the
-        // uppercased internal matching key.
         assert_eq!(idx.unknown_operator_names[s1], "De Lijn");
         assert_eq!(idx.unknown_operator_names[s2], "TEC");
     }
 
     #[test]
     fn sncb_operator_matches_slashed_agency_name() {
-        // Defect B regression: the real SNCB GTFS agency is named "NMBS/SNCB", but
-        // config keys it as "SNCB". An exact-string match silently failed, pricing
-        // trains as an UNKNOWN operator. Token-based matching must resolve it to the
-        // modeled SNCB fare, not to Unknown.
         use crate::structures::cost::{
             FareModel, KnownEurosEpsilon, OperatorFare, OperatorFareId, OperatorModel,
         };
@@ -1217,14 +994,10 @@ mod tests {
 
     #[test]
     fn agency_matches_operator_token_rules() {
-        // Whole-string and any-token matches; a non-token substring does NOT match.
         assert!(RaptorIndex::agency_matches_operator("SNCB", "SNCB"));
         assert!(RaptorIndex::agency_matches_operator("NMBS/SNCB", "SNCB"));
         assert!(RaptorIndex::agency_matches_operator("NMBS/SNCB", "NMBS"));
-        // Whitespace is also a token delimiter (a multi-word brand name).
         assert!(RaptorIndex::agency_matches_operator("DE LIJN", "LIJN"));
-        // Substring-but-not-token must NOT match (guards against loose matching):
-        // "SNCB" is not a `/`- or whitespace-delimited token of "SNCBX".
         assert!(!RaptorIndex::agency_matches_operator("SNCBX", "SNCB"));
     }
 
@@ -1233,7 +1006,6 @@ mod tests {
         let mut idx = RaptorIndex::new();
         idx.transit_agencies = vec![agency("STIB")];
         idx.transit_routes = vec![route(0)];
-        // fare_model default is disabled.
         idx.rebuild_operator_fare_lookup();
         assert!(
             idx.operator_fare_of_route.is_empty(),

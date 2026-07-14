@@ -1,25 +1,78 @@
-//! Per-node elevation sampling from a local GeoTIFF DEM (Belge Lambert 2008).
-//! Absent DEM ⇒ `None` everywhere (elevation cost/time disabled).
-//!
-//! Decodes the DEM with the `tiff` crate directly (unlimited decode limits, so
-//! large national rasters load), replicating the GeoTIFF raster↔model transform
-//! (ModelTiepoint+ModelPixelScale or ModelTransformation, plus the PixelIsPoint
-//! half-pixel offset). Sampling is nearest-cell in projected (model) space.
-
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
 use super::lambert;
 
-/// Sentinel for "no data" in the DEM and for out-of-bounds samples.
-const NODATA_SENTINEL: f32 = -1.0e30; // file uses ~ -3.4e38; anything below this is nodata.
+#[derive(Debug, Clone, Copy)]
+pub enum DemProjection {
+    BelgianLambert2008,
+}
 
-/// GeoKey id for `GTRasterTypeGeoKey` (1 = PixelIsArea, 2 = PixelIsPoint).
+impl DemProjection {
+    fn project(&self, lat: f64, lon: f64) -> (f64, f64) {
+        match self {
+            DemProjection::BelgianLambert2008 => lambert::project(lat, lon),
+        }
+    }
+
+    fn epsg(&self) -> u16 {
+        match self {
+            DemProjection::BelgianLambert2008 => 3812,
+        }
+    }
+}
+
+pub trait ElevationSource {
+    fn elevation(&self, lat: f64, lon: f64) -> Option<f32>;
+}
+
+pub struct DemSet(pub Vec<Dem>);
+
+impl ElevationSource for DemSet {
+    fn elevation(&self, lat: f64, lon: f64) -> Option<f32> {
+        self.0.iter().find_map(|d| d.elevation(lat, lon))
+    }
+}
+
+impl ElevationSource for Dem {
+    fn elevation(&self, lat: f64, lon: f64) -> Option<f32> {
+        Dem::elevation(self, lat, lon)
+    }
+}
+
+// Nodata fallback when no GDAL_NODATA tag: Belgian DTM uses ~ -3.4e38, and
+// common SRTM/EU-DEM sentinels (-9999, -32768) also fall below this.
+const NODATA_SENTINEL: f32 = -1.0e30;
+
+// GeoKey id GTRasterTypeGeoKey (1 = PixelIsArea, 2 = PixelIsPoint).
 const RASTER_TYPE_KEY: u16 = 1025;
 
-/// Raster→model georeferencing for a north-up or affine GeoTIFF.
+// GeoKey id ProjectedCSTypeGeoKey, holds the raster's projected EPSG.
+const PROJECTED_CS_TYPE_KEY: u16 = 3072;
+
+fn is_nodata(v: f32, nodata: Option<f32>) -> bool {
+    if !v.is_finite() {
+        return true;
+    }
+    match nodata {
+        Some(nd) => v == nd || (nd.is_finite() && (v - nd).abs() <= nd.abs() * 1e-6),
+        None => v <= NODATA_SENTINEL,
+    }
+}
+
+// GeoKeyDirectory layout: header of 4 u16, then quads (key, location, count,
+// value); an inline projected EPSG has location == 0 and the code in value.
+fn geokey_projected_epsg(dir: &[u16]) -> Option<u16> {
+    for quad in dir[4.min(dir.len())..].chunks_exact(4) {
+        if quad[0] == PROJECTED_CS_TYPE_KEY && quad[1] == 0 {
+            return Some(quad[3]);
+        }
+    }
+    None
+}
+
 enum Transform {
-    /// `model = (raster - raster_point) * pixel_scale + model_point` (y flipped).
+    // model = (raster - raster_point) * pixel_scale + model_point (y flipped).
     TiePointScale {
         raster_x: f64,
         raster_y: f64,
@@ -28,12 +81,11 @@ enum Transform {
         scale_x: f64,
         scale_y: f64,
     },
-    /// 2x3 inverse affine mapping model → raster.
+    // 2x3 inverse affine mapping model → raster.
     Affine { inverse: [f64; 6] },
 }
 
 impl Transform {
-    /// Maps model-space (x, y) to fractional raster (col, row).
     fn to_raster(&self, x: f64, y: f64) -> (f64, f64) {
         match self {
             Transform::TiePointScale {
@@ -59,15 +111,16 @@ pub struct Dem {
     data: Vec<f32>,
     width: usize,
     height: usize,
-    /// -0.5 for PixelIsPoint rasters, else 0.0 (OGC raster-space convention).
+    // -0.5 for PixelIsPoint rasters, else 0.0 (OGC raster-space convention).
     raster_offset: f64,
     transform: Transform,
+    projection: DemProjection,
+    // Per-file GDAL_NODATA value (tag 42113) if present; else fallback sentinel.
+    nodata: Option<f32>,
 }
 
 impl Dem {
-    /// Loads a GeoTIFF DEM from `path`. Returns `Err` if the file cannot be read,
-    /// parsed, or lacks georeferencing, so the caller can proceed without elevation.
-    pub fn load(path: &str) -> Result<Self, String> {
+    pub fn load(path: &str, projection: DemProjection) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("open DEM '{path}': {e}"))?;
         let mut decoder = Decoder::new(file)
             .map_err(|e| format!("decode DEM '{path}': {e:?}"))?
@@ -81,6 +134,8 @@ impl Dem {
         let transform = Self::read_transform(&mut decoder)
             .map_err(|e| format!("DEM georeferencing '{path}': {e}"))?;
         let raster_offset = Self::read_raster_offset(&mut decoder);
+        let nodata = Self::read_nodata(&mut decoder);
+        Self::check_crs(&mut decoder, projection, path);
 
         let data = match decoder
             .read_image()
@@ -101,7 +156,41 @@ impl Dem {
             height,
             raster_offset,
             transform,
+            projection,
+            nodata,
         })
+    }
+
+    // GDAL_NODATA (TIFF tag 42113) is an ASCII string holding the nodata number.
+    fn read_nodata(decoder: &mut Decoder<std::fs::File>) -> Option<f32> {
+        decoder
+            .find_tag(Tag::GdalNodata)
+            .ok()
+            .flatten()
+            .and_then(|v| v.into_string().ok())
+            .and_then(|s| s.trim().trim_end_matches('\0').trim().parse::<f64>().ok())
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+    }
+
+    fn check_crs(decoder: &mut Decoder<std::fs::File>, projection: DemProjection, path: &str) {
+        let Some(dir) = decoder
+            .find_tag(Tag::GeoKeyDirectoryTag)
+            .ok()
+            .flatten()
+            .and_then(|v| v.into_u16_vec().ok())
+        else {
+            return;
+        };
+        let Some(file_epsg) = geokey_projected_epsg(&dir) else {
+            return;
+        };
+        let expected = projection.epsg();
+        if file_epsg != 0 && file_epsg != 32767 && file_epsg != expected {
+            tracing::warn!(
+                "DEM '{path}' CRS EPSG:{file_epsg} does not match configured projection EPSG:{expected}; elevations may be wrong"
+            );
+        }
     }
 
     fn read_transform(decoder: &mut Decoder<std::fs::File>) -> Result<Transform, String> {
@@ -145,7 +234,7 @@ impl Dem {
         })
     }
 
-    /// PixelIsPoint rasters sample at cell centers ⇒ -0.5 offset; else 0.
+    // PixelIsPoint rasters sample at cell centers ⇒ -0.5 offset; else 0.
     fn read_raster_offset(decoder: &mut Decoder<std::fs::File>) -> f64 {
         let Some(dir) = decoder
             .find_tag(Tag::GeoKeyDirectoryTag)
@@ -158,17 +247,14 @@ impl Dem {
         // Header is 4 u16; entries are quads (key, location, count, value).
         for quad in dir[4.min(dir.len())..].chunks_exact(4) {
             if quad[0] == RASTER_TYPE_KEY && quad[1] == 0 && quad[3] == 2 {
-                return -0.5; // RasterPixelIsPoint
+                return -0.5;
             }
         }
         0.0
     }
 
-    /// Elevation (meters) at geographic (lat, lon), or `None` when outside the
-    /// raster or over a nodata cell. Projects to Lambert, then samples the DEM
-    /// at the nearest raster cell in projected (model) space.
     pub fn elevation(&self, lat: f64, lon: f64) -> Option<f32> {
-        let (mx, my) = lambert::project(lat, lon);
+        let (mx, my) = self.projection.project(lat, lon);
         let (mut col, mut row) = self.transform.to_raster(mx, my);
         col -= self.raster_offset;
         row -= self.raster_offset;
@@ -177,7 +263,7 @@ impl Dem {
         }
         let idx = row as usize * self.width + col as usize;
         let v = *self.data.get(idx)?;
-        if v <= NODATA_SENTINEL || !v.is_finite() {
+        if is_nodata(v, self.nodata) {
             None
         } else {
             Some(v)
@@ -190,19 +276,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nodata_sentinel_filters_extreme_negatives() {
-        // Guard the nodata logic without a real raster: values at/below the
-        // sentinel are rejected, plausible elevations pass.
-        let filter = |v: f32| (v > NODATA_SENTINEL && v.is_finite()).then_some(v);
-        assert_eq!(filter(-3.4e38), None);
-        assert_eq!(filter(f32::NAN), None);
-        assert_eq!(filter(120.0), Some(120.0));
+    fn nodata_fallback_filters_extreme_negatives() {
+        assert!(is_nodata(-3.4e38, None));
+        assert!(is_nodata(f32::NAN, None));
+        assert!(is_nodata(f32::NEG_INFINITY, None));
+        assert!(!is_nodata(120.0, None));
+        assert!(!is_nodata(-5.0, None));
+    }
+
+    #[test]
+    fn per_file_nodata_masks_that_value() {
+        let nd = Some(-9999.0);
+        assert!(is_nodata(-9999.0, nd));
+        assert!(!is_nodata(120.0, nd));
+        assert!(!is_nodata(-3.0, nd));
+        assert!(!is_nodata(-1.0e30, nd));
+        let nd = Some(-32768.0);
+        assert!(is_nodata(-32768.0, nd));
+        assert!(!is_nodata(-32767.0, nd));
+    }
+
+    #[test]
+    fn per_file_nodata_still_rejects_non_finite() {
+        assert!(is_nodata(f32::NAN, Some(-9999.0)));
+        assert!(is_nodata(f32::INFINITY, Some(-9999.0)));
+    }
+
+    #[test]
+    fn parses_gdal_nodata_string() {
+        // GDAL writes the nodata tag as an ASCII string, sometimes NUL-padded.
+        let parse = |s: &str| -> Option<f32> {
+            s.trim()
+                .trim_end_matches('\0')
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|v| v as f32)
+                .filter(|v| v.is_finite())
+        };
+        assert_eq!(parse("-9999"), Some(-9999.0));
+        assert_eq!(parse("-32768\0"), Some(-32768.0));
+        assert_eq!(parse(" -9999.0 "), Some(-9999.0));
+        assert_eq!(parse("nan"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn crs_mismatch_is_detected() {
+        // GeoKeyDirectory header (4 u16) then quads (key, location, count, value).
+        let dir = |epsg: u16| vec![1, 1, 0, 1, PROJECTED_CS_TYPE_KEY, 0, 1, epsg];
+        assert_eq!(geokey_projected_epsg(&dir(3812)), Some(3812));
+        assert_eq!(geokey_projected_epsg(&dir(32631)), Some(32631));
+        assert_eq!(geokey_projected_epsg(&[1, 1, 0, 1, 1024, 0, 1, 1]), None);
+        assert_eq!(geokey_projected_epsg(&[]), None);
+        assert_eq!(DemProjection::BelgianLambert2008.epsg(), 3812);
+        assert_ne!(
+            geokey_projected_epsg(&dir(32631)),
+            Some(DemProjection::BelgianLambert2008.epsg())
+        );
     }
 
     #[test]
     fn tie_point_scale_maps_model_to_raster() {
-        // Origin tie point at (0,0)->(100000, 200000), 20 m cells. The model
-        // point itself maps to raster (0,0); one cell east/south is (1,1).
         let t = Transform::TiePointScale {
             raster_x: 0.0,
             raster_y: 0.0,
@@ -220,9 +355,29 @@ mod tests {
     #[test]
     #[ignore = "requires data/belgium-DTM-20m.tif"]
     fn real_dem_returns_plausible_belgian_elevation() {
-        let dem = Dem::load("data/belgium-DTM-20m.tif").unwrap();
-        // Brussels-ish; Belgium elevations are 0..700 m.
+        let dem = Dem::load("data/belgium-DTM-20m.tif", DemProjection::BelgianLambert2008).unwrap();
         let z = dem.elevation(50.85, 4.35).unwrap();
         assert!((0.0..700.0).contains(&z), "elevation {z}");
+    }
+
+    struct Fixed(Option<f32>);
+    impl ElevationSource for Fixed {
+        fn elevation(&self, _lat: f64, _lon: f64) -> Option<f32> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn demset_first_hit_wins() {
+        let set = vec![Fixed(None), Fixed(Some(10.0)), Fixed(Some(20.0))];
+        let hit = set.iter().find_map(|d| d.elevation(0.0, 0.0));
+        assert_eq!(hit, Some(10.0));
+    }
+
+    #[test]
+    fn demset_all_miss_is_none() {
+        let set = vec![Fixed(None), Fixed(None)];
+        let hit = set.iter().find_map(|d| d.elevation(0.0, 0.0));
+        assert_eq!(hit, None);
     }
 }

@@ -40,7 +40,13 @@ const MAGIC: &[u8; 4] = b"MAAS";
 ///     stair-top-to-platform links tagged `virtual:highway=footway`). More ways
 ///     are imported → node/edge counts in osm.bin change → rebuild required.
 ///     GRAPH stays 17: no routing-core struct layout change.
-pub const OSM_SCHEMA_VERSION: u32 = 12;
+/// v13: elevation moved from `build.elevation` into `build.inputs` as projection-tagged
+///      `dem/*` ingestors (first-hit `DemSet`); baked per-edge `elev_delta` may change when
+///      multiple DEMs layer, so osm.bin must rebuild.
+/// v14: header layout changed: osm.bin now carries a 32-byte input+param fingerprint
+///      after the version field (dependency-aware cache invalidation), so a v13 header is
+///      unreadable and must rebuild.
+pub const OSM_SCHEMA_VERSION: u32 = 14;
 /// Bump when any `Graph`/`RaptorIndex` field changes layout (or, like v5, the baked
 /// `elev_delta` edge values change meaning).
 /// v7: `Graph` gained a serialized `contracted: Option<ContractedGraph>` (P3 node
@@ -82,7 +88,14 @@ pub const OSM_SCHEMA_VERSION: u32 = 12;
 /// v20: `StationInfo` gains `lines` (distinct routes serving the station, each with mode +
 ///      hex colours), populated at build time for the per-mode line badges in autocomplete.
 ///      Rebuild required so the field is populated.
-pub const GRAPH_SCHEMA_VERSION: u32 = 20;
+/// v21: elevation moved into `build.inputs` as projection-tagged `dem/*` ingestors; the baked
+///      `elev_delta` values live in the serialized contracted graph, so graph.bin must rebuild
+///      alongside the OSM_SCHEMA_VERSION 13 bump.
+/// v22: header layout changed: graph.bin now carries a 32-byte input+param fingerprint after
+///      the version field (dependency-aware cache invalidation), so a v21 header is unreadable
+///      and must rebuild. The graph fingerprint embeds the osm fingerprint, so an OSM/DEM
+///      change cascades to graph.bin; this bump also invalidates cch.bin via the XOR header.
+pub const GRAPH_SCHEMA_VERSION: u32 = 22;
 
 /// Bump when the persisted (`#[serde]`-non-skipped) fields of [`AddressIndex`] change
 /// layout. Sibling cache `address.bin`, independent of the routing graph.
@@ -94,7 +107,10 @@ pub const GRAPH_SCHEMA_VERSION: u32 = 20;
 ///     (and any out-of-Belgium coordinate); street-level collapse now uses the
 ///     component-wise median instead of the mean. Rebuild required so the poisoned
 ///     records leave the index and street centroids land on-street.
-pub const ADDRESS_SCHEMA_VERSION: u32 = 3;
+/// v4: header layout changed: address.bin now carries a 32-byte input+param fingerprint
+///     after the version field (dependency-aware cache invalidation), so a v3 header is
+///     unreadable and must rebuild.
+pub const ADDRESS_SCHEMA_VERSION: u32 = 4;
 
 /// Bump when the persisted `cch.bin` payload layout (the metric-independent nested-
 /// dissection ORDER + vertex count) changes. Independent of the CCH *metric*, which is
@@ -112,6 +128,87 @@ const CCH_HEADER_VERSION: u32 = CCH_SCHEMA_VERSION ^ GRAPH_SCHEMA_VERSION;
 
 const HEADER_LEN: usize = 8;
 
+/// MAGIC(4) + version(4) + fingerprint(32).
+const HEADER_FP_LEN: usize = HEADER_LEN + 32;
+
+pub type Fingerprint = [u8; 32];
+
+/// A bad/absent magic-version header or a fingerprint mismatch; both signal "rebuild".
+#[derive(Debug)]
+pub struct StaleCache(pub String);
+
+impl std::fmt::Display for StaleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+fn with_header_fp(version: u32, fp: &Fingerprint, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_FP_LEN + payload.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&version.to_le_bytes());
+    out.extend_from_slice(fp);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn split_header_fp<'a>(
+    bytes: &'a [u8],
+    expected_version: u32,
+    expected_fp: &Fingerprint,
+    path: &str,
+) -> Result<&'a [u8], StaleCache> {
+    if bytes.len() < HEADER_FP_LEN || &bytes[..4] != MAGIC {
+        return Err(StaleCache(format!(
+            "'{path}' is not a maas-rs cache file (missing header)"
+        )));
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != expected_version {
+        return Err(StaleCache(format!(
+            "'{path}' schema version mismatch (file={version}, expected={expected_version})"
+        )));
+    }
+    if &bytes[HEADER_LEN..HEADER_FP_LEN] != expected_fp.as_slice() {
+        return Err(StaleCache(format!(
+            "'{path}' fingerprint mismatch (inputs or baked params changed)"
+        )));
+    }
+    Ok(&bytes[HEADER_FP_LEN..])
+}
+
+/// Verifies only magic + version, IGNORING the fingerprint (for config-less diagnostics).
+fn split_header_fp_any<'a>(
+    bytes: &'a [u8],
+    expected_version: u32,
+    path: &str,
+) -> Result<&'a [u8], String> {
+    if bytes.len() < HEADER_FP_LEN || &bytes[..4] != MAGIC {
+        return Err(format!("'{path}' is not a maas-rs cache file (missing header)"));
+    }
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != expected_version {
+        return Err(format!(
+            "'{path}' schema version mismatch (file={version}, expected={expected_version})"
+        ));
+    }
+    Ok(&bytes[HEADER_FP_LEN..])
+}
+
+/// Validate a cache header without reading the payload.
+pub fn header_valid(path: &str, expected_version: u32, expected_fp: &Fingerprint) -> bool {
+    let mut buf = [0u8; HEADER_FP_LEN];
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    if std::io::Read::read_exact(&mut f, &mut buf).is_err() {
+        return false;
+    }
+    &buf[..4] == MAGIC
+        && u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) == expected_version
+        && &buf[HEADER_LEN..HEADER_FP_LEN] == expected_fp.as_slice()
+}
+
 fn with_header(version: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(MAGIC);
@@ -120,8 +217,6 @@ fn with_header(version: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Verify the magic + version header, returning the payload slice. Any mismatch
-/// is an error so the caller can rebuild instead of deserializing stale bytes.
 fn split_header<'a>(bytes: &'a [u8], expected: u32, path: &str) -> Result<&'a [u8], String> {
     if bytes.len() < HEADER_LEN || &bytes[..4] != MAGIC {
         return Err(format!(
@@ -137,29 +232,27 @@ fn split_header<'a>(bytes: &'a [u8], expected: u32, path: &str) -> Result<&'a [u
     Ok(&bytes[HEADER_LEN..])
 }
 
-pub fn save_graph(graph: &Graph, path: &str) -> Result<(), String> {
+pub fn save_graph(graph: &Graph, fp: &Fingerprint, path: &str) -> Result<(), String> {
     let payload = to_allocvec(graph).map_err(|e| format!("Failed to serialize graph: {e}"))?;
-    let bytes = with_header(GRAPH_SCHEMA_VERSION, &payload);
+    let bytes = with_header_fp(GRAPH_SCHEMA_VERSION, fp, &payload);
     fs::write(path, &bytes).map_err(|e| format!("Failed to save graph: {e}"))?;
     tracing::info!("graph saved to {path}");
     Ok(())
 }
 
-pub fn load_graph(path: &str) -> Result<Graph, String> {
+pub fn load_graph(path: &str, fp: &Fingerprint) -> Result<Graph, StaleCache> {
     tracing::info!("restoring graph from {path}…");
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read graph file: {e}"))?;
-    let payload = split_header(&bytes, GRAPH_SCHEMA_VERSION, path)?;
-    let mut graph: Graph =
-        from_bytes(payload).map_err(|e| format!("Failed to deserialize graph: {e}"))?;
+    let bytes = fs::read(path).map_err(|e| StaleCache(format!("Failed to read graph file: {e}")))?;
+    let payload = split_header_fp(&bytes, GRAPH_SCHEMA_VERSION, fp, path)?;
+    let mut graph: Graph = from_bytes(payload)
+        .map_err(|e| StaleCache(format!("Failed to deserialize graph: {e}")))?;
     graph.raptor.validate().map_err(|e| {
         tracing::error!("{e}");
-        e
+        StaleCache(e)
     })?;
-    // Rebuild #[serde(skip)] runtime indices (e.g. trip_id → TripId).
+    // Rebuild #[serde(skip)] runtime indices / spatial R-trees.
     graph.raptor.build_runtime_indices();
-    // Rebuild the #[serde(skip)] spatial edge index for edge-aware snapping.
     graph.build_edge_index();
-    // Rebuild the contracted graph's #[serde(skip)] segment R-tree (P3 node contraction).
     if let Some(cg) = graph.contracted.as_mut() {
         cg.build_seg_index();
     }
@@ -167,42 +260,75 @@ pub fn load_graph(path: &str) -> Result<Graph, String> {
     Ok(graph)
 }
 
-/// Save the OSM network only (no `RaptorIndex`) to `path`, headered with
-/// `OSM_SCHEMA_VERSION` so it can be reused across transit-only struct changes.
-pub fn save_osm_graph(graph: &Graph, path: &str) -> Result<(), String> {
+/// Verifies only the schema version, ignoring the fingerprint. NOT for the serving
+/// path (fingerprint-gated); for config-less diagnostics only.
+pub fn load_graph_unchecked(path: &str) -> Result<Graph, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read graph file: {e}"))?;
+    let payload = split_header_fp_any(&bytes, GRAPH_SCHEMA_VERSION, path)?;
+    let mut graph: Graph =
+        from_bytes(payload).map_err(|e| format!("Failed to deserialize graph: {e}"))?;
+    graph.raptor.validate()?;
+    graph.raptor.build_runtime_indices();
+    graph.build_edge_index();
+    if let Some(cg) = graph.contracted.as_mut() {
+        cg.build_seg_index();
+    }
+    Ok(graph)
+}
+
+pub fn load_osm_graph_unchecked(path: &str) -> Result<Graph, String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read OSM graph file: {e}"))?;
+    let payload = split_header_fp_any(&bytes, OSM_SCHEMA_VERSION, path)?;
+    Graph::from_osm_postcard(payload)
+}
+
+pub fn save_osm_graph(graph: &Graph, fp: &Fingerprint, path: &str) -> Result<(), String> {
     let payload = graph.to_osm_postcard()?;
-    let bytes = with_header(OSM_SCHEMA_VERSION, &payload);
+    let bytes = with_header_fp(OSM_SCHEMA_VERSION, fp, &payload);
     fs::write(path, &bytes).map_err(|e| format!("Failed to save OSM graph: {e}"))?;
     tracing::info!("OSM graph saved to {path}");
     Ok(())
 }
 
-/// Load an OSM-only cache into a `Graph` with an empty `RaptorIndex`.
-pub fn load_osm_graph(path: &str) -> Result<Graph, String> {
+pub fn load_osm_graph(path: &str, fp: &Fingerprint) -> Result<Graph, StaleCache> {
     tracing::info!("restoring OSM graph from {path}…");
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read OSM graph file: {e}"))?;
-    let payload = split_header(&bytes, OSM_SCHEMA_VERSION, path)?;
-    let graph = Graph::from_osm_postcard(payload)?;
+    let bytes =
+        fs::read(path).map_err(|e| StaleCache(format!("Failed to read OSM graph file: {e}")))?;
+    let payload = split_header_fp(&bytes, OSM_SCHEMA_VERSION, fp, path)?;
+    let graph = Graph::from_osm_postcard(payload).map_err(StaleCache)?;
     tracing::info!("OSM graph restored from {path}");
     Ok(graph)
 }
 
-/// Sibling cache path for the foot-access CCH order, placed next to `graph.bin`
-/// (`cch.bin` in the same directory as `graph_output`).
+/// Sibling CCH-order path derived from the graph output, so distinct presets never
+/// share a CCH file.
 pub fn cch_cache_path(graph_output: &str) -> String {
     let p = std::path::Path::new(graph_output);
+    let file = p
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let leaf = cch_leaf_name(&file);
     match p.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
-            dir.join("cch.bin").to_string_lossy().into_owned()
+            dir.join(&leaf).to_string_lossy().into_owned()
         }
-        _ => "cch.bin".to_string(),
+        _ => leaf,
     }
 }
 
-/// Save ONLY the metric-independent CCH order (the ~56 s nested-dissection result) plus
-/// the vertex count `n`, headered so a graph-schema or CCH-layout change invalidates it.
-/// The CCH structure, walk-second metric, and target set are all re-derived from the live
-/// graph at load, so this file is small and cheap to rewrite.
+fn cch_leaf_name(graph_file: &str) -> String {
+    if graph_file.is_empty() {
+        return "cch.bin".to_string();
+    }
+    match graph_file.strip_prefix("graph") {
+        Some(rest) => format!("cch{rest}"),
+        None => format!("cch-{graph_file}"),
+    }
+}
+
+/// Saves ONLY the metric-independent CCH order + vertex count; the rest is re-derived
+/// from the live graph at load.
 pub fn save_cch(order: &[u32], path: &str) -> Result<(), String> {
     let n = order.len() as u32;
     let payload = to_allocvec(&(n, order.to_vec()))
@@ -213,9 +339,6 @@ pub fn save_cch(order: &[u32], path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the cached CCH order from `path`, verifying the magic + combined
-/// (CCH ^ GRAPH) schema header and the internal `n == order.len()` integrity check.
-/// Returns the order; any mismatch is an `Err` so the caller recomputes.
 pub fn load_cch(path: &str) -> Result<Vec<u32>, String> {
     let bytes = fs::read(path).map_err(|e| format!("Failed to read CCH file: {e}"))?;
     let payload = split_header(&bytes, CCH_HEADER_VERSION, path)?;
@@ -230,36 +353,34 @@ pub fn load_cch(path: &str) -> Result<Vec<u32>, String> {
     Ok(order)
 }
 
-/// Save the sibling [`AddressIndex`] to `path`, headered with `ADDRESS_SCHEMA_VERSION`.
-/// Only the interned tables and compact rows are serialized; the token/prefix lookup
-/// structures are `#[serde(skip)]` and rebuilt on load.
-pub fn save_address_index(index: &AddressIndex, path: &str) -> Result<(), String> {
+pub fn save_address_index(
+    index: &AddressIndex,
+    fp: &Fingerprint,
+    path: &str,
+) -> Result<(), String> {
     let payload =
         to_allocvec(index).map_err(|e| format!("Failed to serialize address index: {e}"))?;
-    let bytes = with_header(ADDRESS_SCHEMA_VERSION, &payload);
+    let bytes = with_header_fp(ADDRESS_SCHEMA_VERSION, fp, &payload);
     fs::write(path, &bytes).map_err(|e| format!("Failed to save address index: {e}"))?;
     tracing::info!("address index saved to {path}");
     Ok(())
 }
 
-/// Load an [`AddressIndex`] from `path`, then rebuild its `#[serde(skip)]` lookup
-/// structures so search works immediately after deserialization.
-pub fn load_address_index(path: &str) -> Result<AddressIndex, String> {
-    let bytes = fs::read(path).map_err(|e| format!("Failed to read address index file: {e}"))?;
-    let payload = split_header(&bytes, ADDRESS_SCHEMA_VERSION, path)?;
-    let mut index: AddressIndex =
-        from_bytes(payload).map_err(|e| format!("Failed to deserialize address index: {e}"))?;
+pub fn load_address_index(path: &str, fp: &Fingerprint) -> Result<AddressIndex, StaleCache> {
+    let bytes =
+        fs::read(path).map_err(|e| StaleCache(format!("Failed to read address index file: {e}")))?;
+    let payload = split_header_fp(&bytes, ADDRESS_SCHEMA_VERSION, fp, path)?;
+    let mut index: AddressIndex = from_bytes(payload)
+        .map_err(|e| StaleCache(format!("Failed to deserialize address index: {e}")))?;
     index.rebuild_indexes();
     Ok(index)
 }
 
-/// Save `graph` to `path` while preserving the previous good copy.
-/// 1. serialize to `<path>.new`, 2. rotate existing `<path>` → `<path>.prev`,
-/// 3. atomically rename `<path>.new` → `<path>`. A crash between steps always
-///    leaves a valid `<path>` or `<path>.prev` for a later `--restore`.
-pub fn save_graph_with_rollback(graph: &Graph, path: &str) -> Result<(), String> {
+/// Write-new, rotate-prev, atomic-rename so a crash always leaves a valid `<path>`
+/// or `<path>.prev` for a later `--restore`.
+pub fn save_graph_with_rollback(graph: &Graph, fp: &Fingerprint, path: &str) -> Result<(), String> {
     let payload = to_allocvec(graph).map_err(|e| format!("Failed to serialize graph: {e}"))?;
-    let bytes = with_header(GRAPH_SCHEMA_VERSION, &payload);
+    let bytes = with_header_fp(GRAPH_SCHEMA_VERSION, fp, &payload);
     let new_path = format!("{path}.new");
     fs::write(&new_path, &bytes).map_err(|e| format!("Failed to write '{new_path}': {e}"))?;
 
@@ -278,6 +399,9 @@ mod tests {
     use super::*;
     use crate::structures::Graph;
 
+    const FP0: Fingerprint = [0u8; 32];
+    const FP1: Fingerprint = [1u8; 32];
+
     #[test]
     fn rollback_save_rotates_previous() {
         let dir = std::env::temp_dir().join("maas_persist_test");
@@ -287,14 +411,14 @@ mod tests {
         let prev_s = format!("{path_s}.prev");
         let _ = std::fs::remove_file(&prev_s);
 
-        save_graph_with_rollback(&Graph::new(), path_s).unwrap();
+        save_graph_with_rollback(&Graph::new(), &FP0, path_s).unwrap();
         assert!(std::path::Path::new(path_s).exists());
 
-        save_graph_with_rollback(&Graph::new(), path_s).unwrap();
+        save_graph_with_rollback(&Graph::new(), &FP0, path_s).unwrap();
         assert!(std::path::Path::new(path_s).exists());
         assert!(std::path::Path::new(&prev_s).exists());
 
-        assert!(load_graph(path_s).is_ok());
+        assert!(load_graph(path_s, &FP0).is_ok());
     }
 
     #[test]
@@ -337,11 +461,9 @@ mod tests {
         };
         g.add_edge(a, edge(a, b));
         g.add_edge(b, edge(b, a));
-        // Deliberately do NOT build the edge index before saving: it is #[serde(skip)]
-        // and must be rebuilt on load.
-        save_graph(&g, path_s).unwrap();
+        save_graph(&g, &FP0, path_s).unwrap();
 
-        let loaded = load_graph(path_s).unwrap();
+        let loaded = load_graph(path_s, &FP0).unwrap();
         let (ep, _) = loaded
             .snap_to_edge(50.000, 4.00425, 300.0, |s| s.bike)
             .expect("loaded graph snaps onto the bike edge");
@@ -368,8 +490,6 @@ mod tests {
             })
         };
         let mut g = Graph::new();
-        // A straight chain a-b-c-d-e: b,c,d are degree-2 interior pass-throughs that the
-        // union contraction collapses into super-edges between junctions a and e.
         let coords = [
             ("a", 50.000, 4.0000),
             ("b", 50.000, 4.0010),
@@ -397,7 +517,6 @@ mod tests {
             g.add_edge(w[0], edge(w[0], w[1]));
             g.add_edge(w[1], edge(w[1], w[0]));
         }
-        // build_raptor_index() populates transit_node_to_stop, which the contraction reads.
         g.build_raptor_index();
 
         let mut cg = crate::structures::contraction::ContractedGraph::from_graph_union(&g);
@@ -405,13 +524,9 @@ mod tests {
         assert!(cg.junction_count() >= 2, "endpoints a,e are junctions");
         g.contracted = Some(cg);
 
-        save_graph(&g, path_s).unwrap();
-        let mut loaded = load_graph(path_s).unwrap();
-        // Move the contracted graph out so it can borrow `loaded` immutably below; this
-        // also proves load_graph populated it (None ⇒ unwrap panics).
+        save_graph(&g, &FP0, path_s).unwrap();
+        let mut loaded = load_graph(path_s, &FP0).unwrap();
         let cg = loaded.contracted.take().expect("contracted survives the round trip");
-        // load_graph rebuilt the serde-skipped seg_index; a coord near a chain edge
-        // midpoint resolves to its bounding junctions.
         let entries = cg.walk_entries_arena(&loaded, 50.000, 4.0015, 100.0);
         assert!(!entries.is_empty(), "snap near an edge yields junction entries");
     }
@@ -424,11 +539,11 @@ mod tests {
         let path_s = path.to_str().unwrap();
 
         let payload = to_allocvec(&Graph::new()).unwrap();
-        let bytes = with_header(GRAPH_SCHEMA_VERSION + 1, &payload);
+        let bytes = with_header_fp(GRAPH_SCHEMA_VERSION + 1, &FP0, &payload);
         std::fs::write(path_s, &bytes).unwrap();
 
-        let err = load_graph(path_s).unwrap_err();
-        assert!(err.contains("version mismatch"), "got: {err}");
+        let err = load_graph(path_s, &FP0).unwrap_err();
+        assert!(err.to_string().contains("version mismatch"), "got: {err}");
     }
 
     #[test]
@@ -438,12 +553,24 @@ mod tests {
         let path = dir.join("graph.bin");
         let path_s = path.to_str().unwrap();
 
-        // Legacy file: raw postcard, no header.
         let payload = to_allocvec(&Graph::new()).unwrap();
         std::fs::write(path_s, &payload).unwrap();
 
-        let err = load_graph(path_s).unwrap_err();
-        assert!(err.contains("missing header"), "got: {err}");
+        let err = load_graph(path_s, &FP0).unwrap_err();
+        assert!(err.to_string().contains("missing header"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_fingerprint_mismatch() {
+        let dir = std::env::temp_dir().join("maas_persist_fp_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graph.bin");
+        let path_s = path.to_str().unwrap();
+
+        save_graph(&Graph::new(), &FP0, path_s).unwrap();
+        assert!(load_graph(path_s, &FP0).is_ok());
+        let err = load_graph(path_s, &FP1).unwrap_err();
+        assert!(err.to_string().contains("fingerprint mismatch"), "got: {err}");
     }
 
     #[test]
@@ -453,8 +580,8 @@ mod tests {
         let path = dir.join("osm.bin");
         let path_s = path.to_str().unwrap();
 
-        save_osm_graph(&Graph::new(), path_s).unwrap();
-        let restored = load_osm_graph(path_s).unwrap();
+        save_osm_graph(&Graph::new(), &FP0, path_s).unwrap();
+        let restored = load_osm_graph(path_s, &FP0).unwrap();
         assert_eq!(restored.node_count(), 0);
         assert_eq!(restored.raptor.transit_trips.len(), 0);
     }
@@ -488,8 +615,8 @@ mod tests {
         );
         g.set_osm_level_data(nl, ce);
 
-        save_osm_graph(&g, path_s).unwrap();
-        let restored = load_osm_graph(path_s).unwrap();
+        save_osm_graph(&g, &FP0, path_s).unwrap();
+        let restored = load_osm_graph(path_s, &FP0).unwrap();
         let idx = restored.platform_index();
         assert_eq!(idx.len(), 1);
         let p = idx.platform(0).unwrap();
@@ -498,7 +625,6 @@ mod tests {
         assert!((p.centroid.latitude - 51.199).abs() < 1e-9);
         assert!((p.centroid.longitude - 4.433).abs() < 1e-9);
         assert_eq!(p.node_ids, vec![crate::structures::NodeID(7)]);
-        // Stage B1 level/connector maps survive the osm.bin round-trip.
         assert_eq!(restored.node_level(crate::structures::NodeID(7)), Some(1));
         assert_eq!(
             restored.connector_kind(crate::structures::NodeID(7), crate::structures::NodeID(8)),
@@ -534,8 +660,8 @@ mod tests {
         b.push_record("A1".into(), s, m, p, "16".into(), String::new(), 50.846, 4.367);
         let idx = b.finish();
 
-        save_address_index(&idx, path_s).unwrap();
-        let loaded = load_address_index(path_s).unwrap();
+        save_address_index(&idx, &FP0, path_s).unwrap();
+        let loaded = load_address_index(path_s, &FP0).unwrap();
         assert_eq!(loaded.search("rue de la loi 16", 5, None).len(), 1);
         assert_eq!(loaded.search("wetstraat 16", 5, None)[0].id, "A1");
     }
@@ -560,7 +686,6 @@ mod tests {
         let path = dir.join("cch.bin");
         let path_s = path.to_str().unwrap();
 
-        // Write a payload under a deliberately wrong header version.
         let payload = to_allocvec(&(2u32, vec![0u32, 1])).unwrap();
         let bytes = with_header(CCH_HEADER_VERSION.wrapping_add(1), &payload);
         std::fs::write(path_s, &bytes).unwrap();
@@ -576,7 +701,6 @@ mod tests {
         let path = dir.join("cch.bin");
         let path_s = path.to_str().unwrap();
 
-        // n disagrees with the actual order length → integrity failure.
         let payload = to_allocvec(&(9u32, vec![0u32, 1, 2])).unwrap();
         let bytes = with_header(CCH_HEADER_VERSION, &payload);
         std::fs::write(path_s, &bytes).unwrap();
@@ -592,20 +716,39 @@ mod tests {
     }
 
     #[test]
+    fn cch_cache_path_derives_distinct_leaf_per_output() {
+        assert_eq!(cch_cache_path("graph.bin"), "cch.bin");
+        assert_eq!(cch_cache_path("data/graph.bin"), "data/cch.bin");
+
+        assert_eq!(cch_cache_path("graph.belgium.bin"), "cch.belgium.bin");
+        assert_eq!(
+            cch_cache_path("data/graph.belgium.bin"),
+            "data/cch.belgium.bin"
+        );
+
+        assert_ne!(
+            cch_cache_path("graph.bin"),
+            cch_cache_path("graph.belgium.bin")
+        );
+
+        assert_eq!(cch_cache_path("data/custom.bin"), "data/cch-custom.bin");
+        assert_ne!(
+            cch_cache_path("data/custom.bin"),
+            cch_cache_path("data/graph.bin")
+        );
+    }
+
+    #[test]
     fn load_osm_rejects_graph_file() {
         let dir = std::env::temp_dir().join("maas_persist_xfmt_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("graph.bin");
         let path_s = path.to_str().unwrap();
 
-        // A full graph.bin must not be loadable as an OSM cache (version differs
-        // only if the consts diverge, but the payloads are structurally distinct).
-        save_graph(&Graph::new(), path_s).unwrap();
-        // Force a version divergence to ensure the header guard triggers even
-        // when both consts currently share a value.
+        save_graph(&Graph::new(), &FP0, path_s).unwrap();
         let bytes = std::fs::read(path_s).unwrap();
-        let bumped = with_header(OSM_SCHEMA_VERSION + 99, &bytes[HEADER_LEN..]);
+        let bumped = with_header_fp(OSM_SCHEMA_VERSION + 99, &FP0, &bytes[HEADER_FP_LEN..]);
         std::fs::write(path_s, &bumped).unwrap();
-        assert!(load_osm_graph(path_s).is_err());
+        assert!(load_osm_graph(path_s, &FP0).is_err());
     }
 }

@@ -1,0 +1,23 @@
+when:
+  - event: tag
+    ref: refs/tags/v*
+
+steps:
+  - name: build-binary
+    image: rust:1.97-bookworm
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
+      - cargo build --release --locked
+
+  - name: build-image
+    image: nixos/nix
+    commands:
+      - nix --extra-experimental-features 'nix-command flakes' build .#dockerImage
+
+  # - name: publish-image
+  #   image: nixos/nix
+  #   commands:
+  #     - nix --extra-experimental-features 'nix-command flakes' build .#dockerImage
+  #     - nix --extra-experimental-features 'nix-command flakes' run nixpkgs#skopeo -- copy docker-archive:result docker://codeberg.org/Bhasher/maas-rs:${CI_COMMIT_TAG} --dest-creds "$REGISTRY_USER:$REGISTRY_TOKEN"
+  #   when:
+  #     - event: manual

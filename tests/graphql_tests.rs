@@ -1,7 +1,3 @@
-/// In-process GraphQL integration tests.
-///
-/// Tests execute queries directly against the async-graphql Schema without
-/// an HTTP server, keeping them fast and hermetic.
 use std::sync::Arc;
 
 use async_graphql::{Name, Value};
@@ -21,9 +17,7 @@ type TestSchema = async_graphql::Schema<
     async_graphql::EmptySubscription,
 >;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Wrap a graph in the hot-swappable container the schema now expects.
 fn shared(g: Graph) -> maas_rs::services::scheduler::SharedGraph {
     Arc::new(arc_swap::ArcSwap::from_pointee(g))
 }
@@ -85,7 +79,6 @@ fn execute_sync(schema: &TestSchema, query: &str) -> async_graphql::Response {
     rt.block_on(schema.execute(query))
 }
 
-/// Returns the top-level data as an `async_graphql::Value::Object`.
 fn data_obj(resp: async_graphql::Response) -> async_graphql::indexmap::IndexMap<Name, Value> {
     match resp.data {
         Value::Object(m) => m,
@@ -101,8 +94,6 @@ fn enable_contraction(g: &mut maas_rs::structures::Graph) {
     g.bake_bike_on_contracted_default();
 }
 
-/// Minimal bidirectional foot edge for contraction tests that need the arena-snap R-tree
-/// to find a segment near query coordinates.
 fn foot_street(
     origin: maas_rs::structures::NodeID,
     destination: maas_rs::structures::NodeID,
@@ -123,7 +114,6 @@ fn foot_street(
     })
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn bike_profile_input_is_exposed() {
@@ -143,8 +133,6 @@ fn bike_profile_input_is_exposed() {
 
 #[test]
 fn raptor_accepts_bike_profile_input() {
-    // Empty graph: routing can't snap, but the bikeProfile argument must parse and
-    // validate (no "unknown argument/field" schema error) — proving it wires through.
     let schema = build_schema(shared(Graph::new()));
     let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
                  modes: [BIKE],
@@ -167,8 +155,6 @@ fn raptor_accepts_bike_profile_input() {
 
 #[test]
 fn plan_price_breakdown_is_exposed() {
-    // The fare-detail shopping list is on PlanPrice.breakdown → FareBreakdownItem
-    // with the exact field names the UI reads.
     let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(
         &schema,
@@ -199,8 +185,6 @@ fn plan_price_breakdown_is_exposed() {
 
 #[test]
 fn raptor_accepts_travel_class_first() {
-    // The fareProfile.travelClass enum must parse (no "unknown argument/field"),
-    // proving FIRST is wired through the GraphQL surface.
     let schema = build_schema(shared(Graph::new()));
     let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
                  fareProfile: { travelClass: FIRST }) { mode } }"#;
@@ -214,10 +198,9 @@ fn raptor_accepts_travel_class_first() {
 
 #[test]
 fn fare_profile_input_no_longer_exposes_brupass() {
-    // Brupass is NOT a user option any more (it is an automatic post-hoc cap). The
-    // GraphQL FareProfileInput must not carry a `brupass` INPUT field: a query that
-    // sets it must be rejected as an unknown field. (The Brupass BREAKDOWN item still
-    // appears in output — that is a value, not a user input.)
+    // Brupass is an automatic post-hoc cap, not a user input: the FareProfileInput
+    // must reject a `brupass` field, even though the Brupass BREAKDOWN item still
+    // appears in output.
     let schema = build_schema(shared(Graph::new()));
     let q = r#"{ raptor(fromLat: 50.0, fromLng: 4.0, toLat: 50.0, toLng: 4.001,
                  fareProfile: { brupass: true }) { mode } }"#;
@@ -230,8 +213,6 @@ fn fare_profile_input_no_longer_exposes_brupass() {
         "setting fareProfile.brupass must be rejected, got: {:?}",
         resp.errors
     );
-    // The FareProfileInput SDL block must not declare a brupass field. Extract the
-    // input object and assert no `brupass` line within it.
     let sdl = schema.sdl();
     if let Some(start) = sdl.find("input FareProfileInput") {
         let block = &sdl[start..];
@@ -275,9 +256,6 @@ fn graphql_raptor_no_nodes_returns_error() {
 
 #[test]
 fn graphql_raptor_accepts_tuning_overrides() {
-    // The reliability/slack override arguments must be part of the schema. With an
-    // empty graph the query still fails at routing ("no node"), but it must NOT fail
-    // with an unknown-argument schema error.
     let schema = build_schema(shared(Graph::new()));
     let resp = execute_sync(
         &schema,
@@ -428,7 +406,7 @@ fn graphql_gtfs_agencies_empty_on_no_transit() {
 #[test]
 fn graphql_search_addresses_returns_synthetic_hits() {
     use maas_rs::structures::{AddressIndexBuilder, Named, RealtimeIndex};
-    use maas_rs::web::app::{SharedAddressIndex, build_schema_full};
+    use maas_rs::web::app::{SharedAddressIndex, WebConfig, build_schema_full};
 
     let mut b = AddressIndexBuilder::new();
     let s = b.intern_street(
@@ -461,12 +439,20 @@ fn graphql_search_addresses_returns_synthetic_hits() {
     let realtime: maas_rs::services::realtime_poller::SharedRealtime =
         Arc::new(arc_swap::ArcSwap::from_pointee(RealtimeIndex::new()));
     let address: SharedAddressIndex = Arc::new(arc_swap::ArcSwap::from_pointee(index));
-    let schema = build_schema_full(shared(Graph::new()), realtime, 120, address);
+    let schema = build_schema_full(
+        shared(Graph::new()),
+        realtime,
+        120,
+        address,
+        WebConfig::default(),
+        None,
+        None,
+    );
 
     let resp = execute_sync(
         &schema,
         r#"{ searchAddresses(query: "wetstraat 16", limit: 5) {
-              id label lat lon street houseNumber postcode municipality } }"#,
+              id label lat lng street houseNumber postcode municipality } }"#,
     );
     assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
     let data = data_obj(resp);
@@ -612,8 +598,6 @@ fn graphql_gtfs_stops_returns_stop_data() {
 #[test]
 fn graphql_gtfs_stations_returns_station_data() {
     let mut g = Graph::new();
-    // Two platforms sharing a parent_station collapse into ONE station with two
-    // members; a standalone stop forms a second single-platform station.
     let p1 = g.add_node(transit_stop_parent("Gent P1", "p1", 51.000, 3.700, Some("Gent")));
     let p2 = g.add_node(transit_stop_parent("Gent P2", "p2", 51.001, 3.701, Some("Gent")));
     g.add_node(transit_stop("Solo Halt", 50.500, 4.200));
@@ -642,7 +626,7 @@ fn graphql_gtfs_stations_returns_station_data() {
     let schema = build_schema(shared(g));
     let resp = execute_sync(
         &schema,
-        "{ gtfsStations { id name lat lon operators modes platformCount } }",
+        "{ gtfsStations { id name lat lng operators modes platformCount } }",
     );
     assert!(
         resp.errors.is_empty(),
@@ -664,12 +648,10 @@ fn graphql_gtfs_stations_returns_station_data() {
             _ => None,
         })
         .expect("the deduped Gent station");
-    // Shape assertion: id (the StationInfo id, NOT a maas: prefix), name, lat, lon,
-    // operators, platformCount all present and well-typed.
     assert_eq!(gent["id"], Value::String("Gent".into()));
     assert!(matches!(gent["name"], Value::String(_)));
     assert!(matches!(gent["lat"], Value::Number(_)));
-    assert!(matches!(gent["lon"], Value::Number(_)));
+    assert!(matches!(gent["lng"], Value::Number(_)));
     assert_eq!(
         gent["platformCount"],
         Value::Number(2.into()),
@@ -830,7 +812,6 @@ fn graphql_gtfs_agencies_returns_agency_and_routes() {
     assert_eq!(route["mode"], Value::String("Bus".into()));
 }
 
-// ── raptorExplain map fields ───────────────────────────────────────────────────
 
 #[test]
 fn graphql_raptor_explain_stops_reached_empty_no_transit() {
@@ -878,8 +859,8 @@ fn graphql_raptor_explain_origin_destination_present() {
     let resp = execute_sync(
         &schema,
         r#"{ raptorExplain(fromLat: 50.0, fromLng: 4.0, toLat: 50.01, toLng: 4.01) {
-              origin { lat lon }
-              destination { lat lon }
+              origin { lat lng }
+              destination { lat lng }
            } }"#,
     );
     assert!(
@@ -901,15 +882,15 @@ fn graphql_raptor_explain_origin_destination_present() {
         "origin.lat should be a number"
     );
     assert!(
-        matches!(origin["lon"], Value::Number(_)),
-        "origin.lon should be a number"
+        matches!(origin["lng"], Value::Number(_)),
+        "origin.lng should be a number"
     );
     let destination = match &explain["destination"] {
         Value::Object(m) => m,
         other => panic!("expected destination object, got {other:?}"),
     };
     assert!(matches!(destination["lat"], Value::Number(_)));
-    assert!(matches!(destination["lon"], Value::Number(_)));
+    assert!(matches!(destination["lng"], Value::Number(_)));
 }
 
 #[test]
@@ -1057,7 +1038,6 @@ fn graphql_walk_plan_alternatives_resolve_with_brackets() {
     }
 }
 
-// ── Transit access/egress multiobj fields ─────────────────────────────────────
 
 #[test]
 fn graphql_transit_plan_access_leg_has_alternatives_and_leave_by() {
@@ -1632,7 +1612,6 @@ fn graphql_realtime_generated_at_tracks_hot_swapped_index() {
     );
 }
 
-// ── liveRefresh: stateless realtime overlay ─────────────────────────────────────
 
 /// Builds a transit-only graph with two consecutive legs:
 ///   Stop A —(trip T0)→ Stop B —(trip T1)→ Stop C.
@@ -2172,7 +2151,6 @@ fn live_refresh_reversed_or_equal_stops_are_not_found_without_panic() {
     }
 }
 
-// ── liveRefresh: service alerts ───────────────────────────────────────────────
 
 const LIVE_ALERTS_QUERY: &str = r#"{ liveRefresh(legs: [
         { tripId: "T0", boardStopId: "SA", alightStopId: "SB" }]) {
@@ -2344,7 +2322,6 @@ fn live_refresh_no_alerts_returns_empty_list() {
     );
 }
 
-// ── HTTP routes ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn get_index_returns_html() {
@@ -2388,7 +2365,6 @@ async fn get_maas_js_returns_javascript() {
     );
 }
 
-// ── stationBackups (same-station cross-line backups) ──────────────────────────
 
 /// Two routes serving SA → SB (Bus T0 reference + Tram T1 cross-line), a same-
 /// route sibling (Bus T2, earlier), and a decoy (Bus T3, SA → SX). The supplied
@@ -2687,7 +2663,6 @@ fn station_backups_unknown_trip_is_empty_without_panic() {
     assert!(backups.is_empty(), "unknown tripId resolves to empty list");
 }
 
-// ── Onboard partial-requery (Phase 2b) over GraphQL ───────────────────────────
 
 /// Minimal transit graph for onboard queries: bus trip "T1" over stops A,B,C
 /// (ids "A","B","C"), with C a short walk from the destination at (50.000,4.020).
@@ -2868,7 +2843,6 @@ fn graphql_onboard_raptor_unknown_trip_errors_cleanly() {
     );
 }
 
-// ── Phase 3.5: vehicle position on liveRefresh ─────────────────────────────────
 
 #[test]
 fn live_refresh_vehicle_position_present_and_fresh() {
@@ -3026,7 +3000,6 @@ fn live_refresh_unresolved_leg_vehicle_is_null() {
     );
 }
 
-// ── Platform code on transit leg from/to ──────────────────────────────────────
 
 fn transit_graph_with_platform() -> Graph {
     use gtfs_structures::{Availability, RouteType};
@@ -3179,7 +3152,6 @@ fn graphql_transit_leg_from_platform_is_exposed() {
     );
 }
 
-// ── liveRefresh: platform change ─────────────────────────────────────────────
 
 /// Builds a minimal graph for platform change tests.
 /// Trip T0 boards at "station_11" (platform code "11") and alights at "SB".
@@ -3344,7 +3316,6 @@ fn live_refresh_no_platform_change_when_same_platform() {
     );
 }
 
-// ── Route-level alert matching ────────────────────────────────────────────────
 
 /// Build the `live_refresh_graph()` fixture and populate `transit_route_ids`
 /// so route-level alert matching works. Both trips (T0, T1) belong to route
@@ -3460,7 +3431,6 @@ fn live_refresh_route_level_alert_not_surfaced_for_different_route() {
     );
 }
 
-// ── travelTimeMap ───────────────────────────────────────────────────────────────
 
 /// A tiny walk-only street graph is enough to exercise the `travelTimeMap` resolver
 /// end-to-end: schema wiring, argument parsing, the returned cell shape, and the
@@ -3580,4 +3550,115 @@ fn graphql_travel_time_map_rejects_nonpositive_max() {
         r#"{ travelTimeMap(centerLat: 50.0, centerLng: 4.0, maxSeconds: 0) { maxSeconds } }"#,
     );
     assert!(!resp.errors.is_empty(), "expected an error for maxSeconds <= 0");
+}
+
+fn hardened_schema(max_depth: Option<usize>, max_complexity: Option<usize>) -> TestSchema {
+    use maas_rs::structures::RealtimeIndex;
+    use maas_rs::web::app::{SharedAddressIndex, WebConfig, build_schema_full};
+    use maas_rs::structures::AddressIndex;
+    let realtime: maas_rs::services::realtime_poller::SharedRealtime =
+        Arc::new(arc_swap::ArcSwap::from_pointee(RealtimeIndex::new()));
+    let address: SharedAddressIndex =
+        Arc::new(arc_swap::ArcSwap::from_pointee(AddressIndex::default()));
+    build_schema_full(
+        shared(Graph::new()),
+        realtime,
+        120,
+        address,
+        WebConfig {
+            tile_url: "https://tiles.example.com/{z}/{x}/{y}.png".to_string(),
+            tile_attribution: "© Example".to_string(),
+            graphiql_enabled: false,
+        },
+        max_depth,
+        max_complexity,
+    )
+}
+
+#[test]
+fn graphql_web_config_returns_configured_tiles() {
+    let schema = hardened_schema(None, None);
+    let resp = execute_sync(&schema, r#"{ webConfig { tileUrl tileAttribution } }"#);
+    assert!(resp.errors.is_empty(), "unexpected errors: {:?}", resp.errors);
+    let data = data_obj(resp);
+    let wc = match &data["webConfig"] {
+        Value::Object(m) => m,
+        other => panic!("expected object, got {other:?}"),
+    };
+    assert_eq!(
+        wc[&Name::new("tileUrl")],
+        Value::String("https://tiles.example.com/{z}/{x}/{y}.png".to_string())
+    );
+    assert_eq!(
+        wc[&Name::new("tileAttribution")],
+        Value::String("© Example".to_string())
+    );
+}
+
+#[test]
+fn graphql_depth_limit_rejects_too_deep_query() {
+    let schema = hardened_schema(Some(1), Some(1000));
+    let deep = r#"{ webConfig { tileUrl tileAttribution } }"#;
+    let resp = execute_sync(&schema, deep);
+    assert!(
+        !resp.errors.is_empty(),
+        "expected a depth-limit rejection for a query deeper than the limit"
+    );
+    assert!(
+        resp.errors[0].message.to_lowercase().contains("deep"),
+        "unexpected error: {}",
+        resp.errors[0].message
+    );
+}
+
+#[test]
+fn graphql_depth_limit_allows_normal_query() {
+    let schema = hardened_schema(Some(15), Some(1000));
+    let resp = execute_sync(&schema, r#"{ webConfig { tileUrl tileAttribution } }"#);
+    assert!(
+        resp.errors.is_empty(),
+        "a normal query must pass under the default depth limit: {:?}",
+        resp.errors
+    );
+}
+
+#[test]
+fn graphql_default_depth_allows_real_ui_query_shape() {
+    let schema = hardened_schema(Some(15), Some(1000));
+    let real = r#"{
+      raptor(fromLat: 50.85, fromLng: 4.35, toLat: 50.86, toLng: 4.36) {
+        start end mode
+        legs {
+          ... on PlanTransitLeg {
+            trip { route { agency { name } } }
+            steps { ... on PlanTransitLegStep { place { node { name } } } }
+          }
+        }
+      }
+    }"#;
+    let resp = execute_sync(&schema, real);
+    let too_deep = resp
+        .errors
+        .iter()
+        .any(|e| e.message.to_lowercase().contains("deep"));
+    assert!(
+        !too_deep,
+        "the real UI query shape must not be rejected by the default depth limit: {:?}",
+        resp.errors
+    );
+}
+
+#[test]
+fn graphql_complexity_limit_rejects_over_budget_query() {
+    let schema = hardened_schema(Some(15), Some(1));
+    let resp = execute_sync(&schema, r#"{ webConfig { tileUrl tileAttribution } }"#);
+    assert!(
+        !resp.errors.is_empty(),
+        "expected a complexity-limit rejection under a tiny complexity budget"
+    );
+    assert!(
+        resp.errors[0].message.to_lowercase().contains("complex"),
+        "unexpected error: {}",
+        resp.errors[0].message
+    );
 }

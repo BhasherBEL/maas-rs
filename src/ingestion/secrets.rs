@@ -1,10 +1,8 @@
 //! Interpolation of `${VAR}` (environment) and `${file:/path}` (file contents)
-//! references inside config strings such as remote URLs and HTTP header values.
-//! Resolved values are returned to the caller and never logged.
+//! references inside config strings. Resolved values are secret and never logged.
 
-/// Replace every `${...}` reference in `s`. `${file:/path}` reads a file (one
-/// trailing newline trimmed); any other token is an environment variable name.
-/// An unresolved reference or unterminated `${` is an error.
+/// `${file:/path}` reads a file (one trailing newline trimmed); any other token is
+/// an environment variable name.
 pub fn interpolate(s: &str) -> Result<String, String> {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;

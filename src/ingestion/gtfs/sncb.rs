@@ -7,8 +7,6 @@ use osmpbf::{Element, ElementReader};
 use super::load_gtfs_with_hook;
 use crate::structures::{Graph, LatLng, NodeID};
 
-// ── Railway way filter ────────────────────────────────────────────────────────
-
 fn is_railway_way(tags: &[(&str, &str)]) -> bool {
     let railway = tags.iter().find(|t| t.0 == "railway").map(|t| t.1);
     if !matches!(railway, Some("rail" | "light_rail" | "narrow_gauge")) {
@@ -18,17 +16,10 @@ fn is_railway_way(tags: &[(&str, &str)]) -> bool {
     !matches!(service, Some("yard"))
 }
 
-/// Maximum distance (metres) a SNCB stop may be from any railway node.
-/// Stops beyond this threshold are not snapped — affected segments fall back to
-/// straight lines rather than routing through an unrelated railway nearby.
+/// Stops beyond this from any railway node are not snapped (fall back to straight lines).
 const MAX_SNAP_DIST_M: f64 = 2_000.0;
 
-/// How many nearest railway nodes to try when routing a single segment.
-/// Trying a small set of candidates handles the common case where the single
-/// nearest node sits on a dead-end platform track or an isolated siding.
 const SNAP_CANDIDATES: usize = 3;
-
-// ── RailwayGraph ──────────────────────────────────────────────────────────────
 
 struct RailwayNode {
     lat: f64,
@@ -55,7 +46,6 @@ impl RailwayGraph {
     }
 
     fn build(osm_path: &str) -> Result<Self, osmpbf::Error> {
-        // Pass 1: collect all node IDs referenced by railway ways
         let mut valid_ids: HashSet<i64> = HashSet::new();
         ElementReader::from_path(osm_path)?.for_each(|el| {
             if let Element::Way(w) = el {
@@ -66,7 +56,6 @@ impl RailwayGraph {
             }
         })?;
 
-        // Pass 2: load their coordinates
         let mut nodes: Vec<RailwayNode> = Vec::new();
         let mut id_map: HashMap<i64, usize> = HashMap::new();
         ElementReader::from_path(osm_path)?.for_each(|el| {
@@ -79,7 +68,6 @@ impl RailwayGraph {
             nodes.push(RailwayNode { lat, lon });
         })?;
 
-        // Pass 3: build adjacency list
         let mut adj: Vec<Vec<(usize, u32)>> = vec![Vec::new(); nodes.len()];
         ElementReader::from_path(osm_path)?.for_each(|el| {
             if let Element::Way(w) = el {
@@ -100,7 +88,6 @@ impl RailwayGraph {
             }
         })?;
 
-        // KD-tree for nearest-node lookup
         let mut tree: KdTree<f64, usize, [f64; 2]> = KdTree::new(2);
         for (i, n) in nodes.iter().enumerate() {
             let _ = tree.add([n.lat, n.lon], i);
@@ -114,8 +101,6 @@ impl RailwayGraph {
         Ok(RailwayGraph { nodes, adj, tree })
     }
 
-    /// Returns up to `SNAP_CANDIDATES` railway node indices closest to `(lat, lon)`,
-    /// filtered to those within `MAX_SNAP_DIST_M`. Closest first.
     fn nearest_nodes(&self, lat: f64, lon: f64) -> Vec<usize> {
         let query = [lat, lon];
         let Ok(iter) = self.tree.iter_nearest(&query, &squared_euclidean) else {
@@ -133,8 +118,6 @@ impl RailwayGraph {
             .collect()
     }
 
-    /// Dijkstra from `from` to `to`; returns ordered `Vec<LatLng>` including
-    /// both endpoints, or `None` if unreachable.
     fn dijkstra(&self, from: usize, to: usize) -> Option<Vec<LatLng>> {
         if from == to {
             return Some(vec![LatLng {
@@ -195,14 +178,6 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     6_371_000.0 * 2.0 * a.sqrt().asin()
 }
 
-// ── Shape synthesis ───────────────────────────────────────────────────────────
-
-/// Try to route between the best candidate pair from `from_candidates` ×
-/// `to_candidates`. Returns the first Dijkstra path that succeeds, or `None`
-/// if every combination is unreachable.
-///
-/// Trying multiple candidates handles the common case where the single nearest
-/// node sits on an isolated platform siding rather than the through track.
 fn best_dijkstra(
     railway: &RailwayGraph,
     from_candidates: &[usize],
@@ -218,9 +193,6 @@ fn best_dijkstra(
     None
 }
 
-/// Returns `Some((pts, stop_idx, had_fallback))` or `None` if no segment could
-/// be routed at all. `had_fallback` is `true` when at least one segment used a
-/// straight-line fallback instead of an on-track path.
 fn compute_railway_shape(
     stops: &[NodeID],
     g: &Graph,
@@ -230,7 +202,6 @@ fn compute_railway_shape(
         return None;
     }
 
-    // Resolve stop coordinates and snap each to its nearest railway candidates.
     let stop_coords: Vec<LatLng> = stops
         .iter()
         .map(|&s| g.get_node(s).map(|n| n.loc()))
@@ -246,9 +217,6 @@ fn compute_railway_shape(
     let mut routed_segments = 0usize;
     let mut fallback_segments = 0usize;
 
-    // Seed with the first stop's geographic position. If a segment is
-    // successfully routed, the seeded point will be corrected to the
-    // track-snapped position (see below).
     all_pts.push(stop_coords[0]);
     stop_idx.push(0);
 
@@ -257,17 +225,11 @@ fn compute_railway_shape(
 
         match path {
             Some(p) if p.len() > 1 => {
-                // p[0] is the snapped start of this segment. Overwrite the
-                // previously-pushed point so it snaps to the track rather than
-                // the raw stop coordinate (no-op when the previous segment was
-                // also routed, since they share the same junction node).
                 *all_pts.last_mut().unwrap() = p[0];
                 all_pts.extend_from_slice(&p[1..]);
                 routed_segments += 1;
             }
             _ => {
-                // Segment unreachable — straight line to the stop coordinate.
-                // The rest of the pattern continues unaffected.
                 all_pts.push(stop_coords[i]);
                 fallback_segments += 1;
             }
@@ -276,19 +238,12 @@ fn compute_railway_shape(
     }
 
     if routed_segments == 0 {
-        // Every segment fell back — no improvement over the default empty shape.
         return None;
     }
 
-    // Return whether any segment had to fall back, so the caller can aggregate.
     Some((all_pts, stop_idx, fallback_segments > 0))
 }
 
-// ── Public entry points ───────────────────────────────────────────────────────
-
-/// Called during the OSM snapshot phase to cache railway topology into the graph.
-/// The stored data is serialized into osm.bin and reused by `load_gtfs_sncb`
-/// during --update-gtfs, avoiding a re-parse of the OSM PBF.
 pub fn prepare_sncb(osm_path: &str, g: &mut Graph) -> Result<(), osmpbf::Error> {
     tracing::info!("caching railway graph from {osm_path}...");
     let railway = RailwayGraph::build(osm_path)?;
@@ -299,8 +254,7 @@ pub fn prepare_sncb(osm_path: &str, g: &mut Graph) -> Result<(), osmpbf::Error> 
     Ok(())
 }
 
-/// SNCB bike-allowance rule: honour an explicit GTFS `bikes_allowed` value, and
-/// otherwise default to allowed — SNCB permits bikes on all of its trains.
+/// SNCB permits bikes on all trains, so default to allowed when GTFS gives no info.
 fn sncb_bikes_decision(explicit: gtfs_structures::BikesAllowedType) -> Option<bool> {
     use gtfs_structures::BikesAllowedType;
     match explicit {
@@ -348,7 +302,7 @@ pub fn load_gtfs_sncb(
     for p in patterns_before..patterns_after {
         if g.get_pattern_shape(p).is_some() {
             n_computed += 1;
-            continue; // pattern already had a GTFS shape
+            continue;
         }
         let stops = g.get_pattern_stop_nodes(p).to_vec();
         match compute_railway_shape(&stops, g, &railway) {
@@ -371,21 +325,8 @@ pub fn load_gtfs_sncb(
     Ok(())
 }
 
-// ── SNCB fare model (operator-specific fare interpretation) ────────────────────
-
-/// Build the SNCB `OperatorModel` from its `distance_base_per_km` config block.
-///
-/// This is the SNCB-specific fare interpretation: the distance-tariff shape
-/// selection (`bracketed` exact 2026 2nd-class / `band` legacy piecewise /
-/// `linear` inert), the 1st-class multiplier bands + rounding tiers, the SNCB
-/// peak-window/discount/cap rule set (`SncbTimeRules`), and the airport special-OD
-/// fare. It composes the operator-agnostic tariff/rule PRIMITIVES that live in
-/// `structures::cost::fares` (`DistanceTariff`, `SncbTimeRules`); only the SNCB
-/// choice of which primitive and which constants is co-located here.
-///
-/// Returns the model plus the uppercased airport-station tokens (an OD touching
-/// such a station prices at the fixed airport fare), which the caller stores on
-/// the `OperatorFare`. `cents` converts an optional euro amount to integer cents.
+/// Builds the SNCB `OperatorModel` from its `distance_base_per_km` config, plus the
+/// uppercased airport-station tokens (an OD touching one prices at the airport fare).
 pub fn build_sncb_operator(
     op: &crate::structures::FareOperatorConfig,
     cents: impl Fn(Option<f64>) -> u32,
@@ -416,14 +357,9 @@ pub fn build_sncb_operator(
             .map(|e| cents(Some(e)))
             .unwrap_or(u32::MAX),
     };
-    // Tariff-distance clamp + floor (shared by both shapes).
     let min_km = op.min_km.unwrap_or(3);
     let max_km = op.max_km.unwrap_or(118);
     let floor_cents = op.floor_euros.map(|e| cents(Some(e))).unwrap_or(260);
-    // Default to the EXACT published 2026 2nd-class BRACKETED model; `band` (legacy
-    // piecewise placeholder) and `linear` remain as inert alternatives. 1st-class
-    // multiplier bands default to the documented SNCB shape ([36,51] /
-    // [1.40,1.50,1.60]), inert here.
     let mut fc_thresholds = [36u32, 51u32];
     for (i, t) in op.first_class_thresholds.iter().take(2).enumerate() {
         fc_thresholds[i] = *t;
@@ -432,8 +368,6 @@ pub fn build_sncb_operator(
     for (i, c) in op.first_class_coefficients.iter().take(3).enumerate() {
         fc_coeffs[i] = *c;
     }
-    // 1st-class rounding tiers (EUR → cents). Defaults: round to 0.10 below 25 EUR,
-    // 0.50 in [25,50], 1 EUR above 50 (half up).
     let mut fc_round_thresholds = [2500u32, 5000u32];
     for (i, t) in op.first_class_round_thresholds.iter().take(2).enumerate() {
         fc_round_thresholds[i] = (*t * 100.0).round() as u32;
@@ -468,7 +402,6 @@ pub fn build_sncb_operator(
                 floor_cents,
             }
         }
-        // "bracketed" or unset ⇒ the exact 2026 2nd-class model.
         _ => DistanceTariff::Bracketed {
             a_cents_per_km: op.a_euros_per_km.unwrap_or(0.0) * 100.0,
             b_cents: op.b_euros.unwrap_or(0.0) * 100.0,
@@ -490,8 +423,6 @@ pub fn build_sncb_operator(
     (model, airport_station_names)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,8 +430,6 @@ mod tests {
 
     #[test]
     fn sncb_allows_bikes_by_default() {
-        // SNCB permits bikes on all trains, so a trip with no GTFS bike info
-        // must still resolve to allowed.
         assert_eq!(
             sncb_bikes_decision(BikesAllowedType::NoBikeInfo),
             Some(true)
@@ -523,7 +452,6 @@ mod tests {
         );
     }
 
-    /// Build a RailwayGraph where consecutive nodes are connected in a chain.
     fn make_chain(coords: &[(f64, f64)]) -> RailwayGraph {
         let nodes: Vec<RailwayNode> = coords
             .iter()
@@ -548,8 +476,6 @@ mod tests {
         RailwayGraph { nodes, adj, tree }
     }
 
-    // ── is_railway_way ────────────────────────────────────────────────────────
-
     #[test]
     fn test_is_railway_way_accepts_rail() {
         assert!(is_railway_way(&[("railway", "rail")]));
@@ -569,20 +495,16 @@ mod tests {
         assert!(!is_railway_way(&[]));
     }
 
-    // ── nearest_nodes / distance cap ─────────────────────────────────────────
-
     #[test]
     fn test_nearest_nodes_returns_closest() {
         let rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
         let result = rg.nearest_nodes(50.001, 4.0);
-        // Node 1 is exactly at (50.001, 4.0) — should come first
         assert_eq!(result[0], 1);
     }
 
     #[test]
     fn test_nearest_nodes_distance_cap() {
         let rg = make_chain(&[(50.0, 4.0), (50.001, 4.0)]);
-        // 200 km away — nothing within MAX_SNAP_DIST_M
         let result = rg.nearest_nodes(52.0, 6.0);
         assert!(result.is_empty());
     }
@@ -590,13 +512,10 @@ mod tests {
     #[test]
     fn test_nearest_nodes_returns_multiple_candidates() {
         let rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
-        // All three nodes are within 2 km; we should get up to SNAP_CANDIDATES
         let result = rg.nearest_nodes(50.001, 4.0);
         assert!(result.len() <= SNAP_CANDIDATES);
         assert!(!result.is_empty());
     }
-
-    // ── Dijkstra ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_dijkstra_linear() {
@@ -616,7 +535,6 @@ mod tests {
 
     #[test]
     fn test_dijkstra_unreachable() {
-        // Two isolated nodes (no edges between them)
         let nodes = vec![
             RailwayNode {
                 lat: 50.0,
@@ -638,15 +556,9 @@ mod tests {
         assert!(rg.dijkstra(0, 1).is_none());
     }
 
-    // ── best_dijkstra ─────────────────────────────────────────────────────────
-
     #[test]
     fn test_best_dijkstra_falls_back_to_second_candidate() {
-        // Graph: nodes 0-1-2 connected in a chain. Node 3 is isolated.
-        // If first candidate is the isolated node 3, routing should still
-        // succeed using the second candidate (node 0).
         let mut rg = make_chain(&[(50.0, 4.0), (50.001, 4.0), (50.002, 4.0)]);
-        // Add an isolated node 3
         rg.nodes.push(RailwayNode {
             lat: 49.0,
             lon: 3.0,
@@ -654,19 +566,13 @@ mod tests {
         rg.adj.push(Vec::new());
         let _ = rg.tree.add([49.0, 3.0], 3usize);
 
-        // from_candidates: [3 (isolated), 0 (connected)]
-        // to_candidates:   [2]
         let path = best_dijkstra(&rg, &[3, 0], &[2]);
         assert!(path.is_some(), "should succeed via second candidate");
         assert_eq!(path.unwrap().last().unwrap().latitude, rg.nodes[2].lat);
     }
 
-    // ── stop_idx correctness ─────────────────────────────────────────────────
-
     #[test]
     fn test_stop_indices_all_routed() {
-        // 5-node chain: 0-1-2-3-4.
-        // 3 stops snapping to nodes 0, 2, 4 → stop_idx = [0, 2, 4], 5 total pts.
         let rg = make_chain(&[
             (50.00, 4.0),
             (50.01, 4.0),
@@ -694,13 +600,8 @@ mod tests {
 
     #[test]
     fn test_stop_indices_partial_fallback() {
-        // 3-node chain: 0-1-2.  Middle segment (stop 1 → stop 2) is unreachable
-        // because stop 2 has no candidates.  Stop 0→1 should be routed, stop 1→2
-        // falls back to a straight line (1 extra point pushed).
-        // Expected: stop_idx = [0, 2, 3], total 4 pts.
         let rg = make_chain(&[(50.0, 4.0), (50.01, 4.0), (50.02, 4.0)]);
 
-        // Stop 2 has no valid candidates — simulates "no railway nearby"
         let candidates: &[&[usize]] = &[&[0], &[2], &[]];
 
         let stop_coords = [
@@ -741,8 +642,8 @@ mod tests {
 
         assert_eq!(routed, 1, "first segment should be routed");
         assert_eq!(stop_idx[0], 0);
-        assert_eq!(stop_idx[1], 2); // routed 0→2 via nodes 0,1,2
-        assert_eq!(stop_idx[2], 3); // fallback: one extra straight-line point
+        assert_eq!(stop_idx[1], 2);
+        assert_eq!(stop_idx[2], 3);
         assert_eq!(all_pts.len(), 4);
     }
 }

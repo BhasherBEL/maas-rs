@@ -2,14 +2,10 @@ use rstar::{AABB, PointDistance, RTree, RTreeObject};
 
 use crate::structures::StreetEdgeData;
 
-/// A street edge projected into a local equirectangular plane (meters), carrying
-/// the source `StreetEdgeData` so the caller can apply a mode predicate and
-/// reconstruct an `Endpoint`. Distances are perpendicular point-to-segment.
 #[derive(Clone, Debug)]
 pub struct EdgeEnvelope {
     pub edge: StreetEdgeData,
-    /// Global segment index into `ContractedGraph::segs` when this index is built over
-    /// the arena (P3f snapping); `u32::MAX` for a full-graph edge index.
+    /// Segment index into `ContractedGraph::segs`; `u32::MAX` for a full-graph index.
     pub seg_id: u32,
     ax: f64,
     ay: f64,
@@ -41,8 +37,6 @@ impl PointDistance for EdgeEnvelope {
     }
 }
 
-/// Bulk-loaded R*-tree over street-edge bodies for nearest-edge snapping. Built
-/// on load/build from the graph's nodes+edges, never serialized.
 #[derive(Default, Debug, Clone)]
 pub struct EdgeIndex {
     tree: RTree<EdgeEnvelope>,
@@ -51,8 +45,7 @@ pub struct EdgeIndex {
 }
 
 impl EdgeIndex {
-    /// Build from `(StreetEdgeData, a_latlon, b_latlon)` triples, projecting into a
-    /// plane centred on `ref_lat`. The same projection must be used at query time.
+    /// The same `ref_lat` projection must be used at query time.
     pub fn build(
         edges: impl Iterator<Item = (StreetEdgeData, (f64, f64), (f64, f64))>,
         ref_lat: f64,
@@ -60,8 +53,6 @@ impl EdgeIndex {
         Self::build_inner(edges.map(|(e, a, b)| (e, u32::MAX, a, b)), ref_lat)
     }
 
-    /// Build over arena segments, tagging each envelope with its global segment index so a
-    /// snap resolves to the owning super-edge (P3f, g-free snapping).
     pub fn build_segs(
         segs: impl Iterator<Item = (StreetEdgeData, u32, (f64, f64), (f64, f64))>,
         ref_lat: f64,
@@ -92,7 +83,6 @@ impl EdgeIndex {
         }
     }
 
-    /// Like [`Self::nearest_usable`] but also returns the matched segment id (P3f).
     pub fn nearest_usable_seg(
         &self,
         lat: f64,
@@ -113,10 +103,6 @@ impl EdgeIndex {
         None
     }
 
-    /// Nearest `usable` edge to `(lat, lon)` by perpendicular body distance, within
-    /// `radius_m`. Iterates candidates in increasing body distance and stops once
-    /// the nearest remaining one is beyond `radius_m`. Returns the edge and its
-    /// perpendicular distance in meters, or `None` if none qualifies.
     pub fn nearest_usable(
         &self,
         lat: f64,

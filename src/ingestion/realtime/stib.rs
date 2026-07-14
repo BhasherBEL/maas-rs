@@ -1,18 +1,11 @@
-//! Custom STIB / MIVB realtime feed.
-//!
-//! STIB has no GTFS-Realtime feed; its proprietary waiting-times API returns
-//! predicted arrival times per stop (`pointid`) and line (`lineid`), with no
-//! trip ids or delays. We derive both by matching each prediction against the
-//! GTFS static schedule held in the graph (see [`crate::structures::graph`]'s
-//! `stib_*` methods and `best_match`).
+//! Custom STIB / MIVB realtime feed. STIB has no GTFS-RT; its waiting-times API
+//! gives predicted arrivals per `pointid`/`lineid` with no trip ids or delays,
+//! which we derive by matching against the GTFS schedule in the graph.
 //!
 //! `expectedArrivalTime` is RFC3339 carrying the Brussels offset, so its
-//! `naive_local()` is the local wall-clock directly — no timezone DB needed.
-//! Predictions are matched against both the current and previous service day so
-//! after-midnight trips (owned by the previous day's service) are found.
-//!
-//! **Match quality is validated against live data**, not unit tests; the tests
-//! here cover the parse + matching mechanics on synthetic schedules.
+//! `naive_local()` is the local wall-clock directly. Predictions are matched
+//! against both the current and previous service day so after-midnight trips
+//! (owned by the previous day's service) are found.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,8 +46,6 @@ impl StibFeed {
     }
 }
 
-// ---- waiting-times JSON shapes (STIB Open Data) ----
-
 #[derive(Deserialize)]
 struct WaitingTimes {
     results: Vec<PointLine>,
@@ -64,7 +55,7 @@ struct WaitingTimes {
 struct PointLine {
     pointid: String,
     lineid: String,
-    /// A JSON-encoded string (escaped) holding an array of `Passage`.
+    /// Double-encoded: a JSON string holding a JSON array of `Passage`.
     passingtimes: String,
 }
 
@@ -73,8 +64,6 @@ struct Passage {
     #[serde(rename = "expectedArrivalTime")]
     expected_arrival_time: Option<String>,
 }
-
-// ---- VehiclePositions JSON shapes (STIB Open Data) ----
 
 #[derive(Deserialize)]
 struct VehiclePositionsResp {
@@ -129,7 +118,6 @@ impl RealtimeFeed for StibFeed {
                 let Ok(dt) = DateTime::parse_from_rfc3339(exp) else {
                     continue;
                 };
-                // RFC3339 offset is Brussels-local, so naive_local() is wall-clock.
                 let local = dt.naive_local();
 
                 match self.match_passage(&stops, &row.lineid, local) {
@@ -183,9 +171,6 @@ impl RealtimeFeed for StibFeed {
 }
 
 impl StibFeed {
-    /// Match one predicted passage (local wall-clock) against the schedule across
-    /// the candidate `stops` for `line`, trying the current and previous service
-    /// day. Returns `(gtfs_trip_id, gtfs_stop_id, delay_secs)` on the best match.
     fn match_passage(
         &self,
         stops: &[usize],
@@ -195,14 +180,12 @@ impl StibFeed {
         let secs_in_day = local.time().num_seconds_from_midnight() as i64;
         let day = local.date();
 
-        // Match against the prediction's own service day, then the previous day
-        // (predicted time treated as +86400 past that day's midnight) so
-        // after-midnight trips owned by the previous day's service are found.
+        // Prev day treats the predicted time as +86400 so after-midnight trips
+        // owned by the previous service day are found.
         let same_day = self.match_on_day(stops, line, day, secs_in_day);
         let prev_day =
             self.match_on_day(stops, line, day - Duration::days(1), secs_in_day + 86_400);
 
-        // Prefer the match with the smaller absolute delay.
         let chosen = match (same_day, prev_day) {
             (Some(a), Some(b)) => {
                 if a.2.abs() <= b.2.abs() {
@@ -220,8 +203,6 @@ impl StibFeed {
         Some((trip_id, stop_id, delay))
     }
 
-    /// Best `(trip, stop, delay)` match for `line` across `stops` on one service
-    /// day, given the predicted arrival in seconds since that day's midnight.
     fn match_on_day(
         &self,
         stops: &[usize],
@@ -603,8 +584,6 @@ mod tests {
                 num_trips: 1,
             });
 
-            // Shape for pattern 0: vertex 0 at stop coord, vertex 1 ≈ 444 m north.
-            // stop_idx[0] = 0 (the single stop maps to vertex 0 of the shape).
             let shape_pts = vec![
                 LatLng { latitude: 50.845, longitude: 4.352 },
                 LatLng { latitude: 50.849, longitude: 4.352 },

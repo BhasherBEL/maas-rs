@@ -1,0 +1,13 @@
+services:
+  maas:
+    image: maas-rs:latest
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # 0.0.0.0 binds inside the container only; the loopback ports mapping above keeps it host-local.
+      - MAAS_HOST=0.0.0.0
+      - BMC_PARTNER_KEY=${BMC_PARTNER_KEY:-}
+    volumes:
+      - .:/app

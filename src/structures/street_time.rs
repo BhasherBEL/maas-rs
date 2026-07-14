@@ -125,7 +125,6 @@ mod tests {
         let m = StreetTimeModel::default();
         assert!(m.access_secs(120) > 120);
         assert!(m.access_secs(600) > 600);
-        // egress = mean = median * exp(σ²/2); for t50=120 with defaults this is 127s.
         assert_eq!(m.egress_secs(120), 127);
         assert!(m.egress_secs(120) >= 120);
         assert!(m.egress_secs(120) < m.access_secs(120));

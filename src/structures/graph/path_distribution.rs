@@ -1,15 +1,5 @@
-//! Post-hoc path-time distribution (Phase 3). Sums per-edge `(mean, variance)`
-//! moments along an ALREADY-CHOSEN path and inflates the total variance by a
-//! systematic coefficient-of-variation term so long legs widen honestly. This is
-//! the generalization of the access/egress `StreetTimeModel` from the two special
-//! cases to an arbitrary path. Probability NEVER enters the search — this runs
-//! only here, on a fixed node list. `TimeMoments::bracket()` yields `[p50, p95]`.
-//!
-//! SOFT SPOT: walk/drive edge means use `length / mode_speed` (via `edge_moments`)
-//! while bike uses `BikeCost::edge_time`; both are the same primitives the search
-//! uses for the Time axis, modulo sub-second rounding. Parallel edges between the
-//! same node pair are disambiguated by "first matching street edge" — street
-//! graphs rarely carry parallel edges and their moments differ negligibly.
+//! Post-hoc path-time distribution: sums per-edge `(mean, variance)` moments over a
+//! fixed path and inflates total variance by a systematic CV term.
 
 use super::{Graph, PrevCtx};
 use crate::structures::cost::{
@@ -18,9 +8,6 @@ use crate::structures::cost::{
 use crate::structures::{BikeCost, NodeID, StreetEdgeData};
 
 impl Graph {
-    /// Sum per-edge time moments from carried arena `(edge, dir, far)` steps for
-    /// `mode`, then add the systematic variance term `(systematic_cv · mean)²` —
-    /// g-free. Empty carried ⇒ `ZERO`. Used in contracted plan reconstruction.
     pub(super) fn annotate_path_edges(
         &self,
         _nodes: &[NodeID],
@@ -35,8 +22,7 @@ impl Graph {
         self.annotate_steps(&steps, mode)
     }
 
-    /// Mean seconds over `recon` edges for a non-bike mode (Walk/Drive), where the
-    /// per-edge mean does not depend on direction, so a dummy dir is sound. g-free.
+    /// Walk/Drive only: the dummy dir is sound because their mean is direction-independent.
     pub(super) fn annotate_steps_secs(&self, recon: &[StreetEdgeData], mode: RoutingMode) -> u32 {
         let steps: Vec<(StreetEdgeData, (f64, f64))> =
             recon.iter().map(|e| (*e, (0.0, 0.0))).collect();
@@ -58,9 +44,6 @@ impl Graph {
 
         let mut total = TimeMoments::ZERO;
         let mut incoming: Option<(f64, f64)> = None;
-        // Previous-edge context (bike): mirrors the search fold so the displayed
-        // [p50,p95] reflects the SAME corner slow-down, dismount stop, and dismount
-        // uncertainty the route was chosen on.
         let mut prev: Option<PrevCtx> = None;
         for (street, this_dir) in steps {
             let street = &street;
@@ -104,8 +87,6 @@ mod tests {
         BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData, Surface,
     };
 
-    /// Node→steps adapter (the former `annotate_path` body) so these tests exercise
-    /// the same `annotate_steps` code path the production carried/arena route uses.
     fn moments(g: &Graph, nodes: &[NodeID], mode: RoutingMode) -> TimeMoments {
         if nodes.len() < 2 {
             return TimeMoments::ZERO;
@@ -275,8 +256,6 @@ mod tests {
         );
     }
 
-    /// Two short edges meeting at a sharp corner, so the displayed bike p50 includes
-    /// the physical corner slow-down — matching the Time axis the route is chosen on.
     fn corner_path_graph() -> (Graph, Vec<NodeID>) {
         let mut g = Graph::new();
         let mk = |id: &str, lat: f64, lon: f64| {
@@ -288,8 +267,6 @@ mod tests {
                 },
             })
         };
-        // a→b heads east, b→c heads north: a ~90° corner at b over short (~8 m) edges
-        // — tight enough to force a slow-down at the commuter cruise speed.
         let a = g.add_node(mk("a", 50.0000, 4.0000));
         let b = g.add_node(mk("b", 50.0000, 4.0003));
         let c = g.add_node(mk("c", 50.0002, 4.0003));
@@ -321,7 +298,6 @@ mod tests {
     fn bike_p50_includes_corner_slowdown() {
         let (g, path) = corner_path_graph();
         let bike = g.default_bike_cost();
-        // Raw kinematic sum (no speed-change) — what p50 would be without corners.
         let kinematic: u32 = path
             .windows(2)
             .map(|w| {
@@ -342,8 +318,6 @@ mod tests {
             m.mean,
             kinematic
         );
-        // The first edge alone (no preceding edge ⇒ no corner) costs only its kinematic
-        // time, confirming the extra in the full path is the per-vertex corner term.
         let first_only = moments(&g, &[path[0], path[1]], RoutingMode::Bike).mean;
         assert_eq!(
             first_only,
@@ -360,9 +334,6 @@ mod tests {
         );
     }
 
-    /// A ride → push → ride path: the displayed p50 must include the dismount stop and
-    /// the remount restart, and the variance must carry the once-per-run push σ², so
-    /// the shown bracket matches the axis the route was chosen on.
     fn dismount_path_graph() -> (Graph, Vec<NodeID>) {
         let mut g = Graph::new();
         let mk = |id: &str, lat: f64, lon: f64| {
@@ -436,7 +407,6 @@ mod tests {
             m.mean,
             kinematic
         );
-        // The dismount run contributes its once-per-run uncertainty σ² to the bracket.
         let mut g0 = g;
         g0.set_systematic_cv(0.0);
         let m0 = moments(&g0, &path, RoutingMode::Bike);
@@ -487,8 +457,6 @@ mod tests {
             .unwrap();
         let fastest_p50 = moments(&g, &fastest_front.nodes, RoutingMode::Walk).mean;
 
-        // Selection must preserve the fastest path: trimming the SAME front to k
-        // representatives must keep its Time-minimum (the user's default fast route).
         let idx = crate::structures::graph::representatives::select_representatives(
             &res.front,
             g.raptor.representatives_k,

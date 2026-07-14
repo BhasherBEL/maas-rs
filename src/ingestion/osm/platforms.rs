@@ -6,11 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::structures::{Connector, Graph, LatLng, NodeID};
 
-/// Search radius (metres) around a GTFS station centroid when looking for the
-/// matching OSM platform. Generous on purpose: SNCB platform stops collapse to
-/// the station centroid, so the real platform geometry can sit a few hundred
-/// metres away. Build-time matcher knob (the offset distribution reveals
-/// clipping if it is too small).
+// Generous: SNCB platform stops collapse to the station centroid, so the real
+// platform geometry can sit a few hundred metres away.
 pub const PLATFORM_MATCH_RADIUS_M: f64 = 400.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,10 +15,6 @@ pub struct OsmPlatform {
     pub refs: Vec<String>,
     pub level: Option<f32>,
     pub centroid: LatLng,
-    /// Graph node IDs of this platform way's polyline (Stage B1). Populated when
-    /// the platform way is imported as routable foot edges; the connector-coverage
-    /// measurement BFS starts here. Empty for platforms whose nodes never made it
-    /// into the graph (old caches / synthetic test indices).
     #[serde(default)]
     pub node_ids: Vec<NodeID>,
 }
@@ -87,11 +80,8 @@ impl PlatformIndex {
             .collect()
     }
 
-    /// Match a GTFS platform stop to an OSM platform. Prefers an OSM platform
-    /// whose split `ref`/`local_ref` set contains the GTFS `platform_code`
-    /// (resolves N:1 island platforms); falls back to the geo-nearest platform
-    /// in range; returns `None` when the code is empty/absent or nothing is in
-    /// range. `dist_m` is the centroid→platform offset in metres.
+    // Prefers a platform whose split ref/local_ref set contains the GTFS
+    // platform_code (resolves N:1 island platforms); falls back to geo-nearest.
     pub fn match_platform(&self, q: &StopPlatformQuery) -> PlatformMatch {
         let code = match q.platform_code.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             Some(c) => c,
@@ -117,15 +107,9 @@ impl PlatformIndex {
     }
 }
 
-/// Returns `true` when tags describe a rail platform — safe to index for
-/// rail-stop matching. Excludes bus/tram-only platforms so a TEC bus terminal
-/// tagged `highway=bus_stop, public_transport=platform` cannot shadow a SNCB
-/// rail platform with the same `local_ref`.
-///
-/// Include: `railway=platform` present, OR `train=yes`, OR
-///   `public_transport=platform` with no bus/tram-only signal.
-/// Exclude: `highway=bus_stop`, OR (`bus=yes`/`tram=yes`/`trolleybus=yes`
-///   AND NOT `train=yes`/`railway=platform`).
+// Excludes bus/tram-only platforms so a bus terminal tagged
+// highway=bus_stop,public_transport=platform cannot shadow a rail platform
+// with the same local_ref.
 fn is_rail_platform(tags: &[(&str, &str)]) -> bool {
     let has_railway_platform = tags.iter().any(|(k, v)| *k == "railway" && *v == "platform");
     let has_train_yes = tags.iter().any(|(k, v)| *k == "train" && *v == "yes");
@@ -140,10 +124,7 @@ fn is_rail_platform(tags: &[(&str, &str)]) -> bool {
     })
 }
 
-/// Parse a way's tags into `(refs, level)` when it is a platform way
-/// (`railway=platform` or `public_transport=platform`). `refs` is the union of
-/// `ref` and `local_ref`, each split on `;` (island platforms). Returns `None`
-/// for non-platform ways and for bus/tram-only platforms (not rail).
+// refs is the union of ref and local_ref, each split on ';' (island platforms).
 pub fn parse_platform_tags(tags: &[(&str, &str)]) -> Option<(Vec<String>, Option<f32>)> {
     let is_platform = tags.iter().any(|(k, v)| {
         (*k == "railway" && *v == "platform") || (*k == "public_transport" && *v == "platform")
@@ -179,34 +160,21 @@ fn parse_level(v: &str) -> Option<f32> {
     v.split(';').next()?.trim().parse::<f32>().ok()
 }
 
-/// True when a way is a railway / public-transport platform (the ways Stage B1
-/// imports as walkable foot edges; `validate_way` rejects them since they carry
-/// no `highway`).
 pub fn is_platform_way(tags: &[(&str, &str)]) -> bool {
     tags.iter().any(|(k, v)| {
         (*k == "railway" && *v == "platform") || (*k == "public_transport" && *v == "platform")
     })
 }
 
-/// Parse a way's `level` tag to a whole storey (`level=1` → `Some(1)`). Takes the
-/// first component of a range (`0;1` → `0`); unparseable (`mezzanine`) → `None`.
-/// Rounds to the nearest integer storey (half levels collapse).
+// Takes the first component of a range (0;1 -> 0); rounds to nearest storey.
 pub fn parse_way_level(tags: &[(&str, &str)]) -> Option<i16> {
     let (_, v) = tags.iter().find(|(k, _)| *k == "level")?;
     let f = parse_level(v)?;
     Some(f.round() as i16)
 }
 
-/// Resolve the effective `highway` value for a way's tag slice.
-///
-/// Prefers the explicit `highway` tag. When `highway` is absent, falls back to
-/// `virtual:highway` **only** for the foot-traversable pedestrian values that
-/// [`crate::ingestion::osm::pbf`]'s `validate_way` already accepts:
-/// `footway`, `steps`, `path`, `pedestrian`. This allows OSM ways tagged
-/// `virtual:highway=footway` (e.g. platform stair-to-platform links at Bruges /
-/// Berchem) to be imported and classified identically to a real `highway=`
-/// way of the same value, without accidentally promoting non-pedestrian
-/// `virtual:highway` values (e.g. `motorway`) to routable edges.
+// Falls back to virtual:highway only for foot-traversable pedestrian values, so a
+// virtual:highway=motorway is never promoted to a routable edge.
 pub(crate) fn effective_highway<'a>(tags: &[(&str, &'a str)]) -> Option<&'a str> {
     if let Some(v) = tags.iter().find(|(k, _)| *k == "highway").map(|(_, v)| *v) {
         return Some(v);
@@ -217,14 +185,7 @@ pub(crate) fn effective_highway<'a>(tags: &[(&str, &'a str)]) -> Option<&'a str>
         .filter(|v| matches!(*v, "footway" | "steps" | "path" | "pedestrian"))
 }
 
-/// Classify a way as a pedestrian vertical [`Connector`] from its highway tag.
-/// Stairs and elevators are unconditional; a ramp must be explicitly tagged
-/// `ramp=yes` (a bare `incline` would mis-flag every sloped street). Returns
-/// `None` for ordinary ways.
-///
-/// Recognises `virtual:highway=steps` / `virtual:highway=footway` (etc.) via
-/// [`effective_highway`] so that OSM platform-stair connector ways tagged with
-/// the `virtual:highway` namespace are classified correctly.
+// A ramp must be explicitly ramp=yes (a bare incline would mis-flag every sloped street).
 pub fn parse_connector(tags: &[(&str, &str)]) -> Option<Connector> {
     let get = |key: &str| tags.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
     match effective_highway(tags) {
@@ -241,29 +202,13 @@ pub fn parse_connector(tags: &[(&str, &str)]) -> Option<Connector> {
     None
 }
 
-/// Pedestrian cost model for a vertical [`Connector`], used by the Stage B1
-/// connector-coverage measurement to report the *extra walk time* a connector
-/// path adds. Stairs/ramps are slow (a meaningful penalty, not free walking);
-/// an elevator is a flat wait. Tunable via `config.yaml`
-/// (`default_routing.connector_cost`); the defaults below are the documented
-/// fallbacks. NOTE: B1 does **not** charge this in routing — it is additive
-/// metadata + a measurement statistic only.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectorCost {
-    /// Effective walking speed on stairs (m/s along the step run). ~0.5 m/s is a
-    /// typical stair descent/ascent pace — far slower than 1.2 m/s level walking.
     pub stairs_speed_mps: f64,
-    /// Effective walking speed on a ramp (m/s) — slower than level but faster
-    /// than stairs.
     pub ramp_speed_mps: f64,
-    /// Fixed time (s) for an elevator: call + ride + doors, independent of run
-    /// length.
     pub elevator_secs: f64,
-    /// Stage B2a fixed penalty (s) added to the re-priced fallback connector that
-    /// joins a relocated platform stop back to its original street snap node when no
-    /// real mapped stairs/elevator exist. Charged ON TOP of pricing the geometric run
-    /// as stairs, so a real mapped vertical connector (priced only by its own geometry)
-    /// always undercuts this synthetic fallback.
+    // Charged ON TOP of pricing the run as stairs, so a real mapped connector
+    // always undercuts this synthetic fallback.
     pub relocation_fallback_secs: f64,
 }
 
@@ -279,7 +224,6 @@ impl Default for ConnectorCost {
 }
 
 impl ConnectorCost {
-    /// Seconds to traverse a connector of the given run `length_m`.
     pub fn seconds(&self, kind: Connector, length_m: f64) -> f64 {
         match kind {
             Connector::Steps => length_m / self.stairs_speed_mps,
@@ -288,10 +232,6 @@ impl ConnectorCost {
         }
     }
 
-    /// Seconds for the Stage B2a synthetic fallback connector over a `run_m` run:
-    /// the run priced as stairs plus the fixed `relocation_fallback_secs` penalty.
-    /// Strictly greater than pricing the same run as real stairs, so genuine mapped
-    /// stairs win whenever they exist.
     pub fn fallback_connector_secs(&self, run_m: f64) -> f64 {
         self.relocation_fallback_secs + self.seconds(Connector::Steps, run_m)
     }
@@ -309,12 +249,6 @@ fn centroid_of(ids: &[i64], coords: &HashMap<i64, (f64, f64)>) -> Option<LatLng>
     })
 }
 
-/// Build an [`OsmPlatform`] from a platform way's raw data (linear or closed/area).
-/// `ids` are the OSM node refs (closed ways repeat first==last); `coords` supplies
-/// lat/lon per OSM id; `resolve` maps an OSM id to its graph [`NodeID`]. Returns
-/// `None` when no coord is available for any ref (e.g. the way is outside the
-/// extract). Closed ways are handled identically to linear ones — the repeated
-/// first/last node contributes a duplicate `node_id` entry which is harmless.
 pub(crate) fn platform_from_way_data(
     ids: &[i64],
     refs: Vec<String>,
@@ -327,10 +261,6 @@ pub(crate) fn platform_from_way_data(
     Some(OsmPlatform { refs, level, centroid, node_ids })
 }
 
-/// Build an [`OsmPlatform`] from a platform OSM **node** (`public_transport=platform`
-/// or `railway=platform` on a node). The node's own coordinate is the centroid;
-/// `resolve` maps the OSM id to its graph [`NodeID`] (populated by
-/// [`crate::ingestion::osm::load_pbf_file`] before this runs).
 pub(crate) fn platform_from_node_data(
     osm_id: i64,
     lat: f64,
@@ -344,20 +274,9 @@ pub(crate) fn platform_from_node_data(
     OsmPlatform { refs, level, centroid, node_ids }
 }
 
-/// Build a [`PlatformIndex`] from an OSM PBF.
-///
-/// Indexes every `railway=platform` / `public_transport=platform` **way** (linear
-/// or closed/area polygon) and every `public_transport=platform` / `railway=platform`
-/// **node** carrying a `local_ref` or `ref`. Each entry retains its ref-set,
-/// `level`, centroid coordinate, and — for Stage B1/B2a — the graph node IDs so
-/// [`crate::ingestion::gtfs::relocate_matched_stop`] can relocate a GTFS stop onto
-/// the platform. Platform way nodes (and platform-tagged OSM nodes) are added to
-/// the graph in [`crate::ingestion::osm::load_pbf_file`] *before* this runs, so
-/// `g.get_id` resolves them.
 pub fn build_platform_index(osm_path: &str, g: &Graph) -> Result<PlatformIndex, osmpbf::Error> {
-    // Pass 0: collect platform relations.  Tags (ref, level, railway/public_transport=platform)
-    // live on the relation itself; member ways are typically untagged (classic multipolygon).
-    // PBF ordering puts relations last, so a separate pre-scan is required.
+    // Relation tags live on the relation itself; member ways are typically untagged,
+    // and PBF ordering puts relations last.
     let mut platform_relations: Vec<(Vec<i64>, Vec<String>, Option<f32>)> = Vec::new();
     let mut relation_member_ways: HashSet<i64> = HashSet::new();
 
@@ -375,11 +294,9 @@ pub fn build_platform_index(osm_path: &str, g: &Graph) -> Result<PlatformIndex, 
         }
     })?;
 
-    // Pass 1: collect platform ways, platform nodes, and node IDs for relation member ways.
     let mut platform_ways: Vec<(Vec<i64>, Vec<String>, Option<f32>)> = Vec::new();
     let mut platform_osm_nodes: Vec<(i64, f64, f64, Vec<String>, Option<f32>)> = Vec::new();
     let mut needed: HashSet<i64> = HashSet::new();
-    // way_id → its node refs, for member ways of platform relations.
     let mut relation_way_nodes: HashMap<i64, Vec<i64>> = HashMap::new();
 
     ElementReader::from_path(osm_path)?.for_each(|el| match el {
@@ -422,7 +339,6 @@ pub fn build_platform_index(osm_path: &str, g: &Graph) -> Result<PlatformIndex, 
         _ => {}
     })?;
 
-    // Pass 2: collect coords for all needed node IDs.
     let mut coords: HashMap<i64, (f64, f64)> = HashMap::new();
     ElementReader::from_path(osm_path)?.for_each(|el| match el {
         Element::DenseNode(n) if needed.contains(&n.id()) => {
@@ -470,8 +386,6 @@ pub fn build_platform_index(osm_path: &str, g: &Graph) -> Result<PlatformIndex, 
     Ok(PlatformIndex::from_platforms(platforms))
 }
 
-/// `(count, mean, median, p90, max)` over a set of offsets (metres). Sorts in
-/// place. Returns all-zero for an empty input.
 pub fn offset_stats(v: &mut [f64]) -> (usize, f64, f64, f64, f64) {
     if v.is_empty() {
         return (0, 0.0, 0.0, 0.0, 0.0);
@@ -571,7 +485,6 @@ mod tests {
             parse_connector(&[("highway", "footway"), ("ramp", "yes")]),
             Some(Connector::Ramp)
         );
-        // A sloped ordinary street must NOT be a connector (would inflate coverage).
         assert_eq!(parse_connector(&[("highway", "residential"), ("incline", "5%")]), None);
         assert_eq!(parse_connector(&[("highway", "footway")]), None);
     }
@@ -579,10 +492,8 @@ mod tests {
     #[test]
     fn connector_cost_stairs_slower_than_elevator_constant() {
         let c = ConnectorCost::default();
-        // 10 m of stairs at 0.5 m/s = 20 s; far slower than 10 m level walk (~8 s).
         assert!((c.seconds(Connector::Steps, 10.0) - 20.0).abs() < 1e-9);
         assert!((c.seconds(Connector::Ramp, 9.0) - 10.0).abs() < 1e-9);
-        // Elevator is a fixed wait, independent of run length.
         assert_eq!(c.seconds(Connector::Elevator, 3.0), c.seconds(Connector::Elevator, 30.0));
     }
 
@@ -602,8 +513,6 @@ mod tests {
     fn fallback_connector_costs_more_than_real_stairs() {
         let c = ConnectorCost::default();
         let run = 12.0;
-        // The synthetic fallback prices the run as stairs PLUS the fixed penalty, so
-        // it is strictly more expensive than a genuine mapped stairs run of equal length.
         assert!(c.fallback_connector_secs(run) > c.seconds(Connector::Steps, run));
         assert!(
             (c.fallback_connector_secs(run)
@@ -651,7 +560,6 @@ mod tests {
 
     #[test]
     fn match_island_platform_n_to_1_both_tracks() {
-        // platform_code 10 also maps to the same island way (refs 9;10).
         let idx = island_index();
         let q = StopPlatformQuery {
             platform_code: Some("10"),
@@ -679,7 +587,6 @@ mod tests {
 
     #[test]
     fn match_missing_platform_code_is_none() {
-        // STIB-style: no platform_code column → None ⇒ matcher no-ops.
         let idx = island_index();
         let q = StopPlatformQuery {
             platform_code: None,
@@ -981,8 +888,6 @@ mod tests {
         assert!(result.is_none(), "relation with no member-way coords must be skipped");
     }
 
-    // --- effective_highway + parse_connector virtual:highway tests ---
-
     #[test]
     fn effective_highway_prefers_explicit_highway_tag() {
         assert_eq!(effective_highway(&[("highway", "footway")]), Some("footway"));
@@ -1058,7 +963,6 @@ mod tests {
 
     #[test]
     fn parse_connector_highway_wins_over_virtual_highway_for_connector() {
-        // highway=footway beats virtual:highway=steps → footway is not a connector
         assert_eq!(
             parse_connector(&[("highway", "footway"), ("virtual:highway", "steps")]),
             None,

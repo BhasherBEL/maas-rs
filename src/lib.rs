@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod ingestion;
 pub mod logging;
 pub mod routing;

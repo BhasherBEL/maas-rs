@@ -1,15 +1,5 @@
-// In-memory fallback store (no SQL) for the Live (realtime) journey view.
-//
-// Adopted when `openLiveDb()` throws — typically on a LAN phone over plain http,
-// where OPFS SAHPool has no secure context. It mirrors the journey/history
-// surface the Live bridge needs (saveJourney/getJourney/clearJourney/
-// appendEvent/listEvents) and matches the SQL store's OBSERVABLE contract:
-// clearing the active journey keeps history, and listEvents returns
-// most-recent-first. Imports NOTHING browser-specific, so it runs under Node.
-
-// Detach a value from caller/stored references, mirroring the SQL store's
-// JSON round-trip (it persists `payload` as TEXT and re-parses on read), so a
-// mutation of a returned object can never corrupt internal state.
+// Must mirror the SQL store's observable contract: clearing the active journey
+// keeps history, and listEvents returns most-recent-first.
 function clonePayload(p) {
   return p == null ? null : JSON.parse(JSON.stringify(p));
 }

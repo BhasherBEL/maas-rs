@@ -1,0 +1,7 @@
+# Pinned toolchain for contributors and CI.
+# Edition 2024 requires Rust >= 1.85; this pins the version the project is
+# developed and released against.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

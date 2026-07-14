@@ -9,16 +9,15 @@ use crate::{
     },
 };
 
-/// A single lat/lon coordinate point in a leg's geometry.
 #[derive(Debug, SimpleObject, Clone, Copy)]
 pub struct PlanCoordinate {
     pub lat: f64,
+    #[graphql(name = "lng")]
     pub lon: f64,
 }
 
 #[derive(Debug, Interface, Clone)]
-// clippy false positive: each #[graphql(field(...))] defines a distinct field,
-// but the lint keys on the repeated `ty` values.
+// clippy false positive: distinct fields, lint keys on repeated `ty` values.
 #[allow(clippy::duplicated_attributes)]
 #[graphql(field(name = "length", ty = "&usize"))]
 #[graphql(field(name = "start", ty = "&u32"))]
@@ -38,14 +37,12 @@ pub enum PlanLeg {
 pub struct PlanWalkLeg {
     pub length: usize,
     pub cycleroute_length: Option<usize>,
-    /// Total ascent (D+) in meters along the leg, summed over the path's positive
-    /// elevation deltas. `None` when not computed (only the cost-routed bike leg sets it).
+    /// Total ascent (D+) in meters. `None` when not computed (only cost-routed bike).
     pub elevation_gain: Option<usize>,
     pub start: u32,
     pub end: u32,
     pub duration: u32,
 
-    /// How this street leg is traversed: `Walk` or `Bike`.
     pub street_mode: Mode,
 
     pub from: PlanPlace,
@@ -53,14 +50,12 @@ pub struct PlanWalkLeg {
 
     pub steps: Vec<PlanLegStep>,
 
-    /// Ordered sequence of coordinates tracing the walking path.
     pub geometry: Vec<PlanCoordinate>,
 
     pub alternatives: Vec<LegOption>,
 
-    /// "Leave by" time (seconds since midnight) for an access leg with a downstream
-    /// boarding deadline: depart by this to make the connection with 95% confidence
-    /// (`board − p95`). `None` for legs without a deadline (egress, direct).
+    /// "Leave by" (secs since midnight) for an access leg with a downstream boarding
+    /// deadline (`board − p95`). `None` for egress/direct legs.
     pub leave_by: Option<u32>,
 }
 
@@ -73,8 +68,8 @@ impl PlanWalkLeg {
             .ok_or("option_index out of range")
     }
 
-    /// A view of this leg with option `i` highlighted: leg metrics/geometry/steps
-    /// mirror `alternatives[i]`, the option set is preserved. O(1), no re-search.
+    /// This leg with option `i` highlighted (metrics/geometry/steps mirror
+    /// `alternatives[i]`, option set preserved). O(1), no re-search.
     pub fn reselect_to(&self, i: usize) -> Option<PlanWalkLeg> {
         let o = self.alternatives.get(i)?;
         let mut leg = self.clone();
@@ -98,7 +93,6 @@ impl PlanWalkLeg {
 
 #[ComplexObject]
 impl PlanWalkLeg {
-    /// Switch the highlighted alternative without re-running the engine.
     async fn reselect(&self, option_index: i32) -> Result<PlanWalkLeg> {
         self.reselect_checked(option_index)
             .map_err(async_graphql::Error::new)
@@ -107,22 +101,17 @@ impl PlanWalkLeg {
 
 #[derive(Debug, SimpleObject, Clone)]
 pub struct TransferRisk {
-    /// Probability (0.0–1.0) that the user boards this vehicle on time.
-    /// 1.0 = deterministic (no delay model for this route type).
+    /// P(0.0–1.0) of boarding this vehicle on time; 1.0 = no delay model.
     pub reliability: f32,
-    /// Scheduled departure time of the boarded trip (seconds since midnight).
+    /// Scheduled departure of the boarded trip (secs since midnight).
     pub scheduled_departure: u32,
-    /// Departure time of the next available trip at the boarding stop, if any.
-    /// The client computes `wait_if_missed = next_departure - scheduled_departure`.
+    /// Departure of the next available trip at the boarding stop, if any.
     pub next_departure: Option<u32>,
-    /// Probability (0.0–1.0) of boarding the *next* trip (if the scheduled one
-    /// is missed), convolving the feeder and boarding delay distributions over
-    /// the `next_departure − arrival_at_boarding_stop` margin.  `None` when there
-    /// is no next departure or no delay model for the feeder route type.
+    /// P(0.0–1.0) of boarding the *next* trip if the scheduled one is missed.
+    /// `None` when no next departure or no feeder delay model.
     pub next_reliability: Option<f32>,
-    /// `scheduled_departure − arrival_at_boarding_stop` in seconds.
-    /// Negative = transfer is physically impossible (arrive after the train departs).
-    /// `None` for the first leg (no preceding vehicle).
+    /// `scheduled_departure − arrival_at_boarding_stop` in seconds. Negative =
+    /// physically impossible transfer. `None` for the first leg.
     pub margin_secs: Option<i32>,
 }
 
@@ -130,18 +119,17 @@ pub struct TransferRisk {
 #[graphql(complex)]
 pub struct PlanTransitLeg {
     pub length: usize,
-    /// Effective boarding time (seconds since midnight). Equals `scheduled_start`
-    /// unless realtime data shifts it.
+    /// Effective boarding time (secs since midnight); `scheduled_start` unless realtime shifts it.
     pub start: u32,
-    /// Effective alighting time. Equals `scheduled_end` unless realtime shifts it.
+    /// Effective alighting time; `scheduled_end` unless realtime shifts it.
     pub end: u32,
     pub duration: u32,
 
-    /// Scheduled (timetable) boarding time, before any realtime delay.
+    /// Scheduled (timetable) boarding time, before realtime delay.
     pub scheduled_start: u32,
-    /// Scheduled (timetable) alighting time, before any realtime delay.
+    /// Scheduled (timetable) alighting time, before realtime delay.
     pub scheduled_end: u32,
-    /// True when realtime data informs this leg's times (UI shows it as "live").
+    /// True when realtime data informs this leg's times.
     pub realtime: bool,
 
     pub from: PlanPlace,
@@ -149,58 +137,42 @@ pub struct PlanTransitLeg {
 
     pub steps: Vec<PlanLegStep>,
 
-    /// Ordered sequence of stop coordinates along the transit route.
     pub geometry: Vec<PlanCoordinate>,
 
-    /// Transfer risk for boarding this vehicle on time.
-    /// `None` for the first transit leg (walked directly from journey origin).
+    /// `None` for the first transit leg (walked directly from origin).
     pub transfer_risk: Option<TransferRisk>,
 
     #[graphql(skip)]
     pub trip_id: TripId,
 
-    /// Arrival time (seconds since midnight) of the preceding transit vehicle at
-    /// this leg's boarding stop.  When combined with `transfer_risk.scheduled_departure`,
-    /// gives the actual transfer window (`scheduled_departure - preceding_arrival`).
+    /// Arrival (secs since midnight) of the preceding vehicle at this leg's boarding
+    /// stop; with `transfer_risk.scheduled_departure` gives the transfer window.
     pub preceding_arrival: Option<u32>,
 
-    /// Route type of the preceding transit vehicle (the one that delivered the
-    /// user to this leg's boarding stop).  Combined with `preceding_arrival` to
-    /// select the correct delay-CDF when populating `transfer_risk` on alternatives.
+    /// Route type of the preceding vehicle, for the correct delay-CDF on alternatives.
     #[graphql(skip)]
     pub preceding_route_type: Option<RouteType>,
 
-    /// This leg's own route type (the vehicle being boarded).  Combined with
-    /// `preceding_route_type` to convolve both delay-CDFs when scoring the
-    /// transfer onto this leg.
+    /// This leg's route type (vehicle being boarded).
     #[graphql(skip)]
     pub route_type: Option<RouteType>,
 
-    /// Route type of the *following* transit leg (the next vehicle the user
-    /// boards after this one).  `None` when this is the last transit leg.  Used,
-    /// with `following_margin_secs`, to score whether an alternative for this leg
-    /// still makes the downstream connection.
+    /// Route type of the following transit leg; `None` when last.
     #[graphql(skip)]
     pub following_route_type: Option<RouteType>,
 
-    /// Outbound connection slack of the original plan, in seconds: the next transit
-    /// leg's scheduled boarding minus this leg's scheduled arrival at that boarding
-    /// stop (i.e. minus the intervening transfer walk).  `None` when this is the
-    /// last transit leg.  An alternative arriving `d` seconds later than scheduled
-    /// has effective slack `following_margin_secs − d`.
+    /// Outbound connection slack of the original plan (secs): next leg's scheduled
+    /// boarding minus this leg's scheduled arrival at that stop. `None` when last. An
+    /// alternative arriving `d` later has effective slack `following_margin_secs − d`.
     #[graphql(skip)]
     pub following_margin_secs: Option<i32>,
 
-    /// Whether bikes are allowed on this transit leg.
     /// `None` = no information available.
     pub bikes_allowed: Option<bool>,
 
-    /// Seconds subtracted from raw timetable times when this leg was built from an
-    /// overnight RAPTOR pass. Signed: `+86400` for a previous-service-day trip whose
-    /// raw times exceed 24 h (date-1 extension), `-86400` for a next-service-day trip
-    /// pulled into a late-night query's window (date+1 extension), `0` otherwise.
-    /// `raw_time = displayed_time + time_shift`. Used by the
-    /// `previousDepartures`/`nextDepartures` resolvers to normalize returned times.
+    /// Signed seconds subtracted from raw timetable times for an overnight-pass leg:
+    /// `+86400` for a date-1 trip (raw > 24 h), `-86400` for a date+1 trip, `0`
+    /// otherwise. `raw_time = displayed_time + time_shift`.
     #[graphql(skip)]
     pub time_shift: i64,
 }
@@ -245,9 +217,7 @@ impl PlanTransitLeg {
 }
 
 impl PlanTransitLeg {
-    /// Earlier same-service + cross-route departures for this leg, scored for swap
-    /// reliability. Shared by the `previousDepartures` resolver and the lazy
-    /// `legAlternatives` query.
+    /// Earlier same-service + cross-route departures, scored for swap reliability.
     pub(crate) fn previous_departures_on(
         &self,
         graph: &Graph,
@@ -274,7 +244,6 @@ impl PlanTransitLeg {
             ),
             count,
         )?;
-        // Use raw timetable reference time for cross-route search.
         let cross = graph.cross_route_departures(
             self.from.node_id,
             self.to.node_id,
@@ -303,8 +272,7 @@ impl PlanTransitLeg {
         Ok(results)
     }
 
-    /// Later same-service + cross-route departures for this leg, scored for swap
-    /// reliability. Shared by the `nextDepartures` resolver and `legAlternatives`.
+    /// Later same-service + cross-route departures, scored for swap reliability.
     pub(crate) fn next_departures_on(
         &self,
         graph: &Graph,
@@ -331,7 +299,6 @@ impl PlanTransitLeg {
             ),
             count,
         )?;
-        // Use raw timetable reference time for cross-route search.
         let cross = graph.cross_route_departures(
             self.from.node_id,
             self.to.node_id,
@@ -360,10 +327,8 @@ impl PlanTransitLeg {
     }
 }
 
-/// Subtract the signed shift `s` from raw-timetable times in a result leg to
-/// normalize it to wall-clock time. Used when returning alternatives for an
-/// overnight-shifted leg. `s > 0` shifts a prev-day (date-1) leg down; `s < 0`
-/// shifts a next-day (date+1) leg up. Clamps at 0.
+/// Subtract signed shift `s` from raw-timetable times to normalize to wall-clock.
+/// `s > 0` shifts a date-1 leg down; `s < 0` shifts a date+1 leg up. Clamps at 0.
 fn shift_transit_leg(mut l: PlanTransitLeg, s: i64) -> PlanTransitLeg {
     let sub = |x: u32| (x as i64 - s).max(0) as u32;
     l.start = sub(l.start);
@@ -387,18 +352,9 @@ fn shift_transit_leg(mut l: PlanTransitLeg, s: i64) -> PlanTransitLeg {
 }
 
 impl PlanTransitLeg {
-    /// Marginal swap reliability for an *alternative* of this leg — the chance the
-    /// whole journey still works if only this leg is replaced by the alternative,
-    /// everything else fixed:
-    ///
-    /// `P(inbound) × P(outbound)`
-    ///   - `P(inbound)`  — board the alternative given the fixed preceding leg's
-    ///     arrival; `1.0` when this is the first transit leg.
-    ///   - `P(outbound)` — the alternative still makes the fixed following leg;
-    ///     `1.0` when this is the last transit leg.
-    ///
-    /// Returns `None` only for a lone transit leg (neither preceding nor following),
-    /// where there is no connection to score.
+    /// Marginal swap reliability for an alternative of this leg: `P(inbound) ×
+    /// P(outbound)`, each `1.0` when this is the first/last transit leg respectively.
+    /// `None` only for a lone leg (no connection to score).
     fn alternative_transfer_risk(
         &self,
         graph: &Graph,
@@ -407,8 +363,7 @@ impl PlanTransitLeg {
         alt_end: u32,
     ) -> Option<TransferRisk> {
         let alt_rt = graph.route_type_of_trip(alt_trip_id);
-        // `self` times were shifted by -time_shift during overnight normalization.
-        // Add it back to compare in the same raw timetable domain as alt_dep/alt_end.
+        // Add back time_shift to compare in the same raw timetable domain as alt_dep/alt_end.
         let s = self.time_shift;
 
         let (p_in, in_margin) = match (self.preceding_arrival, self.preceding_route_type) {
@@ -520,9 +475,8 @@ impl PlanTransitLeg {
                 let mut new_steps = Vec::with_capacity(self.steps.len());
 
                 // Derive the first step's departure index from THIS leg's first
-                // timetable segment (not the caller's index, which may come from a
-                // different segment/pattern — e.g. the backward-tightening path). If
-                // the trip isn't on this segment it isn't a valid alternative here.
+                // timetable segment; if the trip isn't on this segment it isn't a
+                // valid alternative here.
                 let first_slice = graph.get_transit_departure_slice(first.timetable_segment);
                 let (first_local, first_seg) = first_slice
                     .iter()
@@ -681,8 +635,6 @@ mod tests {
     #[test]
     fn shift_transit_leg_shifts_both_endpoint_dwell_fields() {
         let shifted = shift_transit_leg(sample_transit_leg(), 86_400);
-        // The new endpoint dwell fields shift into the display frame consistently
-        // with the pre-existing from.departure / to.arrival shifts.
         assert_eq!(shifted.from.departure, Some(3_660));
         assert_eq!(shifted.from.arrival, Some(3_600));
         assert_eq!(shifted.to.arrival, Some(4_200));
@@ -804,10 +756,8 @@ mod tests {
         assert_eq!(reselected.duration, p50_1);
     }
 
-    /// P3f drop gate: `previous_departures_on` / `next_departures_on` must (a) not panic
-    /// and (b) return byte-identical results before and after `drop_full_node_arrays()`.
-    /// Uses a 2-trip fixture so `next_departures_on` returns a non-empty list, proving the
-    /// path actually traverses timetable data rather than short-circuiting to empty.
+    /// `previous_departures_on`/`next_departures_on` must return byte-identical
+    /// results before and after `drop_full_node_arrays()`.
     #[test]
     fn leg_alternatives_drop_gate_identical() {
         use crate::{
@@ -922,7 +872,7 @@ mod tests {
             // Column-major: stop 0 (stop_a): trip 0 at 8:00, trip 1 at 9:00
             g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600, departure: 8 * 3600, ..Default::default() });
             g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600, departure: 9 * 3600, ..Default::default() });
-            // Column-major: stop 1 (stop_b): trip 0 at 8:10, trip 1 at 9:10
+            // Column-major: stop 1 (stop_b)
             g.push_transit_pattern_stop_time(StopTime { arrival: 8 * 3600 + 600, departure: 8 * 3600 + 600, ..Default::default() });
             g.push_transit_pattern_stop_time(StopTime { arrival: 9 * 3600 + 600, departure: 9 * 3600 + 600, ..Default::default() });
             g.push_transit_idx_pattern_stop_times(Lookup { start: sts, len: 4 });
@@ -935,9 +885,7 @@ mod tests {
         g.contracted = Some(cg);
         g.bake_bike_on_contracted_default();
 
-        // Route directly by NodeID (bypasses coordinate snapping), using the same
-        // parameters as `t4_drop_g_then_route_identical` — date=0 (2000-01-01),
-        // weekday=0x7F (all days), querying at 7:50 to board the 8:00 trip.
+        // Route directly by NodeID (bypasses snapping); querying at 7:50 to board the 8:00 trip.
         let plans_before = g.raptor(origin, dest, 7 * 3600 + 50 * 60, 0, 0x7F, 10 * 60);
 
         let transit_leg_before = plans_before

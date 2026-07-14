@@ -1,26 +1,9 @@
-//! Travel-time map (isochrone / one-to-many reachability).
-//!
-//! From a single CENTER coordinate at a given day + departure time, compute the
-//! travel time to reach MANY sampled points, so a client can paint a continuous
-//! green(0)->red(maxSeconds) heatmap. This REUSES the RAPTOR forward pass and the
-//! exact one-to-many foot machinery — it adds no new graph traversal:
-//!
-//!  1. **Reach every stop** — [`Graph::stop_arrivals`] seeds foot/bike/car access
-//!     from the centre (via the production [`Graph::build_mode_context`], with an
-//!     empty egress so the forward search is not clamped to a destination) and runs
-//!     ONE [`Graph::run_departure_into`] sweep, the same forward pass `raptor`
-//!     drives. The per-stop earliest arrival is then read straight off the carried
-//!     label grid — the same survey `raptorExplain`'s `stops_reached` uses.
-//!  2. **Fill the area** — the reachable bounding box is sampled on a lat/lng grid
-//!     (cell edge `travel_map_grid_step_m`). For each grid point `P` the travel time
-//!     is `min(direct walk centre->P, min over reached stops s of
-//!     arrival[s] + walk s->P)`, capped at `maxSeconds`. Both the stop->P walk set
-//!     and the direct walk reuse the exact contracted-graph one-to-many
-//!     (`nearby_stops_arena` / CCH egress) and point-to-point (`walk_secs_coord_to_coord`)
-//!     foot cost — no bespoke Dijkstra.
-//!  3. **Departure window** — [`Graph::travel_time_map_window`] runs steps 1-2 at
-//!     several departures spaced `travel_map_window_sample_secs` apart across the
-//!     window and aggregates each cell (BEST = min, AVERAGE = mean).
+//! Travel-time map (isochrone / one-to-many reachability). From a CENTER coordinate
+//! at a day + departure time, compute travel time to many sampled points. Reuses the
+//! RAPTOR forward pass and the exact one-to-many foot machinery (no new traversal):
+//! reach every stop ([`Graph::stop_arrivals`]), fill the reachable bounding box on a
+//! grid ([`Graph::travel_time_map`]), and aggregate across a departure window
+//! ([`Graph::travel_time_map_window`], BEST = min / AVERAGE = mean).
 
 use crate::structures::{
     ActiveModes, BikeCost, LatLng, NodeID, RealtimeIndex, ReliabilityBuckets,
@@ -29,8 +12,8 @@ use crate::structures::{
 use super::raptor_route::{BestGrid, FullRow, Label, LabelRow, QueryEndpoints, SlimRow};
 use super::Graph;
 
-/// One sampled reachability cell: a coordinate and the travel time (seconds) to
-/// reach it from the centre at the query departure.
+/// One sampled reachability cell: a coordinate and travel time (seconds) from the
+/// centre.
 #[derive(Clone, Copy, Debug)]
 pub struct TravelCell {
     pub loc: LatLng,
@@ -40,26 +23,17 @@ pub struct TravelCell {
 /// Per-cell aggregation across a departure window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TravelAggregation {
-    /// Best (minimum) travel time across the sampled departures — "if you time it
-    /// perfectly". This is the default and matches a single-departure isochrone.
+    /// Minimum travel time across the sampled departures ("if you time it perfectly").
     Best,
-    /// Mean travel time across the sampled departures — "on an average departure".
+    /// Mean travel time across the sampled departures.
     Average,
 }
 
 impl Graph {
-    /// Earliest arrival time (seconds since midnight) at every compact transit stop
-    /// reachable from `center` departing at `start_time`, or `u32::MAX` for stops
-    /// not reached within one forward pass. Reuses the production forward pass:
-    /// access is seeded from `center` through [`Graph::build_mode_context`] (empty
-    /// egress, so [`Graph::target_cutoff`] stays unbounded and the sweep relaxes the
-    /// whole reachable network in one pass), then the per-stop minimum arrival is
-    /// read off the carried label grid exactly as `raptorExplain`'s survey does.
-    ///
-    /// `max_secs` is the isochrone budget: it is used as the FOOT-ACCESS radius so
-    /// every stop boardable within the budget's walk is seeded (a fixed
-    /// `min_access_secs` disc would silently omit stops reachable by a longer access
-    /// walk on a large isochrone). Vehicle (bike/car) access still uses the
+    /// Earliest arrival (seconds since midnight) at every compact transit stop
+    /// reachable from `center` at `start_time`, or `u32::MAX` for stops not reached.
+    /// `max_secs` (the isochrone budget) is the FOOT-ACCESS radius so every stop
+    /// boardable within the budget's walk is seeded; vehicle access uses the
     /// length-scaled budget from `build_mode_context`.
     #[allow(clippy::too_many_arguments)]
     pub fn stop_arrivals(
@@ -90,10 +64,8 @@ impl Graph {
         }
     }
 
-    /// Test-only oracle for OPT-B (horizon) + OPT-C1 (skip-egress): the SAME forward
-    /// pass with both optimizations DISABLED (full egress sweep, unbounded flood).
-    /// [`Graph::stop_arrivals`] must return a bit-identical arrival vector; pinned in
-    /// `tests/travel_map_tests.rs`.
+    /// Test-only oracle: the same forward pass with OPT-B/OPT-C1 DISABLED (full egress
+    /// sweep, unbounded flood). [`Graph::stop_arrivals`] must be bit-identical.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn stop_arrivals_reference(
@@ -124,10 +96,8 @@ impl Graph {
         }
     }
 
-    /// `optimize` (default `true` on the production path): when `false`, DISABLE the
-    /// travel-map forward-pass optimizations — compute the full center egress and run
-    /// an UNBOUNDED flood (no horizon). Used only by [`Graph::stop_arrivals_reference`]
-    /// as the bit-identity oracle.
+    /// `optimize == false` DISABLES the forward-pass optimizations (full center
+    /// egress, unbounded flood); used only by the bit-identity oracle.
     #[allow(clippy::too_many_arguments)]
     fn stop_arrivals_grid<R: LabelRow>(
         &self,
@@ -149,14 +119,12 @@ impl Graph {
 
         let n_stops = self.raptor.transit_stop_to_node.len();
         if n_stops == 0 || !am.wants_transit() {
-            // No transit (walk/bike/car-only isochrone) or an empty network: the
-            // area fill below handles the direct-walk term, so return "no stop
-            // reached" without running a pass.
+            // Walk/bike/car-only or empty network: fill_area handles the direct walk.
             return vec![u32::MAX; n_stops];
         }
 
-        // The centre snaps to itself for both endpoints; only the ACCESS side is
-        // used (egress is forced empty), so the destination endpoint is irrelevant.
+        // The centre snaps to itself for both endpoints; only ACCESS is used (egress
+        // forced empty), so the destination endpoint is irrelevant.
         let center_node = match self.arena_snap_center(center) {
             Some(n) => n,
             None => return vec![u32::MAX; n_stops],
@@ -167,21 +135,12 @@ impl Graph {
             origin_station: None,
             destination_station: None,
         };
-        // Foot-access radius = the isochrone budget (floored at the configured
-        // minimum), so every stop boardable within `max_secs` on foot is seeded.
-        // On the CCH path `build_mode_context` returns ALL foot-reachable stops
-        // regardless of this value (even more complete); this bounds only the
-        // radius-limited two-pass foot Dijkstra fallback.
+        // Foot-access radius = the isochrone budget, floored at the configured minimum.
         let access_secs = max_secs.max(self.raptor.min_access_secs);
-        // OPT-C1: skip the wasted CCH/two-pass center-egress sweep whenever there is
-        // no vehicle (bike/car) access. The center egress is unobserved by an
-        // isochrone (we clear the per-state egress grid below), and its only OTHER
-        // consumer — the park&ride vehicle-access retain-filter in
-        // `build_mode_context` — is a provable no-op when no bike/car access states
-        // exist. For walk / walk-transit isochrones (the UI default) this holds, so
-        // `skip_egress = true` is bit-identical. If a vehicle mode is active we pass
-        // `false` and compute egress exactly as before, keeping vehicle isochrones
-        // correct.
+        // OPT-C1: skip the center-egress sweep when there is no vehicle access — the
+        // egress is unobserved by an isochrone (grid cleared below) and its only other
+        // consumer (park&ride retain-filter) is a no-op without bike/car states. With a
+        // vehicle mode active, compute egress as before.
         let skip_egress = optimize && !am.uses_vehicle();
         let mut mc = self.build_mode_context_opts(
             am,
@@ -196,30 +155,19 @@ impl Graph {
             skip_egress,
         );
         // Force EGRESS empty: an isochrone has no destination, so the forward search
-        // must not be clamped by a destination-based `target_cutoff`. With `skip_egress`
-        // the egress lists are already empty; otherwise (vehicle modes) clear them now.
+        // must not be clamped by a destination-based `target_cutoff`.
         for e in mc.egress.iter_mut() {
             e.clear();
         }
         if !mc.any_access() {
             return vec![u32::MAX; n_stops];
         }
-        // OPT-B: bound the forward pass to the isochrone horizon. With egress forced
-        // empty the destination-based `target_cutoff` is `u32::MAX` for every state,
-        // so `run_departure_into` would otherwise flood the WHOLE network across all
-        // MAX_ROUNDS rounds even for a small budget. Setting the horizon mins every
-        // cutoff with `start_time + max_secs`, pruning labels that arrive after the
-        // budget and letting rounds terminate once nothing under the horizon improves.
-        // No arrival `> horizon` can survive `fill_area`'s `offset > max_secs` filter,
-        // so the surviving cells are bit-identical to the unbounded pass.
-        //
-        // The `+1` makes the horizon EXCLUSIVE at `start_time + max_secs`: the cutoff
-        // comparisons prune `arr >= cutoff`, and a stop arriving at EXACTLY
-        // `start_time + max_secs` (offset == max_secs) is still kept by `fill_area`
-        // (its `offset > max_secs` filter is `<=`-inclusive) — e.g. a cell sitting on
-        // that stop with a zero-length egress stub. Pruning it would drop a cell the
-        // reference keeps, so we widen the horizon by one second to preserve it while
-        // still bounding the flood.
+        // OPT-B: bound the flood to the isochrone horizon (egress-empty ⇒ cutoff is
+        // u32::MAX, so it would otherwise flood the whole network). Bit-identical
+        // because no arrival > horizon survives fill_area's `offset > max_secs` filter.
+        // The `+1` makes the horizon EXCLUSIVE (cutoffs prune `arr >= cutoff`) so a
+        // stop arriving at EXACTLY start_time + max_secs — which fill_area keeps — is
+        // not pruned.
         if optimize {
             mc.horizon = Some(start_time.saturating_add(max_secs).saturating_add(1));
         }
@@ -257,7 +205,6 @@ impl Graph {
             None,
         );
 
-        // Survey: per stop, the minimum earliest arrival across all rounds/states.
         let mut arrivals = vec![u32::MAX; n_stops];
         for stop_idx in 0..n_stops {
             let mut best_arr = u32::MAX;
@@ -274,9 +221,8 @@ impl Graph {
         arrivals
     }
 
-    /// Single-departure travel-time map: sample the reachable area and return one
-    /// [`TravelCell`] per grid point reachable within `max_secs`. Points beyond
-    /// `max_secs` (or unreachable) are omitted.
+    /// Single-departure travel-time map: one [`TravelCell`] per grid point reachable
+    /// within `max_secs`; points beyond it (or unreachable) are omitted.
     #[allow(clippy::too_many_arguments)]
     pub fn travel_time_map(
         &self,
@@ -301,9 +247,8 @@ impl Graph {
         self.fill_area(center, start_time, max_secs, grid_step_m, &arrivals)
     }
 
-    /// Test-only reference travel-time map using the pre-OPT-A per-cell [`Graph::fill_area_reference`]
-    /// (two full graph searches per grid cell). The inverted [`Graph::travel_time_map`] must
-    /// return bit-identical cells; the equivalence is pinned in `tests/travel_map_tests.rs`.
+    /// Test-only reference map via the pre-OPT-A per-cell [`Graph::fill_area_reference`];
+    /// the inverted [`Graph::travel_time_map`] must return bit-identical cells.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn travel_time_map_reference(
@@ -329,11 +274,10 @@ impl Graph {
         self.fill_area_reference(center, start_time, max_secs, grid_step_m, &arrivals)
     }
 
-    /// Departure-window travel-time map: evaluate [`Graph::travel_time_map`] at
-    /// departures spaced `travel_map_window_sample_secs` apart across
-    /// `[start_time, window_end]` (inclusive of both ends), then aggregate each
-    /// cell across the samples (`Best` = min, `Average` = mean). A cell is emitted
-    /// iff it was reachable within `max_secs` on at least one sampled departure.
+    /// Departure-window travel-time map: [`Graph::travel_time_map`] at departures
+    /// spaced `travel_map_window_sample_secs` apart across `[start_time, window_end]`,
+    /// aggregated per cell (`Best` = min, `Average` = mean). A cell is emitted iff
+    /// reachable within `max_secs` on at least one sampled departure.
     #[allow(clippy::too_many_arguments)]
     pub fn travel_time_map_window(
         &self,
@@ -355,10 +299,8 @@ impl Graph {
     ) -> Vec<TravelCell> {
         let departures = self.window_departures(start_time, window_end);
 
-        // Aggregate per grid point, keyed by quantized lat/lng so the same sampled
-        // point across departures lands in the same bucket (grid points are generated
-        // identically per departure, so the quantization is exact for our own grid).
-        // `sum`/`count` support Average; `min` supports Best.
+        // Aggregate per grid point, keyed by quantized lat/lng so the same point across
+        // departures lands in the same bucket.
         use std::collections::HashMap;
         let mut acc: HashMap<(i64, i64), (u64, u32, u32)> = HashMap::new(); // (sum, count, min)
 
@@ -380,11 +322,9 @@ impl Graph {
             .map(|((qlat, qlng), (sum, count, min))| {
                 let seconds = match agg {
                     TravelAggregation::Best => min,
-                    // Mean over ALL sampled departures: a departure on which the cell
-                    // was NOT reachable within `max_secs` counts as `max_secs` (the
-                    // cap), so a cell reachable only sometimes reads as slower-on-
-                    // average rather than spuriously fast. Cells never reachable on
-                    // any departure are absent from `acc` and so are omitted.
+                    // Mean over ALL departures: a departure where the cell was NOT
+                    // reachable counts as `max_secs`, so a sometimes-reachable cell
+                    // reads as slower-on-average rather than spuriously fast.
                     TravelAggregation::Average => {
                         let missed = n.saturating_sub(count as u64);
                         ((sum + missed * max_secs as u64) / n) as u32
@@ -398,14 +338,9 @@ impl Graph {
             .collect()
     }
 
-    /// Resolve the effective grid step (metres) for a fill, applying the safety cap.
-    /// `req_step_m` is the requested per-query step (already clamped by the resolver);
-    /// it is floored at 1 m. If a grid at that step over the reachable bounding box
-    /// `[min_lat,max_lat]×[min_lng,max_lng]` would produce more than
-    /// `travel_map_max_cells` cells, the step is COARSENED upward by
-    /// `sqrt(cells / cap)` so the emitted cell count stays bounded regardless of how
-    /// fine a step the client asked for. Both `fill_area` and its reference use this,
-    /// so their grids stay identical.
+    /// Effective grid step (metres), floored at 1 m: if a grid at `req_step_m` over
+    /// the reachable box would exceed `travel_map_max_cells`, coarsen upward by
+    /// `sqrt(cells / cap)`. Shared by `fill_area` and its reference so their grids match.
     fn effective_grid_step_m(
         &self,
         req_step_m: f64,
@@ -420,36 +355,27 @@ impl Graph {
         let cos = center_lat.to_radians().cos().max(0.2);
         let dlat_step = step_m / 111_320.0;
         let dlng_step = step_m / (111_320.0 * cos);
-        // Candidate cell count over the (un-snapped) box. Snapping the low corner down
-        // only extends the box by <1 step, so this over-estimates by at most one row
-        // and column — a safe bound for the cap.
         let n_lat = ((max_lat - min_lat) / dlat_step).ceil().max(0.0) + 1.0;
         let n_lng = ((max_lng - min_lng) / dlng_step).ceil().max(0.0) + 1.0;
         let product = n_lat * n_lng;
         if product > cap {
-            // Scale the step so the (product) shrinks by the overshoot factor; cell
-            // count scales ~1/step², so multiply the step by sqrt(product/cap).
+            // Cell count scales ~1/step², so multiply the step by sqrt(product/cap).
             step_m * (product / cap).sqrt()
         } else {
             step_m
         }
     }
 
-    /// Fill the reachable area on a lat/lng grid. For each grid point `P` the travel
-    /// time is `min(direct walk centre->P, min over reached stops of
-    /// arrival[s] - start_time + walk s->P)`, capped at `max_secs`; points beyond
-    /// `max_secs` are omitted.
+    /// Fill the reachable area on a lat/lng grid. For each grid point `P` travel time
+    /// is `min(direct walk centre->P, min over reached stops of arrival - start_time +
+    /// walk s->P)`, capped at `max_secs`; points beyond it omitted.
     ///
-    /// **Inverted (OPT-A):** rather than running two full graph searches per cell
-    /// (re-flooding the centre walk and constructing a fresh CCH one-to-many over all
-    /// ~83k stops), this builds ONE bounded multi-source foot field over the contracted
-    /// graph, seeded at every reached stop (pinned at its arrival offset) AND at the
-    /// centre's snap (offset 0). Foot cost is direction-symmetric, so reading that forward
-    /// field at a cell's ≤2 snap junctions reproduces exactly the per-cell "min over
-    /// reached stops of arrival + walk(stop -> P)" merged with the centre's via-junction
-    /// walk. The only piece the junction field cannot carry — the centre's same-super-edge
-    /// direct walk (a cell on the centre's own chain) — is added per-cell as a cheap
-    /// special case. Result is bit-identical to the un-inverted per-cell searches.
+    /// OPT-A: one bounded multi-source foot field over the contracted graph, seeded at
+    /// every reached stop (at its arrival offset) AND the centre's snap (offset 0).
+    /// Foot cost is direction-symmetric, so reading the field at a cell's ≤2 snap
+    /// junctions reproduces the per-cell result. The centre's same-super-edge direct
+    /// walk (not representable in the junction field) is added per-cell. Bit-identical
+    /// to the un-inverted per-cell searches.
     fn fill_area(
         &self,
         center: LatLng,
@@ -458,9 +384,7 @@ impl Graph {
         grid_step_m: f64,
         arrivals: &[u32],
     ) -> Vec<TravelCell> {
-        // Bounding box: the centre can walk `max_secs` in any direction, and can also
-        // arrive at a far stop and walk out from THERE, so expand the box to cover
-        // the centre's own walk circle plus every reached stop's residual walk circle.
+        // Box covers the centre's walk circle plus every reached stop's residual circle.
         let mut min_lat = center.latitude;
         let mut max_lat = center.latitude;
         let mut min_lng = center.longitude;
@@ -494,11 +418,9 @@ impl Graph {
         let dlat_step = step_m / 111_320.0;
         let dlng_step = step_m / (111_320.0 * center.latitude.to_radians().cos().max(0.2));
 
-        // Anchor the lattice at the CENTRE, snapping the box's low corner down to an
-        // integer number of steps from it. The grid points are then a pure function
-        // of (centre, step), IDENTICAL across departures regardless of which stops a
-        // given departure reached — so the window aggregation's per-cell buckets line
-        // up exactly (no split cells, no spurious AVERAGE inflation).
+        // Anchor the lattice at the CENTRE so grid points are a pure function of
+        // (centre, step), IDENTICAL across departures — the window aggregation's
+        // per-cell buckets line up exactly (no split cells, no AVERAGE inflation).
         let snap_down = |v: f64, anchor: f64, step: f64| {
             anchor + ((v - anchor) / step).floor() * step
         };
@@ -506,15 +428,12 @@ impl Graph {
         min_lng = snap_down(min_lng, center.longitude, dlng_step);
 
         let Some(cg) = self.contracted.as_ref() else {
-            // No contracted graph: no foot cost is available at all (the un-inverted path
-            // returned u32::MAX for every cell's centre walk and an empty egress), so no
-            // cell is ever <= max_secs. Nothing to emit.
+            // No contracted graph: no foot cost available, so no cell is <= max_secs.
             return Vec::new();
         };
 
-        // Reached stops, filtered to offset <= max_secs (a stop arriving later than the
-        // budget always caps out: offset + walk >= offset > max_secs), keyed by contracted
-        // junction index for the multi-source flood.
+        // Reached stops with offset <= max_secs (a later arrival always caps out),
+        // keyed by contracted junction index for the multi-source flood.
         let mut stop_seeds: Vec<(usize, u32)> = Vec::new();
         for (stop_idx, &arr) in arrivals.iter().enumerate() {
             if arr == u32::MAX {
@@ -531,16 +450,14 @@ impl Graph {
             }
         }
 
-        // Snap the centre ONCE. Its bounding-junction entries become offset-0 coord seeds
-        // in the same flood (reproducing `walk_secs_coord_to_coord`'s via-junction term),
-        // and its chain identity + prefix drive the per-cell same-chain direct term.
+        // Snap the centre ONCE: its junction entries become offset-0 coord seeds in the
+        // same flood; its chain identity + prefix drive the per-cell same-chain term.
         let center_snap = cg.foot_snap_travel_map(self, center.latitude, center.longitude, radius);
         let coord_seeds: Vec<(usize, u32)> = center_snap
             .as_ref()
             .map(|s| s.entries.clone())
             .unwrap_or_default();
 
-        // ONE bounded multi-source foot field for this departure.
         let field =
             self.walk_dijkstra_travel_map_field(&stop_seeds, &coord_seeds, max_secs, cg);
 
@@ -559,9 +476,7 @@ impl Graph {
                     continue;
                 };
 
-                // O(1) read: best over P's ≤2 snap junctions of field[junction] + stub.
-                // This merges the centre via-junction walk and every reached stop's
-                // arrival + walk(stop -> P), all respecting the stop-sink rule.
+                // Best over P's ≤2 snap junctions of field[junction] + stub.
                 let mut best = u32::MAX;
                 for &(dj, stub) in &p_snap.entries {
                     if let Some(&d) = field.get(&cg.junctions[dj]) {
@@ -572,9 +487,8 @@ impl Graph {
                     }
                 }
 
-                // Centre same-super-edge direct walk: a cell on the centre's own chain can
-                // walk straight along it, never via a junction — not representable in the
-                // junction field. Mirrors `walk_secs_coord_to_coord`'s same-chain shortcut.
+                // Centre same-super-edge direct walk: a cell on the centre's own chain
+                // walks straight along it, not via a junction (not in the field).
                 if let Some(cs) = center_snap.as_ref() {
                     if cs.seg_start == p_snap.seg_start && cs.seg_len == p_snap.seg_len {
                         if let (Some(pc), Some(pp)) = (cs.from_ji_prefix, p_snap.from_ji_prefix) {
@@ -594,9 +508,8 @@ impl Graph {
         cells
     }
 
-    /// Test-only public wrapper over [`Graph::fill_area_reference`], so a test can
-    /// build reference cells from an EXTERNALLY-supplied arrival vector (e.g. the
-    /// unbounded/full-egress [`Graph::stop_arrivals_reference`] output).
+    /// Test-only wrapper over [`Graph::fill_area_reference`] taking an externally
+    /// supplied arrival vector.
     #[doc(hidden)]
     pub fn fill_area_reference_from(
         &self,
@@ -609,10 +522,8 @@ impl Graph {
         self.fill_area_reference(center, start_time, max_secs, grid_step_m, arrivals)
     }
 
-    /// Pre-OPT-A reference fill: the original per-cell implementation that ran TWO full
-    /// graph searches per grid cell (a centre-bounded [`ContractedGraph::walk_secs_coord_to_coord`]
-    /// and a fresh CCH/arena egress one-to-many over all stops). Kept only as a correctness
-    /// oracle for the inverted [`Graph::fill_area`]; the two must agree cell-for-cell.
+    /// Pre-OPT-A reference fill (two full graph searches per cell). Correctness oracle
+    /// for the inverted [`Graph::fill_area`]; the two must agree cell-for-cell.
     #[doc(hidden)]
     fn fill_area_reference(
         &self,
@@ -719,18 +630,16 @@ impl Graph {
         cells
     }
 
-    /// Snap the centre coordinate to a bounding-junction NodeID over the contracted
-    /// graph (the same arena snap `route` uses), or `None` if unsnappable / no
-    /// contracted graph.
+    /// Snap the centre to a bounding-junction NodeID over the contracted graph, or
+    /// `None` if unsnappable / no contracted graph.
     fn arena_snap_center(&self, center: LatLng) -> Option<NodeID> {
         let cg = self.contracted.as_ref()?;
         let radius = self.raptor.edge_snap_radius_m;
         cg.foot_bounding_junction(self, center.latitude, center.longitude, radius)
     }
 
-    /// Sampled departure times across `[start, end]` (inclusive), spaced
-    /// `travel_map_window_sample_secs` apart. At least the two endpoints are always
-    /// sampled; `end <= start` yields a single sample at `start`.
+    /// Sampled departures across `[start, end]` (inclusive), spaced
+    /// `travel_map_window_sample_secs` apart; `end <= start` yields a single sample.
     fn window_departures(&self, start: u32, end: u32) -> Vec<u32> {
         let step = self.raptor.travel_map_window_sample_secs.max(1);
         if end <= start {
@@ -742,14 +651,13 @@ impl Graph {
             out.push(t);
             t = t.saturating_add(step);
         }
-        out.push(end); // always include the window end
+        out.push(end);
         out
     }
 }
 
 /// Quantize a coordinate to a ~0.1 m grid so the same sampled point across window
-/// departures maps to one aggregation bucket (grid points are generated identically
-/// per departure, so this is exact for our own grid).
+/// departures maps to one aggregation bucket.
 fn quantize(loc: LatLng) -> (i64, i64) {
     (
         (loc.latitude * 1e6).round() as i64,

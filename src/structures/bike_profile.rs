@@ -1,12 +1,8 @@
-//! Tunable bike cost profile (BRouter "trekking"-inspired). The default matches
-//! the values shipped in `config.yaml`; a sparse override merges field-by-field.
-
 use serde::{Deserialize, Serialize};
 
 use crate::structures::HighwayClass;
 
-/// Per-highway base cost factors (>= 1 ideal). `_bike` variants apply when the
-/// way carries a bike hint (BRouter `isbike`).
+/// `_bike` variants apply when the way carries a bike hint (BRouter `isbike`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HighwayFactors {
@@ -59,35 +55,26 @@ impl Default for HighwayFactors {
 #[serde(default)]
 pub struct BikeProfile {
     pub allow_steps: bool,
-    /// When false, push (dismount) ways — foot-accessible but not bike-accessible —
-    /// are impassable, so routes detour entirely around them instead of assuming
-    /// the rider walks the bike.
+    /// When false, push (dismount) ways are impassable, so routes detour around them.
     pub allow_dismount: bool,
     pub ignore_cycleroutes: bool,
     pub stick_to_cycleroutes: bool,
     pub avoid_unsafe: bool,
-    /// When true, riding against a one-way (a `wrong_way` edge that ingest did not
-    /// clear via a cyclist contraflow exemption) is impassable, so the search routes
-    /// the legal direction instead of merely paying the `oneway_*` penalty.
+    /// When true, riding against a one-way is impassable rather than merely penalized.
     pub respect_oneway: bool,
 
     pub highway: HighwayFactors,
 
-    /// Cost factor for a `highway=steps` (when allowed).
     pub steps_cost: f64,
-    /// Extra cost factor added on unsafe roads without a bike hint (avoid_unsafe).
     pub unsafe_penalty: f64,
-    /// Oneway penalties by class (added to costfactor on a wrong-way traversal).
     pub oneway_roundabout: f64,
     pub oneway_primary: f64,
     pub oneway_secondary: f64,
     pub oneway_tertiary: f64,
     pub oneway_other: f64,
-    /// Access penalties (foot-only / cycleroute fallback / forbidden).
     pub access_foot_only: f64,
     pub access_cycleroute: f64,
     pub access_forbidden: f64,
-    /// Turn cost (meters) for a 90° turn; scaled by (1 - cos angle).
     pub turncost: f64,
 
     pub consider_elevation: bool,
@@ -95,10 +82,8 @@ pub struct BikeProfile {
     pub uphillcutoff: f64,
     pub downhillcost: f64,
     pub downhillcutoff: f64,
-    /// BRouter elevation hysteresis buffers (meters). Descent/ascent must exceed
-    /// `elevation_penalty_buffer` before any cost; above `elevation_max_buffer`
-    /// the excess is force-drained and charged; `elevation_buffer_reduce` is a
-    /// slope-proportional bleed (0 = drain only at the max ceiling).
+    /// BRouter hysteresis (m): excess above `penalty_buffer` accrues, above
+    /// `max_buffer` is force-drained and charged; `buffer_reduce` is a slope bleed.
     pub elevation_penalty_buffer: f64,
     pub elevation_max_buffer: f64,
     pub elevation_buffer_reduce: f64,
@@ -109,29 +94,15 @@ pub struct BikeProfile {
     pub c_r: f64,
     pub biker_power: f64,
 
-    /// Braking deceleration (m/s²) used to time a slow-down for a corner or a stop.
     pub brake_decel: f64,
-    /// Comfortable forward acceleration (m/s²) when getting back up to speed after a
-    /// stop or a corner. A rider surges well above cruise power to accelerate, so this
-    /// is a constant rate, not energy/cruise-power.
     pub accel_rate: f64,
-    /// Comfortable lateral (centripetal) acceleration (m/s²) a cyclist accepts in a
-    /// bend; the cornering speed is `sqrt(lateral_accel · radius)`.
     pub lateral_accel: f64,
-    /// Higher lateral tolerance (m/s²) applied when entering bike infrastructure
-    /// (cycleway / cycle route / signed bike way): following a dedicated cycleway is
-    /// efficient by design, so its curves and through-junctions are taken near cruise
-    /// — only a genuine hairpin still slows. Roads keep the conservative `lateral_accel`.
+    /// Higher lateral tolerance on bike infra (cycleway/route/signed) than on roads.
     pub lateral_accel_infra: f64,
-    /// Floor (m) on the segment length used to derive a corner's radius
-    /// (`r = max(min_seg_len, corner_min_len) / θ`). A cyclist cannot pivot tighter
-    /// than roughly a bike-length, so finely digitized geometry or a short junction
-    /// connector must not fabricate a hairpin radius and a phantom slow-down.
+    /// Floor (m) on segment length for corner radius (`r = max(seg, this)/θ`), so
+    /// finely digitized geometry cannot fabricate a hairpin slow-down.
     pub corner_min_len_m: f64,
-    /// Speed (m/s) of pushing a dismounted bike on a non-stairs way (slower than free
-    /// walking — a loaded bike is awkward to maneuver).
     pub push_speed_mps: f64,
-    /// Speed (m/s) of hauling a dismounted bike up/down stairs (slower still).
     pub steps_push_speed_mps: f64,
 }
 
@@ -181,8 +152,6 @@ impl Default for BikeProfile {
 }
 
 impl BikeProfile {
-    /// Base cost factor for a highway class given a bike hint and surface,
-    /// before cycleroute/oneway/access/elevation/turn adjustments.
     pub fn highway_factor(&self, h: HighwayClass, isbike: bool, unpaved: bool) -> f64 {
         use HighwayClass::*;
         let f = &self.highway;
@@ -268,12 +237,10 @@ mod tests {
 
     #[test]
     fn partial_yaml_merges_onto_defaults() {
-        // `#[serde(default)]` means a sparse map keeps the trekking defaults for
-        // unspecified fields.
         let p: BikeProfile =
             serde_yaml_ng::from_str("allow_steps: false\nbiker_power: 150").unwrap();
         assert!(!p.allow_steps);
         assert_eq!(p.biker_power, 150.0);
-        assert_eq!(p.downhillcost, 100.0); // untouched default
+        assert_eq!(p.downhillcost, 100.0);
     }
 }

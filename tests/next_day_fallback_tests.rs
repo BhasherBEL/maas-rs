@@ -1,11 +1,4 @@
-//! Degenerate next-day-fallback tests: when no same-day service reaches the
-//! destination before midnight, the engine used to fabricate a "ride partway +
-//! huge egress walk" plan. The fix surfaces the genuine next-day morning trip
-//! (times shifted onto the next-day clock, `>= 86400`) via a Pareto-dominating
-//! addition, gated so that a same-day-reachable OD gains no next-day plan.
-//!
-//! The graph is a single ~50 km corridor whose ONLY transit trip runs
-//! 09:00->10:00 daily; the direct street walk arrives long after midnight.
+//! Next-day plans carry times shifted onto the next-day clock (`>= 86400`).
 
 use gtfs_structures::RouteType;
 use maas_rs::{
@@ -75,12 +68,10 @@ fn enable_contraction(g: &mut Graph) {
     g.bake_bike_on_contracted_default();
 }
 
-/// Origin/dest ~50 km apart on one street edge, joined by a single daily
-/// 09:00->10:00 transit trip. Direct walk arrives well after midnight.
 fn corridor_graph() -> (Graph, NodeID, NodeID, LatLng, LatLng) {
     let mut g = Graph::new();
     let osm_origin = g.add_node(osm_node("origin", 50.000, 4.000));
-    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.700)); // ~50 km east
+    let osm_dest = g.add_node(osm_node("dest", 50.000, 4.700));
     let stop_o = g.add_node(transit_stop("Origin Halt", 50.000, 4.0005));
     let stop_d = g.add_node(transit_stop("Dest Halt", 50.000, 4.6995));
 
@@ -200,9 +191,6 @@ fn is_transit(p: &Plan) -> bool {
     p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_)))
 }
 
-/// (a) No same-day dest arrival before midnight + a next-day trip exists ->
-/// next-day transit plan returned (start/end >= 86400), and it is a short ride,
-/// not the ~50 km walk fabrication. Windowless / probe driver.
 #[test]
 fn next_day_fallback_surfaces_morning_trip_windowless() {
     let (g, o, d, oll, dll) = corridor_graph();
@@ -221,9 +209,8 @@ fn next_day_fallback_surfaces_morning_trip_windowless() {
     );
 }
 
-/// (a) Same, via the range/window driver with a 30-min window that does NOT cross
-/// midnight (the pre-existing forward extension never fires) — only the new
-/// degenerate fallback can surface the trip.
+/// 30-min window does NOT cross midnight, so the forward extension never fires;
+/// only the degenerate fallback can surface the trip.
 #[test]
 fn next_day_fallback_surfaces_morning_trip_range() {
     let (g, o, d, oll, dll) = corridor_graph();
@@ -235,7 +222,6 @@ fn next_day_fallback_surfaces_morning_trip_range() {
     );
 }
 
-/// (b) Normal same-day-reachable OD -> no next-day plan added. Windowless driver.
 #[test]
 fn no_next_day_plan_when_same_day_reachable_windowless() {
     let (g, o, d, oll, dll) = corridor_graph();
@@ -248,7 +234,6 @@ fn no_next_day_plan_when_same_day_reachable_windowless() {
     );
 }
 
-/// (b) Same, via the range driver with a 60-min window covering the 09:00 trip.
 #[test]
 fn no_next_day_plan_when_same_day_reachable_range() {
     let (g, o, d, oll, dll) = corridor_graph();

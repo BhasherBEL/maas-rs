@@ -4,12 +4,7 @@ use crate::structures::NodeID;
 use crate::structures::cost::{Axis, BalanceWeights};
 use crate::structures::plan::PlanCoordinate;
 
-/// One representative of a street leg: its cost-axis projection, its post-hoc
-/// `[p50,p95]` time bracket, and its own geometry/metrics. The set of options for a
-/// leg is weight-invariant; `initial_cursor` (the only weight reader) picks which
-/// one is highlighted.
-/// One contiguous dismount (push) stretch of a leg option, as inclusive geometry
-/// point indices into the option's `geometry`.
+/// Inclusive index range into the option's `geometry`.
 #[derive(Debug, Clone, Copy, SimpleObject)]
 pub struct DismountRun {
     pub start: usize,
@@ -26,28 +21,20 @@ pub struct LegOption {
     pub p50: u32,
     pub p95: u32,
     pub length: usize,
-    /// Metres of the route on `Surface::Unpaved` — the user-facing "% unpaved".
     pub unpaved_length: usize,
-    /// Metres the rider must dismount and push (bike only; `BikeCost::is_push` ways).
     pub dismount_length: usize,
-    /// Contiguous push stretches as `[start,end]` geometry-point indices, so the UI
-    /// can paint the dismount sections of a selected alternative.
     pub dismount_runs: Vec<DismountRun>,
     pub elevation_gain: Option<usize>,
     pub cycleroute_length: Option<usize>,
     pub geometry: Vec<PlanCoordinate>,
     #[graphql(skip)]
     pub nodes: Vec<NodeID>,
-    /// Per-step arena edges aligned to `nodes.windows(2)`, carried from the contracted
-    /// search so step reconstruction is g-free. Empty when reconstructed off the full
-    /// graph (`path_edges`); `street_steps`/stub-folding fall back to `path_edges` then.
+    /// Aligned to `nodes.windows(2)`; empty when reconstructed off the full graph.
     #[graphql(skip)]
     pub edges: Vec<crate::structures::StreetEdgeData>,
 }
 
-/// Index of the highlighted "balanced" option: min-max normalize each axis across
-/// `options`, scalarize by `balance` weights, return the argmin (lowest index breaks
-/// ties). The ONLY place a weight is read. `options` must be non-empty.
+/// The ONLY place a weight is read; ties break to lowest index. `options` non-empty.
 pub fn initial_cursor(options: &[LegOption], balance: &BalanceWeights) -> usize {
     let axes = [
         Axis::Time,
@@ -95,10 +82,8 @@ pub fn initial_cursor(options: &[LegOption], balance: &BalanceWeights) -> usize 
     best
 }
 
-/// Highlighted option index, honoring a deadline `window` (max feasible `p50`).
-/// With `window`, restrict to options whose `p50 <= window`, choose the balance
-/// cursor among them; if none fit, return the fastest (lowest `p50`). Without a
-/// window, this is exactly `initial_cursor`.
+/// Best option with `p50 <= window`; falls back to fastest when none fit.
+/// Without a window, exactly `initial_cursor`.
 pub fn highlight_index(
     options: &[LegOption],
     window: Option<u32>,

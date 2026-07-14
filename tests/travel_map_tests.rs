@@ -1,11 +1,3 @@
-//! Integration tests for the travel-time map (isochrone / one-to-many reachability)
-//! endpoint. Builds small synthetic graphs where reachability + times to a few grid
-//! points are known, and asserts:
-//!  - cells within `max_secs` are returned, cells beyond are omitted;
-//!  - transit lets a far point be reachable when walking there would exceed the budget;
-//!  - restricting modes (WALK vs WALK_TRANSIT) restricts the reachable set;
-//!  - BEST vs AVERAGE over a 2-departure window differ as expected.
-
 use gtfs_structures::{Availability, RouteType};
 use maas_rs::{
     ingestion::gtfs::{
@@ -21,7 +13,6 @@ use maas_rs::{
     },
 };
 
-// ── Helpers (mirrors of the graph_tests fixtures) ──────────────────────────────
 
 fn osm_node(eid: &str, lat: f64, lon: f64) -> NodeData {
     NodeData::OsmNode(OsmNodeData {
@@ -176,10 +167,9 @@ fn add_two_stop_line(
     g.push_transit_pattern(PatternInfo { route, num_trips: n as u32 });
 }
 
-// Deterministic tuning shared by every case.
-const DATE: u32 = 9660; // arbitrary weekday-covered date (service is all-days)
+const DATE: u32 = 9660;
 const WEEKDAY: u8 = 0x01; // Monday; service is 0x7F so it is active
-const START: u32 = 8 * 3600; // 08:00
+const START: u32 = 8 * 3600;
 
 fn buckets(g: &Graph) -> ReliabilityBuckets {
     ReliabilityBuckets::new(&g.raptor.reliability_bucket_edges)
@@ -192,7 +182,6 @@ fn walk_transit() -> ActiveModes {
     ActiveModes::new(&[Mode::Walk, Mode::WalkTransit])
 }
 
-/// Nearest emitted cell to `loc`, if any, with its travel-time seconds.
 fn cell_near(cells: &[TravelCell], loc: LatLng, tol_m: f64) -> Option<u32> {
     cells
         .iter()
@@ -201,15 +190,13 @@ fn cell_near(cells: &[TravelCell], loc: LatLng, tol_m: f64) -> Option<u32> {
         .map(|c| c.seconds)
 }
 
-/// A long east–west corridor: origin O; a far junction JD ~3.5 km east (well beyond
-/// a 20-min walk at 1.2 m/s). Stop A snaps to O; stop B snaps to JD. A fast bus
-/// A→B departs at 08:05 and 08:20, riding 5 min. So a point near JD is reachable in
-/// ~5–10 min by transit, but ~50 min on foot.
+/// Origin O; far junction JD ~3.5 km east (beyond a 20-min walk at 1.2 m/s). Stop A
+/// snaps to O; stop B snaps to JD. Bus A→B departs 08:05 and 08:20, 5-min ride: a
+/// point near JD is reachable in ~5-10 min by transit, ~50 min on foot.
 fn corridor_graph() -> Graph {
     let mut g = Graph::new();
     g.set_street_time(identity_street_time());
     g.set_walking_speed_mps(1.2);
-    // Keep the isochrone grid coarse so the tests run a handful of cells, not thousands.
     g.set_travel_map_grid_step_m(400.0);
     g.set_travel_map_window_sample_secs(600);
 
@@ -224,8 +211,8 @@ fn corridor_graph() -> Graph {
 
     add_street_bidir(&mut g, o, jmid, 1750);
     add_street_bidir(&mut g, jmid, jd, 1750);
-    add_snap_bidir(&mut g, stop_a, o, 12); // ~10 s access
-    add_snap_bidir(&mut g, stop_b, jd, 12); // ~10 s egress
+    add_snap_bidir(&mut g, stop_a, o, 12);
+    add_snap_bidir(&mut g, stop_b, jd, 12);
 
     g.add_transit_services(vec![all_days_service()]);
     g.add_transit_routes(vec![RouteInfo {
@@ -240,7 +227,6 @@ fn corridor_graph() -> Graph {
         TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
         TripInfo { trip_headsign: None, route_id: RouteId(0), service_id: ServiceId(0), bikes_allowed: None },
     ]);
-    // Two departures: 08:05→08:10 and 08:20→08:25 (5-min ride).
     let deps = [START + 300, START + 1200];
     let arrs = [START + 600, START + 1500];
     add_two_stop_line(&mut g, stop_a, stop_b, RouteId(0), &[TripId(0), TripId(1)], &deps, &arrs, 3480);
@@ -251,12 +237,10 @@ fn corridor_graph() -> Graph {
 }
 
 fn far_point() -> LatLng {
-    // ~200 m west of JD (near stop B), i.e. ~3.3 km east of O.
     LatLng { latitude: 50.000, longitude: 4.0 + 3300.0 / 71_695.0 }
 }
 
 fn near_point() -> LatLng {
-    // ~300 m east of O — an easy walk.
     LatLng { latitude: 50.000, longitude: 4.0 + 300.0 / 71_695.0 }
 }
 
@@ -279,19 +263,15 @@ fn run(g: &Graph, am: &ActiveModes, max_secs: u32) -> Vec<TravelCell> {
     )
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[test]
 fn walk_only_covers_near_point_and_omits_far_point() {
     let g = corridor_graph();
-    // 20-min budget: the near point (~300 m ≈ 250 s walk) is in; the far point
-    // (~3.3 km ≈ 2750 s walk) is far beyond 1200 s.
     let cells = run(&g, &walk_only(), 1200);
     assert!(!cells.is_empty(), "walk isochrone must emit some cells");
 
     let near = cell_near(&cells, near_point(), 250.0).expect("near point must be reachable on foot");
     assert!(near <= 1200, "near point within budget, got {near}s");
-    // ~300 m at 1.2 m/s ≈ 250 s (plus grid snap slack).
     assert!(near < 600, "near point should be a short walk, got {near}s");
 
     assert!(
@@ -303,19 +283,15 @@ fn walk_only_covers_near_point_and_omits_far_point() {
 #[test]
 fn transit_makes_far_point_reachable() {
     let g = corridor_graph();
-    // Same 20-min budget, but WALK_TRANSIT: the express bus reaches stop B (near the
-    // far point) in ~5–10 min, so the far point becomes reachable.
     let cells = run(&g, &walk_transit(), 1200);
     let far = cell_near(&cells, far_point(), 250.0)
         .expect("far point must be reachable via transit within 20 min");
-    // Board ~08:05, ride 5 min, short egress walk: well under the walk-only time.
     assert!(far <= 1200, "far point within transit budget, got {far}s");
     assert!(
         far < 1500,
         "transit far-point time should reflect the ~5-15 min ride+walk, got {far}s"
     );
 
-    // And walk-only at the same budget does NOT reach it — the mode restriction bites.
     let walk_cells = run(&g, &walk_only(), 1200);
     assert!(
         cell_near(&walk_cells, far_point(), 250.0).is_none(),
@@ -446,7 +422,6 @@ fn access_radius_widens_to_budget_not_min_access() {
     );
 }
 
-// ── OPT-A: inverted fill_area must equal the pre-OPT-A per-cell reference ────────
 
 /// Assert the inverted `travel_time_map` (one multi-source foot field + O(1) per-cell
 /// reads) is BIT-IDENTICAL to the pre-OPT-A per-cell reference (two full graph searches
@@ -633,7 +608,6 @@ fn inverted_fill_equals_reference_access_radius_fixture() {
     }
 }
 
-// ── OPT-B (horizon) + OPT-C1 (skip-egress): optimized forward pass must equal the
 //     unbounded, full-egress reference stop-arrival vector, bit for bit ──────────
 
 /// The production `stop_arrivals` runs the forward pass with the OPT-B horizon and
@@ -863,7 +837,6 @@ fn walk_only_isochrone_needs_no_transit() {
     assert!(origin < 200, "origin cell should be ~0 s, got {origin}s");
 }
 
-// ── Per-query grid step + safety cap ─────────────────────────────────────────────
 
 /// Single-departure travel-time map with an EXPLICIT per-query grid step (metres).
 fn run_step(g: &Graph, am: &ActiveModes, max_secs: u32, step_m: f64) -> Vec<TravelCell> {

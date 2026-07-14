@@ -1,5 +1,3 @@
-//! Deterministic multi-objective cost foundation (Phase 0). The search consumes
-//! `CostVector`; probability is a separate post-hoc moment pair (`variance`).
 pub mod agglomeration;
 pub mod axis;
 pub mod fares;

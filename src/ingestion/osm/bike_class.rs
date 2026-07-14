@@ -1,27 +1,15 @@
-//! Classify an OSM `Way`'s tags into `BikeAttrs` once at ingest. Mirrors the
-//! BRouter `way`-context logic for the tags we read (ferries excluded).
-
 use osmpbf::{Relation, Way};
 
 use crate::structures::{BikeAttrs, HighwayClass, Surface, SurfaceSpeedFactors};
 
-/// Looks up a tag value on a way.
 fn tag<'a>(w: &'a Way, key: &str) -> Option<&'a str> {
     w.tags().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
-/// Per-edge bike speed factor (quantized to `u8`) for a way, from its raw OSM
-/// `surface=*` tag and the configured factor table. Non-directional, so both
-/// emitted directed edges share it.
 pub fn surface_speed(w: &Way, factors: &SurfaceSpeedFactors) -> u8 {
     factors.quantize(tag(w, "surface"))
 }
 
-/// Pure predicate: do these relation tags describe a signposted cycle route?
-/// In raw OSM, cycle-route membership lives on `type=route, route=bicycle`
-/// (and `mtb` / `superroute`) relations — not on the member ways — so the ways'
-/// `route_bicycle_*`/`lcn` tags are almost never present. This lets the ingester
-/// propagate membership from the relation onto its member ways.
 fn tags_are_cycle_route<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> bool {
     let mut is_route = false;
     let mut is_bike = false;
@@ -35,8 +23,6 @@ fn tags_are_cycle_route<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> b
     is_route && is_bike
 }
 
-/// Whether a relation is a cycle route whose member ways should be treated as a
-/// signposted cycle route (BRouter's lcn/rcn/ncn/icn membership).
 pub fn is_cycle_route_relation(r: &Relation) -> bool {
     tags_are_cycle_route(r.tags())
 }
@@ -90,7 +76,6 @@ fn is_bike(w: &Way) -> bool {
         || tag(w, "lcn") == Some("yes")
 }
 
-/// BRouter way-level `bikeaccess`.
 fn bike_access(w: &Way) -> bool {
     let default_access = match tag(w, "access") {
         None => tag(w, "motorroad") != Some("yes"),
@@ -108,7 +93,7 @@ fn bike_access(w: &Way) -> bool {
             }
             Some(v) => !matches!(v, "private" | "no"),
         },
-        Some(b) if tag(w, "bicycle_road") == Some("yes") => b != "no", // bicycle_road wins
+        Some(b) if tag(w, "bicycle_road") == Some("yes") => b != "no",
         Some(b) => !matches!(b, "private" | "no" | "dismount" | "use_sidepath"),
     }
 }
@@ -127,8 +112,6 @@ fn foot_access(w: &Way, bikeaccess: bool) -> bool {
     }
 }
 
-/// Whether traversing in the given direction is a "bad oneway" for bikes.
-/// `forward` = the edge runs along the way's node order.
 fn wrong_way(w: &Way, forward: bool) -> bool {
     let reversed = !forward;
     let cycleway_opp = ["cycleway", "cycleway:left", "cycleway:right"]
@@ -157,10 +140,6 @@ fn wrong_way(w: &Way, forward: bool) -> bool {
     }
 }
 
-/// Classify a way for a directed edge. `forward` distinguishes the two emitted
-/// directions so oneway handling is direction-correct. `in_cycle_route` is true
-/// when the way belongs to a bicycle route relation (see
-/// [`is_cycle_route_relation`]); it's OR-ed with any way-level route tags.
 pub fn classify(w: &Way, forward: bool, in_cycle_route: bool) -> BikeAttrs {
     let bikeaccess = bike_access(w);
     BikeAttrs {
@@ -206,9 +185,7 @@ mod tests {
     fn rejects_non_bicycle_routes() {
         assert!(!check(&[("type", "route"), ("route", "hiking")]));
         assert!(!check(&[("type", "route"), ("route", "bus")]));
-        // A bicycle restriction relation, not a route.
         assert!(!check(&[("type", "restriction"), ("route", "bicycle")]));
-        // Missing the route value entirely.
         assert!(!check(&[("type", "route")]));
         assert!(!check(&[]));
     }

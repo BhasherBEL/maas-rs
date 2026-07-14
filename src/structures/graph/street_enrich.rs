@@ -1,8 +1,5 @@
-//! Post-pass that replaces a finished plan's access/egress/direct street walk legs
-//! with their multi-objective versions (alternatives + [p50,p95], ingress leave_by),
-//! deduped per distinct (from,to,mode,role) leg. Runs once over the FINAL plans in
-//! route()/route_explain — not inside per-departure reconstruction — so a Range
-//! query never re-derives the same leg.
+//! Post-pass replacing a plan's access/egress/direct walk legs with multi-objective
+//! versions. Runs once over the FINAL plans, deduped per (from,to,mode,role).
 
 use std::collections::HashMap;
 
@@ -125,9 +122,8 @@ impl Graph {
                         new.alternatives = opts;
                         new.leave_by = None;
                         *plan.legs.last_mut().unwrap() = PlanLeg::Walk(new);
-                        // Shift the arrival timeline by the change in egress time so the
-                        // transit delay-CDF spread carried in `arrival_distribution` is
-                        // preserved (not collapsed to a deterministic point).
+                        // Shift the arrival timeline by the egress delta so the transit
+                        // delay-CDF spread in `arrival_distribution` is preserved.
                         let delta = end as i64 - old_end as i64;
                         plan.end = end;
                         plan.expected_end =
@@ -141,9 +137,8 @@ impl Graph {
         }
     }
 
-    /// Rebuild a walk leg from the highlighted option. `deadline = Some((board,
-    /// earliest))` anchors the leg's END to `board` (access leg) and sets leave_by;
-    /// `None` anchors the START (direct/egress at their existing start).
+    /// `deadline = Some((board, earliest))` anchors the leg's END to `board` and
+    /// sets leave_by (access); `None` anchors the START (direct/egress).
     fn rebuild_leg(
         &self,
         old: &PlanWalkLeg,
@@ -210,8 +205,6 @@ fn leg_start(l: &PlanLeg) -> u32 {
     }
 }
 
-/// (leg_start, leave_by, highlight_index) for an access leg ending at `board`,
-/// earliest departure `earliest`. Window = board − earliest.
 pub(super) fn access_timing(
     options: &[LegOption],
     board: u32,
@@ -220,8 +213,7 @@ pub(super) fn access_timing(
 ) -> (u32, u32, usize) {
     let window = board.saturating_sub(earliest);
     let cur = highlight_index(options, Some(window), balance);
-    // `.min(board)`: an access leg can never start after it ends (the boarding
-    // time), even if `earliest` is somehow later than `board`.
+    // `.min(board)`: an access leg can never start after it ends (boarding time).
     let leg_start = board.saturating_sub(options[cur].p50).max(earliest).min(board);
     let leave_by = board.saturating_sub(options[cur].p95);
     (leg_start, leave_by, cur)
@@ -253,8 +245,6 @@ mod tests {
         StreetEdgeData, Surface,
     };
 
-    /// Build + bake the contracted graph so reconstruction carries the arena edges —
-    /// production is contraction-only, so enriched street legs read carried `.edges`.
     fn enable_contraction(g: &mut Graph) {
         use crate::structures::contraction::ContractedGraph;
         let mut cg = ContractedGraph::from_graph_union(g);
@@ -300,8 +290,7 @@ mod tests {
         g.add_edge(o, e(o, s, 100, Surface::Unpaved));
         g.add_edge(o, e(o, oc, 60, Surface::Paved));
         g.add_edge(oc, e(oc, s, 60, Surface::Paved));
-        // s has no outgoing edges; a back-edge makes it a proper junction endpoint so
-        // contraction reaches it (otherwise the builder skips it, k=0).
+        // Back-edge makes s a proper junction endpoint so contraction reaches it.
         g.add_edge(s, e(s, o, 100, Surface::Paved));
         (g, o, s)
     }
@@ -330,9 +319,6 @@ mod tests {
         }
     }
 
-    /// Two-route graph with a genuine bike Pareto trade-off: a short rough (unpaved)
-    /// direct edge (faster, worse surface) vs a longer smooth (paved) detour (slower,
-    /// better surface). Both survive the front, so bike legs get >= 2 alternatives.
     fn bike_enrich_graph() -> (Graph, NodeID, NodeID) {
         let mut g = Graph::new();
         let mk = |id: &str, lat: f64, lon: f64| {
@@ -367,14 +353,9 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        // Climb trade-off (D+ is a bike front axis; Surface is display-only): a short
-        // climby direct edge vs a long flat detour. Both survive the 3-axis front as a
-        // faster-hillier vs flatter-slower pair.
         g.add_edge(o, e(o, s, 100, 8));
         g.add_edge(o, e(o, oc, 400, 0));
         g.add_edge(oc, e(oc, s, 400, 0));
-        // This fixture's only trade-off is the climb-vs-flat detour, so exercise the
-        // D+-as-selection-axis path (off by default — Time prices climbing on real graphs).
         g.raptor.set_bike_select_dplus(true);
         (g, o, s)
     }
@@ -495,8 +476,6 @@ mod tests {
 
     #[test]
     fn enrich_egress_recomputes_arrival_from_highlighted_p50() {
-        // Reuse the o→s two-route graph with `o` as the alight stop and `s` as the
-        // destination: [transit ending at o] then [egress walk o→s].
         let (mut g, o, s) = enrich_graph();
         enable_contraction(&mut g);
         let bike = g.default_bike_cost();

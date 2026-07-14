@@ -11,7 +11,6 @@
 <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
-/* ── Global tokens (header, map, modal) ─────────────────────── */
 :root {
   --bg:        #f6f7f9;
   --panel:     #ffffff;
@@ -31,7 +30,6 @@
   --radius:    8px;
   --radius-s:  6px;
   --mono:      ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, monospace;
-  /* ── Design system palette override (warm neutral) ── */
   --ds-bg:        oklch(0.978 0.004 95);
   --ds-surface:   #ffffff;
   --ds-surface-2: oklch(0.967 0.005 95);
@@ -51,8 +49,6 @@
   --ds-rel-high-soft: oklch(0.95 0.04 152);
   --ds-rel-mid-soft:  oklch(0.955 0.05 88);
   --ds-rel-low-soft:  oklch(0.955 0.045 33);
-  /* Bike-leg palette (ride = green, dismount/push = orange). Themed like the
-     rel-* tokens so bike badges/stats stay legible in dark mode. */
   --ds-bike:       oklch(0.52 0.13 149);
   --ds-bike-push:  oklch(0.58 0.19 45);
   --ds-stone:      oklch(0.55 0.018 75);
@@ -77,12 +73,6 @@
     --accent-2: #1a2a4a;
     --shadow:   0 1px 2px rgba(0,0,0,.4);
     --shadow-l: 0 8px 24px rgba(0,0,0,.6);
-    /* ── Design-system palette (dark) ──
-       These --ds-* tokens back most of the modern UI (search panel, plan
-       cards, route picker, breakdown popup). They live only in :root as light
-       values, so without these dark overrides the bulk of the UI renders with
-       light surfaces/ink in dark mode. Every consumer resolves through them
-       (incl. the .pd-root aliases and the --ink-*/--accent-deep aliases). */
     --ds-bg:        #0e1116;
     --ds-surface:   #161a21;
     --ds-surface-2: #1c2129;
@@ -113,11 +103,6 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  /* Reliability chip TEXT colors are hardcoded dark oklch (L~0.42-0.5) tuned for
-     the light "soft" backgrounds. In dark mode those soft backgrounds are now
-     dark, so the text is dark-on-dark. Lift the text to a light tint of the same
-     hue so the chips stay legible. Grouped by hue: green (high/ontime),
-     amber (mid/open), red (low/late). */
   .rel.high, .xfer-prob[data-rel="high"], .conn-rel[data-rel="high"],
   .rc-rel[data-rel="high"], .rib .s.xf[data-rel="high"] .pc,
   .it-live.ontime, .it-t.ontime .s, .it-t.early.major .r, .it-t.early .r,
@@ -139,7 +124,6 @@ body { font: 13.5px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui
 button { font: inherit; color: inherit; cursor: pointer; }
 input, select { font: inherit; color: inherit; }
 
-/* ── Header ──────────────────────────────────────────────────── */
 header {
   display: flex; align-items: center; gap: 12px;
   padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
@@ -155,7 +139,6 @@ header .head-btn:hover { background: var(--panel-2); color: var(--fg); }
 header .head-btn.active { background: var(--accent-2); border-color: var(--accent); color: var(--accent); }
 header a.head-btn { text-decoration: none; }
 
-/* ── Layout ──────────────────────────────────────────────────── */
 .main { display: flex; flex: 1; overflow: hidden; position: relative; }
 
 #sidebar {
@@ -180,7 +163,6 @@ header a.head-btn { text-decoration: none; }
   .leaflet-control-attribution a { color: #6cf !important; }
 }
 
-/* ── Stop search / dropdown (global) ─────────────────────────── */
 .maas-input {
   width: 100%; padding: 7px 9px; border: 1px solid var(--border);
   border-radius: var(--radius-s); background: var(--panel-2);
@@ -236,7 +218,6 @@ header a.head-btn { text-decoration: none; }
   opacity: .7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
-/* ── Panel head: brand + OD ──────────────────────────────────── */
 .panel-head {
   padding: 16px 18px 14px;
   background: var(--ds-surface);
@@ -305,7 +286,6 @@ header a.head-btn { text-decoration: none; }
   font-family: 'Hanken Grotesk', ui-sans-serif, system-ui, sans-serif;
 }
 
-/* ── Date/time/go section ────────────────────────────────────── */
 .input-section { padding: 10px 12px 12px; border-bottom: 1px solid var(--border); }
 .field { margin-bottom: 8px; }
 .field-label {
@@ -343,7 +323,6 @@ header a.head-btn { text-decoration: none; }
   #error-msg { background: #2a1418; color: #ff8a8a; border-color: #5a2228; }
 }
 
-/* ── Advanced drawer ──────────────────────────────────────────── */
 .advanced { display: none; padding: 10px 12px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
 .advanced.open { display: block; }
 .advanced .row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
@@ -353,7 +332,7 @@ header a.head-btn { text-decoration: none; }
 .advanced input[type=number], .advanced input[type=range], .advanced select { width: 110px; padding: 4px 6px; font-size: 12px; }
 .advanced input[type=range] { width: 130px; }
 .advanced .val { width: 44px; text-align: right; font-family: var(--mono); font-size: 12px; color: var(--fg); }
-/* ── Fare-profile card (main page, mirrors #modes-card) ───────── */
+
 #fare-card { border: 1px solid var(--ds-line, var(--border)); border-radius: 12px;
   background: var(--ds-surface-2, var(--panel-2)); margin-bottom: 10px; overflow: hidden; }
 #fare-head {
@@ -389,7 +368,6 @@ header a.head-btn { text-decoration: none; }
   color: var(--ds-ink-2, var(--fg-2)); cursor: pointer; padding: 3px 0; }
 .fare-check input[type=checkbox] { flex: none; margin: 0; accent-color: var(--ds-accent, var(--accent)); }
 
-/* ── Fare breakdown popup (clickable price) ───────────────────── */
 .fb-backdrop { display: none; position: fixed; inset: 0; z-index: 9100; background: rgba(0,0,0,.35); }
 .fb-backdrop.open { display: block; }
 .fb-pop {
@@ -426,7 +404,6 @@ header a.head-btn { text-decoration: none; }
 .query-panel textarea[disabled] { opacity: 0.55; }
 .query-panel code { font-family: var(--mono); font-size: 11px; }
 
-/* ── Plans panel ─────────────────────────────────────────────── */
 #plans-panel {
   flex: 1; overflow-y: visible;
   background: var(--ds-bg);
@@ -444,7 +421,6 @@ header a.head-btn { text-decoration: none; }
 }
 #plans-list { padding: 4px 14px 20px; display: flex; flex-direction: column; }
 
-/* Extend-search-window buttons (earlier / later). Reuse --ds-* tokens only. */
 .extend-btn {
   font: inherit; cursor: pointer; margin: 6px 14px;
   display: flex; align-items: center; justify-content: center; gap: 7px;
@@ -463,7 +439,6 @@ header a.head-btn { text-decoration: none; }
 .status-msg { color: var(--fg-3); font-size: 13px; padding: 24px 14px; text-align: center; }
 .status-msg.error { color: var(--danger); }
 
-/* ── Per-leg route picker (Pareto alternatives) — reuses --ds-* tokens only ── */
 #plans-panel.rp-active .plans-list-head { display: none; }
 .rp { display: flex; flex-direction: column; }
 .rp-back { display: flex; align-items: center; gap: 6px; padding: 11px 2px; cursor: pointer;
@@ -533,13 +508,11 @@ header a.head-btn { text-decoration: none; }
   padding: 11px 18px; border-radius: 10px; white-space: nowrap; box-shadow: var(--ds-shadow-sm); transition: background .12s; }
 .rp-choose:hover { background: var(--ds-accent-deep); }
 .rp-choose.done { background: var(--ds-rel-high); box-shadow: none; }
-/* Entry-point affordances for a leg that has route alternatives.
-   (Ribbon walk segments reuse `.rib .s.clickable` from the itinerary styles.) */
+
 .leg-row-pick { cursor: pointer; border-radius: var(--ds-radius-sm); transition: background .12s; }
 .leg-row-pick:hover { background: var(--ds-surface-2); }
 .leg-routes-link { font-size: 11px; font-weight: 700; color: var(--ds-accent); white-space: nowrap; }
 
-/* ── Trip card ───────────────────────────────────────────────── */
 .card {
   background: var(--ds-surface); border: 1px solid var(--ds-line);
   border-radius: var(--ds-radius); padding: 13px 14px 11px; margin-bottom: 10px;
@@ -556,7 +529,6 @@ header a.head-btn { text-decoration: none; }
 .card-tag { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 650; color: var(--ds-ink-3); margin: 3px 0 11px; min-height: 18px; }
 .card-tag .lead { color: var(--ds-accent); font-size: 8px; }
 
-/* ── Ribbon ──────────────────────────────────────────────────── */
 .rb { display: flex; flex-direction: column; gap: 4px; }
 .rb-track { display: flex; align-items: stretch; gap: 2px; height: 34px; }
 .rb-seg { display: flex; align-items: center; justify-content: center; gap: 5px; border-radius: 5px; min-width: 14px; overflow: hidden; position: relative; }
@@ -600,13 +572,11 @@ header a.head-btn { text-decoration: none; }
 .rb-transfer.rel-low .rb-rel { color: oklch(0.5 0.17 33); }
 .rb-transfer.rel-low::after { background: var(--ds-rel-low); }
 
-/* ── Card footer ─────────────────────────────────────────────── */
 .card-foot { display: flex; align-items: center; gap: 7px; margin-top: 11px; font-size: 11.5px; color: var(--ds-ink-3); }
 .card-foot .sep { color: var(--ds-line); }
 .card-foot .warn-txt { color: oklch(0.55 0.13 64); font-weight: 600; }
 .card-foot .expand { margin-left: auto; color: var(--ds-accent); font-weight: 650; }
 
-/* ── Reliability chip + donut ────────────────────────────────── */
 .rel {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 600;
@@ -629,7 +599,6 @@ header a.head-btn { text-decoration: none; }
 .donut[data-rel="mid"]  { --dc: var(--ds-rel-mid); }
 .donut[data-rel="low"]  { --dc: var(--ds-rel-low); }
 
-/* ── Travel-mode grid (foldable card) ───────────────────────── */
 #modes-card { border: 1px solid var(--border); border-radius: 12px;
   background: var(--panel-2); margin-bottom: 10px; overflow: hidden; }
 #modes-head {
@@ -686,7 +655,6 @@ header a.head-btn { text-decoration: none; }
 }
 .modes-caption { margin: 10px 0 0; font-size: 11px; color: var(--fg-2); line-height: 1.35; }
 
-/* ── Results grouping toggle + group headers ────────────────── */
 #group-toggle { display: inline-flex; gap: 2px; background: var(--panel-2);
   border: 1px solid var(--border); border-radius: 999px; padding: 3px; }
 #group-toggle button {
@@ -751,7 +719,6 @@ header a.head-btn { text-decoration: none; }
 .access-alts { margin: 6px 0 2px; font-size: 12px; color: var(--fg-2); }
 .access-alts .alt { display: block; margin-top: 2px; }
 
-/* ── Mode badge ──────────────────────────────────────────────── */
 .rt-badge {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 21px; height: 21px; padding: 0 6px; border-radius: 5px;
@@ -760,19 +727,17 @@ header a.head-btn { text-decoration: none; }
 }
 .rt-badge.sm { min-width: 17px; height: 17px; font-size: 10px; padding: 0 4px; border-radius: 4px; }
 
-/* ── Expanded card detail ────────────────────────────────────── */
 .card-detail { margin-top: 13px; padding-top: 13px; border-top: 1px dashed var(--ds-line); }
 
-/* ── Leg list ────────────────────────────────────────────────── */
 .legs { margin-bottom: 14px; }
 .leg-row { display: grid; grid-template-columns: 42px 16px 1fr; gap: 8px; }
 .leg-time-col { font-size: 11.5px; color: var(--ds-ink-3); padding-top: 1px; font-family: 'IBM Plex Mono', monospace; }
-/* Realtime time cell: green when live & on time, scheduled struck through + red when delayed. */
+
 .leg-time-col.rt { display: flex; flex-direction: column; line-height: 1.15; }
 .leg-time-col.rt-ontime .lt-rt { color: var(--ok); font-weight: 700; }
 .leg-time-col .lt-sched { color: var(--ds-ink-4); text-decoration: line-through; font-size: 10.5px; }
 .leg-time-col .lt-rt { color: var(--danger); font-weight: 700; }
-/* A realtime-backed transit leg reads green; non-RT legs stay default (black). */
+
 .leg-row.rt-leg .leg-to { color: var(--ok); }
 .leg-dot.rt-dot { box-shadow: 0 0 0 2px var(--ok); }
 .leg-rail { display: flex; flex-direction: column; align-items: center; }
@@ -786,7 +751,6 @@ header a.head-btn { text-decoration: none; }
 .leg-to { color: var(--ds-ink); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .leg-dur { font-size: 11px; color: var(--ds-ink-3); font-family: 'IBM Plex Mono', monospace; }
 
-/* ── Transfer card (in leg list) ─────────────────────────────── */
 .leg-row.xfer .leg-dot.xfer-dot { width: 11px; height: 11px; background: var(--ds-surface); border: 2.5px solid var(--ds-accent); margin-top: 3px; }
 .xfer-card {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
@@ -806,7 +770,6 @@ header a.head-btn { text-decoration: none; }
 .xfer-prob[data-rel="mid"]  { color: oklch(0.52 0.12 64); }
 .xfer-prob[data-rel="low"]  { color: oklch(0.52 0.17 33); }
 
-/* ── Plan reliability banner ─────────────────────────────────── */
 .plan-rel {
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px;
   padding: 9px 12px; background: var(--ds-surface-2); border: 1px solid var(--ds-line); border-radius: 9px;
@@ -814,7 +777,6 @@ header a.head-btn { text-decoration: none; }
 .pr-k { font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--ds-ink-4); }
 .pr-note { font-size: 11px; color: var(--ds-ink-3); flex: 1 1 100%; }
 
-/* ── Connection card ─────────────────────────────────────────── */
 .conn { background: var(--ds-surface-2); border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm); padding: 12px 13px; }
 .conn-head { display: flex; align-items: center; gap: 8px; }
 .conn-title { font-size: 12.5px; font-weight: 700; color: var(--ds-ink); }
@@ -823,7 +785,7 @@ header a.head-btn { text-decoration: none; }
 .conn-rel[data-rel="mid"]  { color: oklch(0.52 0.12 64); }
 .conn-rel[data-rel="low"]  { color: oklch(0.52 0.17 33); }
 .conn-block { margin-top: 11px; }
-/* Departures panel (prev/next departures for a transit leg) */
+
 .dep-toggle {
   font: inherit; cursor: pointer; width: 100%; text-align: left;
   display: flex; align-items: center; gap: 6px;
@@ -867,12 +829,6 @@ header a.head-btn { text-decoration: none; }
 .cf-k { font-weight: 700; color: var(--ds-ink-2); }
 .cf-mono { font-family: 'IBM Plex Mono', monospace; color: var(--ds-ink); font-weight: 600; }
 
-/* ════════════════════════════════════════════════════════════════
-   Plan detail — boxed-spine rework. Tokens alias the global --ds-*
-   palette so this block stays a verbatim port of the design handoff.
-   Classes: rc- (result card), rib (folded ribbon), it- (itinerary),
-   wsplit (walk+buffer), opx (operator wordmark).
-   ════════════════════════════════════════════════════════════════ */
 .pd-root {
   --bg: var(--ds-bg); --surface: var(--ds-surface); --surface-2: var(--ds-surface-2); --surface-3: var(--ds-surface-3);
   --line: var(--ds-line); --line-soft: var(--ds-line-soft);
@@ -887,7 +843,6 @@ header a.head-btn { text-decoration: none; }
 }
 .pd-root .mono{ font-family: var(--mono); font-feature-settings:"tnum" 1; letter-spacing:-.01em; }
 
-/* ---- result card (collapsed / expanded) ---- */
 .rc { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
 .rc.best { border-color: var(--accent); box-shadow: var(--shadow-sm); }
 .rc-head { display: flex; align-items: center; gap: 11px; padding: 13px 16px 11px; cursor: pointer; }
@@ -905,7 +860,6 @@ header a.head-btn { text-decoration: none; }
 .rc-rel[data-rel="mid"]  { color: oklch(0.5 0.12 64); }   .rc-rel[data-rel="mid"]  .bead { background: var(--rel-mid); }
 .rc-rel[data-rel="low"]  { color: oklch(0.5 0.17 33); }   .rc-rel[data-rel="low"]  .bead { background: var(--rel-low); }
 
-/* folded plan: where + when the first transit leaves */
 .rc-first { display: flex; align-items: center; gap: 8px; padding: 0 16px 11px; }
 .rc-first .ic { color: var(--fc); flex: none; }
 .rc-fbadge { display: inline-flex; align-items: center; justify-content: center; min-width: 21px; height: 20px; padding: 0 6px; border-radius: 5px; font-family: var(--mono); font-size: 11.5px; font-weight: 700; line-height: 1; flex: none; }
@@ -919,7 +873,6 @@ header a.head-btn { text-decoration: none; }
 .rc-expand .chev { font-size: 9px; transition: transform .15s; }
 .rc-expand.open .chev { transform: rotate(180deg); }
 
-/* ---- proportional ribbon (header summary) ---- */
 .rib { display: flex; align-items: stretch; gap: 3px; height: 38px; }
 .rib .s { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; border-radius: 6px; min-width: 14px; overflow: hidden; line-height: 1.05; }
 .rib .s.transit { color: #fff; }
@@ -941,7 +894,6 @@ header a.head-btn { text-decoration: none; }
 .rib .s.clickable:hover { filter: brightness(1.04); box-shadow: 0 0 0 2px var(--accent-soft); }
 .rib .s.hi { box-shadow: 0 0 0 2px var(--accent); }
 
-/* ---- the itinerary: white background, boxed-ride spine ---- */
 .it { border-top: 1px solid var(--line-soft); padding: 14px 16px 16px; background: var(--surface); }
 .it-live { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; padding: 8px 11px; border-radius: 9px; font-size: 11.5px; font-weight: 600; }
 .it-live.ontime { background: var(--rel-high-soft); color: oklch(0.42 0.13 152); }
@@ -951,9 +903,6 @@ header a.head-btn { text-decoration: none; }
 .it-live.late .pulse { background: var(--rel-low); }
 .it-live b { font-weight: 700; white-space: nowrap; }
 
-/* Next-day marker: a small muted superscript "+N" appended to an absolute time
-   that lands on a following day (secs >= 86400). Superscript keeps it from
-   widening the time column. */
 .day-sup { font-size: 0.62em; font-weight: 600; color: var(--ds-ink-4, var(--ink-4)); margin-left: 1px; vertical-align: super; line-height: 0; letter-spacing: 0; text-decoration: none; }
 
 .it-row { display: grid; grid-template-columns: 50px 22px 1fr; column-gap: 11px; }
@@ -1036,7 +985,6 @@ header a.head-btn { text-decoration: none; }
 .wscap b { color: var(--ink); font-weight: 700; }
 .wscap .mg { color: var(--accent-deep); font-weight: 700; }
 
-/* ── Modal ───────────────────────────────────────────────────── */
 .modal-backdrop {
   display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
   z-index: 9000; align-items: center; justify-content: center; padding: 24px;
@@ -1057,7 +1005,6 @@ header a.head-btn { text-decoration: none; }
 .modal-body { padding: 14px 16px; overflow-y: auto; }
 .hint { font-size: 11px; color: var(--fg-3); margin-bottom: 8px; }
 
-/* ── Share view (QR + link) ──────────────────────────────────── */
 .share-modal { max-width: 380px; }
 .share-qr {
   display: flex; align-items: center; justify-content: center;
@@ -1088,7 +1035,6 @@ header a.head-btn { text-decoration: none; }
 .stop.terminus .n { font-weight: 600; }
 kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; color: var(--fg-2); }
 
-/* ── Mobile List|Map toggle (hidden on desktop) ──────────────── */
 #view-toggle { display: none; gap: 0; border: 1px solid var(--border); border-radius: var(--radius-s); overflow: hidden; }
 #view-toggle button {
   padding: 5px 12px; font-size: 12px; font-weight: 600;
@@ -1100,8 +1046,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   header { gap: 8px; padding: 8px 10px; }
   header .logo { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #view-toggle { display: inline-flex; flex-shrink: 0; }
-  /* Keep the header compact: drop the secondary desktop links, but keep the
-     Travel-map link reachable (nav is symmetric with the map page's back-link). */
+  
   header a.head-btn:not([href="/travel_map"]) { display: none; }
   header a.head-btn[href="/travel_map"] { padding: 6px 10px; }
 
@@ -1113,15 +1058,12 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   .main.show-map #sidebar { display: none; }
   .main.show-map #map { display: block; }
 
-  /* The origin/destination selector scrolls away with the results instead of
-     pinning to the top and starving the list of vertical space. */
   .panel-brand, .panel-hint { display: none; }
   .panel-head { padding: 10px 12px; }
   #plans-panel { overflow: visible; flex: 0 0 auto; }
   .plans-list-head { position: static; }
 }
 
-/* ── Start-journey CTA (in expanded plan detail) ─────────────── */
 .lv-start { display: flex; align-items: center; justify-content: center; gap: 8px;
   width: 100%; margin-top: 10px; padding: 11px 14px; border: 0; cursor: pointer;
   border-radius: var(--ds-radius-sm); background: var(--ds-accent); color: #fff;
@@ -1131,7 +1073,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 .lv-start .lv-dot { width: 8px; height: 8px; border-radius: 50%; background: #fff;
   box-shadow: 0 0 0 3px rgba(255,255,255,.3); }
 
-/* ── Resume-live-journey banner (planner, when an active journey persists) ── */
 .lv-resume { display: flex; align-items: center; gap: 8px; width: 100%;
   margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--ds-accent);
   border-radius: var(--ds-radius-sm); background: var(--ds-surface-2);
@@ -1145,7 +1086,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   overflow: hidden; text-overflow: ellipsis; }
 .lv-resume .lv-resume-go { flex: none; color: var(--ds-accent); font-weight: 800; }
 
-/* ── Live (realtime) journey view ────────────────────────────── */
 .lv { position: fixed; inset: 0; z-index: 1200; background: var(--ds-bg);
   display: flex; flex-direction: column; }
 .lv[hidden] { display: none; }
@@ -1175,8 +1115,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 .lv-net { flex: none; font-size: 12px; color: var(--ok); }
 .lv-net.off { color: var(--ds-ink-4); }
 .lv-body { flex: 1; overflow: auto; padding: 14px; max-width: 720px; width: 100%; margin: 0 auto; }
-/* The live plan reuses the planner result card (.pd-root > .rc); it is the sole,
-   always-open plan, so suppress the collapse affordance and the inter-card gap. */
+
 .lv-body .lv-card { margin-bottom: 0; }
 .lv-body .lv-rc-head { cursor: default; }
 .lv-icon-btn { flex: none; width: 30px; height: 30px; border: 1px solid var(--ds-line);
@@ -1189,7 +1128,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 .lv-map.dragging { transition: none; }
 .lv-map > #map { display: block !important; position: relative !important; inset: auto !important;
   width: 100%; height: 100%; z-index: auto !important; }
-/* Drag handle to resize the live map; snaps to anchors on release. */
+
 .lv-grab { flex: none; height: 18px; display: flex; align-items: center; justify-content: center;
   cursor: ns-resize; background: var(--ds-surface); border-bottom: 1px solid var(--ds-line);
   touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -1197,7 +1136,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   background: var(--ds-surface-3); transition: background .15s ease; }
 .lv-grab:hover::before, .lv-grab:active::before { background: var(--ds-ink-4); }
 @media (prefers-reduced-motion: reduce) { .lv-map { transition: none; } }
-/* Estimated vehicle marker — a route-coloured dot ringed to read "approximate". */
+
 .lv-veh { position: relative; }
 .lv-veh-dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff;
   box-shadow: 0 0 0 2px rgba(0,0,0,.18); }
@@ -1227,7 +1166,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   font-size: 11px; color: oklch(0.48 0.12 64); font-weight: 600; cursor: default; }
 .it-alert-ic { flex: none; }
 .it-alert-txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Bottom sheet for in-realtime edits (departure / route swap). */
+
 .lv-sheet { position: absolute; inset: 0; z-index: 5; background: rgba(0,0,0,.4);
   display: flex; align-items: flex-end; justify-content: center; }
 .lv-sheet[hidden] { display: none; }
@@ -1246,7 +1185,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 .lv-opt-d { font-size: 11px; color: var(--ds-ink-3); flex: 1; }
 .lv-opt-r { font-size: 11px; font-weight: 700; color: var(--ds-ink-3); }
 
-/* Live alternatives affordance + Card 1 backup rail. */
 .lv-alt-btn { display: inline-flex; align-items: center; gap: 5px; margin-top: 7px;
   padding: 5px 10px; border: 1px solid var(--ds-line); border-radius: 999px;
   background: var(--ds-surface); color: var(--ds-ink-2); font-size: 11px; font-weight: 700;
@@ -1358,7 +1296,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   <button id="advanced-btn" class="head-btn" title="Advanced settings">⚙ Advanced</button>
   <button id="share-btn" class="head-btn" title="Share this view (QR code + link)" aria-label="Share this view">⧉ Share</button>
   <a href="/travel_map" class="head-btn" title="Travel-time map">🗺 Travel map</a>
-  <a href="/graphiql" class="head-btn" target="_blank">GraphQL ↗</a>
+  <a href="/graphiql" id="graphiql-link" class="head-btn" target="_blank" style="display:none">GraphQL ↗</a>
   <button id="pwa-install-btn" class="head-btn" style="display:none" title="Install MaaS as an app">⊕ Install</button>
 </header>
 
@@ -1560,7 +1498,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   </div>
 </div>
 
-<!-- Share view: QR code + copyable link for the current URL -->
 <div id="share-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Share this view">
   <div class="modal share-modal">
     <div class="modal-head">
@@ -1578,11 +1515,9 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
   </div>
 </div>
 
-<!-- Fare breakdown popup — dismissable, anchored to a clicked price badge -->
 <div id="fb-backdrop" class="fb-backdrop"></div>
 <div id="fb-pop" class="fb-pop" role="dialog" aria-label="Fare breakdown" hidden></div>
 
-<!-- Live (realtime) journey view — additive overlay, hidden until SELECT -->
 <div id="live-view" class="lv" hidden>
   <div class="lv-bar">
     <button class="lv-close" id="lv-close" title="Exit live view" aria-label="Exit live view">×</button>
@@ -1616,9 +1551,7 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/maas.js"></script>
-<!-- Self-contained QR Code encoder (byte mode, ECC M). No network/CDN. -->
-<!-- Adapted from Project Nayuki's QR Code generator (MIT License). Mirror of -->
-<!-- src/web/static/js/vendor/qr.mjs (kept in sync). Attaches window.QRCode. -->
+<!-- QR encoder adapted from Project Nayuki's QR Code generator (MIT License). Mirror of src/web/static/js/vendor/qr.mjs (kept in sync). -->
 <script>
 (function () {
   'use strict';
@@ -1718,7 +1651,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
       var cx = align[a], cy = align[bb2];
       for (var dy2 = -2; dy2 <= 2; dy2++) for (var dx2 = -2; dx2 <= 2; dx2++) setF(cx + dx2, cy + dy2, Math.max(Math.abs(dx2), Math.abs(dy2)) !== 1);
     }
-    // reserve format region
     for (var f = 0; f <= 5; f++) setF(8, f, false);
     setF(8, 7, false); setF(8, 8, false); setF(7, 8, false);
     for (var f2 = 9; f2 < 15; f2++) setF(14 - f2, 8, false);
@@ -1798,7 +1730,6 @@ kbd { font: 11px var(--mono); padding: 1px 5px; background: var(--panel-2); bord
 <script>
 'use strict';
 
-// ── GraphQL query ─────────────────────────────────────────────
 const PLAN_FRAGMENT = `
   start end mode
   price { knownEuros cappedEuros unknownOperators breakdown { operator description euros coverage } }
@@ -1806,10 +1737,10 @@ const PLAN_FRAGMENT = `
   legs {
     ... on PlanWalkLeg {
       __typename start end duration streetMode cyclerouteLength elevationGain length
-      from { node { name lat lon } }
-      to   { node { name lat lon } }
-      geometry { lat lon }
-      alternatives { p50 p95 length elevationGain cyclerouteLength surface unpavedLength dismountLength dismountRuns { start end } geometry { lat lon } }
+      from { node { name lat lng } }
+      to   { node { name lat lng } }
+      geometry { lat lng }
+      alternatives { p50 p95 length elevationGain cyclerouteLength surface unpavedLength dismountLength dismountRuns { start end } geometry { lat lng } }
       steps {
         ... on PlanWalkLegStep {
           length time dismount geomStart geomEnd
@@ -1827,13 +1758,13 @@ const PLAN_FRAGMENT = `
         headsign
         route { shortName longName mode color textColor agency { name } }
       }
-      from { arrival departure stopId platform node { name lat lon } }
-      to   { arrival departure stopId platform node { name lat lon } }
-      geometry { lat lon }
+      from { arrival departure stopId platform node { name lat lng } }
+      to   { arrival departure stopId platform node { name lat lng } }
+      geometry { lat lng }
       steps {
         ... on PlanTransitLegStep {
           scheduledArrival scheduledDeparture
-          place { arrival departure platform node { name lat lon } }
+          place { arrival departure platform node { name lat lng } }
         }
       }
     }
@@ -1855,10 +1786,6 @@ const QUERY = `query Plan(
   ) { ${PLAN_FRAGMENT} }
 }`;
 
-// Lazily fetch earlier/later DEPARTURES for the transit legs of the current
-// result. Re-runs raptor (same inputs) and reads previousDepartures/nextDepartures
-// on each transit leg; results are matched back by tripId so a leg is found
-// regardless of plan order. `count` is symmetric (prev == next).
 const DEP_ALT_FIELDS = `
   tripId start end scheduledStart scheduledEnd realtime
   transferRisk { reliability }
@@ -1885,52 +1812,66 @@ const DEP_QUERY = `query Deps(
   }
 }`;
 
-// ── Map ───────────────────────────────────────────────────────
 const map = L.map('map').setView([50.85, 4.35], 12);
 window.map = map;
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '© OpenStreetMap contributors', maxZoom: 19,
+const DEFAULT_TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+const DEFAULT_TILE_ATTRIBUTION = '© OpenStreetMap contributors';
+let tileLayer = L.tileLayer(DEFAULT_TILE_URL, {
+  attribution: DEFAULT_TILE_ATTRIBUTION, maxZoom: 19,
 }).addTo(map);
 
-// ── Mobile List|Map toggle ────────────────────────────────────
+fetch('/graphql', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ query: '{ webConfig { tileUrl tileAttribution graphiqlEnabled } }' }),
+}).then(r => r.json()).then(j => {
+  const wc = j && j.data && j.data.webConfig;
+  if (!wc) return;
+  if (wc.graphiqlEnabled) {
+    const gl = document.getElementById('graphiql-link');
+    if (gl) gl.style.display = 'inline-block';
+  }
+  if (!wc.tileUrl) return;
+  if (wc.tileUrl === DEFAULT_TILE_URL) return;
+  map.removeLayer(tileLayer);
+  tileLayer = L.tileLayer(wc.tileUrl, {
+    attribution: wc.tileAttribution || DEFAULT_TILE_ATTRIBUTION, maxZoom: 19,
+  }).addTo(map);
+}).catch(() => {});
+
 const mainEl = document.querySelector('.main');
 function setMobileView(view) {
   const showMap = view === 'map';
   mainEl.classList.toggle('show-map', showMap);
   document.querySelectorAll('#view-toggle button').forEach(b =>
     b.classList.toggle('active', b.dataset.view === view));
-  // Leaflet sizes lazily; the map was hidden when initialised, so recompute.
   if (showMap) setTimeout(() => map.invalidateSize(), 0);
 }
 document.querySelectorAll('#view-toggle button').forEach(b =>
   b.addEventListener('click', () => setMobileView(b.dataset.view)));
 
-// ── State ─────────────────────────────────────────────────────
-// Departures picker: fetch up to 2 each side when a leg's panel is opened, then
-// grow by DEPARTURE_STEP on "show more". detectHeadway lives in maas.js.
 const DEFAULT_DEP_COUNT = 2, DEPARTURE_STEP = 4;
 const state = {
   plans: [],
-  grouping: 'departure',        // 'departure' | 'none' | 'arrival'
-  displayOrder: [],             // plan indices in current render order (for kbd nav)
+  grouping: 'departure',
+  displayOrder: [],
   selectedIdx: -1,
-  selectedLegIdxMap: new Map(), // planIdx -> leg index within that plan
-  openStops: new Set(),         // `${planIdx}:${legIdx}` of itinerary legs with in-between stops expanded
+  selectedLegIdxMap: new Map(),
+  openStops: new Set(),
   legLayers: [],
-  queryVars: null,              // routing inputs of the current result (for lazy alternatives)
-  depCache: new Map(),          // tripId -> { prev:[], next:[], count, loading, error } (per-line departures)
-  collapsedDeps: new Set(),     // `${planIdx}:${legIdx}` of transit legs whose departures panel the user explicitly collapsed (panels are open by default when a leg is surfaced)
-  picker: null,                 // active per-leg route picker, or null (see openPicker)
+  queryVars: null,
+  depCache: new Map(),
+  collapsedDeps: new Set(),
+  picker: null,
 };
 
-// ── Stop search inputs ────────────────────────────────────────
 const fromSearch = createStopSearch(
   document.getElementById('from-search'), 'Search station or address, or right-click map',
-  s => { setOriginMarker(s.lat, s.lon); doSyncUrl(); },
+  s => { setOriginMarker(s.lat, s.lng); doSyncUrl(); },
 );
 const toSearch = createStopSearch(
   document.getElementById('to-search'), 'Search station or address, or right-click map',
-  s => { setDestMarker(s.lat, s.lon); doSyncUrl(); },
+  s => { setDestMarker(s.lat, s.lng); doSyncUrl(); },
 );
 
 let originMarker = null, destMarker = null;
@@ -1957,7 +1898,6 @@ createContextMenu(map,
   },
 );
 
-// ── Geolocation ("use my location") ───────────────────────────
 let gpsNoteTimer = null;
 function showGpsNote(msg) {
   const n = el('gps-note');
@@ -2018,7 +1958,6 @@ function locateInto(target, btn) {
   });
 })();
 
-// ── URL state ─────────────────────────────────────────────────
 function el(id) { return document.getElementById(id); }
 
 function doSyncUrl() {
@@ -2039,12 +1978,10 @@ function doSyncUrl() {
     modes:      selectedModes().join(',') || null,
     group:      state.grouping !== 'departure' ? state.grouping : null,
     sel:        state.selectedIdx >= 0 ? state.selectedIdx : null,
-    live:       readUrl().get('live') || null,   // preserve active live-journey marker
+    live:       readUrl().get('live') || null,
   });
 }
 
-// Set/clear the `live=<journeyId>` URL marker without dropping any planner params
-// and without navigating (replaceState). A reload on this URL auto-resumes the view.
 function setLiveUrlParam(id) {
   const p = readUrl();
   if (id) p.set('live', id); else p.delete('live');
@@ -2067,8 +2004,6 @@ function loadFromUrl() {
       b.classList.toggle('active', wanted.has(b.dataset.mode)));
     updateModeCount();
   }
-  // Deep-link to open the travel-mode matrix on load. `?matrix=open` is a separate
-  // param from `?modes=` (the selected-mode CSV) so the two never collide.
   if (p.get('matrix') === 'open') {
     el('modes-card').classList.remove('collapsed');
     el('modes-head').setAttribute('aria-expanded', 'true');
@@ -2095,10 +2030,6 @@ function loadFromUrl() {
   el(id).addEventListener('change', doSyncUrl);
 });
 
-// ── Travel-mode grid ──────────────────────────────────────────
-// Rows = vehicle, columns = how the vehicle relates to transit. Each populated
-// cell is one Mode enum value; null cells are impossible combos (e.g. car on
-// board) and render disabled. Headers toggle a whole row/column at once.
 const MODE_COLS = [
   { col: 'SOLO', label: 'Solo' },
   { col: 'ON',   label: 'On transit' },
@@ -2137,8 +2068,6 @@ function selectedModes() {
   return [...document.querySelectorAll('#modes-grid .mode-cell.active')].map(b => b.dataset.mode);
 }
 
-// Collapsed-card summary: one glanceable family chip per vehicle row (walk/bike/
-// car) showing its icon and how many of its modes are selected.
 const MODE_FAMS = [
   { glyph: '🚶', row: 'WALK', label: 'Walk' },
   { glyph: '🚲', row: 'BIKE', label: 'Bike' },
@@ -2158,8 +2087,6 @@ function updateModeCount() {
   });
 }
 
-// Apply `target` (on/off) to a set of cells, then enforce the never-zero rule by
-// reverting if nothing is left selected.
 function setModeCells(cells, target) {
   cells.forEach(c => c.classList.toggle('active', target));
   updateModeCount();
@@ -2229,7 +2156,6 @@ el('adv-window').addEventListener('input', e => {
   el('adv-window-val').textContent = e.target.value + 'm';
 });
 
-// ── Header buttons ────────────────────────────────────────────
 el('advanced-btn').addEventListener('click', () => {
   const drawer = el('advanced');
   drawer.classList.toggle('open');
@@ -2277,12 +2203,7 @@ el('now-btn').addEventListener('click', () => {
   doSyncUrl();
 });
 
-// ── Fare profile (client-side preferences) ────────────────────
-// Persisted in localStorage as a small blob. Injected into the raptor /
-// onboardRaptor query as the `fareProfile` variable. Field names match the
-// GraphQL FareProfileInput (camelCase). Only non-default fields are sent, so an
-// unset profile sends `null` and the server applies its own default (adult, no
-// products). See docs/superpowers/specs/2026-07-10-transit-pricing-design.md A.1.
+// Field names must match the GraphQL FareProfileInput (camelCase).
 const FARE_PROFILE_KEY = 'maas.fareProfile.v1';
 const FARE_BOOL_FIELDS = {
   'fare-stib-sub':       'stibSubscription',
@@ -2294,8 +2215,6 @@ const FARE_BOOL_FIELDS = {
   'fare-tec-6':          'tec6Journey',
 };
 
-// Read the UI controls into a plain profile object (category + travelClass +
-// all booleans).
 function readFareControls() {
   const p = {
     passengerCategory: el('fare-category').value || 'ADULT',
@@ -2305,9 +2224,6 @@ function readFareControls() {
   return p;
 }
 
-// The GraphQL variable: send only fields that differ from the default (ADULT,
-// 2nd class, no products). Returns null when the profile is entirely default, so
-// an anonymous query stays byte-identical to the pre-feature behavior.
 function fareProfileVar() {
   const p = readFareControls();
   const out = {};
@@ -2317,8 +2233,6 @@ function fareProfileVar() {
   return Object.keys(out).length ? out : null;
 }
 
-// Short human summary shown in the collapsed card header (e.g. "Adult · SNCB
-// subscription · +1"). Empty string when the profile is entirely default.
 function fareSummary() {
   const p = readFareControls();
   const bits = [];
@@ -2356,9 +2270,6 @@ function loadFareProfile() {
   updateFareSummary();
 }
 
-// Re-run the active search so prices reflect the new profile, but only when a
-// route is already set (both endpoints present) and the query is not in manual
-// mode. Otherwise just refresh the query preview.
 function fareProfileChanged() {
   saveFareProfile();
   updateFareSummary();
@@ -2378,7 +2289,6 @@ el('fare-reset').addEventListener('click', (e) => {
 el('fare-body').addEventListener('change', fareProfileChanged);
 loadFareProfile();
 
-// ── Run query ─────────────────────────────────────────────────
 async function runQuery() {
   const fromLat = fromSearch.getLat();
   const fromLng = fromSearch.getLng();
@@ -2407,10 +2317,6 @@ async function runQuery() {
   const vars = { fromLat, fromLng, toLat, toLng, date, time, windowMinutes, walkRadiusSecs,
                  modes: modes.length ? modes : null, bikeProfile: null, fareProfile: fareProfileVar() };
 
-  // Zero-cost station hub: when a dropdown station was selected, pass its id so
-  // routing treats all its platforms as zero-walk access/egress. The station ids
-  // stay OUT of `vars`/`state.queryVars` so the lazy departures fetch (DEP_QUERY)
-  // keeps using only coordinates (it does not declare these variables).
   const fromStationId = fromSearch.getStationId();
   const toStationId   = toSearch.getStationId();
   const sendVars = {
@@ -2419,7 +2325,6 @@ async function runQuery() {
     ...(toStationId ? { toStationId } : {}),
   };
 
-  // Manual mode: send the user-edited query + variables verbatim.
   let queryToSend = QUERY, varsToSend = sendVars;
   if (queryManual()) {
     try {
@@ -2441,7 +2346,7 @@ async function runQuery() {
   try {
     const data = await gql(queryToSend, varsToSend);
     state.plans = data.raptor || [];
-    state.queryVars = vars;          // reused by lazy per-leg alternative fetches
+    state.queryVars = vars;
     state.depCache.clear();
     state.collapsedDeps.clear();
     state.picker = null;
@@ -2461,11 +2366,8 @@ async function runQuery() {
 }
 el('go').addEventListener('click', () => runQuery());
 
-// ── Manual GraphQL query panel ────────────────────────────────
 function queryManual() { return el('query-manual').checked; }
 
-// Write the current query string + a variables object (with bikeProfile: null,
-// ready to fill in) into the editable boxes.
 function fillQueryBoxes() {
   el('query-text').value = QUERY.trim();
   const modes = selectedModes();
@@ -2482,7 +2384,6 @@ function fillQueryBoxes() {
   el('query-vars').value = JSON.stringify(vars, null, 2);
 }
 
-// Auto mode mirrors UI state into the boxes; manual mode owns them.
 function renderQuery() { if (!queryManual()) fillQueryBoxes(); }
 
 function setManualMode(on) {
@@ -2493,16 +2394,11 @@ function setManualMode(on) {
 }
 
 el('query-manual').addEventListener('change', e => setManualMode(e.target.checked));
-el('query-resync').addEventListener('click', fillQueryBoxes); // refresh from UI, keep editing
-// Keep the auto-mode boxes in sync as the user tweaks controls.
+el('query-resync').addEventListener('click', fillQueryBoxes);
 document.addEventListener('input', renderQuery);
 document.addEventListener('change', renderQuery);
-setManualMode(false); // initial render of the auto-mode query/vars
+setManualMode(false);
 
-// Lazily load (and cache) earlier/later alternatives for one leg, then re-render.
-// Lazily fetch prev/next departures for ALL transit legs of the current result,
-// keyed by tripId (a line is shared across plans, so one fetch serves every card).
-// `count` grows as the user expands. Re-runs raptor with the original inputs.
 async function loadDepartures(tripId, count) {
   if (!state.queryVars || !tripId) return;
   const entry = state.depCache.get(tripId) || { prev: [], next: [], count: 0, loading: false };
@@ -2516,7 +2412,6 @@ async function loadDepartures(tripId, count) {
       date: v.date, time: v.time, windowMinutes: v.windowMinutes,
       walkRadiusSecs: v.walkRadiusSecs, modes: v.modes, count,
     });
-    // Fold every transit leg of every plan into the cache (one fetch, many legs).
     (data?.raptor || []).forEach(p => (p.legs || []).forEach(l => {
       if (l && l.__typename === 'PlanTransitLeg' && l.tripId) {
         const e = state.depCache.get(l.tripId) || { prev: [], next: [], count: 0, loading: false };
@@ -2537,12 +2432,9 @@ async function loadDepartures(tripId, count) {
   }
 }
 
-// ── Plan helpers ──────────────────────────────────────────────
 function planTransferCount(plan) {
   return Math.max(0, plan.legs.filter(l => l.__typename === 'PlanTransitLeg').length - 1);
 }
-// Foot-only seconds: bike/car access & egress legs are PlanWalkLeg too, but must
-// not count as "walk".
 function planWalkSeconds(plan) {
   return plan.legs
     .filter(l => l.__typename === 'PlanWalkLeg' && l.streetMode !== 'BIKE' && l.streetMode !== 'CAR')
@@ -2559,7 +2451,6 @@ function planReliability(plan) {
   return r;
 }
 
-// ── Design helpers ────────────────────────────────────────────
 function relClass(p)    { return p >= 0.8 ? 'high' : p >= 0.5 ? 'mid' : 'low'; }
 function relPct(p)      { return Math.round(p * 100) + '%'; }
 function tightClass(ms) { return ms < 120 ? 'low' : ms < 480 ? 'mid' : 'high'; }
@@ -2611,13 +2502,10 @@ function mkWalkIcon(s) {
   ], s || 12);
 }
 
-// Distance in m / km, compactly.
 function fmtDist(m) {
   return m >= 1000 ? (m / 1000).toFixed(m >= 10000 ? 0 : 1) + ' km' : Math.round(m) + ' m';
 }
 
-// Stats panel shown under an expanded bike leg: distance, average speed and the
-// share of the ride that follows a signposted cycle route.
 function mkBikeStats(leg) {
   const stats = mkEl('div', 'leg-bike-stats');
   const dist = leg.length || 0;
@@ -2653,8 +2541,6 @@ function mkClockIcon(s) {
   ], s || 12);
 }
 
-// ── Boxed-spine icons ─────────────────────────────────────────
-// Mode glyph as a small stroked SVG, tinted to the line colour.
 function mkModeIc(mode, size, color) {
   const m = (mode || '').toUpperCase();
   const ns = 'http://www.w3.org/2000/svg';
@@ -2671,7 +2557,7 @@ function mkModeIc(mode, size, color) {
   } else if (m === 'RAIL' || m === 'METRO' || m === 'SUBWAY') {
     add('rect', { x: 5, y: 3, width: 14, height: 14, rx: 3 }); add('path', { d: 'M5 11h14' });
     add('path', { d: 'M8 21l2-4M16 21l-2-4' }); add('circle', { cx: 8.5, cy: 14, r: 1 }); add('circle', { cx: 15.5, cy: 14, r: 1 });
-  } else { // Bus (default)
+  } else {
     add('rect', { x: 4, y: 4, width: 16, height: 13, rx: 3 }); add('path', { d: 'M4 11h16' });
     add('circle', { cx: 8.5, cy: 20, r: 1.4 }); add('circle', { cx: 15.5, cy: 20, r: 1.4 });
   }
@@ -2688,8 +2574,6 @@ function mkShieldIcon(s) {
 }
 function mkChev() { return mkEl('span', 'chev', '▾'); }
 
-// Realtime-aware time descriptor → {s, real?, delta?, rt}.
-// rt: 'plain' | 'ontime' | 'shifted' (realtime differs from schedule, early or late) | 'dim'.
 function rtTime(schedSecs, actualSecs, realtime) {
   if (schedSecs == null && actualSecs == null) return null;
   const v = actualSecs ?? schedSecs;
@@ -2701,15 +2585,12 @@ function rtTime(schedSecs, actualSecs, realtime) {
     return { s: sSched, sSecs: schedSecs, real: sReal, rSecs: actualSecs, delta: actualSecs - schedSecs, rt: 'shifted' };
   return { s: sReal, sSecs: actualSecs, rt: 'ontime' };
 }
-// A time span carrying the wall-clock string plus a day marker when the time
-// crosses midnight. Same-day → byte-identical to mkEl('span', cls, text).
 function mkTimeSpan(cls, text, secs) {
   const el = mkEl('span', cls, text);
   const mk = mkDayMark(secs);
   if (mk) el.appendChild(mk);
   return el;
 }
-// Render an .it-t time cell from an rtTime() descriptor.
 function mkTimeCell(t) {
   const w = mkEl('div', 'it-t');
   if (!t) return w;
@@ -2761,7 +2642,6 @@ function planTag(plans, plan) {
   return null;
 }
 
-// ── Segment builder ───────────────────────────────────────────
 function buildPlanSegs(plan) {
   const legs = plan.legs;
   const out  = [];
@@ -2793,7 +2673,6 @@ function buildPlanSegs(plan) {
   return out;
 }
 
-// ── Ribbon renderer (folded summary, proportional flex) ───────
 function renderRibbon(plan, openLeg, onLeg) {
   const segs = buildPlanSegs(plan);
   const rib  = mkEl('div', 'rib');
@@ -2836,7 +2715,6 @@ function renderRibbon(plan, openLeg, onLeg) {
       rib.appendChild(d);
       return;
     }
-    // transit
     const route = s.leg.trip?.route;
     const { bg, fg } = routeColors(route);
     const d = mkEl('div', 's transit clickable' + (openLeg === s.leg ? ' hi' : ''));
@@ -2853,8 +2731,6 @@ function renderRibbon(plan, openLeg, onLeg) {
   return rib;
 }
 
-// ── Itinerary (boxed-spine timeline) ──────────────────────────
-// The median-walk + safety-buffer split shown under the first foot leg.
 function mkWalkSplit(leaveT, walkMed, buffer, bufLabel, modeWord = 'walk') {
   const w   = mkEl('div', 'wsplit');
   const bar = mkEl('div', 'wsbar');
@@ -2876,7 +2752,6 @@ function mkWalkSplit(leaveT, walkMed, buffer, bufLabel, modeWord = 'walk') {
   return w;
 }
 
-// First boarded transit leg → folded "where + when the first ride leaves".
 function firstTransitOf(plan) {
   const leg = plan.legs.find(l => l.__typename === 'PlanTransitLeg');
   if (!leg) return null;
@@ -2889,7 +2764,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
   const legs = plan.legs;
   const liveMode = !!opts.live;
 
-  // Live banner — only when some transit leg carries realtime.
   const rtTransit = legs.filter(l => l.__typename === 'PlanTransitLeg' && l.realtime);
   if (rtTransit.length) {
     const lastRt   = rtTransit[rtTransit.length - 1];
@@ -2910,7 +2784,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
     }
   }
 
-  // Lateness carried to the final arrival (from the last transit leg).
   const lastTransit  = [...legs].reverse().find(l => l.__typename === 'PlanTransitLeg');
   const arrLateSecs  = lastTransit && lastTransit.realtime
     ? Math.max(0, (lastTransit.end ?? 0) - (lastTransit.scheduledEnd ?? lastTransit.end ?? 0)) : 0;
@@ -2927,7 +2800,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
 
     if (isWalk) {
       const prev = legs[i - 1], next = legs[i + 1];
-      // a walk between two transit legs is the transfer of the next transit leg
       if (prev?.__typename === 'PlanTransitLeg' && next?.__typename === 'PlanTransitLeg') return;
 
       const isFirst = i === 0;
@@ -2997,7 +2869,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
     }
 
     if (isTransit) {
-      // preceding transfer (walk between two transit legs)
       const pw = legs[i - 1], before = legs[i - 2];
       if (pw?.__typename === 'PlanWalkLeg' && before?.__typename === 'PlanTransitLeg') {
         const walkMin   = Math.round((pw.end - pw.start) / 60);
@@ -3060,7 +2931,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
       const alight  = leg.to?.node?.name || '—';
       const rideMin = Math.round((leg.end - leg.start) / 60);
 
-      // board row + boxed vehicle descriptor
       const b = mkEl('div', 'it-row');
       const boardArr = leg.from?.arrival ?? null;
       const schedBoardArr = boardArr != null ? boardArr - (leg.start - leg.scheduledStart) : null;
@@ -3103,7 +2973,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
       }
       veh.appendChild(vline);
 
-      // expandable in-between stops — keep name AND arrival time per stop
       const between = (leg.steps || [])
         .map(st => ({
           name: st.place?.node?.name,
@@ -3128,9 +2997,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
       veh.appendChild(pill);
       bc.appendChild(veh);
 
-      // Live "Find alternatives" affordance — same-station backups for this
-      // boarding (Card 1). More prominent when the connection INTO this leg is
-      // at risk. Planner never sets liveMode, so this stays invisible there.
       if (liveMode) {
         const _rs = window.MaaSLive?.logic?.transferRiskState?.(leg._liveRisk ?? null);
         const atRisk = _rs?.state === 'alarm';
@@ -3169,7 +3035,6 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
         it.appendChild(m);
       });
 
-      // alight row
       const a = mkEl('div', 'it-row');
       const alightDep = leg.to?.departure ?? null;
       const schedAlightDep = alightDep != null ? alightDep - (leg.end - leg.scheduledEnd) : null;
@@ -3197,18 +3062,11 @@ function buildItinerary(plan, idx, onLeg, opts = {}) {
   return it;
 }
 
-// ── Connection card (always renders for any transit leg) ──────
-// ── Previous / next departures ────────────────────────────────
-// (detectHeadway is defined in maas.js so it can be unit-tested in isolation.)
 
-// Re-plan the whole journey to leave in time for a chosen departure of this line.
-// The engine has no "board exactly trip X" input, so we re-issue the raptor query
-// with `time` nudged to the chosen boarding minute (and a tight window) and show
-// the fresh itinerary. `depSecs` is seconds since midnight of the query date.
 async function replanFromDeparture(depSecs) {
   if (!state.queryVars) return;
   const v = state.queryVars;
-  const secs = ((depSecs % 86400) + 86400) % 86400;   // wrap next-day back to wall clock
+  const secs = ((depSecs % 86400) + 86400) % 86400;
   const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
   const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
   const vars = { ...v, time: hh + ':' + mm, windowMinutes: Math.max(v.windowMinutes || 0, 30) };
@@ -3223,7 +3081,7 @@ async function replanFromDeparture(depSecs) {
     state.selectedLegIdxMap.clear();
     resetExtendPaging();
     state.selectedIdx = state.plans.length ? 0 : -1;
-    el('time').value = hh + ':' + mm;                  // reflect the shift in the form
+    el('time').value = hh + ':' + mm;
     renderList();
     renderAllPlansOnMap();
   } catch (err) {
@@ -3231,19 +3089,10 @@ async function replanFromDeparture(depSecs) {
   }
 }
 
-// ── Extend search window (earlier / later) ────────────────────
-// The raptor query is a RANGE query over [time, time + windowMinutes], so a
-// result is a bundle of plans spanning that window. These helpers re-query an
-// adjacent window and MERGE the fresh plans into the current list (deduped,
-// re-sorted), letting the user page earlier/later without losing state.
 
-// A plan's departure/arrival, matching how cards read them (seconds since the
-// query-date midnight; may exceed 86400 for next-day).
 function planDeparture(p) { return p.legs?.[0]?.start ?? p.start; }
 function planArrival(p)   { return p.end; }
 
-// Stable identity for dedup: same departure + arrival + leg shape is the same
-// journey regardless of which window surfaced it.
 function planKey(p) {
   const legs = (p.legs || []).map(l =>
     l.__typename === 'PlanTransitLeg'
@@ -3253,23 +3102,16 @@ function planKey(p) {
   return planDeparture(p) + '>' + planArrival(p) + '#' + legs;
 }
 
-const EXTEND_WINDOW_MIN = 30;   // window width for each earlier/later page
+const EXTEND_WINDOW_MIN = 30;
 
-// Merge `extra` plans into state.plans, deduped by planKey, re-sorted by
-// departure (then arrival). Preserves existing plan objects (and their in-flight
-// per-plan UI state keyed by plan index is rebuilt on renderList). Returns the
-// count of genuinely new plans added.
 function mergePlans(extra) {
   const seen = new Set(state.plans.map(planKey));
   let added = 0;
   extra.forEach(p => { const k = planKey(p); if (!seen.has(k)) { seen.add(k); state.plans.push(p); added++; } });
   if (added) {
-    // Keep the currently-selected plan selected across the re-sort.
     const selKey = state.selectedIdx >= 0 ? planKey(state.plans[state.selectedIdx]) : null;
     state.plans.sort((a, b) => (planDeparture(a) - planDeparture(b)) || (planArrival(a) - planArrival(b)));
     state.selectedIdx = selKey ? state.plans.findIndex(p => planKey(p) === selKey) : -1;
-    // Index-keyed UI caches (leg selection, collapsed departures) no longer line
-    // up after a re-sort, so clear them; depCache is keyed by tripId and survives.
     state.selectedLegIdxMap.clear();
     state.collapsedDeps.clear();
   }
@@ -3278,31 +3120,26 @@ function mergePlans(extra) {
 
 let extendBusy = false;
 const extendExhausted = { earlier: false, later: false };
-// A fresh routing result re-opens paging in both directions.
 function resetExtendPaging() { extendExhausted.earlier = false; extendExhausted.later = false; }
 
-// dir: 'earlier' searches a window ending just before the current earliest
-// departure; 'later' searches a window starting just after the current latest.
 async function extendWindow(dir) {
   if (extendBusy || !state.queryVars || !state.plans.length) return;
   const v = state.queryVars;
   const deps = state.plans.map(planDeparture);
   const anchor = dir === 'earlier'
-    ? Math.min(...deps) - EXTEND_WINDOW_MIN * 60   // window [earliest - W, earliest)
-    : Math.max(...deps) + 60;                       // window (latest, latest + W]
-  const secs = ((anchor % 86400) + 86400) % 86400;  // wrap next-day back to wall clock
+    ? Math.min(...deps) - EXTEND_WINDOW_MIN * 60
+    : Math.max(...deps) + 60;
+  const secs = ((anchor % 86400) + 86400) % 86400;
   const hh = String(Math.floor(secs / 3600)).padStart(2, '0');
   const mm = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
   const vars = { ...v, time: hh + ':' + mm, windowMinutes: EXTEND_WINDOW_MIN };
 
   extendBusy = true;
-  renderExtendButtons(dir);   // reflect the loading state on the clicked button
+  renderExtendButtons(dir);
   try {
     const data = await gql(QUERY, vars);
     const fresh = data.raptor || [];
     const added = mergePlans(fresh);
-    // No new plans in that direction (empty response or all duplicates) → stop
-    // offering to page further that way.
     if (!added) extendExhausted[dir] = true;
   } catch (err) {
     el('error-msg').textContent = 'Could not extend results: ' + err.message;
@@ -3314,8 +3151,6 @@ async function extendWindow(dir) {
   }
 }
 
-// Show/label/enable the earlier & later buttons around the plan list. `loadingDir`
-// (optional) marks the button currently fetching.
 function renderExtendButtons(loadingDir) {
   const eb = el('extend-earlier'), lb = el('extend-later');
   if (!eb || !lb) return;
@@ -3334,25 +3169,17 @@ function renderExtendButtons(loadingDir) {
   });
 }
 
-// Departures panel for the open transit leg: a compact toggle that, when open,
-// shows the previous departure + the next few (with a headway summary when the
-// service is regular), expandable to the full list, each selectable to re-plan.
 function renderDepartures(leg, planIdx, legIdx) {
   const block = mkEl('div', 'conn-block');
   const key      = planIdx + ':' + legIdx;
-  // Departures are surfaced by default when a leg's connection is shown; the user
-  // may collapse a given panel (tracked in collapsedDeps), and it stays collapsed
-  // until re-opened. This makes prev/next departures discoverable on expand.
   const expanded = !state.collapsedDeps.has(key);
   const cache    = leg.tripId ? state.depCache.get(leg.tripId) : null;
 
-  // Only fetch once the panel is open (collapsed panels do no network work).
   if (expanded && leg.tripId &&
       (!cache || (cache.count < DEFAULT_DEP_COUNT && !cache.loading && !cache.error))) {
     loadDepartures(leg.tripId, DEFAULT_DEP_COUNT);
   }
 
-  // Toggle header.
   const toggle = mkEl('button', 'dep-toggle' + (expanded ? ' open' : ''));
   toggle.appendChild(mkEl('span', 'dep-toggle-lbl', 'Departures'));
   toggle.appendChild(mkChev());
@@ -3380,12 +3207,10 @@ function renderDepartures(leg, planIdx, legIdx) {
     return block;
   }
 
-  // Headway is judged over prev + current + next gaps, so include the used time.
-  const prevSorted = [...prev].sort((a, b) => a.start - b.start);   // ascending
+  const prevSorted = [...prev].sort((a, b) => a.start - b.start);
   const times = [...prevSorted.map(d => d.start), leg.start, ...next.map(d => d.start)];
   const head  = detectHeadway(times);
 
-  // Summary line: regular → "every N minutes (upcoming times, excl. current)".
   const summary = mkEl('div', 'dep-summary');
   if (head.regular) {
     const upcoming = next.map(d => fmtTime(d.start));
@@ -3398,8 +3223,6 @@ function renderDepartures(leg, planIdx, legIdx) {
   }
   block.appendChild(summary);
 
-  // Selectable rows: previous departure, the current (used, not selectable), then
-  // the upcoming ones. Selecting re-plans the journey for that departure.
   const list = mkEl('div', 'dep-list');
   const mkRow = (dep, { current = false } = {}) => {
     const row = mkEl('button', 'dep-opt' + (current ? ' current' : ''));
@@ -3416,15 +3239,11 @@ function renderDepartures(leg, planIdx, legIdx) {
     else row.addEventListener('click', e => { e.stopPropagation(); replanFromDeparture(dep.start); });
     return row;
   };
-  // Regular service already reads as a headway in the summary, so the row list
-  // omits the currently-chosen departure (spec) and just offers the alternatives
-  // to re-plan from. Irregular service lists every time, marking the current one.
   prevSorted.forEach(d => list.appendChild(mkRow(d)));
   if (!head.regular) list.appendChild(mkRow({ start: leg.start }, { current: true }));
   next.forEach(d => list.appendChild(mkRow(d)));
   block.appendChild(list);
 
-  // Grow the window on demand.
   const more = mkEl('button', 'dep-more', 'Show more departures');
   more.disabled = !!cache.loading;
   more.addEventListener('click', e => { e.stopPropagation(); loadDepartures(leg.tripId, cache.count + DEPARTURE_STEP); });
@@ -3477,19 +3296,12 @@ function renderConnection(leg, planIdx, legIdx) {
   return conn;
 }
 
-// ── Trip card ─────────────────────────────────────────────────
-// Which leg's connection detail (incl. its departures panel) is surfaced when a
-// card is expanded. An explicit choice — including an explicit collapse to -1 via
-// a second click on the open leg — is stored in selectedLegIdxMap and honoured.
-// When the user has NOT touched a leg yet (no map entry), default to the FIRST
-// transit leg so departures are discoverable on expand without a manual click.
 function resolveOpenLegIdx(plan, idx) {
   if (state.selectedLegIdxMap.has(idx)) return state.selectedLegIdxMap.get(idx);
   const i = plan.legs.findIndex(l => l.__typename === 'PlanTransitLeg');
   return i;
 }
 
-// Shared leg-click handler used by both ungrouped cards and grouped option rows.
 function buildLegHandler(plan, idx, isOpen, openLegIdx) {
   return (e, clickedLeg) => {
     e.stopPropagation();
@@ -3513,7 +3325,6 @@ function buildLegHandler(plan, idx, isOpen, openLegIdx) {
   };
 }
 
-// The expandable detail panel, shared by cards and option rows.
 function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
   const detail = mkEl('div', 'card-detail');
   detail.addEventListener('click', e => e.stopPropagation());
@@ -3534,9 +3345,6 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
     const connEl = renderConnection(openLeg, idx, openLegIdx);
     if (connEl) detail.appendChild(connEl);
   }
-  // Start-journey CTA — only for plans that actually board transit (a live
-  // refresh has nothing to do for walk/bike/car-only plans). Gated on the live
-  // bridge being ready (deferred module); maaslive:ready re-renders the list.
   if (transitLegsOf(plan).length) {
     const btn = mkEl('button', 'lv-start');
     btn.type = 'button';
@@ -3553,10 +3361,6 @@ function buildPlanDetail(plan, idx, openLegIdx, openLeg, rel) {
   return detail;
 }
 
-// Compact price badge for a plan header. Returns null when fares are disabled
-// (plan.price null). cappedEuros shown as €X.XX; a non-empty unknownOperators
-// list marks the amount a lower bound (adds " + ?" plus a tooltip of the
-// unpriced operators), or just "?" when nothing at all is priced.
 function mkPriceBadge(price) {
   if (!price) return null;
   const unknown = price.unknownOperators || [];
@@ -3582,11 +3386,6 @@ function mkPriceBadge(price) {
   return el;
 }
 
-// ── Fare breakdown popup ──────────────────────────────────────
-// A small dismissable card anchored below a clicked price badge. Renders the
-// price.breakdown "shopping list": each item "<description> .... €<euros>",
-// covered items (coverage != null) as "<description> - covered by <coverage>
-// €0.00", and a Total = cappedEuros. Unpriced operators are noted below.
 function closeFareBreakdown() {
   const pop = el('fb-pop');
   pop.hidden = true; pop.innerHTML = '';
@@ -3639,7 +3438,6 @@ function openFareBreakdown(price, anchor) {
   el('fb-backdrop').classList.add('open');
   pop.hidden = false;
 
-  // Position below the anchor, clamped to the viewport.
   const r = anchor.getBoundingClientRect();
   const pw = pop.offsetWidth, ph = pop.offsetHeight;
   let left = r.left;
@@ -3661,7 +3459,6 @@ function renderTripCard(plan, idx, isOpen) {
   card.id = 'plan-card-' + idx;
   const rel = planReliability(plan);
 
-  // header — departure → arrival, tag, reliability chip
   const head  = mkEl('div', 'rc-head');
   const times = mkEl('div', 'rc-times');
   times.appendChild(mkTimeEl('span', 'big', plan.legs[0]?.start ?? plan.start));
@@ -3682,7 +3479,6 @@ function renderTripCard(plan, idx, isOpen) {
   head.addEventListener('click', () => { if (isOpen) closeCard(); else openCard(idx); });
   card.appendChild(head);
 
-  // folded: when + where the first transit departs (omitted for street-only plans)
   const ft = firstTransitOf(plan);
   if (ft) {
     const { bg, fg } = routeColors(ft.route);
@@ -3702,7 +3498,6 @@ function renderTripCard(plan, idx, isOpen) {
     card.appendChild(row);
   }
 
-  // ribbon
   const openLegIdx = isOpen ? resolveOpenLegIdx(plan, idx) : -1;
   const openLeg    = (isOpen && openLegIdx >= 0) ? plan.legs[openLegIdx] : null;
   const onLeg      = buildLegHandler(plan, idx, isOpen, openLegIdx);
@@ -3721,15 +3516,10 @@ function renderTripCard(plan, idx, isOpen) {
   return card;
 }
 
-// ── Result grouping ───────────────────────────────────────────
 function transitLegsOf(plan) {
   return plan.legs.filter(l => l.__typename === 'PlanTransitLeg');
 }
 
-// Group plans for the current mode. Returns ordered [{ header, indices }].
-// Departure groups share the first boarded vehicle (route+scheduled time+stop);
-// arrival groups share the last alighted vehicle. Direct (no-transit) plans
-// collapse into one "Direct" group on departure, one group each on arrival.
 function groupPlans(plans, mode) {
   if (mode === 'none') {
     return [{ header: null, indices: plans.map((_, i) => i) }];
@@ -3771,9 +3561,6 @@ document.querySelectorAll('#group-toggle button').forEach(btn => {
   btn.addEventListener('click', () => setGrouping(btn.dataset.group));
 });
 
-// One compact, expandable option row inside a group card. The shared time lives
-// in the group header, so each row leads with the *varying* time: where it lands
-// (Leaving-at) or when to leave (Arrival-at).
 function renderOptionRow(plan, idx, mode, pos) {
   const rel    = planReliability(plan);
   const isOpen = idx === state.selectedIdx;
@@ -3810,8 +3597,6 @@ function renderOptionRow(plan, idx, mode, pos) {
   return row;
 }
 
-// A group of plans sharing the same first (Leaving-at) or last (Arrival-at)
-// vehicle, drawn as a bordered card with a prominent shared-time header.
 function renderGroupCard(group, mode, isFirst) {
   const g = group.header;
   const right = mode === 'arrival';
@@ -3847,7 +3632,6 @@ function renderGroupCard(group, mode, isFirst) {
   return card;
 }
 
-// ── Render list ───────────────────────────────────────────────
 function renderList() {
   if (state.picker) { renderExtendButtons(); renderPicker(); return; }
   el('plans-panel').classList.remove('rp-active');
@@ -3901,9 +3685,6 @@ function closeCard() {
   doSyncUrl();
 }
 
-// ── Live (realtime) journey view ──────────────────────────────
-// Thin classic-side controller. Storage + pure ETA/shift logic live in the
-// deferred module bridge (window.MaaSLive); this owns DOM + the poll lifecycle.
 const LIVE_POLL_MS = 20000;
 const LIVE_QUERY = `query Live($legs: [LiveLegInput!]!) {
   liveRefresh(legs: $legs) {
@@ -3913,17 +3694,14 @@ const LIVE_QUERY = `query Live($legs: [LiveLegInput!]!) {
   }
 }`;
 
-// Full transit-leg shape used by the in-realtime departure picker: enough to
-// splice the chosen trip into the live plan (geometry, stops) AND rebuild the
-// poll descriptor (tripId + stop ids). Fetched lazily, once, at select time.
 const DEP_LEG_FIELDS = `
   __typename tripId start end duration scheduledStart scheduledEnd realtime bikesAllowed
   transferRisk { reliability scheduledDeparture nextDeparture nextReliability marginSecs }
   trip { headsign route { shortName longName mode color textColor agency { name } } }
-  from { departure stopId platform node { name lat lon } }
-  to   { arrival   stopId platform node { name lat lon } }
-  geometry { lat lon }
-  steps { ... on PlanTransitLegStep { place { arrival departure platform node { name lat lon } } } }
+  from { departure stopId platform node { name lat lng } }
+  to   { arrival   stopId platform node { name lat lng } }
+  geometry { lat lng }
+  steps { ... on PlanTransitLegStep { place { arrival departure platform node { name lat lng } } } }
 `;
 const LIVE_DEP_QUERY = `query LiveDep(
   $fromLat: Float!, $fromLng: Float!, $toLat: Float!, $toLng: Float!,
@@ -3942,9 +3720,6 @@ const LIVE_DEP_QUERY = `query LiveDep(
     }
   }
 }`;
-// Same-station backups for ONE boarded leg (Card 1 of the live alternatives rail):
-// other trips leaving the same stop and reaching the same downstream stop. Keyed
-// purely by GTFS handle, so it's stable across polls; fetched on demand per leg.
 const STATION_BACKUPS_QUERY = `query Backups(
   $tripId: String!, $boardStopId: String!, $alightStopId: String!,
   $beforeCount: Int, $afterCount: Int, $date: String
@@ -3955,11 +3730,6 @@ const STATION_BACKUPS_QUERY = `query Backups(
     scheduledDeparture scheduledArrival realtimeDeparture realtimeArrival reliability
   }
 }`;
-// Onboard requery for the live alternatives rail (Card 2+ — SWITCH cards): route
-// FROM the rider's CURRENT vehicle (tripId + last-passed/board stop) to the same
-// destination, returning COMPLETE alternative plans (stay-on, alight-and-transfer,
-// alight-and-walk). Reuses PLAN_FRAGMENT so a chosen plan can fully replace the
-// live journey and re-render its spine. Fired lazily, once per boarded leg.
 const LIVE_ONBOARD_QUERY = `query Onboard(
   $tripId: String!, $fromStopId: String,
   $toLat: Float!, $toLng: Float!,
@@ -3973,10 +3743,8 @@ const LIVE_ONBOARD_QUERY = `query Onboard(
 }`;
 const LIVE_VEH_ANIM_MS = 1000;
 
-let liveReady = !!(window.MaaSLive && window.MaaSLive.ready);  // module may have raced ahead
+let liveReady = !!(window.MaaSLive && window.MaaSLive.ready);
 // `live` owns the whole realtime lifecycle. Every entry MUST be torn down on exit
-// (see exitLiveView): timer (poll), animTimer (vehicle), watchId (GPS), the two
-// map markers, and the reparented #map node.
 const live = {
   plan: null, descriptor: null, journeyId: null, queryVars: null,
   timer: null, animTimer: null, watchId: null,
@@ -3985,8 +3753,6 @@ const live = {
   lastRefreshSec: null, pollFails: 0, mapAnchor: null,
 };
 
-// Live-map height anchors (fraction of the live-view content height, i.e. below
-// the .lv-bar): 0 = collapsed, 0.5 = half, 0.9 = near-full. Drag snaps to these.
 const LIVE_MAP_ANCHORS = [0, 0.5, 0.9];
 const LIVE_MAP_ANCHOR_KEY = 'maas.live.mapAnchor';
 function loadMapAnchor() {
@@ -3994,7 +3760,6 @@ function loadMapAnchor() {
   try { const s = localStorage.getItem(LIVE_MAP_ANCHOR_KEY); if (s != null) a = parseFloat(s); } catch (_) {}
   return LIVE_MAP_ANCHORS.includes(a) ? a : 0.5;
 }
-// Available content height = live-view minus the top bar.
 function liveContentHeight() {
   const lv = el('live-view'), bar = lv?.querySelector('.lv-bar');
   if (!lv) return 0;
@@ -4005,8 +3770,6 @@ function scheduleInvalidate() {
   if (mapSizeRaf) return;
   mapSizeRaf = requestAnimationFrame(() => { mapSizeRaf = 0; try { map.invalidateSize(); } catch (_) {} });
 }
-// Apply an anchor (fraction). `animate` lets the CSS height transition run, then
-// invalidates the map once it settles. Persists the chosen anchor.
 function applyMapAnchor(frac, animate) {
   const host = el('lv-map-host');
   if (!host) return;
@@ -4019,12 +3782,11 @@ function applyMapAnchor(frac, animate) {
     let done = false;
     const fin = () => { if (done) return; done = true; host.removeEventListener('transitionend', fin); scheduleInvalidate(); };
     host.addEventListener('transitionend', fin);
-    setTimeout(fin, 320);   // fallback when height is unchanged (no transitionend)
+    setTimeout(fin, 320);
   } else {
     scheduleInvalidate();
   }
 }
-// Pointer-driven resize: drag the grabber, snap to the nearest anchor on release.
 function setupMapDrag() {
   const grab = el('lv-grab'), host = el('lv-map-host');
   if (!grab || !host) return;
@@ -4061,18 +3823,12 @@ function setupMapDrag() {
 let liveAutoResumeTried = false;
 window.addEventListener('maaslive:ready', () => {
   liveReady = true;
-  if (state.selectedIdx >= 0 && !state.picker) renderList();  // enable Start buttons
-  // A reload of a `?live=<id>` URL auto-resumes the stored journey; otherwise just
-  // surface the resume banner for a persisted active journey from a previous load.
+  if (state.selectedIdx >= 0 && !state.picker) renderList();
   if (!tryAutoResumeLive()) maybeShowResume();
 });
 
-// If the URL carries `live=<journeyId>` and the bridge still has that exact stored
-// journey (persistent OPFS store), re-enter the live view automatically — same path
-// as the resume banner. Degrades to false (banner/planner) when the store is the
-// in-memory fallback (getJourney null after reload) or the id no longer matches.
 function tryAutoResumeLive() {
-  if (liveAutoResumeTried) return false;   // guard against re-entry loops
+  if (liveAutoResumeTried) return false;
   liveAutoResumeTried = true;
   if (!el('live-view').hidden) return false;
   const wantId = readUrl().get('live');
@@ -4099,7 +3855,7 @@ function startJourney(plan) {
   const dest   = (toSearch.getName && toSearch.getName()) || plan.legs[plan.legs.length - 1]?.to?.node?.name || 'Destination';
   const id = 'j:' + descriptor.legs.map(l => l.tripId).join('|') + ':' + plan.start;
   live.journeyId = id;
-  live.queryVars = state.queryVars;     // for the lazy departure-alternatives fetch
+  live.queryVars = state.queryVars;
   try {
     window.MaaSLive.saveJourney({
       id, payload: { plan, descriptor, queryVars: live.queryVars },
@@ -4111,8 +3867,8 @@ function startJourney(plan) {
 }
 
 function enterLiveView(plan, descriptor, origin, dest) {
-  stopLivePoll();                       // kill any prior journey's interval first
-  teardownLiveOverlays();               // markers/watch/anim from a prior journey
+  stopLivePoll();
+  teardownLiveOverlays();
   live.plan = plan;
   live.descriptor = descriptor;
   live.viewLegs = plan.legs;
@@ -4122,7 +3878,7 @@ function enterLiveView(plan, descriptor, origin, dest) {
   live.pollFails = 0;
   el('lv-fresh').textContent = '';
   el('lv-fresh').classList.remove('stale');
-  el('lv-resume').hidden = true;   // hide the planner banner while the journey is live
+  el('lv-resume').hidden = true;
   el('lv-origin').textContent = origin;
   el('lv-dest').textContent   = dest;
   el('lv-status').className = 'lv-status';
@@ -4133,13 +3889,13 @@ function enterLiveView(plan, descriptor, origin, dest) {
   el('lv-hist').hidden = true;
   renderLiveSpine(plan.legs);
   el('live-view').hidden = false;
-  setLiveUrlParam(live.journeyId);   // F5 on this URL auto-resumes the live view
+  setLiveUrlParam(live.journeyId);
   attachLiveMap();
   applyMapAnchor(live.mapAnchor != null ? live.mapAnchor : loadMapAnchor(), false);
   startGpsWatch();
   updateNetBadge();
-  enrichDepartures();                   // background: fetch swap-able departures
-  pollLive();                           // immediate first paint
+  enrichDepartures();
+  pollLive();
   if (navigator.onLine) live.timer = setInterval(pollLive, LIVE_POLL_MS);
   live.animTimer = setInterval(animateVehicle, LIVE_VEH_ANIM_MS);
 }
@@ -4148,8 +3904,6 @@ function exitLiveView() {
   stopLivePoll();
   teardownLiveOverlays();
   detachLiveMap();
-  // Drop the persisted active journey so no orphaned status:'active' row lingers
-  // (history is untouched — clearJourney only removes the active row).
   try { window.MaaSLive?.clearJourney(); } catch (err) { console.warn('clearJourney failed', err); }
   live.plan = null;
   live.descriptor = null;
@@ -4162,7 +3916,7 @@ function exitLiveView() {
   el('lv-sheet').hidden = true;
   el('lv-hist').hidden = true;
   el('live-view').hidden = true;
-  setLiveUrlParam(null);   // so a later reload doesn't re-enter the live view
+  setLiveUrlParam(null);
   maybeShowResume();
 }
 
@@ -4170,8 +3924,6 @@ function stopLivePoll() {
   if (live.timer) { clearInterval(live.timer); live.timer = null; }
 }
 
-// Clear every non-poll realtime overlay: vehicle marker, GPS marker+watch, and
-// the per-second animation timer. Idempotent — safe to call on plan-change too.
 function teardownLiveOverlays() {
   if (live.animTimer) { clearInterval(live.animTimer); live.animTimer = null; }
   if (live.watchId != null && navigator.geolocation) {
@@ -4182,9 +3934,6 @@ function teardownLiveOverlays() {
   if (live.gpsMarker) { map.removeLayer(live.gpsMarker); live.gpsMarker = null; }
 }
 
-// Reuse the SINGLE planner Leaflet map by reparenting its #map node into the
-// live overlay (the selected plan's polylines are already drawn on it). The
-// original parent/sibling are stashed so detach restores the planner layout.
 function attachLiveMap() {
   const m = el('map'), host = el('lv-map-host');
   if (!m || !host || m.parentNode === host) return;
@@ -4219,15 +3968,12 @@ function startGpsWatch() {
           zIndexOffset: 1000,
         }).addTo(map).bindTooltip('You');
       },
-      () => {},   // permission denied / unavailable — silently omit the dot
+      () => {},
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
     );
-  } catch (_) { /* geolocation unavailable */ }
+  } catch (_) {}
 }
 
-// Place / move the ESTIMATED vehicle marker on the currently-boarded leg. Phase 1
-// has no VehiclePosition feed, so this is interpolated from the realtime window —
-// styled with a dashed ring + "~" so it never reads as a true GPS fix.
 function animateVehicle() {
   const L = window.MaaSLive?.logic;
   if (!L || !live.plan || el('live-view').hidden) return;
@@ -4239,7 +3985,7 @@ function animateVehicle() {
   }
   const leg = active.leg;
   const seg = {
-    points: leg.geometry.map(p => ({ lat: p.lat, lng: p.lon })),
+    points: leg.geometry.map(p => ({ lat: p.lat, lng: p.lng })),
     tPrev: leg.start, tNext: leg.end,
   };
   const interpolated = L.interpolatePosition(seg, nowSecOfDay());
@@ -4268,12 +4014,6 @@ function makeVehicleIcon(color, real) {
   });
 }
 
-// Render the active journey as an EXPANDED planner plan card so the live view
-// shares the Plans UI chrome: `.pd-root` (remaps --ds-* → --bg/--surface/--ink,
-// which the ribbon + itinerary need), a `.rc` header (departure → realtime
-// arrival + reliability), the line-badge ribbon, and the boxed `.card-detail`
-// itinerary. No "Start journey" CTA (already en route) and no collapse toggle
-// (one plan, always open). `liveOnLeg` keeps the in-trip edit picker working.
 function renderLiveSpine(legs, endSec) {
   const spine = el('lv-spine');
   spine.replaceChildren();
@@ -4283,7 +4023,6 @@ function renderLiveSpine(legs, endSec) {
   const root = mkEl('div', 'pd-root');
   const card = mkEl('div', 'rc best lv-card');
 
-  // header — departure → realtime arrival, LIVE eyebrow, reliability bead
   const head  = mkEl('div', 'rc-head lv-rc-head');
   const times = mkEl('div', 'rc-times');
   times.appendChild(mkTimeEl('span', 'big', legs[0]?.start ?? view.start));
@@ -4300,7 +4039,6 @@ function renderLiveSpine(legs, endSec) {
   }
   card.appendChild(head);
 
-  // folded: where + when the first transit departs (matches planner card)
   const ft = firstTransitOf(view);
   if (ft) {
     const { bg, fg } = routeColors(ft.route);
@@ -4320,12 +4058,10 @@ function renderLiveSpine(legs, endSec) {
     card.appendChild(row);
   }
 
-  // ribbon (line badges + summary), identical to the planner card
   const ribWrap = mkEl('div', 'rc-ribbon');
   ribWrap.appendChild(renderRibbon(view, null, liveOnLeg));
   card.appendChild(ribWrap);
 
-  // boxed itinerary spine — sentinel idx avoids openStops collision with plan cards
   const detail = mkEl('div', 'card-detail');
   detail.appendChild(buildItinerary(view, 999000, liveOnLeg, { live: true, rerender: () => renderLiveSpine(legs, end) }));
   card.appendChild(detail);
@@ -4334,13 +4070,9 @@ function renderLiveSpine(legs, endSec) {
   spine.appendChild(root);
 }
 
-// In-realtime edit entry point, shared with buildItinerary's onLeg hook. Walk/bike
-// legs with stored alternatives, or any transit leg, open the live edit sheet.
 function liveOnLeg(e, clickedLeg) {
   e.stopPropagation();
   if (!live.plan) return;
-  // The spine renders view-leg COPIES (applyRealtime output); map the click back
-  // to the pristine plan leg by position (1:1 with the view legs).
   const idx = (live.viewLegs || live.plan.legs).indexOf(clickedLeg);
   if (idx < 0) return;
   const pristine = live.plan.legs[idx];
@@ -4364,17 +4096,15 @@ async function pollLive() {
     return;
   }
   const lr = data?.liveRefresh;
-  if (!lr) {                            // parsed but empty — a silent failure
+  if (!lr) {
     if (live.plan) { live.pollFails++; updateFreshness(); }
     return;
   }
-  if (!live.plan) return;              // exited mid-flight
+  if (!live.plan) return;
   live.pollFails = 0;
-  live.lastRefreshSec = nowSecOfDay(); // freshness stamp: successful refresh only
+  live.lastRefreshSec = nowSecOfDay();
   const isT = l => l.__typename === 'PlanTransitLeg';
   const { legs, arrival } = L.applyRealtime(live.plan.legs, lr, isT);
-  // Baseline (select-time) vs live reliability, per interior transfer. Attach the
-  // at-risk row to the arriving transit leg so the spine renders it inline.
   live.riskRows = L.transferRiskRows(transitLegsOf(live.plan), lr.transfers);
   const transitView = legs.filter(isT);
   legs.forEach(l => { if (isT(l)) l._liveRisk = null; });
@@ -4385,7 +4115,7 @@ async function pollLive() {
   });
   live.viewLegs = legs;
   const headEta = arrival != null ? arrival : (L.etaFromLegs(lr.legs) ?? live.plan.end);
-  renderLiveSpine(legs, headEta);   // card header + bar ETA share one number
+  renderLiveSpine(legs, headEta);
   el('lv-eta').textContent = L.secOfDayToHHMM(headEta);
   updateLiveStatus(legs, lr);
   updateFreshness();
@@ -4393,9 +4123,6 @@ async function pollLive() {
   maybeComplete(arrival);
 }
 
-// "Updated HH:MM" freshness cue in the live bar, fed by the last SUCCESSFUL poll.
-// Dims + appends "reconnecting" once polls have failed N times while still online,
-// so a silent refresh failure can't keep masquerading as fresh.
 function updateFreshness() {
   const f = el('lv-fresh');
   if (!f) return;
@@ -4435,8 +4162,6 @@ function updateLiveStatus(legs, lr) {
   }
 }
 
-// Connection-risk signal: any interior transfer whose live reliability fell ≥50%
-// below its select-time baseline (computed once in pollLive via transferRiskRows).
 function riskyTransfer() {
   return (live.riskRows || []).some(r => r.atRisk);
 }
@@ -4452,9 +4177,7 @@ function maybeComplete(arrival) {
     el('lv-status').className = 'lv-status ontime';
     el('lv-status').textContent = 'Journey complete';
     stopLivePoll();
-    teardownLiveOverlays();   // stop the vehicle animation + GPS watch; map stays
-    // The journey is done — drop the active row (history survives) so it can't
-    // resume later or pile up as an orphan.
+    teardownLiveOverlays();
     try { window.MaaSLive?.clearJourney(); } catch (err) { console.warn('clearJourney failed', err); }
   }
 }
@@ -4465,17 +4188,11 @@ function updateNetBadge() {
   else { n.classList.add('off'); n.textContent = '○'; n.title = 'Offline — polling paused'; }
 }
 
-// Record a user-initiated change as a durable (or in-session) change_event.
-// NEVER called on poll ticks — only on real edits.
 function recordLiveEvent(kind, summary, payload) {
   try { window.MaaSLive?.appendEvent({ journeyId: live.journeyId, kind, summary, payload: payload ?? null }); }
   catch (err) { console.warn('appendEvent failed', err); }
 }
 
-// ── In-realtime edits ─────────────────────────────────────────
-// Lazy, one-shot fetch of earlier/later departures for each boarded leg, keyed
-// by tripId so a leg can be matched regardless of plan order. Uses the journey's
-// ORIGINAL queryVars so the result is consistent with the selected plan.
 async function enrichDepartures() {
   if (!live.queryVars || live.depsReady) return;
   const v = live.queryVars;
@@ -4487,7 +4204,7 @@ async function enrichDepartures() {
       walkRadiusSecs: v.walkRadiusSecs, modes: v.modes,
     });
   } catch (err) { console.warn('departure enrichment failed', err); live.depsReady = true; return; }
-  if (!live.plan) return;               // exited mid-flight
+  if (!live.plan) return;
   const byTrip = new Map();
   (data?.raptor || []).forEach(p => (p.legs || []).forEach(l => {
     if (l && l.tripId && !byTrip.has(l.tripId)) {
@@ -4518,9 +4235,6 @@ function liveSheetShell(title, sub) {
   return card;
 }
 
-// Swap a transit leg to an earlier/later departure. On confirm: splice the chosen
-// trip into the live plan, rebuild the poll descriptor (applyDepartureChange),
-// record a change_event, and re-poll with the UPDATED descriptor.
 function openLiveDepartureEdit(leg) {
   const transit = transitLegsOf(live.plan);
   const ti = transit.indexOf(leg);
@@ -4567,13 +4281,9 @@ function confirmDepartureChange(transitIndex, chosen, oldLeg) {
   closeLiveSheet();
   renderLiveSpine(live.plan.legs);
   if (state.selectedIdx >= 0) renderAllPlansOnMap();
-  pollLive();                           // re-poll with the new descriptor
+  pollLive();
 }
 
-// ── Live alternatives rail (Card 1 — same-station backups) ────
-// Card 1 keeps the main plan and only sets a NET: selecting a backup row never
-// replaces the boarded leg, it records a fallback you can lean on if you miss it.
-// Switch cards (Card 2+) instead REPLACE the whole plan with a reroute on confirm.
 function mkBackupChip(model) {
   const chip = mkEl('span', 'lv-bk-chip');
   chip.dataset.rel = model.relClass || 'none';
@@ -4583,7 +4293,6 @@ function mkBackupChip(model) {
   return chip;
 }
 
-// Lazy, per-leg fetch of same-station backups (cached on the pristine leg).
 async function fetchBackups(leg) {
   if (leg._backups) return;
   const L = window.MaaSLive?.logic;
@@ -4603,8 +4312,6 @@ async function fetchBackups(leg) {
   }
 }
 
-// Open the rail for a boarded leg. Maps the clicked VIEW leg back to its pristine
-// plan leg (so the chosen backup persists across re-renders/polls).
 function openAlternativesRail(viewLeg) {
   if (!live.plan) return;
   const L = window.MaaSLive?.logic;
@@ -4620,7 +4327,7 @@ function openAlternativesRail(viewLeg) {
   liveSheetShell('Alternatives', 'Set a backup at ' + boardName + ' if you miss it, or reroute onto a different route. Your call.');
   el('lv-sheet-card').appendChild(mkEl('div', 'lv-sheet-sub', 'Loading backups…'));
   fetchBackups(leg).then(() => {
-    if (el('lv-sheet').hidden || !live.plan) return;       // closed / exited mid-flight
+    if (el('lv-sheet').hidden || !live.plan) return;
     if (live.plan.legs.indexOf(leg) < 0) return;
     renderAlternativesRail(leg, boardName, mainLine);
   });
@@ -4631,7 +4338,6 @@ function renderAlternativesRail(leg, boardName, mainLine) {
   const card = liveSheetShell('Alternatives', 'Set a backup at ' + boardName + ' if you miss it, or reroute onto a different route. Your call.');
   const rail = mkEl('div', 'lv-rail');
 
-  // Card 1 — your plan + backup rows.
   const c1 = mkEl('div', 'lv-railcard keep');
   const hd = mkEl('div', 'lv-rc-hd');
   const sh = mkEl('span', 'ic'); sh.appendChild(mkShieldIcon(14)); hd.appendChild(sh);
@@ -4639,7 +4345,6 @@ function renderAlternativesRail(leg, boardName, mainLine) {
   hd.appendChild(mkEl('span', 'sub', 'your plan'));
   c1.appendChild(hd);
 
-  // Kept main row (the leg you're boarding) — never replaced by a backup pick.
   const route = leg.trip?.route; const { bg, fg } = routeColors(route);
   const keep = mkEl('div', 'lv-keep-row');
   const kb = mkEl('span', 'lv-bk-badge', mainLine); kb.style.background = bg; kb.style.color = fg; keep.appendChild(kb);
@@ -4688,12 +4393,9 @@ function renderAlternativesRail(leg, boardName, mainLine) {
   });
   rail.appendChild(c1);
 
-  // Card 2+ — SWITCH alternatives, powered by the onboard requery. Fetched lazily
-  // on first open; selecting one is the ONLY action that replaces the live plan.
   appendSwitchCards(rail, leg, boardName, mainLine);
   card.appendChild(rail);
 
-  // Lock action — reflects keep + chosen net.
   const sel = live._railSel != null ? backups[live._railSel] : null;
   const confirm = mkEl('button', 'lv-bk-confirm');
   confirm.textContent = L.backupConfirmLabel(mainLine, sel);
@@ -4705,7 +4407,7 @@ function renderAlternativesRail(leg, boardName, mainLine) {
 function confirmBackup(leg, model, boardName, mainLine) {
   const L = window.MaaSLive?.logic;
   if (!L || !live.plan) return;
-  leg._backup = model;                    // pristine leg → survives re-render/poll
+  leg._backup = model;
   recordLiveEvent('backup_set', L.backupSummary(boardName, mainLine, model),
     { tripId: leg.tripId, boardStopId: model.boardStopId, backupTripId: model.tripId, dep: model.depSec });
   persistLiveJourney();
@@ -4713,10 +4415,6 @@ function confirmBackup(leg, model, boardName, mainLine) {
   renderLiveSpine(live.plan.legs);
 }
 
-// ── Live alternatives rail (Card 2+ — switch alternatives) ────
-// Lazy onboard requery: from the boarded leg's trip + board stop to the journey
-// destination. Deduped against the journey's transit suffix from this leg onward
-// (so the stay-on plan is excluded). Cached on the pristine leg.
 async function fetchSwitchAlternatives(leg) {
   if (leg._switches !== undefined) return;
   const L = window.MaaSLive?.logic;
@@ -4728,7 +4426,7 @@ async function fetchSwitchAlternatives(leg) {
       toLat: v.toLat, toLng: v.toLng, date: v.date || null, time: v.time || null,
       walkRadiusSecs: v.walkRadiusSecs, fareProfile: fareProfileVar(),
     });
-    if (!live.plan) return;               // exited mid-flight
+    if (!live.plan) return;
     const onward = transitLegsOf(live.plan).slice(transitLegsOf(live.plan).indexOf(leg)).map(l => l.tripId);
     leg._switches = L.dedupeSwitchPlans(data?.onboardRaptor || [], onward);
   } catch (err) {
@@ -4737,8 +4435,6 @@ async function fetchSwitchAlternatives(leg) {
   }
 }
 
-// Append the switch area to the rail: a loading peek (and kick off the fetch), a
-// quiet empty state, or one card per distinct alternative plan.
 function appendSwitchCards(rail, leg, boardName, mainLine) {
   const L = window.MaaSLive?.logic;
   if (!L) return;
@@ -4803,8 +4499,6 @@ function appendSwitchCards(rail, leg, boardName, mainLine) {
   });
 }
 
-// Selecting a switch card → a DIMMED preview of the alternative's full spine plus a
-// primary confirm. Replaces the rail view in the sheet; "Back" returns to the rail.
 function selectSwitch(leg, idx, boardName, mainLine) {
   const L = window.MaaSLive?.logic;
   const plan = (leg._switches || [])[idx];
@@ -4832,9 +4526,6 @@ function selectSwitch(leg, idx, boardName, mainLine) {
   card.appendChild(confirm);
 }
 
-// Confirm a switch → REPLACE the live journey with the chosen alternative: swap the
-// plan + descriptor, refresh the app-bar ETA + spine, restart polling against the
-// new descriptor, and record a 'switch' change_event. Destination is unchanged.
 function confirmSwitch(plan, model, boardName) {
   const L = window.MaaSLive?.logic;
   if (!L || !live.plan) return;
@@ -4857,12 +4548,9 @@ function confirmSwitch(plan, model, boardName) {
   renderLiveSpine(plan.legs);
   if (state.selectedIdx >= 0) renderAllPlansOnMap();
   enrichDepartures();
-  pollLive();                             // re-poll with the new descriptor
+  pollLive();
 }
 
-// Swap a walk/bike leg to one of its stored Pareto alternatives. Geometry+timing
-// recompute mirrors the planner's commitPicker; descriptor is unchanged (walk legs
-// aren't polled), so this records an event and re-renders without touching the poll.
 function openLiveWalkEdit(legPos) {
   const leg = live.plan.legs[legPos];
   if (!leg || !(leg.alternatives?.length >= 2)) return;
@@ -4904,9 +4592,6 @@ function confirmWalkChange(legPos, altIdx, isEgress) {
   if (state.selectedIdx >= 0) renderAllPlansOnMap();
 }
 
-// Persist the (edited) journey so a reload resumes the new plan. Passed
-// { logSelect: false } so it does NOT append a generic 'select' history row —
-// the edit (departure_change / walk_bike_change) already logged its own event.
 function persistLiveJourney() {
   if (!window.MaaSLive || !live.plan) return;
   try {
@@ -4919,9 +4604,6 @@ function persistLiveJourney() {
   } catch (err) { console.warn('persistLiveJourney failed', err); }
 }
 
-// ── Resume a persisted active journey ─────────────────────────
-// On load (after the bridge is ready) a non-intrusive planner banner offers to
-// re-enter the Live view reconstructed from the stored payload — never auto-enters.
 function maybeShowResume() {
   const banner = el('lv-resume');
   if (!banner) return;
@@ -4952,7 +4634,6 @@ function resumeLiveJourney(j) {
   );
 }
 
-// ── Journey history ───────────────────────────────────────────
 function openLiveHistory() {
   const listEl = el('lv-hist-list');
   listEl.replaceChildren();
@@ -5001,7 +4682,6 @@ window.addEventListener('online', () => {
   }
 });
 
-// ── Trip drill-down modal ─────────────────────────────────────
 function openTripModal(leg) {
   const route    = leg.trip?.route;
   const { bg, fg } = routeColors(route);
@@ -5024,7 +4704,7 @@ function openTripModal(leg) {
     row.appendChild(mkTimeEl('span', 't', isFirst ? s.departure : s.arrival));
     const n = mkEl('span', 'n', s.name || '—');
     if (s.platform) n.appendChild(mkEl('span', 'it-platform it-platform--mid', 'Pl. ' + s.platform));
-    n.addEventListener('click', () => { if (s.lat != null && s.lon != null) map.setView([s.lat, s.lon], 16); });
+    n.addEventListener('click', () => { if (s.lat != null && s.lng != null) map.setView([s.lat, s.lng], 16); });
     row.appendChild(n);
     stopsEl.appendChild(row);
   });
@@ -5040,16 +4720,14 @@ el('trip-modal').addEventListener('click', e => {
   if (e.target === el('trip-modal')) el('trip-modal').classList.remove('open');
 });
 
-// ── Map rendering ─────────────────────────────────────────────
 function clearLegLayers() {
   state.legLayers.forEach(l => map.removeLayer(l));
   state.legLayers = [];
 }
 
 function geomKey(geom) {
-  // Compact key for deduplication — first+last+length is fast and sufficient.
   const f = geom[0], l = geom[geom.length - 1];
-  return `${f.lat},${f.lon}|${l.lat},${l.lon}|${geom.length}`;
+  return `${f.lat},${f.lng}|${l.lat},${l.lng}|${geom.length}`;
 }
 
 function renderAllPlansOnMap() {
@@ -5058,9 +4736,8 @@ function renderAllPlansOnMap() {
 
   const selIdx = state.selectedIdx;
   const allPts = [];
-  const drawnGray = new Map(); // key -> plan idx (first/best match)
+  const drawnGray = new Map();
 
-  // Gray pass — all non-selected plans (deduplicated by geometry key)
   state.plans.forEach((plan, idx) => {
     if (idx === selIdx) return;
     plan.legs.forEach(leg => {
@@ -5069,7 +4746,7 @@ function renderAllPlansOnMap() {
       const key = geomKey(geom);
       if (drawnGray.has(key)) return;
       drawnGray.set(key, idx);
-      const pts = geom.map(p => [p.lat, p.lon]);
+      const pts = geom.map(p => [p.lat, p.lng]);
       if (selIdx < 0) allPts.push(...pts);
       const isTransit = leg.__typename === 'PlanTransitLeg';
       const poly = L.polyline(pts, {
@@ -5081,13 +4758,12 @@ function renderAllPlansOnMap() {
     });
   });
 
-  // Colored pass — selected plan on top
   if (selIdx >= 0) {
     const plan = state.plans[selIdx];
     plan.legs.forEach(leg => {
       const geom = leg.geometry;
       if (!geom?.length) return;
-      const pts = geom.map(p => [p.lat, p.lon]);
+      const pts = geom.map(p => [p.lat, p.lng]);
       allPts.push(...pts);
       const isTransit = leg.__typename === 'PlanTransitLeg';
       const isBike = !isTransit && leg.streetMode === 'BIKE';
@@ -5098,9 +4774,6 @@ function renderAllPlansOnMap() {
         color, weight: isTransit ? 5 : (isBike || isCar ? 4 : 3), opacity: 0.9,
         dashArray: isTransit ? null : (isBike || isCar ? '2,8' : '5,6'),
       }).addTo(map));
-      // Overlay dismount (push) stretches of a bike leg distinctly. A selected
-      // alternative carries its push ranges in `_dismountRuns` (the default route's
-      // are in `steps`), so the orange follows whichever route is on the map.
       if (isBike) {
         const runs = leg._dismountRuns
           ? leg._dismountRuns.map(r => [r.start, r.end])
@@ -5116,9 +4789,9 @@ function renderAllPlansOnMap() {
       }
       if (isTransit && leg.from?.node && leg.to?.node) {
         state.legLayers.push(
-          L.marker([leg.from.node.lat, leg.from.node.lon], { icon: makeStopDot(color) })
+          L.marker([leg.from.node.lat, leg.from.node.lng], { icon: makeStopDot(color) })
             .addTo(map).bindTooltip(leg.from.node.name),
-          L.marker([leg.to.node.lat, leg.to.node.lon], { icon: makeStopDot(color) })
+          L.marker([leg.to.node.lat, leg.to.node.lng], { icon: makeStopDot(color) })
             .addTo(map).bindTooltip(leg.to.node.name),
         );
       }
@@ -5132,16 +4805,6 @@ function renderPlanOnMap(_idx) {
   renderAllPlansOnMap();
 }
 
-// ── Per-leg route picker ──────────────────────────────────────
-// A panel-takeover that lets a user compare a walk/bike leg's Pareto
-// alternatives across objectives, preview on the map, and commit one back into
-// the plan. Bike legs are scalar today (no alternatives) so this fires for walk;
-// the column set is mode-parametrized for when bike enrichment lands. All values
-// are real figures derived from the leg's LegOption[] — never a server label.
-// `cost` is the raw objective (fine-grained, used only for the sort dropdown).
-// `disp` is the displayed value as an integer (lower = better) — the exact
-// granularity the user reads. Tile colour and the "best" label compare `disp`,
-// so two routes that READ identical share a colour and both earn "best".
 const _pct = (a, b) => (a || 0) / (b || 1);
 const RP_OBJ = {
   time:     { head: 'Time',     cost: o => o.p50,                 disp: o => Math.round(o.p50 / 60),
@@ -5161,7 +4824,6 @@ const RP_OBJ = {
               disp: o => -Math.round(_pct(o.cyclerouteLength, o.length) * 100),
               val: o => Math.round(_pct(o.cyclerouteLength, o.length) * 100) + '%', tag: 'Most bike lanes',
               grade: o => Math.min(1, _pct(o.cyclerouteLength, o.length) / 0.75) },
-  // Reliability = the p50→p95 spread (seconds), shown as a ± band in minutes.
   variance: { head: 'Reliable', cost: o => o.p95 - o.p50,         disp: o => Math.round((o.p95 - o.p50) / 60),
               val: o => { const m = Math.round((o.p95 - o.p50) / 60); return '±' + (o.p95 > o.p50 && m === 0 ? '<1' : m) + ' min'; },
               tag: 'Steadiest', grade: o => 1 - Math.min(1, ((o.p95 - o.p50) / 60) / 8) },
@@ -5185,9 +4847,6 @@ function rpRamp(t, lo, mid, hi) {
 const rpGradeBg = t => rpRamp(t, 'var(--ds-rel-low-soft)', 'var(--ds-rel-mid-soft)', 'var(--ds-rel-high-soft)');
 const rpGradeFg = t => rpRamp(t, 'var(--ds-rel-low)', 'var(--ds-rel-mid)', 'var(--ds-rel-high)');
 
-// Normalize the option set on each objective → per-cell 0–1 goodness + best/worst
-// flags. Ranges/colours/best use `disp` (the displayed integer), so equal displayed
-// values colour alike and share the "best" label.
 function rpNormalize(opts, keys) {
   const ranges = {};
   keys.forEach(k => { const cs = opts.map(o => RP_OBJ[k].disp(o)); ranges[k] = { min: Math.min(...cs), max: Math.max(...cs) }; });
@@ -5208,8 +4867,6 @@ function rpNormalize(opts, keys) {
   });
 }
 
-// Curate: each objective's corner (min-cost) + the maximin all-rounder (best worst
-// axis). These are the genuinely DIFFERENT routes; the rest fold under the expander.
 function rpCurate(norm, keys) {
   const tagOf = {};
   const cornerOf = k => { let bi = 0; norm.forEach((n, i) => { if (n.cells[k].cost < norm[bi].cells[k].cost) bi = i; }); return bi; };
@@ -5249,8 +4906,6 @@ function closePicker() {
   renderAllPlansOnMap();
 }
 
-// Write the chosen alternative back into the leg (client-side; geometry is already
-// in hand, no refetch). Idempotent: timings recompute from the captured originals.
 function commitPicker() {
   const p = state.picker; if (!p) return;
   const plan = state.plans[p.planIdx], leg = plan.legs[p.legIdx], o = p.norm[p.sel].o;
@@ -5260,14 +4915,10 @@ function commitPicker() {
   leg.cyclerouteLength = o.cyclerouteLength;
   leg.elevationGain = o.elevationGain;
   if (p.legIdx === plan.legs.length - 1) {
-    // Direct / egress leg: anchored at its start; arrival and the plan's end
-    // shift by the change in walk duration.
     leg.start = p.origLegStart;
     leg.end = p.origLegStart + o.p50;
     plan.end = p.origPlanEnd + (o.p50 - p.origLegDur);
   } else {
-    // Access leg: anchored at the (fixed) boarding time; the leave time moves
-    // instead. If it is the first leg, that leave time is the plan's start.
     leg.end = p.origLegEnd;
     leg.start = p.origLegEnd - o.p50;
     if (p.legIdx === 0) plan.start = leg.start;
@@ -5370,15 +5021,11 @@ function renderPicker() {
   });
 }
 
-// Map for the active picker: three polyline styles (faint alternatives, dashed
-// hover ghost, solid selected) + fit to the leg's alternatives.
-// `fit` re-frames the map to all alternatives — done only when the picker first
-// opens, not on every hover/select re-render.
 function renderPickerMap(fit) {
   clearLegLayers();
   const p = state.picker; if (!p) return;
   const accent = rpVar('--ds-accent'), other = rpVar('--ds-ink-3');
-  const pts = g => g.map(c => [c.lat, c.lon]);
+  const pts = g => g.map(c => [c.lat, c.lng]);
   const clickable = (poly, i) => {
     poly.on('click', () => { p.sel = i; renderPicker(); renderPickerMap(); });
     state.legLayers.push(poly);
@@ -5398,7 +5045,6 @@ function renderPickerMap(fit) {
   }
 }
 
-// ── Keyboard ──────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.target.matches('input, select, textarea')) return;
   if (e.key === '/') { e.preventDefault(); fromSearch.el.focus(); return; }
@@ -5425,18 +5071,12 @@ document.addEventListener('keydown', e => {
   }
 });
 
-// ── Bootstrap ─────────────────────────────────────────────────
 loadFromUrl();
 fillDateTimeIfEmpty();
 doSyncUrl();
 const _p = readUrl();
 if (_p.has('fromLat') && _p.has('toLat')) runQuery();
 
-// ── Share view (QR code + copyable link) ──────────────────────
-// The URL is already kept in sync with app state on every change (doSyncUrl),
-// so location.href round-trips the current view via loadFromUrl on the target
-// device. We re-sync once on open to catch any not-yet-flushed control state.
-// The QR is rendered fully client-side (window.QRCode, no network).
 (function () {
   const btn = el('share-btn');
   const modal = el('share-modal');
@@ -5481,7 +5121,7 @@ if (_p.has('fromLat') && _p.has('toLat')) runQuery();
         await navigator.clipboard.writeText(text);
         ok = true;
       }
-    } catch (_) { /* fall through to legacy path */ }
+    } catch (_) {}
     if (!ok) {
       urlInput.focus();
       urlInput.select();
@@ -5497,7 +5137,6 @@ if (_p.has('fromLat') && _p.has('toLat')) runQuery();
   });
 }());
 
-// ── PWA: service worker + install affordance ───────────────────
 (function () {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
 

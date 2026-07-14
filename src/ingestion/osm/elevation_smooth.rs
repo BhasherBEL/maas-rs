@@ -1,21 +1,9 @@
-//! Ingestion-time elevation denoising for way profiles.
-//!
-//! A ~20 m DTM carries ±1–3 m of sub-resolution noise on flat ground, which
-//! makes phantom-climb routes win the min-D+ Pareto axis. We denoise ONCE here,
-//! per way, so each segment carries a stable, additive, noise-free ascent.
-//!
-//! The core is Ramer–Douglas–Peucker on the (cumulative-distance, elevation)
-//! profile with a vertical epsilon (default 4 m, config-driven), mirroring
-//! GraphHopper's `ramer`/`max_elevation`. Endpoints and any vertex deviating
-//! more than ε from the simplified line are retained; every original node is then
-//! assigned a smoothed elevation by linear interpolation along the retained
-//! polyline. Per-segment deltas derived from the smoothed elevations telescope to
-//! `smoothed(last) − smoothed(first)`, so additivity along the way is preserved.
+//! Ingestion-time elevation denoising for way profiles via Ramer-Douglas-Peucker
+//! on the (cumulative-distance, elevation) profile. Per-segment deltas telescope
+//! to `smoothed(last) − smoothed(first)`, so additivity along the way is preserved.
 
-/// Smooth a way's elevation profile and return a smoothed elevation per input
-/// node. `points` is `(cumulative_distance_m, elevation_m)` for each node in
-/// order; `epsilon` is the RDP vertical tolerance in meters. The first and last
-/// elevations are always preserved exactly.
+// `points` is `(cumulative_distance_m, elevation_m)` per node in order; `epsilon`
+// is the RDP vertical tolerance in meters. First/last elevations preserved exactly.
 pub fn smooth_profile(points: &[(f64, f64)], epsilon: f64) -> Vec<f64> {
     let n = points.len();
     if n <= 2 || epsilon <= 0.0 {
@@ -41,9 +29,8 @@ pub fn smooth_profile(points: &[(f64, f64)], epsilon: f64) -> Vec<f64> {
     out
 }
 
-/// Linear-interpolation profile for bridges/tunnels: every node gets the
-/// straight end-to-end elevation by distance, ignoring intermediate DEM samples
-/// (DTMs read the valley floor / canopy under such ways and fabricate climbs).
+// For bridges/tunnels: straight end-to-end elevation by distance, ignoring
+// intermediate DEM samples (DTMs read the valley floor / canopy and fabricate climbs).
 pub fn linear_profile(points: &[(f64, f64)]) -> Vec<f64> {
     let n = points.len();
     if n == 0 {
@@ -57,7 +44,6 @@ pub fn linear_profile(points: &[(f64, f64)]) -> Vec<f64> {
     (0..n).map(|i| interpolate(points, a, b, i)).collect()
 }
 
-/// Elevation at node `i` interpolated linearly by distance along segment a→b.
 fn interpolate(points: &[(f64, f64)], a: usize, b: usize, i: usize) -> f64 {
     if i == a {
         return points[a].1;
@@ -75,8 +61,6 @@ fn interpolate(points: &[(f64, f64)], a: usize, b: usize, i: usize) -> f64 {
     za + (zb - za) * t
 }
 
-/// Recursive RDP on the (distance, elevation) profile: keep the vertex of maximum
-/// vertical deviation from the chord a→b when it exceeds ε, then recurse.
 fn rdp(points: &[(f64, f64)], a: usize, b: usize, epsilon: f64, keep: &mut [bool]) {
     if b <= a + 1 {
         return;
@@ -98,9 +82,6 @@ fn rdp(points: &[(f64, f64)], a: usize, b: usize, epsilon: f64, keep: &mut [bool
     }
 }
 
-/// Smoothed per-segment signed deltas (meters) for consecutive nodes, derived
-/// from `smooth_profile`. Returned vector has `points.len() - 1` entries; their
-/// sum equals `smoothed(last) − smoothed(first)` (additivity preserved).
 #[cfg(test)]
 pub fn smoothed_deltas(points: &[(f64, f64)], epsilon: f64) -> Vec<f64> {
     let z = smooth_profile(points, epsilon);
@@ -117,7 +98,6 @@ mod tests {
 
     #[test]
     fn flat_noise_bump_collapses_to_zero_ascent() {
-        // Symmetric ±2 m blips on otherwise flat ground, 20 m node spacing.
         let pts = vec![
             (0.0, 100.0),
             (20.0, 102.0),
@@ -135,7 +115,6 @@ mod tests {
 
     #[test]
     fn real_distributed_climb_is_preserved() {
-        // A genuine 8 m climb spread over several nodes (monotone rise).
         let pts = vec![
             (0.0, 100.0),
             (30.0, 102.0),
@@ -153,9 +132,6 @@ mod tests {
 
     #[test]
     fn short_steep_ramp_not_erased() {
-        // A >4 m step (one node up by 4.5 m), flat before and after. ε=4 retains it
-        // because the deviation from the flat chord exceeds 4.0. At exactly ε the
-        // vertex would be dropped; we use a step that clears ε.
         let pts = vec![
             (0.0, 100.0),
             (15.0, 100.0),
@@ -173,8 +149,6 @@ mod tests {
 
     #[test]
     fn bridge_tunnel_is_linear_end_to_end() {
-        // Intermediate DEM reads the valley floor: a deep dip mid-span. Linear
-        // interpolation across the feature must show no phantom intermediate climb.
         let pts = vec![
             (0.0, 100.0),
             (25.0, 70.0),
@@ -183,7 +157,6 @@ mod tests {
             (100.0, 101.0),
         ];
         let deltas = smoothed_deltas_linear(&pts);
-        // End-to-end rise is 1 m over 100 m, monotone => total ascent ~1 m, no dip.
         assert!(
             (ascent(&deltas) - 1.0).abs() < 0.01,
             "bridge/tunnel must be linear, got ascent {}",
@@ -210,7 +183,6 @@ mod tests {
             (sum - (z[z.len() - 1] - z[0])).abs() < 1e-9,
             "Σ deltas must equal smoothed(last) − smoothed(first)"
         );
-        // Endpoints are preserved exactly by the smoother.
         assert_eq!(z[0], 100.0);
         assert_eq!(z[z.len() - 1], 107.0);
     }

@@ -1,9 +1,3 @@
-//! Build production direct-street `Plan`s from the multi-objective engine: each
-//! representative becomes a `LegOption` (geometry from its node path, `[p50,p95]`
-//! from `annotate_path`, axes from its `CostVector`, bike ride/push steps rebuilt
-//! from the per-edge `is_push` attribute), and the config-`balance` cursor picks the
-//! highlighted leg. Weights touch only the cursor; the option set is untouched.
-
 use super::Graph;
 use crate::structures::cost::{Axis, LegRole, RoutingMode};
 use crate::structures::graph::bike_cost::BikeCost;
@@ -14,9 +8,6 @@ use crate::structures::plan::{
 use crate::structures::{Mode, NodeID, StreetEdgeData};
 
 impl Graph {
-    /// Time-agnostic representative options for a street leg `from → to` under
-    /// `mode`/`role`. Empty when no route exists. Shared by direct plans and
-    /// transit access/egress; callers attach timing/placement.
     pub(crate) fn multiobj_leg_options(
         &self,
         from: NodeID,
@@ -38,10 +29,8 @@ impl Graph {
             .iter()
             .map(|p| self.leg_option(&p.nodes, &p.edges, p.cost, mode, bike, 0))
             .collect::<Vec<_>>();
-        // Drive has no displayed diversity axis (cycleway/surface/D+ are inert), so the
-        // display-granularity dedup degenerates to a (time,reliability)-minute Pareto that
-        // drops geographically distinct roads. Skip it for Drive and let the geographic
-        // `select_diverse` (edge-share ≤ alt_max_share_factor) be the sole dedup.
+        // Drive's display-granularity dedup degenerates to a (time,reliability) Pareto
+        // that drops distinct roads; skip it and let `select_diverse` be the sole dedup.
         let opts = if mode == RoutingMode::Drive {
             opts
         } else {
@@ -51,18 +40,10 @@ impl Graph {
     }
 
     /// Drop options weakly dominated on the DISPLAYED objectives, each bucketed to
-    /// the granularity the user actually sees: time → whole minutes, surface →
-    /// 0.01× roughness, climb → whole metres, reliability → whole minutes. Keeps an
-    /// earlier index on exact read-alikes. An option that only "wins" below display
-    /// granularity (e.g. 20 s faster, both "10 min") is pruned; genuine visible
-    /// Time/Surface/Climb/Reliability trade-offs survive.
+    /// display granularity, so a sub-display-only win is pruned.
     pub(crate) fn dedup_leg_options(opts: Vec<LegOption>) -> Vec<LegOption> {
-        // Displayed differentiators, each bucketed to the granularity the user sees:
-        // time → minutes, cycleway exposure → 100 m, surface → 0.01× roughness,
-        // climb → metres, reliability → minutes. CyclewayDeficit is a *core* bike axis
-        // (Time › Cycleway › D+): without it the most-cycleway route — slower, but on
-        // bike infra so equal/better on the other displayed axes — is wrongly dropped
-        // as "dominated", collapsing the very trade-off the user routes on.
+        // CyclewayDeficit must stay in the key: without it the most-cycleway route
+        // (equal/better on the other displayed axes) is wrongly dropped as dominated.
         let key = |o: &LegOption| {
             (
                 (o.p50 as f64 / 60.0).round(),
@@ -120,10 +101,8 @@ impl Graph {
         if total == 0 { 0.0 } else { shared as f64 / total as f64 }
     }
 
-    /// Greedily keep options (in their incoming rank order) that share at most
-    /// `max_share` of their length with every already-kept, higher-ranked option —
-    /// ADGW limited-sharing applied pairwise, replacing display-granularity dedup so
-    /// two geometrically near-identical routes are never both surfaced.
+    /// Greedily keep options (rank order) sharing at most `max_share` of their length
+    /// with every already-kept option (ADGW limited-sharing).
     pub(crate) fn select_diverse(&self, opts: Vec<LegOption>, max_share: f64) -> Vec<LegOption> {
         let mut kept: Vec<LegOption> = Vec::new();
         for o in opts {
@@ -142,10 +121,8 @@ impl Graph {
         kept
     }
 
-    /// Direct multi-objective street plan: representatives → `LegOption`s → a single
-    /// `Walk` leg highlighting the `balance` cursor, with the others as alternatives.
-    /// `None` when no route exists. `role == Deadline` runs the search with the
-    /// variance-proxy axis active (calmer routes).
+    /// Direct multi-objective street plan: a single `Walk` leg highlighting the
+    /// `balance` cursor, other representatives as alternatives. `None` if no route.
     pub fn multiobj_direct_plan(
         &self,
         origin: NodeID,
@@ -208,7 +185,6 @@ impl Graph {
                 probability: 1.0,
             }],
             expected_end: end,
-            // Street-only plan: no transit boardings, so no fare.
             price: None,
         })
         .map(|mut plan| {
@@ -219,9 +195,6 @@ impl Graph {
         })
     }
 
-    /// Per-step street edges for a reconstructed path, from the carried arena edges
-    /// (the g-free authority). Empty carried ⇒ empty. Returns owned edges so the
-    /// carried far-coords can be dropped (geometry is built separately from them).
     pub(super) fn recon_edges(
         &self,
         _nodes: &[NodeID],
@@ -230,9 +203,8 @@ impl Graph {
         carried.iter().map(|(e, _, _)| *e).collect()
     }
 
-    /// Geometry of a reconstructed path from the carried far-coords (interior nodes
-    /// have no `junction_coord`, so `node_coord` would panic post-drop). Empty
-    /// carried ⇒ empty geometry.
+    /// Geometry from the carried far-coords: interior nodes have no `junction_coord`,
+    /// so `node_coord` would panic post-drop.
     fn recon_geometry(
         &self,
         nodes: &[NodeID],
@@ -277,12 +249,8 @@ impl Graph {
             .sum();
         let dplus = cost.get(Axis::Dplus);
         let cyc_deficit = cost.get(Axis::CyclewayDeficit);
-        // Displayed ascent (metres). For walk the Dplus axis already IS the denoised
-        // ascent. For bike the Dplus axis is a routing cost that blends raw ascent with
-        // the downhill SAFETY penalty (`downhillcost`), so it is NOT metres of climb —
-        // displaying it shows absurd figures (thousands of "metres" on a flat city
-        // ride). Recompute the true ascent as denoised metres over the path, with the
-        // same elevation-buffer hysteresis used for walk D+.
+        // For bike the Dplus axis is a cost blend (ascent + downhill penalty), NOT
+        // metres of climb: recompute true denoised ascent. For walk it already IS ascent.
         let elevation_gain = if mode == RoutingMode::Bike {
             let mut ehbu = 0.0;
             let mut asc = 0.0;
@@ -292,15 +260,13 @@ impl Graph {
                 asc += charged;
                 ehbu = new_ehbu;
             }
-            asc += ehbu; // flush residual sustained climb (matches the walk D+ flush)
+            asc += ehbu;
             Some(asc.round() as usize)
         } else {
             Some(dplus.round() as usize)
         };
-        // Metres of the route on cycle infrastructure. Uses the SAME on-infra
-        // predicate as the CyclewayDeficit cost axis (mode_axes.rs `bike_vector`).
-        // (Previously this subtracted `cyc_deficit` — a *seconds* cost — from
-        // `length` in *metres*, a unit mismatch that produced a nonsensical value.)
+        // Metres on cycle infra (same on-infra predicate as CyclewayDeficit); must NOT
+        // subtract `cyc_deficit` (seconds) from `length` (metres) — a unit mismatch.
         let cycleroute_length = (mode == RoutingMode::Bike).then(|| {
             recon
                 .iter()
@@ -359,10 +325,8 @@ impl Graph {
         }
     }
 
-    /// Build leg steps for a chosen path. Walk/Drive ⇒ one plain step. Bike ⇒ group
-    /// consecutive ride/push runs (push = `BikeCost::is_push`) into dismount-aware
-    /// steps. `recon` carries the per-step arena edges (from `LegOption::edges`) and
-    /// is the g-free authority; empty ⇒ a degenerate zero-length/zero-time step.
+    /// Leg steps for a chosen path. Walk/Drive ⇒ one plain step; Bike ⇒ group
+    /// consecutive ride/push runs into dismount-aware steps.
     pub(crate) fn street_steps(
         &self,
         nodes: &[NodeID],
@@ -381,9 +345,6 @@ impl Graph {
         let mut steps: Vec<PlanLegStep> = Vec::new();
         let mut i = 0;
         let mut cum_time = 0u32;
-        // Group consecutive ride/push runs. `geometry` is one coord per node, so
-        // edge k connects geometry[k]→geometry[k+1]; a run over edges [start_idx, i)
-        // spans geometry indices [start_idx, i] and ends at nodes[i].
         while i < edges.len() {
             let push = BikeCost::is_push(&edges[i].attrs);
             let start_idx = i;
@@ -394,7 +355,7 @@ impl Graph {
                 i += 1;
             }
             cum_time += run_time;
-            let node_id = nodes[i]; // edges[start_idx..i] end at nodes[i]
+            let node_id = nodes[i];
             steps.push(PlanLegStep::Walk(PlanWalkLegStep {
                 length: run_len,
                 time: run_time,
@@ -428,8 +389,6 @@ mod tests {
         Surface,
     };
 
-    /// Build + bake the contracted graph so reconstruction carries the arena edges —
-    /// production is contraction-only, so the leg/step builders read carried `.edges`.
     fn enable_contraction(g: &mut Graph) {
         use crate::structures::contraction::ContractedGraph;
         let mut cg = ContractedGraph::from_graph_union(g);
@@ -475,8 +434,7 @@ mod tests {
         g.add_edge(a, edge(a, b, 100, Surface::Unpaved));
         g.add_edge(a, edge(a, c, 90, Surface::Paved));
         g.add_edge(c, edge(c, b, 90, Surface::Paved));
-        // b has no outgoing edges, so the contraction builder would skip it (k=0) and
-        // no super-edge would reach b. A back-edge makes b a proper junction endpoint.
+        // A back-edge makes b a proper junction endpoint (else the builder skips it, k=0).
         g.add_edge(b, edge(b, a, 100, Surface::Paved));
         (g, a, b)
     }
@@ -501,7 +459,6 @@ mod tests {
             assert_eq!(*o.nodes.first().unwrap(), a);
             assert_eq!(*o.nodes.last().unwrap(), b);
         }
-        // Leg fields mirror the highlighted (balanced) option.
         let cur = crate::structures::plan::initial_cursor(&leg.alternatives, &g.raptor.balance);
         assert_eq!(
             leg.length, leg.alternatives[cur].length,
@@ -564,34 +521,31 @@ mod tests {
         }
     }
 
-    /// End-to-end feature validation on the real Belgium graph: run the ACTUAL
-    /// leg-options pipeline (multiobj_representatives_budgeted → leg_option → dedup →
-    /// select_diverse) the GraphQL `raptor` query feeds the UI from, with the shipped
-    /// E1 config (bucketing + corridor + budget 0.15). Asserts the user sees several
-    /// geographically distinct bike alternatives that span the cycleway axis, each
-    /// with full polyline geometry — and that budget 0.15 does not collapse a short
-    /// walk leg to a single option.
     #[test]
     #[ignore]
     fn leg_options_e2e_real_belgium() {
         use std::time::Instant;
-        let dem = crate::ingestion::osm::Dem::load("data/belgium-DTM-20m.tif").ok();
+        let dem = crate::ingestion::osm::Dem::load(
+            "data/belgium-DTM-20m.tif",
+            crate::ingestion::osm::DemProjection::BelgianLambert2008,
+        )
+        .ok();
+        let dem_ref = dem
+            .as_ref()
+            .map(|d| d as &dyn crate::ingestion::osm::ElevationSource);
         let mut g = Graph::new();
         let t0 = Instant::now();
-        crate::ingestion::osm::load_pbf_file("data/belgium-latest.osm.pbf", dem.as_ref(), 4.0, &Default::default(), &mut g)
+        crate::ingestion::osm::load_pbf_file("data/belgium-latest.osm.pbf", dem_ref, 4.0, &Default::default(), &mut g)
             .unwrap();
         g.build_raptor_index();
-        // Shipped E1 production config.
         g.set_bike_bucket_cyc_k(0.11);
         g.set_bike_bucket_dpl_k(0.013);
         g.set_distance_budget(0.15);
         eprintln!("E2E load+index={:.1?}", t0.elapsed());
         let bike = g.default_bike_cost();
 
-        // --- Bike: ~10 km across Brussels ---
         let (_, &o) = g.nearest_node_dist(50.796, 4.298).expect("o");
         let (_, &d) = g.nearest_node_dist(50.878, 4.402).expect("d");
-        // Stage diagnostics: representatives (post select_representatives) → final.
         let reps = g.multiobj_representatives_budgeted(
             o, d, RoutingMode::Bike, LegRole::Neutral, &bike, g.raptor.distance_budget, true,
         );
@@ -613,9 +567,6 @@ mod tests {
             );
         }
         assert!(opts.len() >= 3, "bike leg must surface ≥3 alternatives, got {}", opts.len());
-        // Displayed elevation gain must be real metres of ascent — never the Dplus
-        // routing-cost blend (which folds in the ×100 downhill penalty). Brussels is
-        // flat; bound D+ per km well under any plausible cost-blend figure.
         for op in &opts {
             let per_km = op.elevation_gain.unwrap_or(0) as f64 / (op.length.max(1) as f64) * 1000.0;
             assert!(
@@ -624,12 +575,10 @@ mod tests {
                 per_km
             );
         }
-        // Geometry survives (not a straight junction-to-junction jump).
         assert!(
             opts.iter().all(|o| o.geometry.len() >= 10 && o.nodes.len() >= 10),
             "each alternative must carry full polyline geometry"
         );
-        // The cycleway span the user routes on is preserved through the pipeline.
         let mut cyc: Vec<i64> = opts.iter().map(|o| o.cycleway_deficit.round() as i64).collect();
         cyc.sort();
         cyc.dedup();
@@ -640,7 +589,6 @@ mod tests {
             cyc.first().unwrap()
         );
 
-        // --- Walk: ~1.5 km (budget-0.15 degradation check) ---
         let (_, &wo) = g.nearest_node_dist(50.846, 4.352).expect("wo");
         let (_, &wd) = g.nearest_node_dist(50.852, 4.368).expect("wd");
         let tw = Instant::now();
@@ -654,14 +602,6 @@ mod tests {
 
     #[test]
     fn bike_elevation_gain_is_ascent_not_descent_penalty() {
-        // A pure descent: the bike Dplus axis is now the denoised per-edge ascent
-        // only (max(0, Δ) = 0 here) — the old in-search descent-SAFETY penalty was
-        // dropped as label-setting-unsound. The DISPLAYED elevation gain must be ~0:
-        // you do not climb while going downhill. Regression for the UI showing
-        // thousands of "metres" of D+ on a flat/descending city ride.
-        //
-        // (Was: the bike Dplus *cost* axis blew up because it folded in the downhill
-        // safety penalty, downhillcost=100. That term is gone now.)
         use crate::structures::cost::VarGen;
         use crate::structures::{
             BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData,
@@ -706,9 +646,6 @@ mod tests {
 
     #[test]
     fn bike_leg_option_reports_dismount_length() {
-        // A path with one push segment (bikeaccess=false, footaccess=true) and one
-        // rideable segment: the LegOption must report the push metres as dismount_length
-        // so the UI can show how much of an alternative is walked, not ridden.
         use crate::structures::cost::VarGen;
         use crate::structures::{
             BikeAttrs, EdgeData, LatLng, NodeData, OsmNodeData, StreetEdgeData,
@@ -725,7 +662,7 @@ mod tests {
         let c = g.add_node(mk("c", 50.0000, 4.0200));
         g.build_raptor_index();
         let mut push = BikeAttrs::road_default();
-        push.bikeaccess = false; // not rideable -> must dismount
+        push.bikeaccess = false;
         push.footaccess = true;
         let ride = BikeAttrs::road_default();
         let edge = |o: NodeID, d: NodeID, len: usize, at: BikeAttrs| {
@@ -742,8 +679,6 @@ mod tests {
         let o = g.leg_option_for_nodes_test(&[a, b, c], RoutingMode::Bike, &bike);
         assert_eq!(o.dismount_length, 500, "only the push segment counts as dismount");
         assert_eq!(o.length, 1200);
-        // The push run spans geometry indices [0,1] (edge a->b); ride edge b->c is not
-        // included. Lets the UI paint the dismount stretch of a selected alternative.
         assert_eq!(o.dismount_runs.len(), 1, "one contiguous push run");
         assert_eq!(o.dismount_runs[0].start, 0);
         assert_eq!(o.dismount_runs[0].end, 1);
@@ -751,10 +686,6 @@ mod tests {
 
     #[test]
     fn bike_leg_option_cycleroute_length_counts_only_infra_metres() {
-        // cycleroute_length must be the METRES of the route on cycle infrastructure —
-        // the same on-infra predicate as the CyclewayDeficit axis — not a unit-mixed
-        // `length(m) - deficit(s)`. Path: one on-infra edge (500 m) + one plain road
-        // (700 m) ⇒ cycleroute_length == 500, independent of ride time.
         use crate::structures::cost::VarGen;
         use crate::structures::{BikeAttrs, EdgeData, LatLng, NodeData, OsmNodeData, StreetEdgeData};
         let mut g = Graph::new();
@@ -769,8 +700,8 @@ mod tests {
         let c = g.add_node(mk("c", 50.0000, 4.0200));
         g.build_raptor_index();
         let mut infra = BikeAttrs::road_default();
-        infra.cycleroute = true; // on cycle infrastructure
-        let road = BikeAttrs::road_default(); // plain road, not on infra
+        infra.cycleroute = true;
+        let road = BikeAttrs::road_default();
         let edge = |o: NodeID, d: NodeID, len: usize, at: BikeAttrs| {
             EdgeData::Street(StreetEdgeData {
                 origin: o, destination: d, partial: false, length: len,
@@ -793,9 +724,6 @@ mod tests {
 
     #[test]
     fn bike_search_times_push_at_push_speed_not_cycling() {
-        // A push (dismount) edge must be costed in the search at the (slow) PUSH speed,
-        // like its displayed time — not at cycling speed, which would make footway
-        // shortcuts look as fast as riding and flood routes with dismounts.
         use crate::structures::cost::VarGen;
         use crate::structures::{
             BikeAttrs, EdgeData, LatLng, NodeData, OsmNodeData, StreetEdgeData,
@@ -827,9 +755,6 @@ mod tests {
         let bike = g.default_bike_cost();
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Bike, LegRole::Neutral, &bike);
         assert!(!opts.is_empty(), "push route must exist");
-        // 300 m at the default push speed (0.9 m/s) ⇒ ~333 s, far above the 60 s a
-        // cycling-speed (5.0 m/s) costing would give. (No ride→push boundary here: the
-        // single edge from the origin has no previous edge, so no dismount stop.)
         let expect = (300.0 / g.raptor.bike_profile.push_speed_mps).round() as u32;
         assert_eq!(
             opts[0].time.round() as u32, expect,
@@ -873,7 +798,6 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        // Direct a->b is a contraflow (wrong_way); the legal detour a->c->b is longer.
         g.add_edge(a, edge(a, b, 700, true));
         g.add_edge(a, edge(a, c, 450, false));
         g.add_edge(c, edge(c, b, 450, false));
@@ -881,9 +805,6 @@ mod tests {
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Bike, LegRole::Neutral, &bike);
         assert!(!opts.is_empty(), "a legal route must exist");
         for o in &opts {
-            // Re-derive the per-step edges from the node path (the former
-            // `path_edges` derivation); this synthetic graph is not contracted so
-            // the carried `.edges` are empty here.
             let edges: Vec<&StreetEdgeData> = o
                 .nodes
                 .windows(2)
@@ -907,11 +828,6 @@ mod tests {
 
     #[test]
     fn bike_leg_options_surface_most_cycleway_detour() {
-        // The direct edge is shorter but off bike infrastructure (high cyc deficit);
-        // the detour is slightly longer but fully on cycleways (deficit 0) — a genuine
-        // Time↔Cycleway trade-off. With bucketing + budget + dedup all active, the
-        // most-cycleway route must still surface (regression for the whole pipeline:
-        // engine front → representatives → dedup → select_diverse).
         use crate::structures::cost::VarGen;
         use crate::structures::{
             BikeAttrs, EdgeData, HighwayClass, LatLng, NodeData, OsmNodeData, StreetEdgeData,
@@ -927,9 +843,6 @@ mod tests {
                 lat_lng: LatLng { latitude: lat, longitude: lon },
             })
         };
-        // Scaled so the detour is several minutes slower — a *visible* time difference,
-        // so display-granularity dedup keeps both (a sub-minute gap would correctly
-        // collapse to one). Coords keep haversine ≤ edge length (corridor stays sound).
         let a = g.add_node(mk("a", 50.0000, 4.0000));
         let c = g.add_node(mk("c", 50.0040, 4.0150));
         let b = g.add_node(mk("b", 50.0000, 4.0300));
@@ -946,8 +859,8 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        g.add_edge(a, edge(a, b, 2130, false)); // direct, off-infra (high cyc deficit)
-        g.add_edge(a, edge(a, c, 1500, true)); // longer detour on cycleway (deficit 0)
+        g.add_edge(a, edge(a, b, 2130, false));
+        g.add_edge(a, edge(a, c, 1500, true));
         g.add_edge(c, edge(c, b, 1500, true));
         let bike = g.default_bike_cost();
         let opts = g.multiobj_leg_options(a, b, RoutingMode::Bike, LegRole::Neutral, &bike);
@@ -1012,14 +925,11 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        g.add_edge(a, e(a, b, 100, 8)); // short, climbs 8 m
-        g.add_edge(a, e(a, c, 400, 0)); // long, flat
+        g.add_edge(a, e(a, b, 100, 8));
+        g.add_edge(a, e(a, c, 400, 0));
         g.add_edge(c, e(c, b, 400, 0));
-        // b has no outgoing edges; a back-edge makes it a proper junction endpoint
-        // so contraction reaches it (otherwise the builder skips it, k=0).
+        // A back-edge makes b a proper junction endpoint (else the builder skips it, k=0).
         g.add_edge(b, e(b, a, 100, -8));
-        // The only trade-off here is climb-vs-flat, so exercise the D+-as-selection
-        // path (off by default; on real graphs Time prices climbing instead).
         g.raptor.set_bike_select_dplus(true);
         (g, a, b)
     }
@@ -1031,9 +941,6 @@ mod tests {
             mode: RoutingMode,
             bike: &BikeCost,
         ) -> LegOption {
-            // Derive the carried arena steps from the node path (the former
-            // `path_edges` derivation) so `.edges` is the g-free authority the
-            // production reconstruction now reads.
             let carried: Vec<(StreetEdgeData, (f64, f64), LatLng)> = nodes
                 .windows(2)
                 .filter_map(|w| {
@@ -1045,7 +952,6 @@ mod tests {
                     })
                 })
                 .collect();
-            // cost vector irrelevant to shared_fraction/select_diverse; ZERO is fine here.
             self.leg_option(
                 nodes,
                 &carried,
@@ -1061,16 +967,14 @@ mod tests {
     fn select_diverse_drops_near_identical_routes() {
         let (g, a, b) = climb_detour_graph();
         let bike = g.default_bike_cost();
-        // Two genuinely distinct routes share 0% -> both kept.
         let direct = g.leg_option_for_nodes_test(&[a, b], RoutingMode::Bike, &bike);
-        let detour = g.leg_option_for_nodes_test(&[a, /*c*/ NodeID(1), b], RoutingMode::Bike, &bike);
+        let detour = g.leg_option_for_nodes_test(&[a, NodeID(1), b], RoutingMode::Bike, &bike);
         assert!(
             g.shared_fraction_edges(&direct.edges, &detour.edges) < 0.01,
             "disjoint routes"
         );
         let kept = g.select_diverse(vec![direct.clone(), detour.clone()], 0.6);
         assert_eq!(kept.len(), 2, "distinct routes both kept");
-        // A duplicate of the first shares 100% -> dropped.
         let kept2 = g.select_diverse(vec![direct.clone(), direct.clone()], 0.6);
         assert_eq!(kept2.len(), 1, "near-identical route dropped");
     }
@@ -1078,8 +982,6 @@ mod tests {
     #[test]
     fn bike_leg_options_span_time_and_dplus_from_front() {
         use crate::structures::Surface;
-        // Reuse detour_graph shape but add an elevation trade-off: direct short+climby,
-        // detour long+flat. Both are on the (Time, D+) front.
         let (mut g, a, b) = climb_detour_graph();
         enable_contraction(&mut g);
         let bike = g.default_bike_cost();
@@ -1138,9 +1040,6 @@ mod tests {
 
     #[test]
     fn leg_options_prune_subdisplay_only_wins() {
-        // Two routes both read "10 min", same surface/climb/reliability; one is 20 s
-        // faster in raw seconds — a win the user can't see. It must be pruned, not
-        // offered as a separate route.
         fn opt(p50: u32, surface: f64) -> crate::structures::plan::LegOption {
             crate::structures::plan::LegOption {
                 time: p50 as f64,
@@ -1161,22 +1060,12 @@ mod tests {
                 edges: vec![],
             }
         }
-        // A is 20 s faster (raw) but rougher; B is smoother (raw) but slower. They
-        // CROSS on raw axes (neither raw-dominates), so without bucketing both
-        // survive. Yet both read "10 min" and "1.02×" (102) — identical on every
-        // displayed bucket — so display-granularity dedup must collapse them to one.
         let kept = Graph::dedup_leg_options(vec![opt(600, 1021.0), opt(620, 1019.0)]);
         assert_eq!(kept.len(), 1, "a sub-display-only win is pruned");
     }
 
     #[test]
     fn leg_options_keep_most_cycleway_route() {
-        // The fast route is off bike infrastructure (high cycleway deficit); the
-        // slower route is on cycleways (low deficit), equal on the other displayed
-        // axes. CyclewayDeficit is a core bike axis (Time › Cycleway › D+), so the
-        // most-cycleway route is a real trade-off and must survive dedup — without it
-        // in the key, the slower route is wrongly dropped as "dominated", which
-        // collapsed the alternatives the UI showed.
         fn opt(p50: u32, cyc: f64) -> crate::structures::plan::LegOption {
             crate::structures::plan::LegOption {
                 time: p50 as f64,
@@ -1207,13 +1096,6 @@ mod tests {
 
     #[test]
     fn drive_keeps_distinct_alternatives_through_pipeline() {
-        // Two fully disjoint car routes a→b: the direct one is faster but noisier
-        // (SIGNALIZED variance), the detour is slower but calmer (NONE) — a genuine
-        // Time↔Variance trade-off, so both are on the Drive front. For Drive the
-        // display-granularity `dedup_leg_options` key degenerates (cycleway/surface/D+
-        // all inert) and would drop the slower-but-distinct road as "display-dominated".
-        // The pipeline must skip that dedup for Drive and let the geographic
-        // `select_diverse` keep both distinct roads.
         let mut g = Graph::new();
         g.set_distance_budget(f64::INFINITY);
         let mk = |id: &str, lat: f64, lon: f64| {
@@ -1226,12 +1108,6 @@ mod tests {
         let b = g.add_node(mk("b", 50.0000, 4.0100));
         let c = g.add_node(mk("c", 50.0030, 4.0050));
         g.build_raptor_index();
-        // Both routes read the same whole minute (≈55 s vs ≈58 s at 11 m/s), so for Drive
-        // their displayed dedup key degenerates to identical (time, reliability) minutes —
-        // exactly the real-graph condition where `dedup_leg_options` collapses distinct
-        // roads. foot/bike are set so the contraction builder keeps the car edges (Drive
-        // still routes on `car`), and ε is zeroed so the Time↔Variance trade-off keeps
-        // both roads on the front rather than ε-collapsing.
         let edge = |o: NodeID, d: NodeID, len: usize, vg: VarGen| {
             let mut at = BikeAttrs::road_default();
             at.highway = HighwayClass::Residential;
@@ -1243,8 +1119,6 @@ mod tests {
             })
         };
         g.raptor.epsilon = crate::structures::cost::Epsilon::uniform(0.0, 0.0);
-        // Direct a→b: 600 m, noisy (signal). Detour a→c→b: 640 m, calm. Reverse edges make
-        // a/b proper junctions and c a degree-2 interior node the contraction removes.
         g.add_edge(a, edge(a, b, 600, VarGen::SIGNALIZED));
         g.add_edge(b, edge(b, a, 600, VarGen::SIGNALIZED));
         g.add_edge(a, edge(a, c, 320, VarGen::NONE));
@@ -1259,7 +1133,6 @@ mod tests {
             "Drive must surface both distinct car roads (Time↔Variance trade-off), got {}",
             opts.len()
         );
-        // The two surfaced roads are geographically distinct (disjoint edges).
         for i in 0..opts.len() {
             for j in (i + 1)..opts.len() {
                 let share = g.shared_fraction_edges(&opts[i].edges, &opts[j].edges);
@@ -1270,9 +1143,6 @@ mod tests {
                 );
             }
         }
-        // Regression guard: the display-granularity dedup (the pre-fix step) would
-        // collapse these Drive routes, since their displayed key degenerates to
-        // (time, reliability). Skipping it for Drive is exactly what preserves them.
         let collapsed = Graph::dedup_leg_options(opts.clone());
         assert!(
             collapsed.len() < opts.len(),
@@ -1284,7 +1154,6 @@ mod tests {
 
     #[test]
     fn bike_plan_rebuilds_ride_push_steps() {
-        // A path with a foot-only (push) middle edge yields a distinct push step.
         let mut g = Graph::new();
         let mk = |id: &str, lat: f64, lon: f64| {
             NodeData::OsmNode(OsmNodeData {

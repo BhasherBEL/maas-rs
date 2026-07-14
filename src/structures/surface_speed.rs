@@ -1,21 +1,10 @@
-//! Per-edge bike SPEED factor baked from the raw OSM `surface=*` tag: a
-//! multiplier on the power-model cruise speed (asphalt = 1.0 baseline, gravel
-//! 0.6, mud 0.2). This is distinct from the Surface *comfort* Pareto axis — it
-//! affects ETA, not route-choice stress. The table is configured under
-//! `build.surface_speed_factors`; absent / sparse config falls back to the
-//! defaults below. The factor is quantized to a `u8` (`round(factor·100)`) and
-//! baked onto each `StreetEdgeData` at ingest, so re-tuning the table requires a
-//! graph rebuild, exactly like `elevation_smoothing_epsilon`.
+//! Per-edge bike speed factor baked from OSM `surface=*` (asphalt=1.0), quantized to
+//! u8 `round(factor·100)` at ingest, so re-tuning needs a rebuild.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 
-/// Speed factor (relative to asphalt = 1.0) used for any way whose `surface`
-/// tag is missing or unrecognised. 0.90 assumes a decent surface — most
-/// untagged ways in a routable network are paved residential/service streets,
-/// and biasing toward the asphalt end avoids spuriously detouring around
-/// unlabelled-but-fine roads. Baked into edges as `90`.
 pub const UNKNOWN_SURFACE_FACTOR: f64 = 0.90;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,7 +41,6 @@ impl Default for SurfaceSpeedFactors {
 }
 
 impl SurfaceSpeedFactors {
-    /// Speed factor for a raw OSM `surface` value (e.g. `Some("gravel")`).
     /// Missing or unrecognised surfaces fall back to [`UNKNOWN_SURFACE_FACTOR`].
     pub fn factor(&self, surface: Option<&str>) -> f64 {
         surface
@@ -60,11 +48,16 @@ impl SurfaceSpeedFactors {
             .unwrap_or(UNKNOWN_SURFACE_FACTOR)
     }
 
-    /// Quantized per-edge factor: `round(factor·100)` clamped to `[1, 255]`.
-    /// Never 0 (which the read side reserves for "unset"), so a configured
-    /// factor always survives the round-trip through the baked `u8`.
+    /// Clamped to `[1, 255]`: never 0, which the read side reserves for "unset".
     pub fn quantize(&self, surface: Option<&str>) -> u8 {
         (self.factor(surface) * 100.0).round().clamp(1.0, 255.0) as u8
+    }
+
+    /// Deterministic key order, so the build fingerprint hash is stable across runs.
+    pub fn sorted_entries(&self) -> Vec<(&str, f64)> {
+        let mut entries: Vec<(&str, f64)> = self.0.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
     }
 }
 

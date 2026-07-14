@@ -1,17 +1,10 @@
-//! Realtime transit feeds: generic GTFS-Realtime (protobuf trip-updates) and a
-//! custom STIB waiting-times parser. Each feed produces [`TripDelay`]s that the
-//! poller folds into a `RealtimeIndex` applied to RAPTOR routing.
-
 pub mod fetcher;
 pub mod gtfs_rt;
 pub mod proto;
 pub mod stib;
 
-/// One realtime delay observation: a trip is `delay` seconds off schedule at a
-/// stop (positive = late). `trip_id` is the GTFS string id; the poller resolves
-/// it to an internal `TripId`, and the stop via `stop_id` (preferred) — both
-/// against the graph's reverse maps. `stop_sequence` is kept for diagnostics and
-/// future stop-sequence-based resolution.
+/// `delay` is seconds off schedule (positive = late). `trip_id`/`stop_id` are raw
+/// GTFS string ids the poller resolves against the graph's reverse maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TripDelay {
     pub trip_id: String,
@@ -20,10 +13,7 @@ pub struct TripDelay {
     pub delay: i32,
 }
 
-/// A resolved vehicle position observation from any feed: the feed-specific
-/// encoding has already been normalised to a GTFS `trip_id` string and WGS84
-/// coordinates before this point. The poller resolves `trip_id` → `TripId` and
-/// folds into `RealtimeIndex.positions`.
+/// `trip_id` is a raw GTFS string; `lat`/`lng` are WGS84.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VehicleObservation {
     pub trip_id: String,
@@ -35,10 +25,7 @@ pub struct VehicleObservation {
     pub timestamp: Option<u64>,
 }
 
-/// One informed entity within a service alert: identifies which routes, trips,
-/// or stops the alert applies to. Fields use raw GTFS string ids from the feed.
-/// Route matching via `route_id` requires a GTFS route_id→internal mapping that
-/// does not yet exist; it is stored but not resolved in this increment (follow-up).
+/// Which routes/trips/stops an alert applies to; raw GTFS string ids.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertEntitySelector {
     pub trip_id: Option<String>,
@@ -46,10 +33,8 @@ pub struct AlertEntitySelector {
     pub stop_id: Option<String>,
 }
 
-/// A parsed GTFS-RT service alert. `active_period` is a list of Unix-second
-/// `(start, end)` ranges; an empty list means always active. `None` on either
-/// bound means open-ended (no start = started at minus-infinity; no end = never
-/// expires). `cause`/`effect` are the raw protobuf `i32` enum values.
+/// `active_period`: Unix-second `(start, end)` ranges; empty list = always active,
+/// `None` bound = open-ended. `cause`/`effect` are raw protobuf enum values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceAlert {
     pub header: Option<String>,
@@ -60,41 +45,26 @@ pub struct ServiceAlert {
     pub informed_entity: Vec<AlertEntitySelector>,
 }
 
-/// One actual stop location reported by a realtime feed for a given trip stop:
-/// the RT `stop_id` at a stop position, captured regardless of whether a delay
-/// is present. Used to detect platform reassignments when the RT `stop_id`
-/// differs from the scheduled one.
+/// RT `stop_id` for a trip stop, captured regardless of delay; used to detect
+/// platform reassignments against the scheduled stop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActualStopId {
     pub trip_id: String,
     pub stop_id: String,
 }
 
-/// One poll cycle's observations from a feed: per-stop [`TripDelay`]s plus the
-/// GTFS string `trip_id`s the feed reports as CANCELED (the trip exists in the
-/// schedule but will not run). Cancellations carry no stop, so they live
-/// alongside the delays rather than as a degenerate `TripDelay`.
+/// One poll cycle's observations. `canceled` holds GTFS `trip_id`s that will not
+/// run; `skipped_stops` holds `(trip_id, stop_id)` pairs the feed marked SKIPPED.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeedUpdate {
     pub delays: Vec<TripDelay>,
     pub canceled: Vec<String>,
     pub positions: Vec<VehicleObservation>,
-    /// Service alerts from GTFS-RT `Alert` entities. STIB-specific alert
-    /// sources are out of scope for this increment.
     pub alerts: Vec<ServiceAlert>,
-    /// Actual RT stop_id per trip stop, captured without delay gating so
-    /// platform assignments are recorded even when a stop runs on time.
     pub actual_stops: Vec<ActualStopId>,
-    /// `(trip_id, stop_id)` pairs the feed marked `SKIPPED` (partial
-    /// cancellation of a stop the trip no longer serves). Kept separate from
-    /// `delays`/`actual_stops` so the poller can record them without fabricating
-    /// a delay or a platform assignment. Empty for feeds that never skip stops.
     pub skipped_stops: Vec<(String, String)>,
 }
 
-/// A pollable realtime data source. Implementations fetch and parse their feed,
-/// returning the delays and cancellations they observed. Network/parse errors
-/// are returned, not panicked — the poller isolates failures per feed.
 pub trait RealtimeFeed: Send + Sync {
     fn name(&self) -> &str;
     fn poll(&self, fetcher: &fetcher::Fetcher) -> Result<FeedUpdate, fetcher::FetchError>;

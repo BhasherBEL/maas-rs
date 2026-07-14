@@ -47,10 +47,7 @@ pub struct PlanRoute {
     pub short_name: String,
     pub long_name: String,
     pub mode: PlanRouteType,
-    /// GTFS route colour as a 6-character hex string (e.g. `"ADD8E6"`), or
-    /// `null` when the GTFS feed does not define a colour for this route.
     pub color: Option<String>,
-    /// GTFS route text colour as a 6-character hex string, or `null`.
     pub text_color: Option<String>,
 
     #[graphql(skip)]

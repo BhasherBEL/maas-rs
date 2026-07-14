@@ -42,11 +42,6 @@ pub use realtime_match::{MatchParams, ScheduledArrival, best_match};
 pub use transit::StationBackup;
 pub use travel_map::{TravelAggregation, TravelCell};
 
-/// A routing terminal: either an exact graph node, or a point projected onto the
-/// interior of an edge between nodes `a` and `b` (used by edge-aware snapping so a
-/// pin sitting mid-way along a long edge isn't forced onto a distant end node).
-/// `dist_a`/`dist_b` are the meters from the projection to each endpoint, summing
-/// to the edge length.
 #[derive(Debug, Clone, Copy)]
 pub enum Endpoint {
     Node(NodeID),
@@ -73,33 +68,18 @@ pub struct Graph {
     pub raptor: RaptorIndex,
     #[serde(skip, default)]
     edge_index: edge_index::EdgeIndex,
-    /// All-mode (union) contracted graph driving all routing. **Serialized** into
-    /// `graph.bin` (its serde-skipped `seg_index` R-tree is rebuilt post-load). `None` ⇒
-    /// no contracted graph (only on a partially-built graph; production always builds it).
+    /// Serialized; its serde-skipped `seg_index` R-tree is rebuilt post-load.
     #[serde(default)]
     pub contracted: Option<contraction::ContractedGraph>,
-    /// OSM-derived platform index (Stage A platform matching). Serialized only via
-    /// the OSM view (lives in `osm.bin`, gated by `OSM_SCHEMA_VERSION`); skipped in
-    /// the full-graph (`graph.bin`) serialization since routing never reads it.
+    /// Serialized only via the OSM view (`osm.bin`); skipped in `graph.bin`.
     #[serde(skip, default)]
     platforms: PlatformIndex,
-    /// OSM `level` (semantic storey) per node, sparse — only nodes on a leveled way
-    /// (platforms, leveled footways). Stage B1 auxiliary OSM data, lives in `osm.bin`
-    /// only (mirrors `platforms`); routing never reads it in B1.
     #[serde(skip, default)]
     node_levels: HashMap<NodeID, i16>,
-    /// Pedestrian vertical connectors (stairs/elevator/ramp) keyed by directed node
-    /// pair, classified from the OSM highway tag. Stage B1 auxiliary OSM data,
-    /// `osm.bin` only. Used by the connector-coverage measurement.
     #[serde(skip, default)]
     connector_edges: HashMap<(NodeID, NodeID), Connector>,
-    /// Pedestrian connector cost model (config `default_routing.connector_cost`).
-    /// Runtime-only knob for the B1 measurement's added-time stat; not serialized.
     #[serde(skip, default)]
     connector_cost: ConnectorCost,
-    /// Foot access/egress CCH (runtime-only, never serialized — adds no bytes to the
-    /// postcard layout, so `GRAPH_SCHEMA_VERSION` need not change). Built on demand;
-    /// chunk 2 wires it into startup. `None` until [`Graph::set_cch`] installs it.
     #[serde(skip, default)]
     pub cch: Option<raptor_cch::CchAccess>,
 }
@@ -156,15 +136,10 @@ impl Graph {
         }
     }
 
-    /// The contracted graph the bike multi-objective search reads — the **serialized union**
-    /// cg (`self.contracted`, which survives the P3 drop of `g`).
     pub(super) fn bike_cg(&self) -> Option<&contraction::ContractedGraph> {
         self.contracted.as_ref()
     }
 
-    /// Cost-bake bike onto the already-built union contracted graph (`self.contracted`) using
-    /// the configured bike profile. Call after `g.contracted` exists, on every startup
-    /// (the bake is serde-skipped). No-op if `self.contracted` is None.
     pub fn bake_bike_on_contracted_default(&mut self) {
         let bike = self.default_bike_cost();
         self.bake_bike_on_contracted(&bike);
@@ -210,8 +185,7 @@ impl Graph {
         &self.platforms
     }
 
-    /// Install the Stage B1 auxiliary OSM level/connector data parsed during the
-    /// PBF pass (sparse `node → level` and `connector edge` maps).
+    /// Install the auxiliary OSM level/connector data parsed during the PBF pass.
     pub fn set_osm_level_data(
         &mut self,
         node_levels: HashMap<NodeID, i16>,
@@ -221,28 +195,23 @@ impl Graph {
         self.connector_edges = connector_edges;
     }
 
-    /// OSM `level` (semantic storey) of a node, if it sits on a leveled way.
-    /// `None` is read as ground level.
+    /// OSM `level` (semantic storey) of a node; `None` is read as ground level.
     pub fn node_level(&self, id: NodeID) -> Option<i16> {
         self.node_levels.get(&id).copied()
     }
 
-    /// Set a node's `level` (Stage B2a relocation pins a stop to its platform
-    /// storey). Sparse — overrides any existing entry.
     pub fn set_node_level(&mut self, id: NodeID, level: i16) {
         self.node_levels.insert(id, level);
     }
 
-    /// Move a **transit stop**'s anchor coordinate (Stage B2a relocation onto its
-    /// matched OSM platform node). Safe only for transit stops, which are NOT in the
-    /// snap KD-tree, so no `nodes_tree` resync is needed; a no-op on OSM nodes.
+    /// Move a transit stop's anchor coordinate. Safe only for transit stops (NOT in
+    /// the snap KD-tree, so no resync needed); a no-op on OSM nodes.
     pub fn relocate_transit_stop(&mut self, id: NodeID, loc: LatLng) {
         if let Some(NodeData::TransitStop(stop)) = self.nodes.get_mut(id.0) {
             stop.lat_lng = loc;
         }
     }
 
-    /// The pedestrian connector kind of the directed edge `a→b`, if any.
     pub fn connector_kind(&self, a: NodeID, b: NodeID) -> Option<Connector> {
         self.connector_edges.get(&(a, b)).copied()
     }
@@ -255,22 +224,16 @@ impl Graph {
         self.connector_cost
     }
 
-    /// Bake connector-specific traversal costs into edge **lengths** so that
-    /// `edge_secs(Foot)` — which always computes `length / walking_speed` — yields
-    /// the correct time even after `connector_edges` is serde-skipped on restore and
-    /// after contraction copies the lengths into super-edge segments.
+    /// Bake connector traversal costs into edge lengths so `edge_secs(Foot)`
+    /// (`length / walking_speed`) stays correct after `connector_edges` is serde-skipped.
     ///
-    /// Must be called after `connector_edges` is populated (post-OSM phase) and
-    /// after `walking_speed_mps` is configured, but **before** contraction builds the
-    /// contracted graph (which bakes the lengths into super-edge segments).
+    /// MUST run after `connector_edges` + `walking_speed_mps` are set, but BEFORE
+    /// contraction (which bakes the lengths into super-edge segments).
     ///
-    /// Formula:
     /// - Stairs/ramp: `new_len = old_len * walk_speed / connector_speed`
-    ///   (so `new_len / walk_speed = old_len / connector_speed`, the correct time)
-    /// - Elevator: `new_len = elevator_secs * walk_speed`
-    ///   (fixed time regardless of physical run length)
+    /// - Elevator: `new_len = elevator_secs * walk_speed` (fixed time)
     ///
-    /// No-op when `connector_edges` or `edges` is empty (restore path, pre-OSM, tests).
+    /// No-op when `connector_edges` or `edges` is empty.
     pub fn bake_connector_lengths(&mut self, cost: ConnectorCost) {
         if self.connector_edges.is_empty() || self.edges.is_empty() {
             return;
@@ -385,31 +348,20 @@ impl Graph {
         self.raptor.balance = b;
     }
 
-    /// Install the transit-pricing model and rebuild its route→operator lookup.
-    /// The lookup rebuild reads `transit_routes`/`transit_agencies`, so this must
-    /// run after the transit index is populated (it is, in `apply_routing_defaults`).
+    /// Install the transit-pricing model and rebuild its route→operator lookup. The
+    /// rebuild reads `transit_routes`/`transit_agencies`, so this must run after the
+    /// transit index is populated.
     pub fn set_fare_model(&mut self, m: crate::structures::cost::FareModel) {
         self.raptor.fare_model = m;
         self.raptor.rebuild_operator_fare_lookup();
-        // Tag each stop with its SNCB flat-agglomeration membership (Appendix A.2)
-        // before the per-km precompute, which collapses in-zone segments to 0 km.
-        // No-op when fares are disabled or no zones are configured.
+        // Stop-zone tags must precede the per-km precompute, which collapses in-zone
+        // segments to 0 km.
         self.rebuild_sncb_stop_zones();
-        // Tag airport stops for the SNCB special-OD override (Appendix A.2). No-op
-        // when fares are disabled or no SNCB airport tokens/override are configured.
         self.rebuild_sncb_airport_stops();
-        // Rebuild the SNCB per-km precompute now that the operator lookup and the
-        // stop-zone tags exist. No-op (and no rail-Dijkstra sweep) when fares are
-        // disabled or no SNCB operator is modeled — keeping the disabled path
-        // zero-cost.
         self.rebuild_sncb_railway_km();
-        // Reference-node zone-collapse tables for the FIXED zone-to-zone SNCB fare
-        // (Appendix A.2, corrected). No-op when fares are disabled, no zones are
-        // configured, or no SNCB operator is modeled.
         self.rebuild_sncb_zone_refs();
     }
 
-    /// `BikeCost` built from the graph's configured default profile.
     pub(super) fn default_bike_cost(&self) -> BikeCost {
         BikeCost::new(self.raptor.bike_profile)
     }
@@ -430,8 +382,8 @@ impl Graph {
         self.raptor.vehicle_access_max_secs = secs;
     }
 
-    /// Sets reliability bucket edges after validating they are sorted, strictly
-    /// increasing, and each in `(0.0, 1.0)`. Invalid input is ignored (keeps default).
+    /// Sets reliability bucket edges if sorted, strictly increasing, each in
+    /// `(0.0, 1.0)`; invalid input is ignored.
     pub fn set_reliability_bucket_edges(&mut self, edges: Vec<f32>) {
         if crate::structures::valid_reliability_edges(&edges) {
             self.raptor.reliability_bucket_edges = edges;
@@ -452,8 +404,7 @@ impl Graph {
         self.raptor.use_cch_access = on;
     }
 
-    /// Sets the graph-level default for the query-latency decomposition profiler
-    /// (`GraphQL raptor(profileLatency: ...)` overrides this per-query).
+    /// Graph-level default for the latency profiler (per-query GraphQL arg overrides).
     pub fn set_profile_latency(&mut self, on: bool) {
         self.raptor.profile_latency = on;
     }
@@ -493,12 +444,9 @@ impl Graph {
         id
     }
 
-    /// Add an OSM node **without** inserting it into the snap KD-tree
-    /// (`nodes_tree`). Used for Stage B1 platform-way nodes: they must be routable
-    /// (edges resolve via `id_mapper`) but must NOT become candidates for GTFS
-    /// stop snapping — otherwise a stop near a newly-imported platform would snap
-    /// to it, silently relocating the stop. Keeping them out of the tree preserves
-    /// today's stop→nearest-street-node snapping exactly.
+    /// Add an OSM node WITHOUT inserting it into the snap KD-tree. Platform-way nodes
+    /// must be routable but must NOT be GTFS-stop-snap candidates, else a nearby stop
+    /// would snap to a platform and silently relocate.
     pub fn add_osm_node_unindexed(&mut self, node: OsmNodeData) -> NodeID {
         let id = NodeID(self.nodes.len());
         self.id_mapper.insert(node.eid.clone(), id);
@@ -519,7 +467,6 @@ impl Graph {
         self.nodes.get(id.0)
     }
 
-    /// Outgoing edges of a node (empty slice if out of bounds).
     pub fn out_edges(&self, id: NodeID) -> &[EdgeData] {
         self.edges.get(id.0).map(|v| v.as_slice()).unwrap_or(&[])
     }
@@ -544,10 +491,8 @@ impl Graph {
         self.edges.len()
     }
 
-    /// Finds the nearest OSM node using squared Euclidean distance in the
-    /// lat/lon plane. Fast but not metrically accurate — suitable for finding
-    /// the closest node when the exact distance doesn't matter.
-    /// See also: `nearest_node_dist` which returns the Haversine distance in meters.
+    /// Nearest OSM node by squared Euclidean distance (fast, not metrically accurate).
+    /// See `nearest_node_dist` for Haversine meters.
     pub fn nearest_node(&self, lat: f64, lon: f64) -> Option<NodeID> {
         match self
             .nodes_tree
@@ -561,9 +506,7 @@ impl Graph {
         }
     }
 
-    /// Finds the nearest OSM node and returns the Haversine distance in meters.
-    /// More expensive than `nearest_node` but gives an accurate metric distance,
-    /// needed when the actual distance matters (e.g. GTFS stop snapping).
+    /// Nearest OSM node with Haversine distance in meters (accurate; e.g. GTFS snapping).
     pub fn nearest_node_dist(&self, lat: f64, lon: f64) -> Option<(f64, &NodeID)> {
         match self.nodes_tree.iter_nearest(&[lat, lon], &LatLng::distance) {
             Ok(mut it) => it.next(),
@@ -574,9 +517,8 @@ impl Graph {
         }
     }
 
-    /// Project a query coordinate onto the segment `pa→pb`, returning
-    /// `(perpendicular_distance_meters, t)` where `t∈[0,1]` is the fraction from
-    /// `pa` to the closest point. Equirectangular meters centred on the query.
+    /// Project a coordinate onto segment `pa→pb`: `(perp_dist_m, t)` with `t∈[0,1]`
+    /// the fraction from `pa` to the closest point. Equirectangular meters.
     fn project_point(lat: f64, lon: f64, pa: LatLng, pb: LatLng) -> (f64, f64) {
         let m_lat = 111_320.0_f64;
         let m_lon = 111_320.0_f64 * lat.to_radians().cos();
@@ -594,10 +536,8 @@ impl Graph {
         ((px * px + py * py).sqrt(), t)
     }
 
-    /// Rebuild the spatial edge index over every street segment. Cheap, bulk-loaded,
-    /// and never serialized — call after a build or after deserialization so
-    /// edge-aware snapping works without a graph rebuild. No-op shape when there are
-    /// no OSM nodes (empty graph).
+    /// Rebuild the spatial edge index. Never serialized: call after build or load so
+    /// edge-aware snapping works. No-op when there are no OSM nodes.
     pub fn build_edge_index(&mut self) {
         let ref_lat = self
             .nodes
@@ -620,12 +560,9 @@ impl Graph {
         self.edge_index = edge_index::EdgeIndex::build(edges, ref_lat);
     }
 
-    /// Snap a coordinate to the nearest *edge* (by perpendicular body distance)
-    /// whose street data satisfies `usable`, within `radius_m`, using the spatial
-    /// edge index (so a point mid-way along a long edge with distant endpoints is
-    /// still found). Returns the projected [`Endpoint`] and its perpendicular
-    /// distance in meters, or `None` if no usable edge is in range (caller falls
-    /// back to `nearest_node`).
+    /// Snap a coordinate to the nearest `usable` edge (perpendicular distance) within
+    /// `radius_m`. Returns the projected [`Endpoint`] and its distance in meters, or
+    /// `None` if none in range (caller falls back to `nearest_node`).
     pub fn snap_to_edge(
         &self,
         lat: f64,

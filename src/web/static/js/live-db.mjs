@@ -1,11 +1,5 @@
-// Browser bootstrap: persistent SQLite via sqlite-wasm + OPFS SAHPool VFS.
-//
-// SAHPool runs entirely on the main thread and needs NO COOP/COEP
-// cross-origin-isolation headers (which would break map-tile loading) — that is
-// the whole reason we use installOpfsSAHPoolVfs rather than the worker OPFS VFS.
-//
-// Exposes the exec/run/all adapter that live-store.mjs is written against, so
-// the same store + schema run here and under node:sqlite in the tests.
+// SAHPool VFS (not the worker OPFS VFS): needs no COOP/COEP headers, which would
+// break map-tile loading.
 
 import sqlite3InitModule from "./vendor/sqlite-wasm/sqlite3.mjs";
 import * as store from "./live-store.mjs";
@@ -16,7 +10,6 @@ const VFS_NAME = "maas-live";
 
 let _adapterPromise = null;
 
-// Wrap an sqlite3 oo1.DB into the exec/run/all adapter contract.
 function wrap(oodb) {
   return {
     exec(sql) {
@@ -45,8 +38,6 @@ function wrap(oodb) {
   };
 }
 
-// Initialise sqlite-wasm, install the SAHPool VFS, open the persistent DB and
-// run the store schema. Idempotent: repeated calls share one DB instance.
 export function openLiveDb() {
   if (_adapterPromise) return _adapterPromise;
   _adapterPromise = (async () => {
@@ -66,7 +57,6 @@ export function openLiveDb() {
   return _adapterPromise;
 }
 
-// Convenience re-exports so callers can `import { openLiveDb, saveSelectedJourney }`.
 export {
   saveSelectedJourney,
   getSelectedJourney,

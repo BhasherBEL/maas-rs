@@ -1,9 +1,7 @@
 'use strict';
-// Shared MaaS utilities — included by index.html
 
 const GRAPHQL_URL = '/graphql';
 
-// ── GraphQL helper ────────────────────────────────────────────
 async function gql(query, variables) {
   const res = await fetch(GRAPHQL_URL, {
     method: 'POST',
@@ -15,7 +13,6 @@ async function gql(query, variables) {
   return json.data;
 }
 
-// ── Formatting ────────────────────────────────────────────────
 function fmtTime(secs) {
   if (secs == null) return '—';
   const h = Math.floor(secs / 3600) % 24;
@@ -23,29 +20,22 @@ function fmtTime(secs) {
   return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
 }
 
-// Times are seconds since midnight of the QUERY date, so a value >= 86400 lands
-// on a following day. fmtTime keeps the correct wall-clock hour (e.g. 170520 →
-// "23:12") but drops that day context; these helpers surface it.
+// Times are seconds since midnight of the QUERY date; a value >= 86400 is a following day.
 function dayOffset(secs) {
   return secs == null ? 0 : Math.floor(secs / 86400);
 }
 
-// A styled superscript "+N" day marker element, or null for same-day times.
 function mkDayMark(secs) {
   const off = dayOffset(secs);
   return off > 0 ? mkEl('sup', 'day-sup', '+' + off) : null;
 }
 
-// HH:MM plus a plain-text " (+N)" day suffix — for prose/tooltip strings that
-// cannot host a DOM element. Same-day renders exactly like fmtTime.
 function fmtTimeDay(secs) {
   if (secs == null) return '—';
   const off = dayOffset(secs);
   return fmtTime(secs) + (off > 0 ? ' (+' + off + ')' : '');
 }
 
-// mkEl carrying a time string plus an appended day marker when it crosses
-// midnight. Same-day → byte-identical DOM to mkEl(tag, cls, fmtTime(secs)).
 function mkTimeEl(tag, cls, secs) {
   const el = mkEl(tag, cls, fmtTime(secs));
   const mk = mkDayMark(secs);
@@ -53,9 +43,6 @@ function mkTimeEl(tag, cls, secs) {
   return el;
 }
 
-// Build a leg-time-col cell that reflects realtime: non-RT legs show a plain
-// (black) time; RT legs are green; an RT time that differs from schedule shows
-// the scheduled time struck through with the realtime time in red.
 function mkLegTime(secs, schedSecs, isRealtime) {
   const wrap = mkEl('div', 'leg-time-col');
   if (isRealtime && schedSecs != null && secs !== schedSecs) {
@@ -100,15 +87,8 @@ function fmtDelta(secs) {
   return sign + fmtDuration(Math.abs(secs));
 }
 
-// ── Departure headway ─────────────────────────────────────────
-// Consecutive departure gaps are "regular" when every gap is within this ratio of
-// the median gap (tolerates realtime jitter / minor timetable rounding).
 const REGULAR_GAP_TOLERANCE = 0.2;
 
-// Detect a regular headway from a list of departure times (seconds since
-// midnight). Returns { regular:true, everyMins } when every consecutive gap is
-// within REGULAR_GAP_TOLERANCE of the median gap, else { regular:false }. Needs
-// >= 3 times to judge an interval. Input order is irrelevant (sorted internally).
 function detectHeadway(times) {
   const t = [...times].sort((a, b) => a - b);
   if (t.length < 3) return { regular: false };
@@ -196,14 +176,14 @@ function mkSvg(d, size = 14) {
 }
 
 // ── Transit stop list builder ─────────────────────────────────
-// Returns [{name, lat, lon, arrival, departure}] for a transit leg.
+// Returns [{name, lat, lng, arrival, departure}] for a transit leg.
 function buildStopList(leg) {
   const stops = [];
   const fromNode = leg.from?.node;
   stops.push({
     name:      fromNode?.name ?? null,
     lat:       fromNode?.lat  ?? leg.geometry?.[0]?.lat,
-    lon:       fromNode?.lon  ?? leg.geometry?.[0]?.lon,
+    lng:       fromNode?.lng  ?? leg.geometry?.[0]?.lng,
     arrival:   null,
     departure: leg.from?.departure ?? leg.start,
     platform:  leg.from?.platform ?? null,
@@ -213,7 +193,7 @@ function buildStopList(leg) {
     stops.push({
       name:      node?.name ?? null,
       lat:       node?.lat,
-      lon:       node?.lon,
+      lng:       node?.lng,
       arrival:   step.place?.arrival   ?? null,
       departure: step.place?.departure ?? null,
       platform:  step.place?.platform  ?? null,
@@ -310,7 +290,7 @@ let _stationsPromise = null;
 
 function _ensureStations() {
   if (_stationsPromise) return _stationsPromise;
-  _stationsPromise = gql('{ gtfsStations { id name lat lon operators lines { mode shortName color textColor } } }')
+  _stationsPromise = gql('{ gtfsStations { id name lat lng operators lines { mode shortName color textColor } } }')
     .then(d => { _stationsCache = d?.gtfsStations || []; })
     .catch(() => { _stationsCache = []; });
   return _stationsPromise;
@@ -382,10 +362,10 @@ function _rankStations(stations, query, focus) {
     if (score === _MATCH_TIER.NONE) continue;
     let dist2 = null;
     if (focus && Number.isFinite(focus.flat) && Number.isFinite(focus.flng)) {
-      dist2 = (!Number.isFinite(s.lat) || !Number.isFinite(s.lon)) ? Infinity
+      dist2 = (!Number.isFinite(s.lat) || !Number.isFinite(s.lng)) ? Infinity
         : (() => {
             const dLat = s.lat - focus.flat;
-            const dLon = (s.lon - focus.flng) * Math.cos((focus.flat * Math.PI) / 180);
+            const dLon = (s.lng - focus.flng) * Math.cos((focus.flat * Math.PI) / 180);
             return dLat * dLat + dLon * dLon;
           })();
     }
@@ -508,20 +488,20 @@ function createStopSearch(parentEl, placeholder, onChange) {
     cancelAddr();
     input.value = s.name;
     selLat = s.lat;
-    selLng = s.lon;
+    selLng = s.lng;
     selStationId = s.id != null ? String(s.id) : null;
     closeDropdown();
-    if (onChange) onChange({ name: s.name, lat: s.lat, lon: s.lon });
+    if (onChange) onChange({ name: s.name, lat: s.lat, lng: s.lng });
   }
 
   function selectAddress(a) {
     cancelAddr();
     input.value = a.label;
     selLat = a.lat;
-    selLng = a.lon;
+    selLng = a.lng;
     selStationId = null;
     closeDropdown();
-    if (onChange) onChange({ name: a.label, lat: a.lat, lon: a.lon });
+    if (onChange) onChange({ name: a.label, lat: a.lat, lng: a.lng });
   }
 
   input.addEventListener('input', async () => {
@@ -540,7 +520,7 @@ function createStopSearch(parentEl, placeholder, onChange) {
     addrTimer = setTimeout(async () => {
       try {
         const f = _focusArgs();
-        const d = await gql('query($q:String!,$flat:Float,$flng:Float){ searchAddresses(query:$q, limit:6, focusLat:$flat, focusLng:$flng){ id label lat lon } }', { q: raw, flat: f.flat, flng: f.flng });
+        const d = await gql('query($q:String!,$flat:Float,$flng:Float){ searchAddresses(query:$q, limit:6, focusLat:$flat, focusLng:$flng){ id label lat lng } }', { q: raw, flat: f.flat, flng: f.flng });
         if (seq !== addrSeq) return;
         addressResults = d?.searchAddresses || [];
         renderResults();

@@ -1,22 +1,13 @@
-//! Live realtime delays applied to RAPTOR routing.
-//!
-//! A [`RealtimeIndex`] maps `(trip, stop_sequence)` to a signed delay in seconds
-//! (positive = late). It is produced by the realtime poller from one or more
-//! feeds and hot-swapped behind an `ArcSwap`, independently of the graph.
-//!
-//! The router consults [`RealtimeIndex::delay`] as an *additive* offset: an
-//! empty index yields 0 everywhere, exactly reproducing schedule-only behavior.
+//! Live realtime delays applied to RAPTOR routing as an additive offset; an empty
+//! index yields 0 everywhere, reproducing schedule-only behavior.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ingestion::gtfs::TripId;
 use crate::ingestion::realtime::ServiceAlert;
 
-/// Resolved vehicle position for one trip in a realtime snapshot.
-///
-/// `lat`/`lng` are WGS84 degrees; `bearing` is optional degrees clockwise from
-/// north; `timestamp` is the unix epoch second of the observation (feed-level for
-/// STIB, per-vehicle for GTFS-RT). Derives `Copy` — no heap allocation.
+/// Resolved vehicle position for one trip. `timestamp` is the unix epoch second of
+/// the observation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VehiclePos {
     pub lat: f32,
@@ -26,70 +17,41 @@ pub struct VehiclePos {
     pub timestamp: Option<u64>,
 }
 
-/// Live status of a transit trip (at a given stop) according to realtime data.
-/// `NoData` is the inert default: an empty index reports it everywhere.
+/// Live status of a transit trip at a stop. `NoData` is the inert default (empty
+/// index reports it everywhere).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripStatus {
-    /// No realtime information is known for this trip/stop.
     NoData,
-    /// Running and reported exactly on schedule (delay 0) at this stop.
     OnTime,
-    /// Running but reported `secs` off schedule (positive = late).
+    /// `secs` off schedule (positive = late).
     Delayed(i32),
-    /// Reported CANCELED — the trip exists in the schedule but will not run.
     Canceled,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RealtimeIndex {
-    /// Delay in seconds per `(trip, compact_stop_index)`; positive = late.
-    /// The stop key is the RAPTOR compact stop index (what `scan_route` uses),
-    /// not the GTFS `stop_sequence`.
+    /// Delay (secs, positive = late) per `(trip, stop)`. Stop key is the RAPTOR
+    /// compact stop index, NOT the GTFS `stop_sequence`.
     delays: HashMap<(TripId, u32), i32>,
-    /// Trips reported CANCELED for this snapshot (whole-trip, stop-independent).
     canceled: HashSet<TripId>,
-    /// Latest resolved vehicle position per trip, keyed by internal `TripId`.
-    /// `is_empty()` / `len()` / `canceled_len()` count delays and cancellations
-    /// only, keeping the inert-default invariant: an index with positions but no
-    /// delays/cancellations is still considered "empty" for routing purposes.
+    /// Excluded from `is_empty`/`len`: positions alone are "empty" for routing.
     positions: HashMap<TripId, VehiclePos>,
-    /// Service alerts from all realtime feeds, kept as-is (not indexed by
-    /// trip/route/stop) for small-to-medium alert counts. Callers filter via
-    /// [`alerts_for_leg`]. Not counted in `is_empty` — alerts alone do not
-    /// change routing behaviour.
+    /// Excluded from `is_empty`: alerts alone do not change routing.
     alerts: Vec<ServiceAlert>,
-    /// Actual compact stop per `(trip, parent_station)` when the RT feed reported
-    /// a platform-level stop_id. Key uses the stop_id prefix before the last `_`
-    /// as the parent station identity. Populated only when the actual stop_id
-    /// contains `_` (is a platform-level stop, e.g. `gs:nmbssncb:8814001_8`).
-    /// In `live_refresh` this is compared against the scheduled compact stop to
-    /// detect a platform reassignment.
+    /// Actual compact stop per `(trip, parent_station)` on a platform-level RT
+    /// stop_id. `parent_station` is the stop_id prefix before the last `_`.
     platform_swaps: HashMap<(TripId, String), u32>,
-    /// `(trip, compact_stop)` pairs the feed marked SKIPPED (a stop the trip no
-    /// longer serves this run — a partial cancellation). Routing must not board
-    /// or alight here, exactly as it must not at a CANCELED trip. Empty on the
-    /// inert default, so with no feed every `is_skipped` query is `false` and the
-    /// scan collapses to schedule-only behaviour. Not serialized (mirrors
-    /// `positions`/`platform_swaps`).
+    /// `(trip, compact_stop)` pairs the feed marked SKIPPED; routing must not board
+    /// or alight here, as at a CANCELED trip. Empty on the inert default.
     skipped: HashSet<(TripId, u32)>,
-    /// Unix seconds when this snapshot was produced (0 for the empty index).
+    /// Unix seconds this snapshot was produced (0 for the empty index).
     pub generated_at: i64,
-    /// Staleness TTL (seconds) stamped by the poller from config
-    /// (`realtime.index_max_age_secs`). The routing consumer boundary ignores this
-    /// snapshot once `now - generated_at > max_age_secs`, so a feed outage cannot
-    /// serve hours-old delays/cancellations forever. `0` on the inert empty index
-    /// (which is short-circuited before the staleness check ever reads it).
+    /// Staleness TTL (secs): routing ignores this snapshot once
+    /// `now - generated_at > max_age_secs`. `0` on the empty index.
     max_age_secs: i64,
-    /// Sticky last-known delays for TRACKED journeys, keyed `(trip, compact_stop)`
-    /// with value `(delay_secs, last_seen_unix)`. Populated by the poller from a
-    /// persistent cross-cycle cache so a boarded trip's observed delay survives
-    /// after the live feed drops it from the upcoming-departures window (STIB
-    /// waiting-times only predict future departures). Read ONLY through
-    /// [`RealtimeIndex::delay_with_sticky`]/[`RealtimeIndex::status_with_sticky`]
-    /// (the live-refresh overlay), NEVER by routing. Deliberately excluded from
-    /// `is_empty`/`len` so a sticky-only index is invisible to planning:
-    /// retention for tracking, never for routing. Not serialized (mirrors
-    /// `positions`/`max_age_secs`).
+    /// Sticky last-known delays, `(trip, stop) → (delay_secs, last_seen_unix)`. Read
+    /// ONLY via `delay_with_sticky`/`status_with_sticky`, NEVER by routing; excluded
+    /// from `is_empty`/`len` so a sticky-only index is invisible to planning.
     sticky_delays: HashMap<(TripId, u32), (i32, i64)>,
 }
 
@@ -115,7 +77,6 @@ impl RealtimeIndex {
         }
     }
 
-    /// Build an index from per-stop delays plus the set of CANCELED trips.
     pub fn from_updates(
         generated_at: i64,
         delays: impl IntoIterator<Item = ((TripId, u32), i32)>,
@@ -134,7 +95,6 @@ impl RealtimeIndex {
         }
     }
 
-    /// Build a full index from delays, cancellations, and vehicle positions.
     pub fn with_positions(
         generated_at: i64,
         delays: impl IntoIterator<Item = ((TripId, u32), i32)>,
@@ -154,8 +114,6 @@ impl RealtimeIndex {
         }
     }
 
-    /// Build a full index from delays, cancellations, vehicle positions, and
-    /// service alerts. Used by the poller when the feed carries all four.
     pub fn with_alerts(
         generated_at: i64,
         delays: impl IntoIterator<Item = ((TripId, u32), i32)>,
@@ -176,8 +134,6 @@ impl RealtimeIndex {
         }
     }
 
-    /// Build a complete index from all fields including platform swaps detected
-    /// by the realtime poller. Used by [`build_index`] in the poller.
     pub fn with_all(
         generated_at: i64,
         delays: impl IntoIterator<Item = ((TripId, u32), i32)>,
@@ -199,69 +155,45 @@ impl RealtimeIndex {
         }
     }
 
-    /// Staleness TTL (seconds) for this snapshot, stamped by the poller from
-    /// config. Consumed at the routing boundary: the snapshot is ignored once
-    /// `now - generated_at > max_age_secs`. Returns 0 for the empty default.
     #[inline]
     pub fn max_age_secs(&self) -> i64 {
         self.max_age_secs
     }
 
-    /// Builder: stamp this snapshot's staleness TTL (seconds). Used by the poller
-    /// to attach `realtime.index_max_age_secs` to every published index.
     pub fn with_max_age_secs(mut self, secs: i64) -> Self {
         self.max_age_secs = secs;
         self
     }
 
-    /// Builder: attach the set of SKIPPED `(trip, compact_stop)` pairs to this
-    /// snapshot. Used by [`build_index`] in the poller after resolving the feed's
-    /// `skipped_stops` to internal ids. An empty set leaves the index inert.
     pub fn with_skipped(mut self, skipped: HashSet<(TripId, u32)>) -> Self {
         self.skipped = skipped;
         self
     }
 
-    /// True if the feed marked `trip` as SKIPPING compact `stop` this run (the
-    /// trip does not serve that stop). The inert default reports `false`
-    /// everywhere, so with no feed routing never sees a skip.
     #[inline]
     pub fn is_skipped(&self, trip: TripId, stop: u32) -> bool {
         self.skipped.contains(&(trip, stop))
     }
 
-    /// Number of skipped `(trip, stop)` pairs in this snapshot. Informational.
     pub fn skipped_len(&self) -> usize {
         self.skipped.len()
     }
 
-    /// Builder: attach the poller's sticky last-known-delay cache to this snapshot.
-    /// The map is keyed `(trip, compact_stop)` with value `(delay_secs,
-    /// last_seen_unix)`. Visible ONLY to [`delay_with_sticky`]/[`status_with_sticky`]
-    /// — never counted by `is_empty`/`len`, never read by routing.
     pub fn with_sticky_delays(mut self, sticky: HashMap<(TripId, u32), (i32, i64)>) -> Self {
         self.sticky_delays = sticky;
         self
     }
 
-    /// Iterate the live per-stop delays as `((trip, compact_stop), delay_secs)`.
-    /// Used by the poller to fold each cycle's live delays into its persistent
-    /// sticky cache.
     pub fn iter_delays(&self) -> impl Iterator<Item = ((TripId, u32), i32)> + '_ {
         self.delays.iter().map(|(&k, &v)| (k, v))
     }
 
-    /// Number of sticky (retained) delays. Informational only — never affects
-    /// `is_empty`/`len`.
     pub fn sticky_len(&self) -> usize {
         self.sticky_delays.len()
     }
 
-    /// Delay (seconds, positive = late) for a trip at a compact stop, preferring
-    /// the LIVE value and falling back to the sticky last-known delay when the
-    /// feed no longer reports this `(trip, stop)`. A live entry always wins even
-    /// when it is 0 (vehicle now reported on-time overrides a stale sticky value).
-    /// Returns 0 when neither is known. Read by the live-refresh overlay only.
+    /// Live value preferred, sticky fallback. A live entry wins even at 0.
+    /// Live-refresh overlay only.
     #[inline]
     pub fn delay_with_sticky(&self, trip: TripId, stop: u32) -> i32 {
         match self.delay_opt(trip, stop) {
@@ -274,11 +206,8 @@ impl RealtimeIndex {
         }
     }
 
-    /// Realtime status of `trip` at compact `stop`, preferring LIVE data and
-    /// falling back to the sticky last-known delay. Cancellation outranks any
-    /// delay; a live per-stop entry outranks sticky (even live 0 → `OnTime`);
-    /// otherwise the sticky delay yields `OnTime`/`Delayed`; else `NoData`.
-    /// Read by the live-refresh overlay only.
+    /// Live preferred, sticky fallback. Cancellation outranks any delay; live
+    /// outranks sticky (even live 0 → `OnTime`). Live-refresh overlay only.
     pub fn status_with_sticky(&self, trip: TripId, stop: u32) -> TripStatus {
         if self.is_canceled(trip) {
             return TripStatus::Canceled;
@@ -294,35 +223,28 @@ impl RealtimeIndex {
         }
     }
 
-    /// Latest resolved vehicle position for a trip, if known.
     pub fn vehicle(&self, trip: TripId) -> Option<&VehiclePos> {
         self.positions.get(&trip)
     }
 
-    /// Delay (seconds, positive = late) for a trip at a compact stop index.
-    /// Returns 0 when no realtime information is known — the inert default.
+    /// Delay (secs, positive = late) at a compact stop index; 0 when unknown.
     #[inline]
     pub fn delay(&self, trip: TripId, stop: u32) -> i32 {
         self.delays.get(&(trip, stop)).copied().unwrap_or(0)
     }
 
-    /// Like [`delay`], but `None` when no realtime info exists for `(trip, stop)`
-    /// — lets callers distinguish "known on time (0)" from "no data".
+    /// Like [`delay`], but `None` distinguishes "known on time (0)" from "no data".
     #[inline]
     pub fn delay_opt(&self, trip: TripId, stop: u32) -> Option<i32> {
         self.delays.get(&(trip, stop)).copied()
     }
 
-    /// True if `trip` is reported CANCELED in this snapshot. The inert default
-    /// (empty index) reports `false` for every trip.
     #[inline]
     pub fn is_canceled(&self, trip: TripId) -> bool {
         self.canceled.contains(&trip)
     }
 
-    /// Realtime status of `trip` at compact `stop`. Cancellation outranks any
-    /// per-stop delay; otherwise the verdict comes from [`delay_opt`]. An empty
-    /// index returns [`TripStatus::NoData`] everywhere.
+    /// Realtime status at compact `stop`. Cancellation outranks any per-stop delay.
     pub fn status(&self, trip: TripId, stop: u32) -> TripStatus {
         if self.is_canceled(trip) {
             return TripStatus::Canceled;
@@ -334,55 +256,36 @@ impl RealtimeIndex {
         }
     }
 
-    /// Number of known per-stop delays. Used to flag a leg as realtime-backed and
-    /// for poller logging; cancellations are counted separately.
+    /// Number of known per-stop delays (cancellations counted separately).
     pub fn len(&self) -> usize {
         self.delays.len()
     }
 
-    /// Number of trips reported CANCELED in this snapshot.
     pub fn canceled_len(&self) -> usize {
         self.canceled.len()
     }
 
-    /// Number of resolved vehicle positions in this snapshot. Informational only —
-    /// positions do not affect `is_empty` (they do not contribute to the inert-default
-    /// invariant; an index with positions but no delays/cancellations is still empty
-    /// for routing purposes).
+    /// Informational only; positions do not affect `is_empty`.
     pub fn positions_len(&self) -> usize {
         self.positions.len()
     }
 
-    /// Number of service alerts in this snapshot. Informational only.
+    /// Informational only.
     pub fn alerts_len(&self) -> usize {
         self.alerts.len()
     }
 
-    /// Actual compact stop index for `(trip, parent_station)` when the RT feed
-    /// signalled a platform-level stop. `parent_station` is the stop_id prefix
-    /// before the last `_` (e.g. `"gs:nmbssncb:8814001"` for a platform stop).
-    /// Returns `None` when no RT platform information is known for this pair.
+    /// Compact stop index for `(trip, parent_station)` on a platform-level RT stop.
+    /// `parent_station` is the stop_id prefix before the last `_`.
     #[inline]
     pub fn platform_swap(&self, trip: TripId, parent_station: &str) -> Option<u32> {
         self.platform_swaps.get(&(trip, parent_station.to_string())).copied()
     }
 
-    /// Returns service alerts relevant to a transit leg, filtered to those
-    /// currently active at `now_unix_secs`.
-    ///
-    /// An alert matches the leg if at least one `informed_entity` satisfies:
-    /// - `trip_id` equals `trip_id_str`, OR
-    /// - `stop_id` equals `board_stop_id` or `alight_stop_id`, OR
-    /// - `route_id` equals `route_id_str` (when both are `Some`).
-    ///
-    /// `route_id_str` is the raw GTFS route_id string for the leg's trip. Pass
-    /// `None` when the trip→route mapping is unavailable (e.g. old graph without
-    /// `transit_route_ids`); route-level alerts will then be silently skipped.
-    ///
-    /// An alert is active at `now` if its `active_period` list is empty (always
-    /// active) or at least one period contains `now`: `start ≤ now < end` where
-    /// a missing bound is treated as open (no start = always started; no end =
-    /// never expires).
+    /// Service alerts matching a leg and active at `now_unix_secs`. Matches when an
+    /// `informed_entity` has `trip_id == trip_id_str`, `stop_id ∈ {board, alight}`,
+    /// or `route_id == route_id_str` (both `Some`). Active if `active_period` is empty
+    /// or some period has `start ≤ now < end` (missing bound = open).
     pub fn alerts_for_leg<'a>(
         &'a self,
         trip_id_str: &str,
@@ -449,14 +352,11 @@ mod tests {
 
     #[test]
     fn skipped_is_inert_by_default_and_visible_when_set() {
-        // No-feed: empty index reports no skips and stays empty.
         let idx = RealtimeIndex::new();
         assert!(!idx.is_skipped(TripId(1), 3));
         assert_eq!(idx.skipped_len(), 0);
         assert!(idx.is_empty());
 
-        // A skip-only index is non-empty (routing must consult it) and reports
-        // exactly the pairs it was given.
         let mut skipped = HashSet::new();
         skipped.insert((TripId(1), 3));
         let idx = RealtimeIndex::new().with_skipped(skipped);
@@ -469,7 +369,6 @@ mod tests {
 
     #[test]
     fn sticky_absent_delay_with_sticky_is_zero_matching_no_feed() {
-        // No-feed byte-identical: empty index, sticky-blind and sticky-aware both 0.
         let idx = RealtimeIndex::new();
         assert_eq!(idx.delay(TripId(1), 0), 0);
         assert_eq!(idx.delay_with_sticky(TripId(1), 0), 0);
@@ -479,21 +378,16 @@ mod tests {
 
     #[test]
     fn sticky_is_invisible_to_routing_accessors_and_is_empty() {
-        // An index whose ONLY realtime content is sticky must look empty to routing:
-        // is_empty()/len() ignore it, and the sticky-blind accessors return the inert
-        // default — while the sticky-aware accessors surface the retained delay.
         let mut sticky = HashMap::new();
         sticky.insert((TripId(7), 3), (120, 1_000));
         let idx = RealtimeIndex::new().with_sticky_delays(sticky);
 
-        // Routing-facing (sticky-blind) view: inert.
         assert!(idx.is_empty(), "sticky-only index must be empty for routing");
         assert_eq!(idx.len(), 0, "len counts live delays only");
         assert_eq!(idx.delay(TripId(7), 3), 0);
         assert_eq!(idx.delay_opt(TripId(7), 3), None);
         assert_eq!(idx.status(TripId(7), 3), TripStatus::NoData);
 
-        // Live-refresh (sticky-aware) view: retained delay is visible.
         assert_eq!(idx.delay_with_sticky(TripId(7), 3), 120);
         assert_eq!(idx.status_with_sticky(TripId(7), 3), TripStatus::Delayed(120));
         assert_eq!(idx.sticky_len(), 1);
@@ -501,7 +395,6 @@ mod tests {
 
     #[test]
     fn live_delay_overrides_sticky_even_when_live_is_zero() {
-        // A fresh live Some(0) (vehicle now on-time) must win over a stale sticky 120.
         let mut sticky = HashMap::new();
         sticky.insert((TripId(1), 0), (120, 1_000));
         let idx = RealtimeIndex::from_delays(2_000, [((TripId(1), 0), 0)])
@@ -512,9 +405,8 @@ mod tests {
 
     #[test]
     fn sticky_fallback_only_where_live_is_absent() {
-        // Live delay for one stop; sticky retains another stop the feed dropped.
         let mut sticky = HashMap::new();
-        sticky.insert((TripId(1), 5), (90, 1_000)); // dropped by feed → sticky only
+        sticky.insert((TripId(1), 5), (90, 1_000));
         let idx = RealtimeIndex::from_delays(2_000, [((TripId(1), 0), 30)])
             .with_sticky_delays(sticky);
         assert_eq!(idx.delay_with_sticky(TripId(1), 0), 30, "live stop wins");
@@ -686,8 +578,8 @@ mod tests {
         );
         assert_eq!(idx.delay(TripId(3), 2), 120);
         assert_eq!(idx.delay(TripId(3), 3), -30);
-        assert_eq!(idx.delay(TripId(3), 9), 0); // unknown stop on a known trip
-        assert_eq!(idx.delay(TripId(4), 2), 0); // unknown trip
+        assert_eq!(idx.delay(TripId(3), 9), 0);
+        assert_eq!(idx.delay(TripId(4), 2), 0);
         assert_eq!(idx.len(), 2);
         assert_eq!(idx.generated_at, 1_700_000_000);
     }

@@ -1,0 +1,555 @@
+build:
+  inputs:
+    - ingestor: gtfs/stib
+      name: STIB
+      url: https://api-management-opendata-production.azure-api.net/api/gtfs/feed/stibmivb/static/
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+
+    - ingestor: gtfs/sncb
+      name: SNCB
+      url: https://api-management-opendata-production.azure-api.net/api/gtfs/feed/nmbssncb/static/
+      osm_url: path:data/belgium-latest.osm.pbf
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+
+    - ingestor: gtfs/generic
+      name: DeLijn
+      url: https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/static/
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+
+    # TEC / Wallonia (OTW). Public OTW open-data GTFS export, auto-downloaded and
+    # cached like the other remote feeds (no manual placement, no key). The feed's
+    # agencies are the five regional brands ("TEC Brabant Wallon", "TEC Charleroi",
+    # "TEC Hainaut", "TEC Liège - Verviers", "TEC Namur - Luxembourg"); each carries
+    # the "TEC" token, so the TEC fare operator in default_routing.fares matches them
+    # all by token. Licence: OTW open data (free reuse; see the Wallonia open-data
+    # portal / letec.be Open Data terms).
+    - ingestor: gtfs/generic
+      name: TEC
+      url: https://opendata.tec-wl.be/Current%20GTFS/TEC-GTFS.zip
+
+    - ingestor: osm/pbf
+      url: path:data/belgium-latest.osm.pbf
+
+    # Elevation DEM (GeoTIFF). The ingestor tag encodes the projection; phase 0 so
+    # per-way ascent bakes into street edges. Multiple dem/* inputs layer with
+    # first-hit priority in listed order.
+    - ingestor: dem/belgian-lambert-2008
+      name: dem
+      url: path:data/belgium-DTM-20m.tif
+
+    # Belgian address search (FPS BOSA / BeST Address, CC BY 4.0). Ingested into a
+    # SIBLING address index (address.bin), NOT the routing graph — phase 2 keeps it
+    # out of the OSM/GTFS build. Like the other remote feeds, the zip is auto-
+    # downloaded once to cache/bestadd.zip and cached, then reused thereafter — no
+    # manual placement needed. First startup on a fresh machine downloads the large
+    # (~hundreds of MB) zip and blocks boot until the index is built. A present, fresh
+    # cache is reused without re-downloading; when the cached zip is older than ~7 days
+    # it is refreshed best-effort on the next start. If a download fails the index is
+    # skipped gracefully (routing/transit unaffected). Deliberately NOT wired into the
+    # hourly auto-update scheduler (which force-downloads every tick).
+    - ingestor: address/bestadd
+      name: bestadd
+      phase: 2
+      url: https://opendata.bosa.be/download/best/best-full-latest.zip
+
+  # Distinct paths so the Belgium preset never clobbers the generic caches.
+  output: graph.belgium.bin
+  osm_output: osm.belgium.bin
+  address_output: address.belgium.bin
+  elevation_smoothing_epsilon: 4.0
+
+  # OSM surface=* -> bike cruise-speed factor (relative to asphalt = 1.0), baked
+  # per-edge at ingest. A SPEED factor only, separate from the Surface comfort
+  # axis. Unlisted or untagged surfaces use the unknown default (0.90). Re-tuning
+  # requires a graph rebuild (the factor is baked, like elevation smoothing).
+  surface_speed_factors:
+    asphalt: 1.00
+    concrete: 0.95
+    paved: 0.90
+    "concrete:plates": 0.85
+    metal: 0.85
+    wood: 0.85
+    paving_stones: 0.80
+    compacted: 0.80
+    fine_gravel: 0.80
+    grass_paver: 0.70
+    unpaved: 0.70
+    sett: 0.65
+    gravel: 0.60
+    pebblestone: 0.60
+    ground: 0.60
+    dirt: 0.60
+    earth: 0.60
+    cobblestone: 0.50
+    unhewn_cobblestone: 0.50
+    grass: 0.45
+    sand: 0.25
+    mud: 0.20
+
+  delay_models:
+    - mode: subway
+      bins: [[-180, 0.009], [-120, 0.039], [-60, 0.123], [0, 0.629], [60, 0.777], [120, 0.86], [180, 0.927], [240, 0.97], [300, 0.986], [360, 0.991], [660, 0.992], [720, 0.992], [900, 0.992], [960, 0.994], [1020, 0.995], [1080, 1]]
+    - mode: tram
+      bins: [[-60, 0.018], [0, 0.607], [60, 0.857], [120, 0.982], [180, 1]]
+    - mode: bus
+      bins: [[-300, 0.008], [-240, 0.019], [-180, 0.043], [-120, 0.095], [-60, 0.192], [0, 0.503], [60, 0.644], [120, 0.747], [180, 0.82], [240, 0.869], [300, 0.905], [360, 0.93], [420, 0.947], [480, 0.959], [540, 0.968], [600, 0.975], [660, 0.98], [720, 0.984], [780, 0.987], [840, 0.989], [900, 0.991], [960, 0.992], [1020, 0.994], [1080, 0.994], [1140, 1]]
+    - mode: rail
+      bins: [[0, 0.455], [60, 0.747], [120, 0.855], [180, 0.903], [240, 0.937], [300, 0.952], [360, 0.963], [420, 0.97], [480, 0.975], [540, 0.979], [600, 0.983], [660, 0.985], [720, 0.986], [780, 0.987], [840, 0.988], [900, 0.991], [960, 0.992], [1020, 0.993], [1080, 0.993], [1140, 0.994], [1200, 0.995], [1320, 0.995], [1380, 1]]
+
+log_level: info
+
+default_routing:
+  # ADGW limited-sharing threshold: drop a bike/car alternative sharing more than this
+  # fraction of its length with a higher-ranked one (0.6 = GraphHopper default).
+  alt_max_share_factor: 0.6
+  max_window_minutes: 1440
+  max_snap_distance_m: 10000
+  # Travel-time-map (isochrone / one-to-many reachability) sampling. The
+  # `travelTimeMap` query samples the reachable bounding box on a lat/lng grid whose
+  # cell edge is `travel_map_grid_step_m` metres (smaller = finer heatmap, more cells,
+  # slower). When a departure window is given, the isochrone is evaluated every
+  # `travel_map_window_sample_secs` seconds across the window and aggregated per cell.
+  travel_map_grid_step_m: 200.0
+  # Safety cap on total heatmap cells: if the (possibly per-query overridden) grid
+  # step would produce more cells than this over the reachable box, the step is
+  # coarsened upward so the response stays bounded (no OOM / huge payload).
+  travel_map_max_cells: 150000
+  travel_map_window_sample_secs: 600
+  # Merge radius (m) for the EXACT normalized-name + SAME-operator/feed case only
+  # (STIB surface tram/bus orphans, all DeLijn stops). That exact-name + same-feed
+  # match is a strong signal, so it tolerates the spread of big interchanges (Gare
+  # du Nord surface<->metro ~95-123 m, Merode ~111 m) while genuinely distinct
+  # same-named stops (>250 m apart) stay separate; also bounds the zero-cost station
+  # hub's free intra-station walk. A future fuzzy/cross-operator matcher would use
+  # its own, tighter value.
+  station_merge_radius_m: 250.0
+  # Address search (BeST-Add) proximity/relevance ranking. Results are biased
+  # toward the map the user is viewing (the UI sends the map centre as focus):
+  # final_score = text_score * geo_decay, sorted high-to-low. geo_decay is an
+  # exponential distance falloff: full score within the offset, halving at the
+  # half-score distance, floored so a far but exact text match is never buried.
+  address_geo_offset_km: 2.0        # full geo score within 2 km of the focus point
+  address_geo_half_score_km: 5.0    # geo score halves at 5 km (scale = (half-offset)/ln2)
+  address_geo_floor: 0.1            # a perfect text match far away still scores text*0.1
+  address_prefix_token_weight: 0.6  # a prefix-only token match scores 0.6 of an exact one
+  address_house_number_boost: 1.5   # exact house number outranks a prefix house-number match
+  # Stage-3 typo tolerance: the exact/prefix pass runs first; a fuzzy fallback only
+  # widens the WORD tokens (never house number/postcode) when too few streets
+  # resolved, so clean-query precision and latency are unchanged. Standard
+  # Levenshtein (a transposition counts as 2 edits).
+  address_fuzzy_trigger_k: 5        # run fuzzy only when fewer than 5 streets matched exactly/by prefix
+  address_fuzzy_min_len_1typo: 3    # query tokens ≥3 chars allow 1 edit (1–2 chars: no fuzzy, prefix intent)
+  address_fuzzy_min_len_2typos: 8   # query tokens ≥8 chars allow 2 edits (longer words absorb more error)
+  address_fuzzy_token_weight: 0.4   # a fuzzy-only token match scores 0.4 (< prefix 0.6 < exact 1.0)
+  # Address index build: BeST models each apartment/box ("bus"/"bte") as its own
+  # address row, so one house number can be many rows sharing a building entrance.
+  # The index collapses them into one building candidate keyed by (street, house
+  # number), keeping the box numbers as metadata. Boxes within this radius of the
+  # building centroid are one entrance (coordinates collapse to the centroid);
+  # beyond it (a rare multi-entrance building) each box keeps its own coordinate.
+  address_box_coord_epsilon_m: 5.0  # box-coordinate divergence epsilon (meters)
+  cycling_speed_mps: 4.2
+  driving_speed_mps: 11.0
+  # Pedestrian vertical-connector (stairs/elevator/ramp) cost model. Used by the
+  # Stage B1 connector-coverage measurement to report the extra walk time a
+  # vertical-access path adds to reach a matched platform. NOT charged in routing
+  # in B1 (additive metadata + measurement only). Absent fields use the defaults.
+  connector_cost:
+    stairs_speed_mps: 0.75  # effective pace on stairs (m/s) — realistic pedestrian stair pace
+    ramp_speed_mps: 0.9     # effective pace on a ramp (m/s)
+    elevator_secs: 45       # fixed call+ride+doors time (s), independent of run length
+    relocation_fallback_secs: 60  # B2a: extra penalty (s) on the synthetic platform→street fallback connector (baked at build; rebuild to re-apply)
+  vehicle_access_secs: 1200       # bike/car access budget floor (s) — short trips keep ~5 km bike
+  vehicle_access_fraction: 0.06   # budget grows to 6% of the crow-flies (walk-time) trip…
+  vehicle_access_max_secs: 2700   # …capped at 45 min so a long trip can bike to a distant hub
+  bike_profile:
+    allow_steps: true
+    allow_dismount: true   # false = forbid push (dismount) ways; routes detour around them
+    ignore_cycleroutes: false
+    stick_to_cycleroutes: true
+    avoid_unsafe: true
+    respect_oneway: true   # forbid riding against a one-way (non-exempt contraflow); false = soft penalty only
+    consider_elevation: true
+    uphillcost: 0
+    uphillcutoff: 1.5
+    downhillcost: 100
+    downhillcutoff: 0.5
+    elevation_penalty_buffer: 5   # descent/ascent below this (m, net of cutoff) is free
+    elevation_max_buffer: 10      # excess above this is force-charged at down/uphillcost per m
+    elevation_buffer_reduce: 0    # slope-proportional buffer bleed (0 = drain only at the ceiling)
+    total_mass: 90
+    max_speed: 36
+    s_c_x: 0.55
+    c_r: 0.006
+    biker_power: 100        # ~5.9 m/s flat cruise (fit commuter heading to the station)
+    # Speed-change physics: a cyclist loses time whenever forced off cruise speed —
+    # slowing for a tight corner, or stopping to dismount. The lost time is the time to
+    # brake to a target speed and re-accelerate back to cruise (re-accel from the power
+    # model; braking at brake_decel). The corner radius comes from geometry,
+    # r = min(L_prev, L_this)/θ, so the same angle is free over long edges (a sweep) but
+    # costly over short ones (a tight corner); v_corner = sqrt(lateral_accel·r), capped
+    # at cruise. A dismount run is one stop (decel→0) + one restart (accel→cruise).
+    brake_decel: 2.5          # braking deceleration (m/s²) for a corner slow-down or a stop
+    accel_rate: 1.0           # forward acceleration (m/s²) getting back to speed after a stop/corner
+    lateral_accel: 3.5        # comfortable cornering lateral accel (m/s²) on roads (~0.36 g)
+    lateral_accel_infra: 8.0  # cornering tolerance on bike infra — cycleways are efficient to
+                              # follow, so their curves/junctions are near-free (only hairpins slow)
+    corner_min_len_m: 10.0    # floor on segment length for a corner's radius — a short junction
+                              # connector / fine digitization can't fabricate a hairpin slow-down
+    push_speed_mps: 0.9       # pushing a dismounted bike (m/s) — slower than free walking (1.2)
+    steps_push_speed_mps: 0.25 # hauling a bike up/down stairs (m/s) — slower still
+  # Stochastic access/egress times. Walk/bike/drive times are log-normal: the
+  # routed time is the median; access legs are planned at access_percentile to
+  # buffer the connection, egress at the mean for an honest arrival estimate.
+  street_time:
+    access_percentile: 0.85   # buffer to catch the scheduled departure
+    sigma_alpha: 3.8          # spread scale; sigma = alpha / sqrt(seconds)
+    sigma_floor: 0.12         # min spread (long trips never become over-confident)
+    sigma_cap: 0.5            # max spread (very short trips)
+  # RCSP distance budget multiplier δ: explore paths up to (1+δ)×shortest distance.
+  # Tightened to 0.15: with the geometric length corridor this bounds the explored
+  # ellipse, keeping a 10 km bike Pareto search near ~2.8 s while still admitting the
+  # most-cycleway detour. Applies to all multi-objective street legs (bike + the
+  # short walk/drive access/egress legs).
+  distance_budget: 0.15
+  # Bike grid-bucketing cell size = k·D (D = origin→dest straight-line distance), on
+  # the CyclewayDeficit and Dplus diversity axes. Bounds the per-node Pareto frontier
+  # so the search stays fast on long legs while the cycleway/climb trade-off span is
+  # preserved cell-by-cell (a fixed grid keeps the axis extremes a coarse ε would
+  # absorb). 0 disables bucketing on that axis.
+  # Tightened 0.11 → 0.025: the elevation D+ axis is now correctly denoised (so the
+  # Dplus diversity dimension is near-flat in flat terrain) AND the signal/turn time
+  # penalty shifts the Time front, so the cycleway cell must be fine to keep distinct
+  # fast↔most-cycleway alternatives (else the front collapses). 0.025 ≈ 4 bike alts on
+  # a city leg (~2 s); 0.02 ≈ 5 (~2.8 s). Costs per-node frontier on long legs (gated).
+  bike_bucket_cyc_k: 0.025
+  bike_bucket_dpl_k: 0.013
+  # Same grid-bucketing mechanism, on Drive's Variance axis and Walk's Surface axis:
+  # both accumulate per-edge like the bike diversity axes and combine combinatorially
+  # on long direct legs. 0 disables bucketing on that axis. See multiobj.rs tests
+  # (synthetic fan-out diagnostic) for the calibration methodology and mechanism
+  # proof: on a controlled graph both axes' frontier growth is bounded as intended.
+  #
+  # walk_bucket_surf_k measured on the real Belgium graph (direct WALK, bearing 135°
+  # from 50.846,4.352): 3/5/10/20 km went from 1.4/4.4/9.5/27.5 s (k=0) to
+  # 1.0/2.3/5.3/6.5 s at 0.025 — a real, monotonic improvement, enabled by default.
+  #
+  # drive_bucket_var_k: LEFT DISABLED — bucketing Drive's Variance axis does not help
+  # and made direct CAR worse as k increased (10 km: 26 s → 42 s → 95 s+). Root cause
+  # was since identified and fixed elsewhere: direct CAR's bottleneck was NOT the
+  # Variance-axis frontier size but pathological A* label-churn on the constant-speed
+  # car graph, so the A* Time-heuristic is now force-disabled for Drive in
+  # `multiobj_search_core` (Drive's front is admissible-invariant to it anyway). With
+  # that fix a Drive Variance bucket is unnecessary; keep this at 0 unless a future
+  # measurement shows the frontier (not the heuristic) is the constraint.
+  drive_bucket_var_k: 0.0
+  walk_bucket_surf_k: 0.025
+  # Whether D+ (ascent) is a bike SELECTION axis. false (default): D+ is displayed but
+  # does not pick routes — the gradient power model already prices climbing into Time, so
+  # a separate min-D+ axis only manufactured absurd extremes (a ~1.5 km walk to shave a
+  # few m of ascent) and tripled search cost. A/B: push 1114→44 m, search 3–4× faster,
+  # diversity comparable. Set true to restore D+ as a third selection axis (e.g. hilly
+  # regions where flat-vs-climb is a genuine trade-off beyond time).
+  bike_select_dplus: false
+  # Per-axis ε-dominance: ε_i = a_i + b_i×value; unspecified axes keep defaults.
+  # epsilon:
+  #   time_a: 2.0            # absolute time slack (seconds)
+  #   time_b: 0.01           # relative time slack (fraction of value)
+  #   dplus_a: 3.0           # ascent slack (meters) — merge routes within ~3 m D+
+  #   surface_a: 10.0        # absolute surface slack (cost·m)
+  #   surface_b: 0.06        # relative surface slack (≈ routes within ~6% roughness)
+  # Time-variance model feeding the always-on Variance axis (and the post-hoc
+  # [p50,p95] bracket): signalized/uncontrolled crossings, elevators, bike turns,
+  # and (opt-in) stressful-road-class exposure.
+  # variance_model:
+  #   signal_sigma_major: 25.0
+  #   signal_sigma_secondary: 18.0
+  #   signal_sigma_minor: 12.0
+  #   elevator_sigma: 20.0
+  #   uncontrolled_sigma: 3.0
+  #   turn_sigma: 10.0          # σ seconds for a full reversal turn (bike only)
+  #   stress_var_per_m: 0.0     # seconds²/m on a stressful road class. OFF by default: as a
+  #                             # continuous, Time-decorrelated term it explodes the walk
+  #                             # Pareto front. Crossings/turns are the discrete primary signal.
+  #   # Expected (mean) delay folded into the Time/ETA objective by lights (the sigmas
+  #   # above only feed the spread). A signal's mean uniform-arrival delay
+  #   # ≈ red²/(2·cycle); ~30 s red on a ~90 s cycle ⇒ ~15 s major; secondary/minor
+  #   # roads have shorter reds/cycles ⇒ smaller means. The bike turn/corner mean is no
+  #   # longer here — it is the physical corner slow-down in bike_profile (brake_decel,
+  #   # lateral_accel), charged per-vertex from the edge geometry.
+  #   signal_delay_major: 15.0      # mean seconds lost at a signal on a major road
+  #   signal_delay_secondary: 10.0  # mean seconds lost at a signal on a secondary road
+  #   signal_delay_minor: 7.0       # mean seconds lost at a signal on a minor road
+  #   push_sigma: 8.0               # σ seconds of dismount-time uncertainty, once per push run (bike only)
+  # Surface roughness and comfort-stress multipliers for the multi-objective cost vector.
+  # Unspecified fields keep their compiled-in defaults.
+  # cost_weights:
+  #   surface_paved: 1.0       # multiplier on edge length for paved surfaces
+  #   surface_unknown: 1.3     # multiplier for unknown surface quality
+  #   surface_unpaved: 2.5     # multiplier for unpaved / gravel / dirt
+  #   comfort_stress_factor: 1.0  # multiplier on stressful-road length for Comfort axis
+
+  # Transit pricing as a POST-HOC plan annotation. Price is NOT an in-search
+  # Pareto axis: routing runs unpriced, and each returned plan's fare is computed
+  # afterwards from its boardings (additive per-boarding, multi-operator). Only some
+  # operators are fare-modeled; boardings on unmodeled operators (e.g. generic
+  # feeds) are reported as unpriced rather than dropped. `enabled` is THE
+  # master switch for the whole feature: when false the post-hoc pricing and
+  # Plan.price output are absent and routing is byte-identical to pre-feature.
+  fares:
+    enabled: true
+    # epsilon-bucket on the known-euros (modeled spend) dominance axis, shaped
+    # like the other epsilon.* tunables (bucket width = a + b*cents). Bucketing
+    # bounds the number of price tiers surviving per Pareto cell.
+    known_euros_epsilon: { a: 10.0, b: 0.0 }   # 10-cent buckets
+    operators:
+      # Matched to the normalized (uppercased, trimmed) agency.name from GTFS,
+      # token-based: the configured name matches the whole agency name OR any of
+      # its slash/whitespace-delimited tokens, so "SNCB" matches the real GTFS
+      # agency "NMBS/SNCB". A configured operator that matches no agency logs a
+      # startup warning (its fares would otherwise be silently inert).
+      - name: STIB
+        model: time_window_flat
+        ticket_euros: 2.40       # flat single-ride ticket
+        validity_secs: 5400      # 90-minute transfer window, gated on boarding
+      # De Lijn: flat 60-minute time-window ticket (own window, independent of
+      # STIB). subscription -> 0; delijn10Journey -> per-journey card_euros.
+      # [ASSUMPTION: 60-min window, no category reduction.]
+      - name: De Lijn
+        model: time_window_flat
+        time_window_operator: delijn
+        ticket_euros: 3.00       # single ride
+        card_euros: 2.20         # 10-journey card, 22.00 / 10
+        validity_secs: 3600      # 60-minute window
+      # TEC: per-boarding flat fare split by route tier (classic vs express). The
+      # TEC GTFS feed IS ingested (a gtfs/generic build input auto-downloaded from
+      # the OTW open-data portal), whose regional agencies all carry the "TEC" token,
+      # so this operator matches them and TEC legs price live. Express classification
+      # is config-driven by route name: TEC express lines are the "(Express)"-named
+      # lines (E1-E13, E109, E110), detected via the "Express" marker in the route
+      # name (express_route_names below), not the "E" number prefix.
+      - name: TEC
+        model: time_window_flat_tiered
+        classic_single_euros: 2.80
+        express_single_euros: 5.50
+        classic_card6_euros: 2.23           # 13.40 / 6
+        express_card6_euros: 4.40           # 26.40 / 6
+        classic_card6_reduced_euros: 1.80   # 10.80 / 6 (YOUNG/SENIOR/BIM)
+        express_card6_reduced_euros: 3.52   # 21.10 / 6
+        # Express routes: TEC's "(Express)"-named lines only (E1-E13, E109, E110),
+        # matched via the "Express" marker in the route name. Regional/urban
+        # E-numbered lines (E20, E40, bare "E") are classic, not express.
+        # express_route_names matches substrings; express_route_prefixes matches
+        # a route name that STARTS WITH any entry. Both are ORed.
+        express_route_names: ["Express"]
+        express_route_prefixes: []
+      # SNCB: the real 2026 second-class single BASE fare as a function of the
+      # zone-collapsed chargeable railway distance D (topology source; see spec
+      # section 5.3 accuracy caveat). The distance-independent floor is charged once
+      # per contiguous SNCB run at board; the distance-dependent remainder accrues
+      # over the shortest railway path, then the whole fare is scaled/capped by the
+      # boarding time bucket + profile. Brussels and Antwerpen flat agglomeration
+      # zones (see `agglomerations:` below) exclude in-zone railway km per
+      # Appendix A.2: any railway segment with both endpoints in the same zone is
+      # charged 0 km, so each agglomeration collapses to one SNCB fare node.
+      #
+      # distance_tariff (bracketed): the EXACT published 2026 SNCB 2nd-class base
+      # single tariff. Verified zero-error against the published 2nd-class fare table.
+      #   d_eff(D_km): clamp D up to min_km; D >= cap_from_km (116) -> cap_km (118,
+      #     the maximum taxable distance); D <= 30 -> D (each km its own value);
+      #     31..60 -> arithmetic midpoint of its 3-km bracket (32,35,...,59);
+      #     61..115 -> arithmetic midpoint of its 5-km bracket (63,68,...,113).
+      #     (These bracket cut-points are the fixed SNCB tariff STRUCTURE, in code.)
+      #   raw = max(a * d_eff + b, floor_euros)
+      #   fare = round raw to the nearest 0.10 EUR, halves rounding UP.
+      # The 2026 values already include the Feb-2026 indexation.
+      # FIRST CLASS (query with fareProfile.travelClass: FIRST): 1st class = the
+      # UNROUNDED 2nd-class raw x a distance multiplier (x1.40 for d_eff<=36, x1.50
+      # for 37-51, x1.60 for 52+), then rounded on the 1st-class grid (0.10 EUR below
+      # 25, 0.50 in 25-50, 1 EUR above 50; half up). The SAME discount pipeline
+      # (Train+ cap, weekend/off-peak %, subscription) applies on top; only the base
+      # changes. Driven by first_class_thresholds / first_class_coefficients and the
+      # first_class_round_thresholds / first_class_round_grids below.
+      # Legacy `distance_tariff: band` (per_km_rate * band_coeff * tariff_km) and an
+      # inert `distance_tariff: linear` alternative remain available.
+      #
+      # NOTE: any residual error vs published fares now comes ONLY from our railway
+      # distance D differing from SNCB's official tariff distance, not the formula.
+      - name: SNCB
+        model: distance_base_per_km
+        distance_tariff: bracketed
+        a_euros_per_km: 0.168546      # slope a (EUR/effective-km), exact 2026 2nd class.
+        b_euros: 1.451226             # intercept b (EUR), exact 2026 2nd class.
+        min_km: 3                     # minimum taxable distance (km).
+        cap_from_km: 116              # >= 116 km bills at cap_km.
+        cap_km: 118                   # maximum taxable distance (km).
+        floor_euros: 2.6151           # absolute fare floor (also charged at board).
+        # 1st-class option (query travelClass: FIRST):
+        first_class_thresholds: [36, 51]        # d_eff band edges for the coefficient.
+        first_class_coefficients: [1.40, 1.50, 1.60]
+        first_class_round_thresholds: [25, 50]  # EUR tier edges for 1st-class rounding.
+        first_class_round_grids: [0.10, 0.50, 1.00]  # EUR grid per tier (half up).
+        railway_distance_source: topology
+        # zone_collapse: railway distance is charged only OUTSIDE the flat
+        # agglomeration zones below (Appendix A.2). This flag is documentation
+        # only; the behaviour is driven by the `agglomerations:` polygons.
+        # peak = weekday 06:00-09:00 or 16:00-18:00 (seconds since midnight).
+        peak_windows: [[21600, 32400], [57600, 64800]]
+        # Without Train+: weekend discount (fraction removed) by category.
+        weekend_discount_adult: 0.30
+        weekend_discount_reduced: 0.40
+        # With Train+: off-peak (incl. weekend) discount, all categories.
+        train_plus_offpeak_discount: 0.40
+        # With Train+: peak per-JOURNEY cap by category (display-only min(raw,cap)).
+        train_plus_peak_cap_adult_euros: 14.00
+        train_plus_peak_cap_reduced_euros: 5.50
+        # Airport special-OD fixed fare (base + Diabolo), overrides base+per-km.
+        # OD detection is wired into the RAPTOR scan: a ride whose board or alight
+        # stop is tagged as an airport station (airport_station_names below) applies
+        # this fixed fare in place of base+per-km. [ASSUMPTION: fixed regardless of
+        # card/category.]
+        airport_od_euros: 7.90
+        airport_station_names: ["Airport", "Luchthaven", "Aeroport", "Aéroport"]
+    # Brupass: a CAP on the Brussels multi-operator fare (NOT a user option). One
+    # Brupass single-journey ticket covers a multi-operator trip WITHIN the Brussels
+    # flat zone. It is applied automatically post-hoc: when a plan's PAID
+    # (non-subscription) boardings whose stops are in the Brussels zone span 2+
+    # DISTINCT operators (STIB / SNCB / De Lijn / TEC), the traveller could buy ONE
+    # Brupass covering them, so their sum is capped at brupass_euros — but only when
+    # that is strictly cheaper than paying each operator's own ticket. It depends on a
+    # configured Brussels `agglomerations:` zone (below) to detect an in-zone boarding;
+    # with no Brussels zone it never fires. Single-operator or subscription-covered
+    # legs are never replaced.
+    brupass_euros: 2.70          # Brupass single-journey price (Brussels multi-operator).
+    brupass_validity_secs: 3600  # Retained for back-compat; the cap is window-agnostic.
+    # Display-only day/journey caps (inert; applied at output later).
+    caps:
+      - name: STIB
+        day_cap_euros: 7.50
+    # SNCB flat agglomeration zones (Appendix A.2). Each is a bounding polygon
+    # ([lat, lng] vertices, implicitly closed); a stop inside is collapsed to that
+    # zone's single fare node, so railway km travelled WITHIN a zone (and the
+    # choice of destination stop within a zone) adds no per-km. Brussels->Brussels
+    # is therefore base only, and Ostende->(any Brussels station) is identical.
+    #
+    # [APPROXIMATION — FLAGGED] These polygons are config-driven bounding polygons
+    # approximating the OSM administrative boundaries, NOT the exact assembled OSM
+    # multipolygon rings (no OSM boundary-assembly tool was available in-env and
+    # re-parsing the 765 MB PBF on every load is prohibitive). Provenance:
+    #   - Brussels-Capital Region: OSM admin_level 4 (relation 54094).
+    #   - Antwerpen: City of Antwerp municipality, OSM admin_level 8 (relation
+    #     59518) — a documented approximation of the SNCB Antwerp fare zone; the
+    #     municipality's northern port polders are intentionally NOT included so
+    #     the box stays over the urban rail core. Refine to the real ring later
+    #     (see the TODO in src/structures/graph/railway.rs).
+    # `admin_level`/`osm_relation` are provenance only; only `polygon` is used.
+    agglomerations:
+      - name: brussels
+        admin_level: 4
+        osm_relation: 54094
+        # Fare REFERENCE station (Appendix A.2, corrected zone collapse): the whole
+        # agglomeration collapses to this one central node, so the SNCB zone-to-zone
+        # fare is fixed (any Brussels station -> any Antwerpen station is one price).
+        # Matched (case-insensitive substring) against SNCB stop names; unset or
+        # unmatched falls back to the polygon centroid's nearest railway node.
+        reference: "Bruxelles-Central"
+        # Octagon over the Brussels-Capital Region extent (~50.76-50.91 N,
+        # 4.24-4.48 E). Coordinates at 3 decimals (geo-precision policy).
+        polygon:
+          - [50.797, 4.242]
+          - [50.764, 4.312]
+          - [50.766, 4.402]
+          - [50.810, 4.482]
+          - [50.880, 4.480]
+          - [50.913, 4.402]
+          - [50.905, 4.300]
+          - [50.860, 4.245]
+      - name: antwerpen
+        admin_level: 8
+        osm_relation: 59518
+        # Fare reference station for the Antwerpen agglomeration (see brussels above).
+        reference: "Antwerpen-Centraal"
+        # Box over the Antwerp urban rail core (~51.16-51.27 N, 4.35-4.48 E).
+        polygon:
+          - [51.160, 4.352]
+          - [51.160, 4.485]
+          - [51.275, 4.485]
+          - [51.275, 4.352]
+
+server:
+  # Set to 0.0.0.0 to expose on all interfaces.
+  host: 127.0.0.1
+  port: 8000
+  graphql_max_depth: 15
+  graphql_max_complexity: 1000
+  graphiql_enabled: true
+  # Base map tiles served to the web UI.
+  tiles:
+    url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+    attribution: "© OpenStreetMap contributors"
+
+auto_update:
+  enabled: true
+  schedule: "0 * * * *"
+  cache_dir: "cache/belgium"
+
+realtime:
+  enabled: true
+  # 6 requests/cycle (sncb, sncb-alerts, delijn, delijn-alerts, STIB
+  # waiting-times + vehicle-positions) at 60s = 6 req/min, 8,640 req/day — within
+  # the shared gateway quota (~8 req/min, ~12k req/day). Polling faster (the old
+  # 30s = 12 req/min, ~17k/day) trips the gateway's 403 "out of call volume
+  # quota" and forces the fetcher into backoff.
+  poll_interval_secs: 60
+  # A vehicle position older than this many seconds is considered stale; the live
+  # UI falls back to schedule interpolation when the position is absent or stale.
+  vehicle_position_max_age_secs: 120
+  # A realtime snapshot older than this many seconds is considered STALE: routing
+  # ignores it and falls back to schedule-only. When every feed fails the poller
+  # keeps the last good index with no TTL of its own, so this bounds how long a
+  # feed outage can keep serving stale delays/cancellations (default 600 = 10 min).
+  index_max_age_secs: 600
+  # How long (seconds) the poller retains a TRACKED journey's last-known live delay
+  # after the feed stops reporting it (STIB waiting-times only predict upcoming
+  # departures, so a boarded vehicle's delay would otherwise vanish once it leaves
+  # the window). The sticky delay is exposed ONLY to the live-refresh overlay, never
+  # to routing/planning (default 86400 = ~24h).
+  tracked_delay_ttl_secs: 86400
+  feeds:
+    - type: gtfs-rt
+      name: sncb
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/nmbssncb/rt/trip-update/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: sncb-alerts
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/nmbssncb/rt/alert/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: delijn
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/rt/trip-update/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: gtfs-rt
+      name: delijn-alerts
+      url: "https://api-management-opendata-production.azure-api.net/api/gtfs/feed/delijn/rt/alert/?format=protobuf"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"
+    - type: stib
+      name: stib
+      waiting_time_url: "https://api-management-opendata-production.azure-api.net/api/datasets/stibmivb/rt/WaitingTimes/"
+      vehicle_position_url: "https://api-management-opendata-production.azure-api.net/api/datasets/stibmivb/rt/VehiclePositions/"
+      headers:
+        Cache-Control: "no-cache"
+        bmc-partner-key: "${BMC_PARTNER_KEY}"

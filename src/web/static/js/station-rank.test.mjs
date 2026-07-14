@@ -33,10 +33,10 @@ test("accents the user omits still match", () => {
 
 test("rankStations ranks exact SNCB Libramont first among Libramont candidates", () => {
   const stations = [
-    { id: "b1", name: "Libramont Gare (TEC)", lat: 49.92, lon: 5.38 },
-    { id: "b2", name: "Rue de Libramont", lat: 50.0, lon: 5.0 },
-    { id: "s1", name: "Libramont", lat: 49.921, lon: 5.381 }, // SNCB station
-    { id: "b3", name: "MALIBRAN", lat: 50.83, lon: 4.37 },    // no "libramont" substring
+    { id: "b1", name: "Libramont Gare (TEC)", lat: 49.92, lng: 5.38 },
+    { id: "b2", name: "Rue de Libramont", lat: 50.0, lng: 5.0 },
+    { id: "s1", name: "Libramont", lat: 49.921, lng: 5.381 }, // SNCB station
+    { id: "b3", name: "MALIBRAN", lat: 50.83, lng: 4.37 },    // no "libramont" substring
   ];
   const ranked = rankStations(stations, "Libramont");
   assert.equal(ranked[0].id, "s1");                 // exact wins
@@ -71,8 +71,8 @@ test("rankStations uses geo distance to focus as a tie-break", () => {
   // Two identical names, same tier & length; nearer to focus wins.
   const focus = { flat: 50.0, flng: 5.0 };
   const stations = [
-    { id: "far", name: "Gare", lat: 51.0, lon: 6.0 },
-    { id: "near", name: "Gare", lat: 50.01, lon: 5.01 },
+    { id: "far", name: "Gare", lat: 51.0, lng: 6.0 },
+    { id: "near", name: "Gare", lat: 50.01, lng: 5.01 },
   ];
   const ranked = rankStations(stations, "gare", focus);
   assert.deepEqual(ranked.map(s => s.id), ["near", "far"]);

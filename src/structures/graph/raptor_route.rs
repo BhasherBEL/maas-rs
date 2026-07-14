@@ -17,11 +17,6 @@ use crate::{
 
 use super::{BikeCost, Graph, MAX_ROUNDS, latency_profile, raptor_access::StreetProfile};
 
-/// Projected snap coordinates for a contracted (flag-on) query. The origin/destination
-/// `NodeID`s threaded alongside are bounding junctions (stable identity, survive the
-/// interior-node drop); these coordinates are the PROJECTED foot-snap points, used for
-/// plan endpoint geometry, the straight-line heuristic, and coord-based access/egress —
-/// never a junction shortcut. `None` ⇒ flag-off, the NodeID path stays byte-identical.
 pub struct QueryEndpoints {
     pub origin: crate::structures::LatLng,
     pub destination: crate::structures::LatLng,
@@ -29,24 +24,17 @@ pub struct QueryEndpoints {
     pub destination_station: Option<Vec<usize>>,
 }
 
-/// Generation-stamped scratch for the live MCR transfer Dijkstra
-/// (`apply_transfers_mcr`). Flat buffers sized to the contracted graph's junction count
-/// are reused across every round / state / range-pass and across queries (thread-local on
-/// the request thread — transfers run sequentially after the parallel scan closes), so no
-/// per-call `HashMap`/heap allocation or O(n) clear is paid. A cell is valid this
-/// generation iff `vgen[j] == cur_gen`; otherwise its distance reads as `u32::MAX`.
+/// A cell is valid this generation iff `vgen[j] == cur_gen`; else its distance reads `u32::MAX`.
 #[derive(Default)]
 struct TransferScratch {
     vgen: Vec<u32>,
     dist: Vec<u32>,
-    /// Seed slot (index into the per-state seed list) owning the best distance to `j`.
     src: Vec<u32>,
     heap: std::collections::BinaryHeap<std::cmp::Reverse<(u32, u32)>>,
     cur_gen: u32,
 }
 
 impl TransferScratch {
-    /// Grow the flat buffers to hold `n` junctions (idempotent; only ever grows).
     fn ensure(&mut self, n: usize) {
         if self.vgen.len() < n {
             self.vgen.resize(n, 0);
@@ -55,8 +43,6 @@ impl TransferScratch {
         }
     }
 
-    /// Begin a fresh Dijkstra: bump the generation (so every cell reads unvisited) and
-    /// clear the heap. On the rare `u32` wrap, reset `vgen` so the sentinel stays sound.
     fn new_generation(&mut self) {
         self.heap.clear();
         self.cur_gen = self.cur_gen.wrapping_add(1);
@@ -66,7 +52,6 @@ impl TransferScratch {
         }
     }
 
-    /// Best settled distance to junction `j` this generation, or `u32::MAX` if unvisited.
     #[inline]
     fn get(&self, j: usize) -> u32 {
         if self.vgen[j] == self.cur_gen {
@@ -76,7 +61,6 @@ impl TransferScratch {
         }
     }
 
-    /// Record distance `d` and owning seed slot `s` for junction `j` this generation.
     #[inline]
     fn set(&mut self, j: usize, d: u32, s: u32) {
         self.vgen[j] = self.cur_gen;
@@ -90,41 +74,20 @@ thread_local! {
         std::cell::RefCell::new(TransferScratch::default());
 }
 
-/// Per-query mode resolution: the active vehicle states plus per-state
-/// access/egress stop lists (walk/ride seconds, relative to the endpoint).
 /// Grid cells are addressed as `stop * n_states + state`.
 pub(super) struct ModeContext<'a> {
     pub am: &'a ActiveModes,
     pub access: Vec<Vec<(usize, u32)>>,
     pub egress: Vec<Vec<(usize, u32)>>,
     pub dest_station: Option<Vec<usize>>,
-    /// When true this query resolves inter-stop transfers via the live MCR
-    /// multi-source Dijkstra (`apply_transfers_mcr`) instead of the capped table.
     pub unrestricted_transfers: bool,
-    /// Per-query active-trip memo (env `MAAS_TRIP_MEMO`). `None` = compute
-    /// `is_trip_active` directly (default / toggle off). Built once per query in
-    /// `build_mode_context`, reused across every windowed pass.
     pub trip_active_memo: Option<TripActiveMemo>,
-    /// Resolved, FIXED-per-query fare profile. Combined with the pass's `weekday`
-    /// at the boarding site to form the `FareContext` the fare functions consume.
-    /// `FareProfile::default()` (adult, no products) when no profile is supplied.
     pub fare_profile: crate::structures::cost::FareProfile,
-    /// OPT-B (travel-map only): an OPT-IN absolute-time horizon. When `Some(h)`,
-    /// `target_cutoff` mins every per-state cutoff with `h`, so any label/candidate
-    /// whose arrival is `>= h` is pruned and the marked frontier empties (rounds
-    /// terminate) once nothing under `h` improves. `None` (the default for EVERY
-    /// production caller) leaves the pass completely unbounded — behaviour is
-    /// provably unchanged. RAPTOR arrivals are monotone non-decreasing along a
-    /// journey, so pruning a label with arrival `> h` cannot lower any arrival
-    /// `<= h`; the isochrone consumer (`fill_area`) then discards every stop with
-    /// offset `> max_secs`, so cells stay bit-identical (see `stop_arrivals_grid`).
+    /// Opt-in absolute-time arrival horizon (travel-map only); `None` leaves the pass unbounded.
     pub horizon: Option<u32>,
 }
 
 impl<'a> ModeContext<'a> {
-    /// Builds the per-state lists from per-profile stop lists.
-    /// Access: `Walked`/`CarEgress` walk, bike states ride, `CarParked` drives.
-    /// Egress: `BikeInHand` rides, `CarEgress` is driven, everything else walks.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         am: &'a ActiveModes,
@@ -179,8 +142,6 @@ impl<'a> ModeContext<'a> {
         self.egress.iter().any(|e| !e.is_empty())
     }
 
-    /// Union of all states' access stops (min seconds per stop, sorted by stop).
-    /// Used by the range driver's interesting-departure collection.
     pub fn merged_access(&self) -> Vec<(usize, u32)> {
         let mut best: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
         for list in &self.access {
@@ -194,7 +155,6 @@ impl<'a> ModeContext<'a> {
         v
     }
 
-    /// `(in_hand_idx, dropped_idx)` when the free drop transition is active.
     pub fn drop_transition(&self) -> Option<(u8, u8)> {
         match (
             self.am.state_of(VehicleState::BikeInHand),
@@ -206,93 +166,63 @@ impl<'a> ModeContext<'a> {
     }
 }
 
-/// Maximum labels kept per `(round, stop)` cell. One per reliability bucket, so this
-/// bounds the supported bucket count (edges.len()+2). Default config uses 5.
+/// One label per reliability bucket: bounds the supported bucket count (`edges.len()+2`).
 pub(super) const MAX_LABELS: usize = 16;
 
-/// Apply a signed realtime delay (seconds) to a scheduled time, clamped at 0.
 #[inline]
 pub(super) fn apply_delay(scheduled: u32, delay: i32) -> u32 {
     (scheduled as i64 + delay as i64).max(0) as u32
 }
 
-/// One remaining downstream stop of an onboard ride: where the boarded vehicle
-/// will next stop, and when (realtime arrival = scheduled + live delay).
 #[derive(Clone, Copy, Debug)]
 pub struct OnboardSeed {
-    /// Pattern position of this downstream stop (`> current_pos`).
+    /// Pattern position, invariant `> current_pos`.
     pub alighted_at: u32,
-    /// Compact stop index reached.
     pub at_stop: u32,
-    /// Realtime arrival time at the stop, seconds since midnight.
     pub arrival: u32,
 }
 
-/// A resolved onboard origin: the boarded trip (identified WITHIN its pattern,
-/// not as a global `TripId`), the current pattern position, and every remaining
-/// downstream stop with its realtime arrival. Seeds the onboard partial-requery.
 #[derive(Clone, Debug)]
 pub struct OnboardRide {
-    /// Pattern carrying the boarded trip.
     pub pattern: u32,
-    /// Within-pattern index of the boarded trip (position in `transit_pattern_trips`).
+    /// Within-pattern index of the boarded trip.
     pub trip_within: u32,
-    /// Global GTFS-internal trip id of the boarded trip (for realtime lookups).
     pub trip_id: TripId,
-    /// Pattern position the user has just passed / is currently at.
     pub current_pos: u32,
-    /// Route type of the boarded trip (feeder route type for downstream transfers).
     pub route_type: Option<RouteType>,
-    /// Remaining downstream stops, in pattern order.
     pub seeds: Vec<OnboardSeed>,
 }
 
-/// A label currently riding a route during a single `scan_route` pass.
 #[derive(Clone, Copy)]
 pub(super) struct Riding {
-    /// Trip index within the pattern (smaller = earlier = arrives earlier downstream).
+    /// Trip index within pattern; smaller = arrives earlier at every downstream stop.
     t: usize,
     boarded_at: u32,
-    /// Marginal on-time probability for arrival-bag construction.
     hit_prob: f32,
-    /// Cumulative path reliability (for bucketing).
     reliability: f32,
-    /// Reliability bucket of the prev label this was boarded from (for reconstruction).
     from_bucket: u8,
-    /// Transit-leg count of the prev label (alight labels get `from_round + 1`).
     from_round: u8,
-    /// Arena index of the prev label this trip was boarded from (the alight label's parent).
     from_arena: u32,
-    /// Compact vehicle-state index of the boarding label (alight into the same state).
     state: u8,
 }
 
-/// One RAPTOR label: an arrival-time distribution plus the cumulative reliability
-/// and the trace needed to reconstruct how the stop was reached.
 #[derive(Clone, Copy)]
 pub(super) struct Label {
     pub bag: ScenarioBag,
     pub route_type: Option<RouteType>,
     pub reliability: f32,
     pub trace: Trace,
-    /// Index of the departure (in the range driver's latest-first ordering) whose
-    /// pass created this label. 0 for single-pass queries. NOT a Pareto axis — it
-    /// lets per-departure extraction select this-departure target labels.
+    /// Departure stamp; 0 for single-pass. NOT a Pareto axis; filters this-departure
+    /// labels during extraction/build.
     pub created_by: u32,
-    /// Compact stop id this label resides at (needed to recover a footpath leg's
-    /// destination during reconstruction, which the trace alone does not record).
     pub at_stop: u32,
-    /// Number of transit legs used to create this label (footpaths don't count).
-    /// More precise than the grid round index under carry-forward; cross-stamp
-    /// pruning compares it so a many-leg ghost can't prune a fewer-leg label.
+    /// Transit-leg count (footpaths excluded). Cross-stamp pruning compares it so a
+    /// many-leg ghost can't prune a fewer-leg label.
     pub round: u8,
-    /// Arena index of the predecessor label (`u32::MAX` = source/root). Reconstruction
-    /// follows these exact pointers instead of re-looking-up grid cells by bucket,
-    /// which would drift to a different (overwritten) label and mis-score the plan.
+    /// Arena index of the predecessor (`u32::MAX` = root). Reconstruction MUST follow
+    /// these exact pointers; a bucket re-lookup drifts to an overwritten label.
     pub parent: u32,
-    /// Own index in the per-pass label arena (`u32::MAX` until pushed).
     pub arena_id: u32,
-    /// Compact vehicle-state index (always 0 in single-state walk routing).
     pub state: u8,
 }
 
@@ -310,8 +240,6 @@ impl Label {
         state: 0,
     };
 
-    /// Pushes `lab` into the per-pass arena, stamping its `arena_id`, and returns the
-    /// updated copy to store in the grid so children can reference it as a parent.
     #[inline]
     pub fn arena_push(arena: &mut Vec<Label>, mut lab: Label) -> Label {
         lab.arena_id = arena.len() as u32;
@@ -320,9 +248,8 @@ impl Label {
     }
 }
 
-/// Bounded Pareto set of labels per `(round, stop)`, traded off on
-/// `(scheduled arrival ↓, reliability bucket ↑)`. At most one label per bucket
-/// (the earliest-arriving one). Fixed-capacity & `Copy` — no heap per cell.
+/// Bounded Pareto set per `(round, stop)` on `(scheduled arrival ↓, reliability bucket ↑)`,
+/// at most one label per bucket.
 #[derive(Clone, Copy)]
 pub(super) struct LabelSet {
     labels: [Label; MAX_LABELS],
@@ -345,9 +272,7 @@ impl LabelSet {
         self.labels[..self.len as usize].iter()
     }
 
-    /// Earliest (scheduled, best-case) arrival across all labels (`u32::MAX` if empty).
-    /// This is the time axis of the Pareto front — risk lives in the reliability axis,
-    /// so we compare on scheduled arrival, not probability-weighted expected arrival.
+    /// Earliest SCHEDULED arrival (not expected), `u32::MAX` if empty.
     pub fn earliest(&self) -> u32 {
         self.iter()
             .map(|l| l.bag.earliest())
@@ -355,7 +280,6 @@ impl LabelSet {
             .unwrap_or(u32::MAX)
     }
 
-    /// The label with the earliest scheduled arrival (fastest), if any.
     pub fn min_arrival_label(&self) -> Option<&Label> {
         self.iter().fold(None, |acc, l| match acc {
             None => Some(l),
@@ -364,9 +288,6 @@ impl LabelSet {
         })
     }
 
-    /// True if some member dominates `cand` over (scheduled arrival ↓, bucket ↑):
-    /// `>=` bucket AND `<=` earliest arrival. Used as a per-pass cross-round local
-    /// prune that does NOT mutate the set (unlike `insert`).
     pub fn dominates(&self, cand: Label, buckets: &ReliabilityBuckets) -> bool {
         let cb = buckets.bucket(cand.reliability);
         let ce = cand.bag.earliest();
@@ -374,20 +295,9 @@ impl LabelSet {
             .any(|l| buckets.bucket(l.reliability) >= cb && l.bag.earliest() <= ce)
     }
 
-    /// Pareto-inserts `cand`. Returns true if the set changed (i.e. `cand` was kept).
-    ///
-    /// Same-stamp dominance is bucket-level (scheduled arrival ↓, reliability
-    /// bucket ↑) — it matches the bucketed per-pass output, so at most one label
-    /// per bucket survives within a departure.
-    ///
-    /// Cross-stamp (carried labels from later departures, the self-pruning range
-    /// driver) dominance requires `>=` PRECISE reliability: two prefixes in the
-    /// same bucket carry different precise reliabilities that can quantize to
-    /// different final buckets downstream, so a bucket-level cross-stamp prune
-    /// drops genuinely Pareto-optimal plans (the historical ~4% range misses).
-    /// Precise-rel + arrival domination IS sound: an extension of the dominator
-    /// has `<=` arrival (same trips catchable, `>=` transfer margins) and `>=`
-    /// precise reliability at every downstream step.
+    /// Pareto-inserts `cand`. Same-stamp dominance is bucket-level; cross-stamp dominance
+    /// MUST require `>=` PRECISE reliability (not bucket), or Pareto-optimal plans are
+    /// dropped (same-bucket prefixes can quantize to different final buckets downstream).
     pub fn insert(&mut self, cand: Label, buckets: &ReliabilityBuckets) -> bool {
         let cb = buckets.bucket(cand.reliability);
         let ce = cand.bag.earliest();
@@ -396,9 +306,6 @@ impl LabelSet {
             let dominates = if l.created_by == cand.created_by {
                 buckets.bucket(l.reliability) >= cb
             } else {
-                // Cross-stamp: precise reliability AND no extra transit legs —
-                // a many-leg ghost pruning a fewer-leg label would lose plans
-                // that win the output filter on the transfers axis.
                 l.reliability >= cand.reliability && l.round <= cand.round
             };
             if dominates && l.bag.earliest() <= ce {
@@ -406,10 +313,6 @@ impl LabelSet {
             }
         }
 
-        // Drop existing labels dominated by `cand`. Same-stamp: bucket-level (one
-        // label per bucket per departure). Cross-stamp: ghosts are pruning-only
-        // (their departure is already extracted), so evicting on bucket level only
-        // weakens future pruning — never output correctness.
         let mut w = 0usize;
         for i in 0..self.len as usize {
             let e = self.labels[i];
@@ -429,10 +332,7 @@ impl LabelSet {
             return true;
         }
 
-        // Full cell. Prefer evicting an old-stamp ghost: ghosts can never reach the
-        // output again, while `cand` (the newest stamp) may be needed for it. Among
-        // ghosts evict the weakest pruner (lowest precise reliability, then latest
-        // arrival).
+        // Full cell: evict an old-stamp ghost (can never reach output again) before `cand`.
         let mut ghost: Option<usize> = None;
         for i in 0..self.len as usize {
             if self.labels[i].created_by == cand.created_by {
@@ -456,8 +356,6 @@ impl LabelSet {
             return true;
         }
 
-        // All same-stamp (only possible with very fine custom bucket edges): replace
-        // the worst label (lowest bucket, then latest arrival) if `cand` beats it.
         let mut worst = 0usize;
         for i in 1..self.len as usize {
             let wb = buckets.bucket(self.labels[worst].reliability);
@@ -477,19 +375,8 @@ impl LabelSet {
     }
 }
 
-/// R6 slim-grid toggle (env `MAAS_SLIM_GRID`). Read once. Default OFF until the
-/// refutator gates it — mirrors `MAAS_COMPACT_BEST` (R3). When ON, the carried
-/// per-round label grid stores 20-byte per-cell SUMMARIES (the five fields any
-/// grid decision reads) instead of full ~68-byte labels; full label content is
-/// fetched from the per-pass arena, valid wherever the caller has already filtered
-/// to the current pass stamp (a current-stamp label always carries a live
-/// `arena_id`; stale foreign-stamp ids are never followed).
 pub(super) fn slim_grid_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Default ON — proven byte-identical (field-for-field port of the insert/evict
-    // logic reading only the 5 summary fields; full labels fetched from the arena
-    // under the existing current-stamp filter). `MAAS_SLIM_GRID=0` falls back to the
-    // full-label grid for A/B.
     *ON.get_or_init(|| {
         std::env::var("MAAS_SLIM_GRID")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
@@ -497,17 +384,8 @@ pub(super) fn slim_grid_enabled() -> bool {
     })
 }
 
-/// Per-query active-trip memo toggle (env `MAAS_TRIP_MEMO`). Read once. Default
-/// OFF until the refutator gates it. When ON, `is_trip_active` is memoized per
-/// query in a `TripActiveMemo` living in `ModeContext` (reused across every
-/// windowed pass). `is_trip_active` is a PURE function of `(trip_id, date,
-/// weekday)`; within one query driver invocation `date`/`weekday` are constant
-/// (the overnight leg is a separate invocation with its own `ModeContext`), so
-/// the memo is byte-identical by construction.
 pub(super) fn trip_memo_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Default ON — byte-identical by construction (pure fn of (trip_id, date,
-    // weekday), constant per query driver invocation). `MAAS_TRIP_MEMO=0` disables.
     *ON.get_or_init(|| {
         std::env::var("MAAS_TRIP_MEMO")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
@@ -515,20 +393,12 @@ pub(super) fn trip_memo_enabled() -> bool {
     })
 }
 
-/// Per-query memo of `is_trip_active(trip_id, date, weekday)` results, keyed by
-/// `trip_id` (the query fixes `date`/`weekday`). Tri-state per trip: `0` =
-/// unknown, `1` = inactive, `2` = active. Lazily filled on first scan of each
-/// trip. The fill is a benign race under the parallel route scan: every writer
-/// stores the SAME pure value, so any interleaving yields the identical result
-/// (`Relaxed` ordering suffices — no cross-cell invariant). Lives in
-/// `ModeContext`, which is already `Sync` and already threaded (and captured)
-/// across the `thread::scope` boundary, so no extra plumbing is needed.
+/// Tri-state per trip: `0` = unknown, `1` = inactive, `2` = active. Lazy fill is a benign
+/// race: every writer stores the SAME pure value, so `Relaxed` suffices.
 pub(super) struct TripActiveMemo {
     states: Vec<std::sync::atomic::AtomicU8>,
-    /// Debug-only guard: the `(date, weekday)` the memo was first queried with,
-    /// packed as `(date << 8) | weekday`. `u64::MAX` = unset. Asserts every
-    /// later lookup uses the same key, catching any future date-shifting caller
-    /// that would reuse one memo across dates. Compiled out of release.
+    /// Debug guard: the `(date, weekday)` first queried, packed `(date << 8) | weekday`
+    /// (`u64::MAX` = unset). Every later lookup MUST use the same key (memo is per-date).
     #[cfg(debug_assertions)]
     dw: std::sync::atomic::AtomicU64,
 }
@@ -545,9 +415,6 @@ impl TripActiveMemo {
     }
 }
 
-/// The five `Label` fields every label-grid decision reads (`insert` / `dominates`
-/// / `earliest` / member ordering) plus the arena index that fetches full content.
-/// A grid cell needs nothing else; full label content lives in the per-pass arena.
 #[derive(Clone, Copy)]
 pub(super) struct Summary {
     pub arena_id: u32,
@@ -570,12 +437,7 @@ impl Summary {
     }
 }
 
-/// Debug-only structural equality between a grid-stored label and its arena entry.
-/// Asserts the R6 invariant `arena[l.arena_id] == l` at every full-content fetch on
-/// the FULL (baseline) path — proving the arena-deref rewrite byte-identical before
-/// slim is ever enabled. Only ever called inside `debug_assert!` (compiled out of
-/// the hot path in release), but must exist unconditionally — the macro still
-/// references the symbol under `if cfg!(debug_assertions)`.
+/// Asserts the R6 invariant `arena[l.arena_id] == l`.
 #[allow(dead_code)]
 fn label_matches_arena(stored: &Label, arena: &[Label]) -> bool {
     let id = stored.arena_id as usize;
@@ -600,19 +462,13 @@ fn label_matches_arena(stored: &Label, arena: &[Label]) -> bool {
         && a.trace.from_bucket == stored.trace.from_bucket
 }
 
-/// A single grid cell: a bounded Pareto set of labels for one `(round, stop, state)`.
-/// Two interchangeable representations — full labels (`LabelSet`, the exact baseline)
-/// and 20-byte summaries (`SlimSet`, R6) — expose the same reads. Full content is
-/// fetched via `full`, valid wherever the caller has filtered to the current stamp.
+/// A grid cell in either representation: full `LabelSet` or 20-byte-summary `SlimSet`.
 pub(super) trait LabelCell: Copy {
     fn is_reached(&self) -> bool;
     fn earliest_arrival(&self) -> u32;
     fn count(&self) -> usize;
     fn summary_at(&self, i: usize) -> Summary;
-    /// Full label for member `i`. Baseline returns the stored label (and asserts it
-    /// equals its arena entry); slim fetches `arena[summary.arena_id]`.
     fn full_at(&self, i: usize, arena: &[Label]) -> Label;
-    /// Min-scheduled-arrival member as a full label (path reconstruction / survey).
     fn min_arrival_full(&self, arena: &[Label]) -> Option<Label>;
 }
 
@@ -652,11 +508,8 @@ impl LabelCell for LabelSet {
     }
 }
 
-/// Slim grid cell (R6): the per-bucket Pareto front stored as 20-byte summaries.
-/// Same fixed capacity, insertion order, eviction and tie-breaks as `LabelSet` —
-/// its `insert_summary` is a field-for-field port of `LabelSet::insert` reading
-/// only the five summary fields, so the two produce byte-identical member streams
-/// (and thus identical stored `arena_id`s).
+/// Per-bucket Pareto front as 20-byte summaries (R6). `insert_summary` MUST stay a
+/// field-for-field port of `LabelSet::insert` so the two produce byte-identical streams.
 #[derive(Clone, Copy)]
 pub(super) struct SlimSet {
     summaries: [Summary; MAX_LABELS],
@@ -685,7 +538,6 @@ impl SlimSet {
         self.iter().map(|s| s.earliest).min().unwrap_or(u32::MAX)
     }
 
-    /// Verbatim port of `LabelSet::insert` operating on `Summary` fields.
     fn insert_summary(&mut self, cand: Summary, buckets: &ReliabilityBuckets) -> bool {
         let cb = buckets.bucket(cand.reliability);
         let ce = cand.earliest;
@@ -798,9 +650,7 @@ impl LabelCell for SlimSet {
     }
 }
 
-/// One round-row of the carried RAPTOR label grid. Abstracts over the two cell
-/// representations so the core loop and reconstruction are written once and
-/// instantiated per toggle: `FullRow` (baseline `LabelSet`) or `SlimRow` (`SlimSet`).
+/// One round-row of the carried RAPTOR label grid, generic over `FullRow`/`SlimRow`.
 pub(super) trait LabelRow: Sync + Sized {
     type Cell: LabelCell;
     fn empty(n_cells: usize) -> Self;
@@ -864,21 +714,14 @@ impl LabelRow for FullRow {
     }
 }
 
-/// Slim round-row (R6). Two exact add-ons on top of the summary cells:
-///  - **Lazy allocation**: `cells` stays empty (zero heap) until the first insert
-///    touches this row. Rounds usually terminate (`queue.is_empty()`) well below
-///    `MAX_ROUNDS`, so the upper rows are never materialized. An untouched row reads
-///    as all-`EMPTY`.
-///  - **Reached-cell index**: `reached` records exactly the cells that hold a label,
-///    so the carried-merge iterates only those (in ascending cell order, mirroring
-///    the baseline `0..n_cells` scan) instead of scanning all `n_cells`. The merge
-///    is per-cell independent (cell `c` of `dst` depends only on `src[c]` and
-///    `dst[c]`), so the result is order-invariant regardless.
+/// Slim round-row (R6): summary cells with lazy allocation and a reached-cell index. The
+/// carried-merge is per-cell independent (cell `c` of `dst` depends only on `src[c]` and
+/// `dst[c]`), so it is order-invariant.
 pub(super) struct SlimRow {
     n_cells: usize,
     /// Empty ⇒ row untouched (all cells `EMPTY`); else length `n_cells`.
     cells: Vec<SlimSet>,
-    /// Indices of cells with ≥1 label (deduplicated, first-touch order).
+    /// Indices of cells with ≥1 label (deduplicated).
     reached: Vec<u32>,
 }
 
@@ -939,9 +782,7 @@ impl LabelRow for SlimRow {
         buckets: &ReliabilityBuckets,
     ) {
         if src.cells.is_empty() {
-            // Prev row untouched: nothing to carry. `!carried` (single-pass copy)
-            // would replace `self` with an all-EMPTY row — but a fresh single-pass
-            // row `k` is only ever written after `k-1`, so `self` is already empty.
+            // Prev row untouched: nothing to carry.
             if !carried {
                 self.cells.clear();
                 self.reached.clear();
@@ -949,11 +790,7 @@ impl LabelRow for SlimRow {
             return;
         }
         if carried {
-            // Carried merge: fold prev's ≤(k-1)-trip frontier into this round,
-            // visiting only prev's reached cells. The merge is per-cell independent
-            // (cell `c` of `dst` depends only on `src[c]` and `dst[c]`), so iteration
-            // order is irrelevant to the result; we still visit in ascending cell
-            // order to mirror the baseline `0..n_cells` scan exactly.
+            // Fold prev's ≤(k-1)-trip frontier into this round over prev's reached cells.
             self.materialize();
             let mut order: Vec<u32> = src.reached.clone();
             order.sort_unstable();
@@ -968,7 +805,6 @@ impl LabelRow for SlimRow {
                 }
             }
         } else {
-            // Single-pass whole-row copy (the `copy_from_slice` equivalent).
             self.cells.clear();
             self.cells.extend_from_slice(&src.cells);
             self.reached.clear();
@@ -977,10 +813,7 @@ impl LabelRow for SlimRow {
     }
 }
 
-/// Runtime toggle (env `MAAS_COMPACT_BEST`) selecting the compact `best` backend
-/// (R3). Read once. Default ON — the compact per-bucket-min backend is proven
-/// byte-identical (same-stamp `best` == per-bucket minimum arrival); set
-/// `MAAS_COMPACT_BEST=0` to fall back to the historical `Vec<LabelSet>` path for A/B.
+/// Toggle (env `MAAS_COMPACT_BEST`, default ON) for the compact `best` backend (R3).
 pub(super) fn compact_best_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -990,22 +823,15 @@ pub(super) fn compact_best_enabled() -> bool {
     })
 }
 
-/// Per-pass forward-exploration bound (`best`). It is reset every pass, so every
-/// label it holds shares one stamp — its ONLY observable behaviour is
-/// `is_reached` / `earliest` / `dominates` / same-stamp `insert`. Same-stamp
-/// LabelSet semantics reduce EXACTLY to "per-reliability-bucket minimum scheduled
-/// arrival": the front dominates every ever-inserted label, so an unconditional
-/// per-bucket `min` reproduces all three reads bit-for-bit (proof holds while the
-/// same-stamp set can't overflow `MAX_LABELS`, i.e. `n_buckets <= MAX_LABELS` —
-/// one label per bucket). Two backends, chosen at construction:
-///  - `Labels`  — the historical `Vec<LabelSet>` (default; the exact baseline).
-///  - `Compact` — `n_cells * n_buckets` `u32` min-arrivals: ~4-24 B/cell vs 1.09 KB,
-///    killing the per-pass reset traffic and the hottest cache misses.
+/// Per-pass forward-exploration bound (`best`), reset every pass so all its labels share
+/// one stamp. Same-stamp LabelSet reads (`is_reached`/`earliest`/`dominates`/`insert`)
+/// reduce EXACTLY to per-reliability-bucket minimum scheduled arrival, so the `Compact`
+/// per-bucket-`min` backend reproduces them bit-for-bit while `n_buckets <= MAX_LABELS`.
 pub(super) enum BestGrid {
     Labels(Vec<LabelSet>),
     Compact {
-        /// Flat `n_cells * n_buckets` grid of minimum scheduled arrivals
-        /// (`u32::MAX` = bucket unreached). Cell `c`, bucket `b` → `arr[c*nb + b]`.
+        /// Flat `n_cells * n_buckets` min scheduled arrivals (`u32::MAX` = unreached).
+        /// Cell `c`, bucket `b` → `arr[c*nb + b]`.
         arr: Vec<u32>,
         n_buckets: usize,
         n_cells: usize,
@@ -1013,12 +839,8 @@ pub(super) enum BestGrid {
 }
 
 impl BestGrid {
-    /// Builds the grid for `n_cells` cells. Uses the compact backend when the toggle
-    /// is on AND `n_buckets <= MAX_LABELS` (above that the same-stamp LabelSet can
-    /// overflow and drop per-bucket minima, so compact would be *stronger* than —
-    /// hence diverge from — the legacy path; fall back to exact). Price is no longer
-    /// a dominance axis (it is annotated post-hoc), so the search is price-blind and
-    /// the compact backend is used regardless of whether fares are enabled.
+    /// Compact backend iff the toggle is on AND `n_buckets <= MAX_LABELS` (above that the
+    /// same-stamp LabelSet can overflow and diverge from the compact per-bucket min).
     pub(super) fn new(n_cells: usize, buckets: &ReliabilityBuckets) -> Self {
         let n_buckets = buckets.bucket(1.0) as usize + 1;
         if compact_best_enabled() && n_buckets <= MAX_LABELS {
@@ -1076,8 +898,7 @@ impl BestGrid {
         }
     }
 
-    /// Same predicate as `LabelSet::dominates`: some member with bucket `>=` cand's
-    /// AND scheduled arrival `<=` cand's. Compact form: a suffix-min over buckets.
+    /// Same predicate as `LabelSet::dominates`: some member with bucket `>=` and arrival `<=`.
     #[inline]
     pub(super) fn dominates(&self, cell: usize, cand: Label, buckets: &ReliabilityBuckets) -> bool {
         match self {
@@ -1092,8 +913,7 @@ impl BestGrid {
         }
     }
 
-    /// Same effect on the three reads as `LabelSet::insert` under one stamp: keep
-    /// the per-bucket minimum scheduled arrival. Return value is unused by callers.
+    /// Same-stamp equivalent of `LabelSet::insert`: keep the per-bucket min scheduled arrival.
     #[inline]
     pub(super) fn insert(&mut self, cell: usize, cand: Label, buckets: &ReliabilityBuckets) {
         match self {
@@ -1113,16 +933,14 @@ impl BestGrid {
 }
 
 impl Graph {
-    /// Foot access/egress stops within `max_secs` of `origin`. Routes over the
-    /// contracted graph when enabled (`nearby_stops_union`), else the full graph.
+    /// Foot access/egress stops within `max_secs` of `origin`.
     fn foot_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
         let cg = self.contracted.as_ref().unwrap();
         self.nearby_stops_union(origin, max_secs, cg)
     }
 
-    /// Foot access/egress stops within `max_secs` of a coord-snapped endpoint when a
-    /// contracted query supplies the projected coordinate (`coord`) — g-free, surviving the
-    /// interior-node drop. Without it, falls back to the NodeID `foot_nearby_stops`.
+    /// Foot access/egress stops, keyed on the projected snap `coord` when supplied (g-free,
+    /// survives the interior-node drop), else falls back to `foot_nearby_stops`.
     fn foot_nearby_stops_ep(
         &self,
         origin: NodeID,
@@ -1137,9 +955,7 @@ impl Graph {
         self.foot_nearby_stops(origin, max_secs)
     }
 
-    /// Car access/egress stops within `max_secs` of `origin`. Mirrors
-    /// `nearby_stops_union` but over the phased car search; identical shape and
-    /// (sorted) order to `nearby_stops_profile(Car)`.
+    /// Car access/egress stops within `max_secs` of `origin` (sorted by stop).
     fn car_nearby_stops(&self, origin: NodeID, max_secs: u32) -> Vec<(usize, u32)> {
         let cg = self.contracted.as_ref().unwrap();
         let dist = self.car_dijkstra_union(origin, max_secs, cg);
@@ -1154,18 +970,14 @@ impl Graph {
         stops
     }
 
-    /// Foot seconds `origin`→`destination` (`u32::MAX` = unreachable). Routes over
-    /// the contracted graph when enabled, else a full-graph walk Dijkstra.
+    /// Foot seconds `origin`→`destination` (`u32::MAX` = unreachable).
     fn walk_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> u32 {
         let cg = self.contracted.as_ref().unwrap();
         cg.walk_secs_point_to_point(self, origin, destination, bound)
             .unwrap_or(u32::MAX)
     }
 
-    /// Foot seconds `origin`→`destination` keyed on the PROJECTED snap coordinates when a
-    /// contracted query supplies them (`ep`) — g-free, so it survives the interior-node
-    /// drop. Without `ep` (flag-off, or junction-keyed callers) falls back to the NodeID
-    /// `walk_secs_to`, byte-identical.
+    /// Foot seconds keyed on projected snap coords (`ep`, g-free), else `walk_secs_to`.
     fn walk_secs_to_ep(
         &self,
         origin: NodeID,
@@ -1183,9 +995,8 @@ impl Graph {
         self.walk_secs_to(origin, destination, bound)
     }
 
-    /// Straight-line meters between endpoints, using the PROJECTED snap coordinates when a
-    /// contracted query supplies them (`ep`), else `nodes_distance`. The 0.99 haversine
-    /// discount matches `nodes_distance` so the heuristic is identical for junction inputs.
+    /// Straight-line meters between endpoints (projected snap coords via `ep`, else
+    /// `nodes_distance`). The 0.99 haversine discount MUST match `nodes_distance`.
     fn endpoint_distance(
         &self,
         origin: NodeID,
@@ -1198,8 +1009,7 @@ impl Graph {
         }
     }
 
-    /// Seconds to the nearest transit stop from a query origin, keyed on the projected
-    /// snap coordinate when available (g-free), else `nearest_stop_secs(node)`.
+    /// Seconds to the nearest transit stop, keyed on projected snap coord when available.
     fn nearest_stop_secs_ep(
         &self,
         origin: NodeID,
@@ -1212,8 +1022,7 @@ impl Graph {
         }
     }
 
-    /// Car seconds `origin`→`destination` (`None` = unreachable). Routes over the
-    /// contracted graph when enabled, else a full-graph car Dijkstra.
+    /// Car seconds `origin`→`destination` (`None` = unreachable).
     fn car_secs_to(&self, origin: NodeID, destination: NodeID, bound: u32) -> Option<u32> {
         let cg = self.contracted.as_ref().unwrap();
         self.car_dijkstra_union(origin, bound, cg)
@@ -1221,11 +1030,9 @@ impl Graph {
             .copied()
     }
 
-    /// Enumerates the onboard ride seeds for a user currently aboard trip
-    /// `trip_within` (within-pattern index) of `pattern`, having passed pattern
-    /// position `current_pos`. Every downstream stop (`pos > current_pos`) is a
-    /// reached label at its realtime arrival (scheduled + `rt.delay`). Stops at or
-    /// before `current_pos` are excluded; arrivals are monotonic non-decreasing.
+    /// Onboard ride seeds for a user aboard trip `trip_within` of `pattern` past
+    /// `current_pos`: one reached label per downstream stop (`pos > current_pos`) at its
+    /// realtime arrival.
     pub fn build_onboard_ride(
         &self,
         pattern: u32,
@@ -1270,13 +1077,10 @@ impl Graph {
         }
     }
 
-    /// Locates a boarded `trip` within its pattern and resolves the current
-    /// pattern position. `from_stop` (compact index) or `from_seq` (pattern
-    /// position) are advisory overrides; without either, the current position is
-    /// the last pattern stop whose realtime departure is `<= now`. Returns
-    /// `(pattern, within-pattern trip index, current_pos)`, or `None` when the
-    /// trip is unknown or the user is already at the trip's final stop (nothing
-    /// downstream to route).
+    /// Locates a boarded `trip` and its current pattern position. `from_stop`/`from_seq`
+    /// override; else current position is the last pattern stop with realtime departure
+    /// `<= now`. Returns `(pattern, trip index, current_pos)`, or `None` if unknown or at
+    /// the final stop.
     pub fn locate_onboard_trip(
         &self,
         trip: TripId,
@@ -1329,10 +1133,8 @@ impl Graph {
         Some((p as u32, t as u32, current_pos))
     }
 
-    /// Egress-only onboard partial-requery: seed the boarded trip's remaining
-    /// downstream stops (round 0, one transit leg each) and run the normal rounds
-    /// + transfers onward to a lat/lng `destination`. No access side, no radius
-    /// widening. Phase 1 routes WalkTransit egress (state 0 = `Walked`).
+    /// Egress-only onboard partial-requery: seed the boarded trip's downstream stops and
+    /// run rounds + transfers onward to `destination`. No access side. State 0 = `Walked`.
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_onboard_tuned_rt_modes_ep(
         &self,
@@ -1367,9 +1169,6 @@ impl Graph {
         Self::finalize_plans(plans, buckets)
     }
 
-    /// Production onboard RAPTOR core: allocates the per-pass grids, seeds the
-    /// onboard ride via `run_departure_into`, and extracts. Mirrors the non-debug
-    /// `raptor_inner` setup but injects onboard seeds in place of foot access.
     #[allow(clippy::too_many_arguments)]
     fn raptor_onboard_inner(
         &self,
@@ -1382,7 +1181,6 @@ impl Graph {
         slack: u32,
         rt: &RealtimeIndex,
     ) -> Vec<Plan> {
-        // R6 toggle (see `raptor_inner_with_debug`).
         if slim_grid_enabled() {
             self.raptor_onboard_grid::<SlimRow>(mc, ride, date, weekday, destination, buckets, slack, rt)
         } else {
@@ -1390,7 +1188,6 @@ impl Graph {
         }
     }
 
-    /// Row-representation-generic body of `raptor_onboard_inner`.
     #[allow(clippy::too_many_arguments)]
     fn raptor_onboard_grid<R: LabelRow>(
         &self,
@@ -1455,16 +1252,9 @@ impl Graph {
         )
     }
 
-    /// Retry loop shared by `raptor` and `raptor_range`.
-    ///
-    /// Doubles `access_secs` until `try_routing` returns a non-empty result or
-    /// the walk-only time is reached (at which point a walk-only plan is returned).
-    /// `try_routing(raw_stops, targets, access_secs)` receives the current stop
-    /// lists and walk radius and returns candidate plans (empty = no result yet).
+    /// Pass A near-stop access radius: nearest-stop reach clamped to the `min_access_secs`
+    /// floor. Shared by prod and debug so their access geometry can't drift.
     #[allow(clippy::too_many_arguments)]
-    /// Pass A near-stop access radius: the nearest-stop reach clamped to the
-    /// `min_access_secs` floor. Shared by prod `with_access_search` and the debug
-    /// variant so their two-pass access geometry can never drift.
     fn near_access_radius(
         &self,
         origin: NodeID,
@@ -1479,12 +1269,9 @@ impl Graph {
             .max(min_access_secs)
     }
 
-    /// Pass B admissible access radius bound = `min(W, best_arrival - start)`, with
-    /// the lazy-W lower-bound shortcut (only compute the unbounded walk-only time `W`
-    /// when the arrival-derived radius could exceed it). Returns `(bound, w_opt)`
-    /// where `w_opt` caches `W` when it had to be computed. `best_arrival` is the
-    /// earliest arrival found by Pass A (`None` ⇒ Pass A found no plan). Shared with
-    /// the debug variant so both compute the identical Pass B radius. See the
+    /// Pass B admissible radius `min(W, best_arrival - start)`, computing the unbounded
+    /// walk-only `W` only when the arrival-derived radius could exceed it (lazy-W).
+    /// Returns `(bound, w_opt)`; `best_arrival = None` ⇒ Pass A found no plan. See the
     /// completeness argument in `with_access_search`.
     fn admissible_access_bound(
         &self,
@@ -1539,7 +1326,6 @@ impl Graph {
     where
         F: FnMut(&ModeContext, u32) -> Vec<Plan>,
     {
-        // No transit mode selected: the direct street plans are the whole answer.
         if !am.wants_transit() {
             let walk_secs = if am.wants_direct_walk() {
                 self.walk_secs_to_ep(origin, destination, u32::MAX, ep)
@@ -1562,42 +1348,18 @@ impl Graph {
             e.origin_station.is_some() && e.destination_station.is_some()
         });
 
-        // FOOT access/egress completeness — accumulate-and-merge over two radii.
-        //
-        // Correctness (fastest-arrival guarantee): any journey arriving EARLIER than
-        // the best arrival `A` found so far must have BOTH its access and its egress
-        // foot walk shorter than `A - start_time`, since
-        // arrival = departure + access + transit + egress >= start_time + access + egress.
-        // So searching access AND egress out to radius `A - start_time` provably
-        // discovers every journey faster than `A`; a lower `A` only tightens the radius,
-        // so two passes suffice. The radius is capped by the walk-only travel time `W`
-        // (no journey needs a foot walk longer than walking the whole way). Bounding by
-        // the journey time rather than the full walk distance is what keeps it fast.
-        //
-        // We run at most two transit passes and MERGE their plans:
-        //   Pass A — the initial near-stop radius. Yields a real arrival bound `A`
-        //     cheaply and, with its tighter `target_cutoff`, preserves near-boarding
-        //     reliability-diverse / later-departure Pareto plans that Pass B's wider
-        //     radius (lower best-arrival => tighter cutoff) could prune before they
-        //     become plans. This is the regression-safety net.
-        //   Pass B — the admissible radius `min(W, A - start_time)`. Finds any faster
-        //     far access/egress journey the near radius missed; skipped when Pass A
-        //     already covered it (`access_secs >= bound`).
-        // The union is Pareto-filtered in `finalize_plans`; sound because every
-        // reconstructed plan is individually valid, so the union is a superset of each
-        // pass and drops only genuinely dominated plans. `start_time` (never a tightened
-        // per-plan departure) is the only departure baseline used here.
-        //
-        // Scope: guarantees no strictly FASTER plan is ever missed. A slower Pareto
-        // variant relying on a far access/egress stop beyond `A - start_time` is
-        // best-effort; Pass A still covers near-stop variants.
-        //
-        // `build_mode_context` uses `access_secs` for BOTH the foot access and the
-        // foot egress radius, so one radius grows both stop sets together.
+        // Fastest-arrival guarantee: any journey arriving before the best arrival `A`
+        // must have BOTH foot access and egress shorter than `A - start_time`
+        // (arrival >= start_time + access + egress), so searching both radii out to
+        // `A - start_time` finds every journey faster than `A`; two passes suffice, capped
+        // by the walk-only time `W`. Pass A (near-stop radius) yields `A` cheaply and, with
+        // its tighter cutoff, protects near-boarding Pareto variants. Pass B (admissible
+        // `min(W, A - start_time)`) catches faster far-access journeys. `start_time` (never
+        // a tightened per-plan departure) is the only baseline. `build_mode_context` uses
+        // `access_secs` for BOTH foot access and egress radius.
         let mut all: Vec<Plan> = Vec::new();
         let mut access_secs = self.near_access_radius(origin, destination, min_access_secs, ep);
 
-        // Pass A — near-stop radius.
         let mc = latency_profile::time_discovery(|| {
             self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile)
         });
@@ -1606,8 +1368,8 @@ impl Graph {
             all.extend(try_routing(&mc, access_secs));
         }
 
-        // Station endpoints already supply their complete platform set at zero access
-        // cost, so no wider radius can improve them — Pass A is already complete.
+        // Station endpoints supply their complete platform set at zero access cost, so
+        // Pass A is already complete.
         if both_stations {
             if all.is_empty() {
                 let actual = self.walk_secs_to_ep(origin, destination, u32::MAX, ep);
@@ -1623,16 +1385,10 @@ impl Graph {
             return Self::finalize_plans(all, buckets);
         }
 
-        // Pass B — admissible radius `min(W, A_est - start)`. W (the unbounded walk-only
-        // time) floods the foot graph on long trips and is the binding cap only when
-        // `A_est - start > W`. To skip computing W we need a PROVABLE lower bound on it:
-        // each endpoint's street projection is within one snap radius of its coordinate,
-        // so the projection-to-projection crow distance is >= endpoint_distance -
-        // 2*snap_radius, and the foot path is at least that straight line. Hence
-        // `(endpoint_distance - 2*snap_radius) / speed <= W`. When `A_est - start` is at or
-        // below this bound it is already `<= W`, so `min(W, .) = A_est - start` exactly and
-        // W need not be computed. (straight_line_secs alone is NOT a sound lower bound: W as
-        // computed excludes the perpendicular coord->projection snap stubs.)
+        // Pass B — admissible radius `min(W, A_est - start)`. `admissible_access_bound`
+        // skips computing the unbounded `W` via the provable lower bound
+        // `(endpoint_distance - 2*snap_radius) / speed <= W`. (straight_line_secs alone is
+        // NOT sound: `W` excludes the perpendicular coord->projection snap stubs.)
         let (bound, w_opt) = self.admissible_access_bound(
             origin,
             destination,
@@ -1667,8 +1423,7 @@ impl Graph {
         Self::finalize_plans(all, buckets)
     }
 
-    /// Inflate access-leg seconds to the conservative percentile (buffer the
-    /// connection). Stop ids are unchanged; only the seconds are transformed.
+    /// Inflate access-leg seconds to the conservative percentile (buffer the connection).
     pub(crate) fn access_times(&self, stops: Vec<(usize, u32)>) -> Vec<(usize, u32)> {
         let m = &self.raptor.street_time;
         stops
@@ -1686,19 +1441,13 @@ impl Graph {
             .collect()
     }
 
-    /// The bike/car access budget (seconds) for a trip whose crow-flies walk-time is
-    /// `crow_secs`: a fraction of the trip, clamped to the floor (short trips keep the
-    /// local radius) and the ceiling (keep the access Dijkstra bounded).
+    /// Bike/car access budget: a fraction of `crow_secs`, clamped to floor and ceiling.
     pub(crate) fn vehicle_access_budget(&self, crow_secs: u32) -> u32 {
         ((self.raptor.vehicle_access_fraction * crow_secs as f64) as u32)
             .clamp(self.raptor.vehicle_access_secs, self.raptor.vehicle_access_max_secs)
     }
 
-    /// Per-profile access/egress stop discovery for the active states. Each list
-    /// is computed only when some active state needs it: foot access for
-    /// `Walked`/`CarEgress`, bike access for the bike states, car access for
-    /// `CarParked`; egress mirror-imaged (foot for parked/dropped/walked, bike
-    /// for `BikeInHand`, car for `CarEgress`).
+    /// Per-profile access/egress stop discovery for the active states.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_mode_context<'a>(
@@ -1719,16 +1468,10 @@ impl Graph {
         )
     }
 
-    /// `build_mode_context` with an extra `skip_egress` flag. OPT-C1 (travel-map
-    /// only): when `true`, the (unused, immediately-cleared) center egress is left
-    /// EMPTY without running the CCH one-to-many / two-pass egress sweep — saving a
-    /// full ~83k-target pass per call. The caller MUST guarantee the egress set is
-    /// unobserved: it feeds only (a) the per-state `egress` grid, which the isochrone
-    /// forces empty anyway, and (b) the park&ride vehicle-access retain-filter below,
-    /// which is a no-op ONLY when there are no bike/car access states. So this is
-    /// bit-identical iff `!am.uses_vehicle()`; the caller gates on exactly that.
-    /// Every OTHER caller passes `skip_egress = false` (via `build_mode_context`) and
-    /// is provably unchanged.
+    /// `build_mode_context` with `skip_egress` (OPT-C1, travel-map only): skips the egress
+    /// sweep entirely. Bit-identical ONLY iff `!am.uses_vehicle()` (the egress set feeds the
+    /// isochrone-cleared grid and the vehicle-access retain-filter); the caller MUST gate on
+    /// exactly that.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_mode_context_opts<'a>(
         &self,
@@ -1745,11 +1488,7 @@ impl Graph {
     ) -> ModeContext<'a> {
         use VehicleState::*;
         let has = |s| am.state_of(s).is_some();
-        // Foot access stays local (the nearest-stop radius). Bike/car reach a
-        // better hub farther out, so their discovery uses a wider budget that scales
-        // with trip length — on a long journey you would ride farther to reach a
-        // well-connected hub. Clamped to a floor (short trips keep the local radius)
-        // and a ceiling (keep the access Dijkstra bounded).
+        // Bike/car use a wider, trip-length-scaled budget than the local foot radius.
         let crow_secs = (self.endpoint_distance(origin, destination, ep) as f64
             / self.raptor.walking_speed_mps) as u32;
         let vehicle_secs = access_secs.max(self.vehicle_access_budget(crow_secs));
@@ -1787,9 +1526,6 @@ impl Graph {
         } else {
             vec![]
         };
-        // OPT-C1: when the caller forces egress empty (isochrone), skip the whole
-        // egress computation — the expensive CCH/two-pass one-to-many sweep — since
-        // the results are unobserved (see `build_mode_context_opts`).
         let foot_egress = if skip_egress {
             vec![]
         } else if let Some(p) = dest_station {
@@ -1824,14 +1560,9 @@ impl Graph {
             vec![]
         };
 
-        // A bike/car can drive far enough to reach a stop that is also within
-        // egress range of the destination. Such a stop is a place you'd simply
-        // *arrive* at — boarding transit there to reach that same destination is
-        // pointless, and seeding it would let a round-0 "drove there" label
-        // poison `target_cutoff` and Pareto-dominate the real transit arrivals at
-        // that stop, collapsing park&ride to a walk fallback. Drop those stops
-        // from the vehicle access lists (foot access is left alone: its overlap on
-        // very short trips is the desirable "don't ride slower than walking").
+        // Drop vehicle-access stops that are also egress stops: a round-0 "drove there"
+        // label would poison `target_cutoff` and dominate real transit arrivals there,
+        // collapsing park&ride to a walk fallback. Foot access is left alone.
         let egress_stops: std::collections::HashSet<usize> = foot_egress
             .iter()
             .chain(bike_egress.iter())
@@ -1863,12 +1594,8 @@ impl Graph {
         mc
     }
 
-    /// Appends direct street plans that arrive within `best transit arrival +
-    /// slack` — the only window in which they can survive the final Pareto.
-    /// Bike-direct is a candidate whenever a bike mode is in play (a
-    /// bike+transit plan must also beat plain cycling); walk-direct only when
-    /// `WALK` is selected without `WALK_TRANSIT` (with it, the legacy
-    /// walk-fallback semantics apply unchanged).
+    /// Appends direct street plans arriving within `best transit arrival + slack` (the
+    /// only window in which they can survive the final Pareto).
     #[allow(clippy::too_many_arguments)]
     fn append_bounded_direct_plans(
         &self,
@@ -1914,7 +1641,6 @@ impl Graph {
     }
 
     /// Direct (no-transit) plans returned when transit routing finds nothing.
-    /// `walk_secs` is the full walk time to the destination (`u32::MAX` = unreachable).
     fn direct_fallback_plans(
         &self,
         am: &ActiveModes,
@@ -1951,7 +1677,6 @@ impl Graph {
         plans
     }
 
-    /// Convenience wrapper using the graph's configured buckets and slack.
     pub fn raptor(
         &self,
         origin: NodeID,
@@ -1972,7 +1697,6 @@ impl Graph {
         )
     }
 
-    /// `raptor` over an explicit mode selection.
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_modes(
         &self,
@@ -2025,7 +1749,6 @@ impl Graph {
         )
     }
 
-    /// `raptor_tuned` with a realtime delay index applied to trip times.
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_tuned_rt(
         &self,
@@ -2088,8 +1811,7 @@ impl Graph {
         )
     }
 
-    /// `raptor_tuned_rt_modes` carrying the projected snap coordinates (`ep`) for g-free
-    /// contracted access/geometry. `None` ⇒ NodeID path, byte-identical.
+    /// `raptor_tuned_rt_modes` carrying projected snap coordinates (`ep`, g-free access).
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_tuned_rt_modes_ep(
         &self,
@@ -2169,10 +1891,8 @@ impl Graph {
         .0
     }
 
-    /// Core RAPTOR over one departure. `want_debug` gates the *discardable* debug
-    /// instrumentation — the `stops_reached` survey and the per-candidate `PlanCandidate`
-    /// sink (which clones every plan). The production path (`raptor_inner`) passes `false`
-    /// so neither is computed; only `raptor_explain*` pays for them.
+    /// Core RAPTOR over one departure. `want_debug` gates the discardable `stops_reached`
+    /// survey and per-candidate sink; production passes `false`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn raptor_inner_with_debug(
         &self,
@@ -2188,8 +1908,6 @@ impl Graph {
         rt: &RealtimeIndex,
         want_debug: bool,
     ) -> (Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>) {
-        // R6 toggle: slim summary grid vs the baseline full-label grid. The core is
-        // written once (generic over the row representation) and instantiated here.
         if slim_grid_enabled() {
             self.raptor_inner_grid::<SlimRow>(
                 mc, start_time, access_secs, date, weekday, origin, destination, buckets, slack,
@@ -2203,7 +1921,6 @@ impl Graph {
         }
     }
 
-    /// Row-representation-generic body of `raptor_inner_with_debug` (single departure).
     #[allow(clippy::too_many_arguments)]
     fn raptor_inner_grid<R: LabelRow>(
         &self,
@@ -2260,7 +1977,6 @@ impl Graph {
             )
         });
 
-        // Discardable debug survey: only built for `raptor_explain*`.
         let stops_reached: Vec<StopReach> = if want_debug {
             (0..n_stops)
                 .filter_map(|stop_idx| {
@@ -2295,7 +2011,6 @@ impl Graph {
             Vec::new()
         };
 
-        // The candidate sink clones every kept plan; only `raptor_explain*` needs it.
         let mut candidates: Vec<PlanCandidate> = Vec::new();
         let debug_sink = if want_debug {
             Some(&mut candidates)
@@ -2323,16 +2038,11 @@ impl Graph {
         (plans, candidates, stops_reached)
     }
 
-    /// Runs one RAPTOR departure (seed → rounds) into caller-owned grids.
-    ///
-    /// `best` is per-pass: it is **reset** here and gates only the per-pass
-    /// cross-round local prune + `target_cutoff`. `labels` is **carried** across
-    /// departures by the self-pruning range driver and is NOT reset — marking is
-    /// gated on per-round `labels[k]` improvement (the round-stratified, transfers-
-    /// preserving, cross-departure bound). `stamp` brands every label this pass
-    /// creates so reconstruction can follow this-departure traces. When `carried`,
-    /// the round-start carry-forward Pareto-**merges** `labels[k-1]` into the
-    /// already-populated `labels[k]`; single-pass uses the faster `copy_from_slice`.
+    /// Runs one RAPTOR departure (seed → rounds) into caller-owned grids. `best` is
+    /// per-pass (RESET here, gates the cross-round prune + `target_cutoff`); `labels` is
+    /// CARRIED across departures and NOT reset, marking gated on per-round `labels[k]`
+    /// improvement. `stamp` brands every label so reconstruction follows this-departure
+    /// traces. `carried` Pareto-merges `labels[k-1]` into `labels[k]`; else whole-row copy.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_departure_into<R: LabelRow>(
         &self,
@@ -2359,19 +2069,13 @@ impl Graph {
         let n_cells = best.len();
         let drop_to = mc.drop_transition();
 
-        // `best` is the per-pass exploration bound — reset it; `labels` is carried.
         best.reset();
         marked.clear();
         is_marked.fill(false);
-        // The arena holds this pass's labels for exact parent-pointer reconstruction.
-        // Same-stamp build keeps a pass's chains within its own arena, so reset it per
-        // pass; carried foreign grid labels keep stale `arena_id`s that are never followed
-        // (extraction and boarding both filter to the current pass's stamp).
+        // Arena is reset per pass: carried foreign grid labels keep stale `arena_id`s that
+        // are never followed (extraction and boarding both filter to the current stamp).
         arena.clear();
 
-        // Seed round 0. Onboard partial-requery seeds the boarded trip's remaining
-        // downstream stops as already-reached transit labels (one transit leg) in
-        // place of foot access; the normal access loop is otherwise untouched.
         if let Some(ride) = onboard {
             for seed in &ride.seeds {
                 let lab = Label::arena_push(
@@ -2439,16 +2143,12 @@ impl Graph {
             }
         }
 
-        // Round-0 transfer bound: foot access uses the uniform access radius; the
-        // onboard seeds have no access radius, so they extend up to the egress-based
-        // target cutoff (the only bound that keeps onboard transfers finite).
+        // Round-0 transfer bound: onboard seeds (no access radius) use the egress-based
+        // cutoff; foot access uses the uniform radius, saturating so a near-unbounded
+        // `access_secs` (MCR/flood path) reads as u32::MAX instead of wrapping.
         let seed_bound = if onboard.is_some() {
             Self::target_cutoff(best, mc, slack)
         } else {
-            // `access_secs` can be near-unbounded on the MCR/unrestricted-transfers path
-            // (or a flood radius); saturate so the round-0 transfer bound reads as
-            // "unbounded" (u32::MAX) instead of wrapping. Restricted queries stay well
-            // within range so this is a no-op for them.
             [start_time.saturating_add(access_secs); ALL_STATES.len()]
         };
         if mc.unrestricted_transfers {
@@ -2485,9 +2185,6 @@ impl Graph {
                 let (prev, rest) = labels.split_at_mut(k);
                 let prev_k = &prev[k - 1];
                 let curr_k = &mut rest[0];
-                // Carried-aware carry-forward (`carried`): keep this round's already-
-                // carried labels and fold in the ≤(k-1)-trip frontier. Single-pass
-                // (`!carried`): the faster whole-row copy.
                 curr_k.carry_from(prev_k, n_cells, carried, buckets);
             }
 
@@ -2522,12 +2219,9 @@ impl Graph {
                         drop_to,
                     );
                 } else {
-                    // Phase A: read-only scans in parallel over contiguous queue
-                    // chunks (each thread emits candidates in scan order). Phase B
-                    // applies them in queue order against the live `best`/grid —
-                    // the exact consideration stream the sequential loop produces,
-                    // so output (and arena ids) are identical regardless of
-                    // thread scheduling.
+                    // Parallel read-only scans, then apply in queue order against the live
+                    // grid: the exact sequential consideration stream, so output and arena
+                    // ids are identical regardless of thread scheduling.
                     let chunk_size = queue.len().div_ceil(chunks);
                     let best_ro: &BestGrid = best;
                     let collected: Vec<Vec<Label>> = std::thread::scope(|s| {
@@ -2597,9 +2291,8 @@ impl Graph {
         }
     }
 
-    /// Follows RAPTOR traces backward from `stop_idx` at `round` and builds the
-    /// ordered sequence of legs (walk / transit) that the algorithm used to reach it.
-    /// Transit legs include all intermediate pattern stops as geometry waypoints.
+    /// Follows RAPTOR traces backward from `(round, stop_idx)` into an ordered leg list
+    /// (walk/transit), transit legs carrying intermediate pattern stops as geometry.
     fn path_to_stop<R: LabelRow>(
         &self,
         stop_idx: usize,
@@ -2609,9 +2302,6 @@ impl Graph {
         arena: &[Label],
         n_states: usize,
     ) -> Vec<StopPathLeg> {
-        // Earliest-arriving label at (round, stop) across all vehicle states.
-        // Debug/explain-only, always single-pass (stamp 0) with a live arena, so
-        // every fetched summary's `arena_id` is valid (asserted below).
         let min_label_at = |k: usize, stop: usize| -> Option<Label> {
             (0..n_states)
                 .filter_map(|s| labels[k].cell(stop * n_states + s).min_arrival_full(arena))
@@ -2681,9 +2371,7 @@ impl Graph {
                     ],
                 });
                 stop = from;
-                // k stays the same for transfers
             } else {
-                // Access walk: origin → this stop
                 let from_loc = self.node_loc(origin);
                 legs.push(StopPathLeg {
                     is_transit: false,
@@ -2707,26 +2395,13 @@ impl Graph {
         legs
     }
 
-    /// Debug variant of `with_access_search`, mirroring its two-pass A/B foot
-    /// access/egress search so raptorExplain explains what production `raptor`
-    /// actually does (rather than the old growing-radius doubling retry loop, which
-    /// used a different access algorithm). Pass A runs the near-stop radius; Pass B
-    /// the admissible radius `min(W, A - start)` — both via the shared
-    /// `near_access_radius` / `admissible_access_bound` helpers, so the debug and
-    /// prod access geometry can never drift.
-    ///
-    /// The closure returns `Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>`
-    /// of RAW (un-Pareto'd) plans for one pass; `None` = the pass produced nothing.
-    /// Both passes' plans + per-candidate instrumentation are merged and then
-    /// union-Pareto'd once — the debug analog of `finalize_plans`' Pareto step —
-    /// since Pass B re-discovers Pass A's stops and prod collapses that overlap.
-    ///
-    /// AccessInfo scalar metadata (`walk_radius_secs`, `*_stops_found`) reflects the
-    /// initial near-stop Pass A discovery; `stops_reached` reflects the widest pass
-    /// that ran (the maximal transit-stop set prod explored). NOTE: unlike prod this
-    /// path does not apply `group_access_alternatives` / `prune_slower_than_direct`
-    /// / `append_bounded_direct_plans`, so its plan SET can still differ from prod on
-    /// finalization grounds (never on access grounds).
+    /// Debug variant of `with_access_search`, mirroring its two-pass A/B access search
+    /// (shared `near_access_radius` / `admissible_access_bound` helpers) so the debug and
+    /// prod access geometry can't drift. The closure returns RAW un-Pareto'd plans per
+    /// pass; both passes are union-Pareto'd once (debug analog of `finalize_plans`). NOTE:
+    /// this path skips prod's `group_access_alternatives`/`prune_slower_than_direct`/
+    /// `append_bounded_direct_plans`, so its plan SET can differ from prod on finalization
+    /// grounds (never on access grounds).
     #[allow(clippy::too_many_arguments)]
     fn with_access_search_debug<F>(
         &self,
@@ -2746,8 +2421,6 @@ impl Graph {
     where
         F: FnMut(&ModeContext, u32) -> Option<(Vec<Plan>, Vec<PlanCandidate>, Vec<StopReach>)>,
     {
-        // Direct / walk-only fallback (prod's `direct_fallback_plans` branch),
-        // wrapped with debug instrumentation.
         let walk_fallback = |walk_secs: u32, radius: u32, extra_passes: u32| {
             let plans =
                 self.direct_fallback_plans(am, origin, destination, start_time, walk_secs, bike, ep);
@@ -2785,7 +2458,6 @@ impl Graph {
         let mut dest_stops = 0u32;
         let mut recorded = false;
 
-        // Pass A — near-stop radius.
         let mc =
             self.build_mode_context(am, origin, destination, access_secs, bike, unrestricted, use_cch, ep, fare_profile);
         if mc.any_access() && mc.any_egress() {
@@ -2801,14 +2473,11 @@ impl Graph {
         }
 
         if both_stations {
-            // Station endpoints already supply their complete platform set at zero
-            // access cost — Pass A is complete, no wider radius can improve them.
             if all_plans.is_empty() {
                 let actual = self.walk_secs_to_ep(origin, destination, u32::MAX, ep);
                 return walk_fallback(actual, pass_a_radius, passes_run.saturating_sub(1));
             }
         } else {
-            // Pass B — admissible radius `min(W, A - start)`.
             let (bound, w_opt) = self.admissible_access_bound(
                 origin,
                 destination,
@@ -2825,7 +2494,6 @@ impl Graph {
                     if !recorded {
                         origin_stops = mc.merged_access().len() as u32;
                         dest_stops = mc.egress.iter().map(|e| e.len()).max().unwrap_or(0) as u32;
-                        recorded = true;
                     }
                     passes_run += 1;
                     if let Some((p, c, s)) = try_routing(&mc, access_secs) {
@@ -2838,7 +2506,6 @@ impl Graph {
                 }
             }
 
-            // No transit plan at any radius up to W: direct / walk-only fallback.
             if all_plans.is_empty() {
                 let w = w_opt
                     .unwrap_or_else(|| self.walk_secs_to_ep(origin, destination, u32::MAX, ep));
@@ -2846,8 +2513,7 @@ impl Graph {
             }
         }
 
-        // Union-Pareto the merged passes (debug analog of `finalize_plans`' Pareto
-        // step). Each Kept candidate maps, in order, to one plan in `all_plans`.
+        // Each Kept candidate maps, in order, to one plan in `all_plans`.
         let plan_to_sink_idx: Vec<usize> = all_cands
             .iter()
             .enumerate()
@@ -2930,8 +2596,8 @@ impl Graph {
         }
     }
 
-    /// Endpoint coordinates for an `ExplainResult`: the projected snap coords when a
-    /// contracted query supplies them (g-free, survive the drop), else `node_coord`.
+    /// Endpoint coordinates for an `ExplainResult`: projected snap coords via `ep`, else
+    /// `node_coord`.
     fn explain_endpoint_coords(
         &self,
         origin: NodeID,
@@ -3030,9 +2696,7 @@ impl Graph {
                     all_candidates.append(&mut cands_t);
                 }
 
-                // Return the RAW union of all departures for this pass; the union
-                // across Pass A/Pass B is Pareto-filtered once in
-                // `with_access_search_debug` (mirroring prod's single `finalize_plans`).
+                // RAW union; Pass A/B Pareto-filtered once in `with_access_search_debug`.
                 Some((all_plans, all_candidates, probe_stops))
             },
         );
@@ -3068,12 +2732,9 @@ impl Graph {
         }
     }
 
-    /// Read-only route scan: walks `pattern` building the riding set from `prev`
-    /// and pushes every surviving candidate label into `out` in scan order.
-    /// `best` is the round-start snapshot used only as a domination *prefilter*
-    /// (it can lag the live set — `apply_scan_candidates` re-checks against the
-    /// live one, so stale pruning here is sound and merely less aggressive).
-    /// Being free of writes to the shared grids, route scans can run in parallel.
+    /// Read-only route scan over `pattern`, pushing surviving candidates into `out` in
+    /// scan order. `best` is a lagging domination PREFILTER only (`apply_scan_candidates`
+    /// re-checks the live set, so stale pruning here is sound). Write-free ⇒ parallelizable.
     #[allow(clippy::too_many_arguments)]
     fn scan_route_collect<R: LabelRow>(
         &self,
@@ -3104,19 +2765,15 @@ impl Graph {
         let route_id = self.raptor.transit_patterns[pattern].route;
         let pat_rt = self.raptor.transit_routes[route_id.0 as usize].route_type;
 
-        // Price is NOT accrued in the search anymore: it is annotated post-hoc on the
-        // finished plan (`plan_price_posthoc`), so the scan is price-blind. The SNCB
-        // per-km / airport-OD / ticket-window accrual that once ran per alight and per
-        // board here is gone; the fare model is walked once over each kept plan's fixed
-        // leg sequence instead.
+        // Price is annotated post-hoc (`plan_price_posthoc`); the scan is price-blind.
 
         let all_times = self.raptor.transit_idx_pattern_stop_times[pattern]
             .of(&self.raptor.transit_pattern_stop_times);
         let trip_ids =
             self.raptor.transit_idx_pattern_trips[pattern].of(&self.raptor.transit_pattern_trips);
 
-        // Labels currently riding this route. Pareto set over (trip index ↓, bucket ↑):
-        // a smaller trip index arrives earlier at every downstream stop.
+        // Riding Pareto set over (trip index ↓, bucket ↑): a smaller trip index arrives
+        // earlier at every downstream stop.
         let mut riding: Vec<Riding> = Vec::new();
 
         for pos in first_pos as usize..pat_stops.len() {
@@ -3125,17 +2782,10 @@ impl Graph {
 
             // 1. Settle arrivals at this stop for every riding label.
             for r in &riding {
-                // GTFS drop_off_type == 1: passengers may not alight here — skip
-                // the label write and keep riding, but do not break the loop.
-                // A realtime SKIPPED stop (partial cancellation) is treated the
-                // same: the trip no longer serves it, so no alighting. Empty index
-                // reports `is_skipped == false` (inert default), so with no feed
-                // this collapses to the pure `alight_allowed` check.
+                // No alighting on drop_off_type==1 or a realtime SKIPPED stop; keep riding.
                 if !col[r.t].alight_allowed || rt.is_skipped(trip_ids[r.t], stop as u32) {
                     continue;
                 }
-                // Realtime: shift the scheduled arrival by the live delay for this
-                // trip at this stop (0 when no realtime info — inert default).
                 let arr = apply_delay(col[r.t].arrival, rt.delay(trip_ids[r.t], stop as u32));
                 if arr >= cutoff[r.state as usize] {
                     continue;
@@ -3187,10 +2837,8 @@ impl Graph {
                 out.push(cand);
             }
 
-            // 2. Board from each prev label at this stop. We board the earliest
-            //    catchable trip, then successively-later trips that reach a *higher*
-            //    reliability bucket (waiting longer = safer connection), up to CERTAIN.
-            //    Reliability is monotonic in departure margin, so buckets only rise.
+            // 2. Board the earliest catchable trip, then later trips reaching a HIGHER
+            //    reliability bucket (buckets rise monotonically with departure margin).
             let max_bucket = buckets.bucket(1.0);
             for sidx in 0..n_states {
                 let prev_cell = stop * n_states + sidx;
@@ -3200,12 +2848,9 @@ impl Graph {
                 let prev_set = prev.cell(prev_cell);
                 let needs_bikes = in_hand_idx == Some(sidx as u8);
                 for pi in 0..prev_set.count() {
-                    // Build only from THIS pass's labels: an `i`-journey must descend
-                    // from the `i`-source (departure d_i). Boarding from a later
-                    // departure's label would fabricate `i`'s journey out of `j`'s.
-                    // The carried grid still PRUNES across departures (curr.insert),
-                    // it just isn't a build source. Single-pass stamps all 0 → no-op.
-                    // Cheap stamp filter on the summary avoids an arena fetch for ghosts.
+                    // Build ONLY from this pass's labels: an `i`-journey must descend from
+                    // the `i`-source, else it fabricates `i`'s journey out of `j`'s. The
+                    // carried grid still prunes across departures, just isn't a build source.
                     if prev_set.summary_at(pi).created_by != stamp {
                         continue;
                     }
@@ -3215,20 +2860,13 @@ impl Graph {
                     let t_start = col.partition_point(|st| st.departure < min_dep);
                     let mut best_bucket_seen: Option<u8> = None;
                     for t in t_start..n_trips {
-                        // Schedule activity AND realtime cancellation: an empty
-                        // index reports `is_canceled == false` (inert default), so
-                        // with no feed this collapses to the pure activity check and
-                        // output is byte-identical. With a feed, a CANCELED trip is
-                        // never boarded — the search boards the next running trip.
+                        // Skip inactive or CANCELED trips (board the next running one).
                         if !self.is_trip_active_memo(mc, trip_ids[t], date, weekday)
                             || rt.is_canceled(trip_ids[t])
                         {
                             continue;
                         }
-                        // GTFS pickup_type == 1: passengers may not board here.
-                        // A realtime SKIPPED stop is likewise not boardable — the
-                        // trip does not serve it this run. Inert default (empty
-                        // index → `is_skipped == false`) keeps no-feed behaviour.
+                        // No boarding on pickup_type==1 or a realtime SKIPPED stop.
                         if !col[t].board_allowed || rt.is_skipped(trip_ids[t], stop as u32) {
                             continue;
                         }
@@ -3239,20 +2877,17 @@ impl Graph {
                         {
                             continue;
                         }
-                        // Realtime: effective departure = scheduled + live delay.
                         let trip_dep =
                             apply_delay(col[t].departure, rt.delay(trip_ids[t], stop as u32));
-                        // `t_start` (a `partition_point`) assumes the column is sorted by
-                        // scheduled departure; overtaking trips leave it non-monotonic, so
-                        // guard against boarding a trip that departs before the passenger
-                        // can reach this stop (`min_dep`) — otherwise a label arrives
-                        // before its parent and surfaces as a negative access-walk.
+                        // Overtaking trips make the delayed column non-monotonic; guard
+                        // against boarding before `min_dep`, else a label arrives before its
+                        // parent (surfaces as a negative access-walk).
                         if trip_dep < min_dep {
                             continue;
                         }
 
-                        // Cumulative reliability — same per-transfer formula as
-                        // reconstruction (earliest-based), so buckets agree.
+                        // Cumulative reliability: same earliest-based per-transfer formula
+                        // as reconstruction, so buckets agree.
                         let factor = self.transfer_on_time_prob(
                             pl.route_type,
                             Some(pat_rt),
@@ -3262,15 +2897,13 @@ impl Graph {
                         let rel = pl.reliability * factor;
                         let cb = buckets.bucket(rel);
 
-                        // Only board this trip if it reaches a bucket we haven't covered
-                        // yet for this prev label (the earliest trip per bucket level).
+                        // Board only if it reaches an as-yet-uncovered bucket (earliest
+                        // trip per bucket level).
                         if best_bucket_seen.is_some_and(|bs| cb <= bs) {
                             continue;
                         }
                         best_bucket_seen = Some(cb);
 
-                        // Marginal on-time probability over the prev arrival
-                        // distribution — used to build the arrival-time bag.
                         let hit_prob: f32 = pl
                             .bag
                             .scenarios()
@@ -3290,9 +2923,6 @@ impl Graph {
                             })
                             .sum();
 
-                        // No fare is charged in the search: price is annotated post-hoc
-                        // (`plan_price_posthoc`) over each kept plan's fixed leg order,
-                        // so the scan is price-blind (identical plan set fares on/off).
                         Self::push_riding(
                             &mut riding,
                             Riding {
@@ -3316,10 +2946,9 @@ impl Graph {
         }
     }
 
-    /// Applies collected scan candidates in order against the live grids: re-checks
-    /// domination on the up-to-date `best` (the collect-time snapshot may lag), then
-    /// arena-pushes and inserts. Replaying candidates in queue order makes the
-    /// result — including arena ids — identical to a fully sequential scan.
+    /// Applies scan candidates in queue order against the live grids (re-checks domination
+    /// on the up-to-date `best`), making the result — arena ids included — identical to a
+    /// sequential scan.
     #[allow(clippy::too_many_arguments)]
     fn apply_scan_candidates<R: LabelRow>(
         &self,
@@ -3334,21 +2963,17 @@ impl Graph {
         drop_to: Option<(u8, u8)>,
     ) {
         for &cand in cands {
-            // `best` is THIS pass's cross-round bound: it drives `target_cutoff`
-            // and the local prune, so it must always capture what this departure
-            // can reach (independent of the carried grid) — otherwise the cutoff
-            // degrades and the pass explores the whole network. Only *marking* is
-            // gated on the carried per-round set, which is what self-prunes earlier
-            // departures against later ones.
+            // `best` must capture what THIS departure reaches (independent of the carried
+            // grid), or `target_cutoff` degrades and the pass floods the whole network.
+            // Only marking is gated on the carried per-round set.
             Self::insert_candidate(
                 self, cand, curr, best, buckets, marked, is_marked, arena, n_states, drop_to,
             );
         }
     }
 
-    /// Inserts `cand` into its `(stop, state)` cell (best-prune → arena → grids →
-    /// mark), then — when the candidate is in `BikeInHand` and `BikeDropped` is
-    /// active — inserts a state-rewritten copy: the free, irreversible drop.
+    /// Inserts `cand` into its `(stop, state)` cell (best-prune → arena → grids → mark),
+    /// then inserts the free irreversible `BikeInHand`→`BikeDropped` drop when active.
     #[allow(clippy::too_many_arguments)]
     fn insert_candidate<R: LabelRow>(
         &self,
@@ -3386,9 +3011,8 @@ impl Graph {
         }
     }
 
-    /// Number of parallel chunks for a round's route-scan queue. 1 = stay
-    /// sequential (small queues are not worth the spawn cost).
-    /// `MAAS_SCAN_THREADS` overrides the thread budget (1 = force sequential).
+    /// Parallel chunk count for a route-scan queue (1 = sequential). `MAAS_SCAN_THREADS`
+    /// overrides the thread budget.
     fn scan_chunks(queue_len: usize) -> usize {
         static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let threads = *THREADS.get_or_init(|| {
@@ -3408,11 +3032,9 @@ impl Graph {
         threads.min(queue_len / 8).max(1)
     }
 
-    /// Pareto-inserts a riding label into the route bag over (trip index ↓, bucket ↑).
-    /// Domination only applies within the same vehicle state: riders in different
-    /// states alight into different cells (and a `Walked` rider must never be
-    /// pruned by a bike-state one, or the walk plan disappears before the
-    /// plan-level burden comparison).
+    /// Pareto-inserts a riding label over (trip index ↓, bucket ↑). Domination applies
+    /// ONLY within the same vehicle state (a `Walked` rider must never be pruned by a
+    /// bike-state one, or the walk plan vanishes before the plan-level burden comparison).
     fn push_riding(riding: &mut Vec<Riding>, cand: Riding, buckets: &ReliabilityBuckets) {
         let cb = buckets.bucket(cand.reliability);
         for r in riding.iter() {
@@ -3429,10 +3051,8 @@ impl Graph {
         }
     }
 
-    /// Probability of boarding a vehicle departing at `board_dep` given arrival at
-    /// the boarding stop at `arr_at_stop` on a preceding leg of type `prev_rt`.
-    /// `1.0` when there is no preceding transit leg or no delay model. Shared by the
-    /// RAPTOR core (label reliability) and reconstruction (`TransferRisk.reliability`).
+    /// Probability of catching a vehicle departing at `board_dep` given arrival at
+    /// `arr_at_stop` on a preceding `prev_rt` leg (`1.0` if none / no delay model).
     pub(super) fn transfer_on_time_prob(
         &self,
         prev_rt: Option<RouteType>,
@@ -3463,14 +3083,10 @@ impl Graph {
     ) -> Option<u32> {
         (start..trip_ids.len())
             .find(|&t| {
-                // The miss-fallback runner must itself be running: skip CANCELED
-                // trips so a missed connection falls through to the next RUNNING
-                // trip (inert on an empty index → byte-identical with no feed).
+                // The miss-fallback trip must itself be running: skip CANCELED trips.
                 self.is_trip_active_memo(mc, trip_ids[t], date, weekday)
                     && !rt.is_canceled(trip_ids[t])
             })
-            // The hit branch already shifts its arrival by the live delay; the miss
-            // arrival must be delayed the same way (0 with no feed → identical).
             .map(|t| apply_delay(col[t].arrival, rt.delay(trip_ids[t], stop)))
     }
 
@@ -3486,8 +3102,7 @@ impl Graph {
     ) -> Option<u32> {
         (after_trip..trip_ids.len())
             .find(|&t| {
-                // The displayed "next departure" fallback must be a RUNNING trip:
-                // skip CANCELED ones (inert on an empty index → byte-identical).
+                // The displayed "next departure" must be a RUNNING trip: skip CANCELED.
                 self.is_trip_active(trip_ids[t], date, weekday) && !rt.is_canceled(trip_ids[t])
             })
             .map(|t| boarding_col[t].departure)
@@ -3513,7 +3128,7 @@ impl Graph {
             let stop = cell / n_states;
             let sidx = (cell % n_states) as u8;
             let state_cutoff = cutoff[sidx as usize];
-            let src = labels.cell(cell); // Copy snapshot; releases the borrow on `labels`.
+            let src = labels.cell(cell);
             if !src.is_reached() || src.earliest_arrival() >= state_cutoff {
                 continue;
             }
@@ -3524,9 +3139,8 @@ impl Graph {
                 let target = self.raptor.transit_node_to_stop[target_node.0] as usize;
 
                 for li in 0..src.count() {
-                    // Transfer only this pass's labels (see scan_route): an `i`-journey
-                    // descends from the `i`-source. Single-pass stamps all 0 → no-op.
-                    // Cheap stamp filter on the summary avoids an arena fetch for ghosts.
+                    // Transfer ONLY this pass's labels (an `i`-journey descends from the
+                    // `i`-source); see `scan_route_collect`.
                     if src.summary_at(li).created_by != stamp {
                         continue;
                     }
@@ -3562,22 +3176,14 @@ impl Graph {
         }
     }
 
-    /// MCR replacement for `apply_transfers`: instead of iterating the precomputed
-    /// ≤`MAX_TRANSFER_DISTANCE_M` table, resolve inter-stop transfers with a live,
+    /// MCR replacement for `apply_transfers`: resolve inter-stop transfers with a live,
     /// per-active-state, multi-source, cutoff-bounded foot-Dijkstra over the contracted
-    /// junction graph — so a journey needing a >1 km walk between two stops is found.
-    ///
-    /// One Dijkstra per active vehicle state (`mc.am.states()`), seeded from every stop
-    /// this round improved in that state. Semantics of a single transfer hop are
-    /// preserved exactly: a source stop is seeded OUT of (its junction's neighbours are
-    /// relaxed at `arr(s)+walk`, the stop-junction itself is never pushed), and a
-    /// stop-junction reached as a target EMITS a transfer candidate and is then a
-    /// dead-end (never through-routed), mirroring `walk_dijkstra_union_seeded`'s guard.
-    /// The multi-source-with-seed-times search settles each target stop `t` at
-    /// `min_s(arr(s) + dist_nonstop(s, t))` — exact for earliest arrival. The winning
-    /// source's reliability bag is carried (shifted by the total walk), an approximation
-    /// on the reliability front only that strictly dominates the capped table (which
-    /// drops >1 km journeys outright).
+    /// junction graph (finds >1 km inter-stop walks the capped table drops). One Dijkstra
+    /// per active state. Single-hop semantics are exact: a source stop is seeded OUT of
+    /// (its junction never pushed), a stop-junction reached as target EMITS a candidate
+    /// then dead-ends (never through-routed); each target settles at
+    /// `min_s(arr(s) + dist_nonstop(s, t))`. The winning source's reliability bag is
+    /// carried (shifted by the walk) — an approximation that strictly dominates the table.
     #[allow(clippy::too_many_arguments)]
     fn apply_transfers_mcr<R: LabelRow>(
         &self,
@@ -3598,19 +3204,14 @@ impl Graph {
         let cg = self.contracted.as_ref().unwrap();
         let n_junctions = cg.junction_count();
 
-        // Snapshot the round's marked cells BEFORE any insert (inserts append new marks
-        // that must not be re-seeded — a transfer is a single hop, never chained).
+        // Snapshot marked cells BEFORE any insert: inserts append marks that must not be
+        // re-seeded (a transfer is a single hop, never chained).
         let n_marked = marked.len();
 
-        // Collect every emitted candidate, then insert after the Dijkstras finish, so the
-        // thread-local scratch borrow never overlaps `insert_candidate` (which mutates
-        // `best`/`marked`/`arena`). Batch insertion is equivalent to the inline one-hop
-        // path: domination is still applied incrementally at insert time, and the seed
-        // set is the fixed `marked[0..n_marked]` in both.
+        // Collect all candidates, insert after the Dijkstras finish (the scratch borrow
+        // must not overlap `insert_candidate`). Equivalent to the inline one-hop path.
         let mut cands: Vec<Label> = Vec::new();
 
-        // Optional perf instrumentation (env `MAAS_MCR_DEBUG`): junctions settled by the
-        // per-round Dijkstras, to gauge how far the bounded search floods.
         let mut settles: u64 = 0;
 
         TRANSFER_SCRATCH.with(|cell| {
@@ -3618,17 +3219,13 @@ impl Graph {
             scratch.ensure(n_junctions);
 
             for (sidx, _vs) in mc.am.states() {
-                // Push-time bound. NOTE: `target_cutoff` is `u32::MAX` for a burden with
-                // no egress stop reached yet (early rounds of a long trip), so this
-                // Dijkstra is then UNBOUNDED and floods the whole reachable foot
-                // component. Sound and terminating, but a real perf risk at country
-                // scale — a fixed admissible-radius fallback (config-tunable) is the
-                // documented next step (design §7). The flag is off by default.
+                // NOTE: `target_cutoff` is `u32::MAX` for a burden with no egress reached
+                // yet, so this Dijkstra is then UNBOUNDED and floods the whole foot
+                // component. Sound and terminating, but a perf risk at country scale.
                 let state_cutoff = cutoff[sidx];
                 let sidx8 = sidx as u8;
 
-                // Seeds for this state: the min-earliest current-stamp label per marked
-                // cell of this state (mirrors the one-hop `src.earliest()` selection).
+                // Seeds: the min-earliest current-stamp label per marked cell of this state.
                 struct Seed {
                     stop: usize,
                     ji: usize,
@@ -3677,8 +3274,8 @@ impl Graph {
                 }
 
                 scratch.new_generation();
-                // Seed OUT of each source stop-junction (never push the stop-junction
-                // itself — it is a dead-end for through-walking).
+                // Seed OUT of each source stop-junction (never push it — dead-end for
+                // through-walking).
                 for (slot, seed) in seeds.iter().enumerate() {
                     for se in &cg.adjacency[seed.ji] {
                         let Some(t) = cg.walk_secs(self, se) else {
@@ -3698,8 +3295,7 @@ impl Graph {
 
                 while let Some(Reverse((d, ji_u))) = scratch.heap.pop() {
                     let ji = ji_u as usize;
-                    // Generation-aware stale check: a `vgen` mismatch means "unvisited this
-                    // generation" (dist = MAX), so a stale heap entry is skipped.
+                    // Generation-aware stale check: `vgen` mismatch = unvisited this gen.
                     if scratch.vgen[ji] != scratch.cur_gen || d > scratch.dist[ji] {
                         continue;
                     }
@@ -3712,14 +3308,12 @@ impl Graph {
                         .copied()
                         .unwrap_or(u32::MAX);
                     if target_compact != u32::MAX {
-                        // Reached a stop as a transfer target: emit the candidate from its
-                        // winning source, then dead-end (never through-route at a stop).
+                        // Reached a stop as a transfer target: emit from its winning source,
+                        // then dead-end (never through-route at a stop).
                         let slot = scratch.src[ji] as usize;
                         let seed = &seeds[slot];
                         let target = target_compact as usize;
-                        // A self-transfer (a walk loop back to the source stop) is always
-                        // dominated by the source's own label; skip it, matching the
-                        // one-hop table's `compact_neighbor == i` guard.
+                        // Self-transfer is always dominated by the source's own label; skip.
                         if target != seed.stop {
                             let walk = d.saturating_sub(seed.arr);
                             let bag = seed.label.bag.shifted_by(walk);
@@ -3788,10 +3382,9 @@ impl Graph {
         self.raptor.transit_services[svc.0 as usize].is_active(date, weekday)
     }
 
-    /// Memoized `is_trip_active` (opt A). When `mc` carries a `TripActiveMemo`
-    /// (toggle on), the tri-state cache is consulted/filled; otherwise this is
-    /// an exact passthrough. Byte-identical: the memo stores the pure result of
-    /// `is_trip_active` for the query's fixed `(date, weekday)`.
+    /// Memoized `is_trip_active`. With a `TripActiveMemo` the tri-state cache is
+    /// consulted/filled; else an exact passthrough. Byte-identical (memo stores the pure
+    /// result for the query's fixed `(date, weekday)`).
     #[inline]
     pub(super) fn is_trip_active_memo(
         &self,
@@ -3827,15 +3420,10 @@ impl Graph {
         }
     }
 
-    /// Cutoff = (minimum expected arrival at any target + its egress walk) + `slack`,
-    /// over every active state's egress list. `slack` widens the explored arrival
-    /// band so safer-but-slower plans survive.
     #[inline]
-    /// Per-compact-state arrival cutoff, indexed by `state` (compact idx). A
-    /// label of burden `b` is bounded only by the best egress arrival across
-    /// states of burden `≤ b` (+ `slack`): a heavier state (e.g. a fast park&ride
-    /// drive) must never tighten the cutoff that prunes a lighter state's
-    /// exploration, or the lighter plan is starved before the plan-level burden
+    /// Per-compact-state arrival cutoff. A label of burden `b` is bounded only by the best
+    /// egress arrival across burdens `≤ b` (+ `slack`): a heavier state must never tighten
+    /// a lighter state's cutoff, or the lighter plan is starved before the plan-level burden
     /// Pareto can protect it. Unreached burdens leave `u32::MAX` (no pruning).
     fn target_cutoff(best: &BestGrid, mc: &ModeContext, slack: u32) -> [u32; ALL_STATES.len()] {
         let n_states = mc.n_states();
@@ -3860,14 +3448,9 @@ impl Graph {
         for (sidx, vs) in mc.am.states() {
             out[sidx] = prefix[vs.burden() as usize];
         }
-        // OPT-B: an OPT-IN absolute-time horizon (travel-map only; `None` for every
-        // production caller). No arrival `>= h` can matter for a `<= h` isochrone, so
-        // min each cutoff with `h`; unreached burdens (still `u32::MAX`) are pulled
-        // down to `h` too, which is what caps the flood and empties the frontier so
-        // rounds terminate early. RAPTOR arrivals are monotone non-decreasing along a
-        // journey (a later boarding never yields an earlier arrival), so pruning any
-        // label with arrival `> h` cannot change an arrival `<= h`; `fill_area` then
-        // drops every stop with offset `> max_secs`, so cells stay bit-identical.
+        // OPT-B opt-in absolute-time horizon (travel-map only, `None` in production): cap
+        // each cutoff at `h`. RAPTOR arrivals are monotone non-decreasing, so pruning any
+        // arrival `> h` cannot change an arrival `<= h`; bit-identical for a `<= h` isochrone.
         if let Some(h) = mc.horizon {
             for c in out.iter_mut() {
                 *c = (*c).min(h);
@@ -3884,10 +3467,8 @@ impl Graph {
         }
     }
 
-    /// Collect every origin-departure time in `[earliest, latest]` such that
-    /// a transit vehicle departs from some access stop at `T + walk_secs`.
-    ///
-    /// Returns times sorted **ascending** (earliest first).
+    /// Origin-departure times in `[earliest, latest]` where a vehicle departs some access
+    /// stop at `T + walk_secs`. Returned ascending.
     #[allow(clippy::too_many_arguments)]
     fn collect_interesting_times(
         &self,
@@ -3929,9 +3510,8 @@ impl Graph {
 
                 let mut per_pattern_count = 0usize;
                 for t in lo..hi {
-                    // Skip CANCELED trips so a dead departure does not consume the
-                    // MAX_TOTAL enumeration budget and crowd out real departures
-                    // (inert on an empty index → byte-identical with no feed).
+                    // Skip CANCELED trips so a dead departure doesn't consume the
+                    // MAX_TOTAL budget.
                     if self.is_trip_active(trip_ids[t], date, weekday)
                         && !rt.is_canceled(trip_ids[t])
                     {
@@ -3955,8 +3535,7 @@ impl Graph {
         departure_times.into_iter().collect()
     }
 
-    /// Range-RAPTOR: run RAPTOR for every interesting departure within
-    /// `[start_time, start_time + window_secs]` and return the Pareto-optimal set.
+    /// Range-RAPTOR over every interesting departure in `[start_time, +window_secs]`.
     pub fn raptor_range(
         &self,
         origin: NodeID,
@@ -4074,7 +3653,7 @@ impl Graph {
         )
     }
 
-    /// `raptor_range_tuned_rt_modes` carrying the projected snap coordinates (`ep`).
+    /// `raptor_range_tuned_rt_modes` carrying projected snap coordinates (`ep`).
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_range_tuned_rt_modes_ep(
         &self,
@@ -4095,18 +3674,11 @@ impl Graph {
         ep: Option<&QueryEndpoints>,
         fare_profile: crate::structures::cost::FareProfile,
     ) -> Vec<Plan> {
-        // Self-pruning range RAPTOR (rRAPTOR). One label grid is carried across all
-        // interesting departures, which are processed **latest → earliest** so a
-        // later-departing journey prunes earlier ones. `best` is reset per pass (it
-        // gives the per-pass cross-round local prune + `target_cutoff`); `labels` is
-        // carried, and marking is gated on per-round `labels[k]` improvement — the
-        // round-stratified bound that preserves the transfers axis across departures.
-        // Each pass reconstructs its own plans (filtered by `created_by`) before the
-        // next pass mutates the grid. Output is the 4-D Pareto set
-        // (departure ↑, arrival ↓, transfers ↓, reliability ↑); walk is an attribute.
-        // One backward-pass memo shared across BOTH passes and all departures:
-        // raptor_backward is a pure function of its key, so any pass/departure that
-        // recomputes the same (stop, arrival, legs, date, weekday) reuses it. Exact.
+        // Self-pruning rRAPTOR: one carried grid, departures processed latest → earliest so
+        // a later-departing journey prunes earlier ones. Each pass reconstructs its own
+        // plans (filtered by `created_by`). Output is the 4-D Pareto set (departure ↑,
+        // arrival ↓, transfers ↓, reliability ↑). The backward memo is shared across all
+        // passes/departures: `raptor_backward` is a pure function of its key, so exact.
         let mut bw_cache: std::collections::HashMap<(usize, u32, usize, u32, u8), Vec<Vec<u32>>> =
             std::collections::HashMap::new();
         self.with_access_search(
@@ -4123,15 +3695,10 @@ impl Graph {
             ep,
             fare_profile,
             |mc, access_secs| {
-                // Interesting departures are cheap to collect and independent of any
-                // probe. Compute them FIRST. When the window has NO service departure,
-                // the probe is the only thing that can answer "next service is after
-                // the window" (it boards arbitrarily-late trips, the range loop is
-                // window-bounded), so run it and return it raw — byte-identical to the
-                // old empty-times path. Otherwise SKIP the probe entirely (its plans
-                // were discarded in the common case anyway) and let the range loop
-                // produce the answer; feasibility is decided inside `range_departures`
-                // by an exact, monotone forward-reachability guard.
+                // Empty window ⇒ run the probe (the only source of "next service is after
+                // the window", since the range loop is window-bounded) and return it raw.
+                // Else skip the probe; `range_departures` decides feasibility via an exact
+                // monotone forward-reachability guard.
                 let departure_times = self.collect_interesting_times(
                     &mc.merged_access(),
                     start_time,
@@ -4157,7 +3724,6 @@ impl Graph {
                     });
                 }
 
-                // R6 toggle (see `raptor_inner_with_debug`).
                 let all_plans = if slim_grid_enabled() {
                     self.range_departures::<SlimRow>(
                         mc,
@@ -4194,8 +3760,7 @@ impl Graph {
         )
     }
 
-    /// Row-representation-generic self-pruning range departure loop: one carried
-    /// grid, departures processed latest → earliest, per-departure extraction.
+    /// Self-pruning range departure loop: one carried grid, departures latest → earliest.
     #[allow(clippy::too_many_arguments)]
     fn range_departures<R: LabelRow>(
         &self,
@@ -4232,19 +3797,11 @@ impl Graph {
         let mut all_plans = Vec::new();
         for (i, t) in times.into_iter().enumerate() {
             let stamp = i as u32;
-            // Feasibility guard (perf only — correctness comes from running every
-            // interesting departure). The first pass is the LATEST departure, i.e. the
-            // one with MINIMAL egress reachability (a later seed boards a subset of
-            // trips). If it reached no egress cell, some earlier departure still might,
-            // so we cannot conclude emptiness from it. Instead probe `start_time` — the
-            // MAXIMAL-reachability seed (monotone: seeding earlier arrives no later,
-            // boards a superset of trips, transfers preserve the superset, MAX_ROUNDS
-            // shared). Its forward pass floods with no `target_cutoff` pruning (nothing
-            // reached ⇒ cutoff stays u32::MAX), so its reached set is EXACT. If even it
-            // reaches no egress, no window departure can, and the whole range is
-            // provably empty — skip the remaining ~19 floods. This is exactly where the
-            // old probe-empty gate fired, but now gated on sound reachability, not on
-            // extract emptiness.
+            // Feasibility guard (perf only). The first pass (latest departure) has minimal
+            // reachability, so its empty egress proves nothing. Instead probe `start_time`,
+            // the MAXIMAL-reachability seed (monotone: seeding earlier boards a superset of
+            // trips); it floods with no cutoff pruning so its reached set is EXACT. If even
+            // it reaches no egress, the whole range is provably empty.
             let mut infeasible = false;
             let plans = latency_profile::time_range_departure(|| {
                 latency_profile::time_forward(|| {
@@ -4305,8 +3862,7 @@ impl Graph {
         all_plans
     }
 
-    /// True iff any active-state egress cell is reached in `best`. Mirrors the
-    /// egress scan in `target_cutoff`; used as the range driver's feasibility guard.
+    /// True iff any active-state egress cell is reached in `best` (feasibility guard).
     fn egress_reached(best: &BestGrid, mc: &ModeContext) -> bool {
         let n_states = mc.n_states();
         for (sidx, _vs) in mc.am.states() {
@@ -4319,11 +3875,8 @@ impl Graph {
         false
     }
 
-    /// Forward-only RAPTOR pass at `start_time` into throwaway scratch grids (no
-    /// extract, no backward, no reconstruction), returning whether it reaches any
-    /// egress cell. All grids are FRESH — the range loop's carried `labels`/`arena`
-    /// are read by the concurrent pass and must not be touched. Only invoked on the
-    /// rare infeasible path, so the allocation cost is irrelevant.
+    /// Forward-only RAPTOR pass at `start_time` into FRESH throwaway grids (the range
+    /// loop's carried `labels`/`arena` must not be touched), returning egress reachability.
     #[allow(clippy::too_many_arguments)]
     fn forward_reaches_egress<R: LabelRow>(
         &self,
@@ -4368,9 +3921,8 @@ impl Graph {
         Self::egress_reached(&best, mc)
     }
 
-    /// Reference range driver: each interesting departure runs as an independent
-    /// from-scratch RAPTOR pass. Kept as the correctness oracle for the self-pruning
-    /// `raptor_range_tuned_rt` (their 4-D Pareto outputs must be set-equal).
+    /// Reference range driver: each departure runs as an independent from-scratch pass.
+    /// Correctness oracle for `raptor_range_tuned_rt` (their 4-D outputs must be set-equal).
     #[allow(clippy::too_many_arguments)]
     pub fn raptor_range_independent_rt(
         &self,
@@ -4433,14 +3985,9 @@ impl Graph {
             None,
             crate::structures::cost::FareProfile::default(),
             |mc, access_secs| {
-                // Same probe-gate redesign as the tuned driver, kept structurally
-                // trivial so this stays the trustworthy oracle: compute interesting
-                // times first; empty window ⇒ run the probe (the only source of the
-                // "next service is after the window" answer) and return it raw;
-                // otherwise skip the probe and run every departure from scratch. The
-                // tuned driver's reachability short-circuit returns `vec![]` exactly
-                // when this loop would be empty anyway (start_time is the maximal-
-                // reachability seed, monotone), so the two stay set-equal.
+                // Empty window ⇒ run the probe and return it raw; else run every departure
+                // from scratch. Set-equal to the tuned driver (its reachability short-circuit
+                // returns `vec![]` exactly when this loop would be empty).
                 let departure_times = self.collect_interesting_times(
                     &mc.merged_access(),
                     start_time,
@@ -4485,8 +4032,7 @@ impl Graph {
         )
     }
 
-    /// Public reference range query (default buckets / no realtime), mirroring
-    /// `raptor_range` but using the independent-passes oracle. For tests.
+    /// Public reference range query (default buckets / no realtime), the oracle. For tests.
     pub fn raptor_range_independent(
         &self,
         origin: NodeID,
@@ -4511,8 +4057,8 @@ impl Graph {
             &RealtimeIndex::new(),
         )
     }
-    /// Trips departing between midnight and this threshold may actually be
-    /// overnight extensions of the previous service day (GTFS times > 86400).
+    /// Trips departing before this threshold may be overnight extensions of the previous
+    /// service day (GTFS times > 86400).
     const OVERNIGHT_THRESHOLD_SECS: u32 = 5 * 3600;
 
     /// Rotate a 7-bit weekday bitmask one day backward (Mon=0x01 → Sun=0x40).
@@ -4525,13 +4071,10 @@ impl Graph {
         ((wd << 1) | ((wd & 0x40) >> 6)) & 0x7F
     }
 
-    /// Subtract the signed `shift` from every time field in a Plan (departure/
-    /// arrival/step times). `shift > 0` normalizes a previous-service-day (date-1)
-    /// overnight pass down into the query day; `shift < 0` normalizes a next-service-
-    /// day (date+1) pass up into a late-night query's window. `date`/`weekday` in leg
-    /// steps are left untouched — they remain the service day the trip is listed
-    /// under, which is correct for previous/next departure lookups (recovered via
-    /// `raw = displayed + time_shift`). Times clamp at 0.
+    /// Subtract signed `shift` from every time field. `shift > 0` normalizes a date-1
+    /// overnight pass down into the query day; `shift < 0` normalizes a date+1 pass up.
+    /// Leg `date`/`weekday` are left UNTOUCHED (the trip's listed service day; recovered
+    /// via `raw = displayed + time_shift`). Times clamp at 0.
     fn shift_plan(mut plan: Plan, shift: i64) -> Plan {
         let sub = |x: u32| (x as i64 - shift).max(0) as u32;
         plan.start = sub(plan.start);
@@ -4563,8 +4106,7 @@ impl Graph {
                     t.end = sub(t.end);
                     t.scheduled_start = sub(t.scheduled_start);
                     t.scheduled_end = sub(t.scheduled_end);
-                    // Boarding/alighting stop times must move with the leg (the UI's
-                    // PLAN_FRAGMENT reads `from.departure`); mirrors `shift_transit_leg`.
+                    // Boarding/alighting stop times must move with the leg.
                     t.from.departure = t.from.departure.map(sub);
                     t.to.arrival = t.to.arrival.map(sub);
                     if let Some(tr) = &mut t.transfer_risk {
@@ -4591,19 +4133,10 @@ impl Graph {
         plan
     }
 
-    /// Earliest-arrival probe on the NEXT service day, used only when the query
-    /// day cannot deliver the traveller to the destination before midnight (all
-    /// same-day dest arrivals land on the next-day clock, `end >= 86400`, or no
-    /// same-day plan reaches the dest at all). Searches `date+1` from next-day
-    /// midnight (`start = 0`) so the first reaching trip of the day is found, then
-    /// shifts every time up by `+86400` (via `shift_plan(-86400)`) so the plans
-    /// carry next-day-clock times (`start/end >= 86400`) — Pareto then lets these
-    /// dominate the degenerate "ride partway + huge egress walk" fabrication (later
-    /// start AND earlier arrival), and the UI's fmtTime "+N day" marker labels them.
-    /// Filtered to transit-bearing plans only: a next-day walk/bike/car copy of the
-    /// direct street plan (same route, later start) would otherwise survive Pareto
-    /// as a spurious incomparable duplicate. If the next day has no transit either,
-    /// the result is empty and the caller keeps whatever the same-day search yielded.
+    /// Earliest-arrival probe on the NEXT service day (searched `date+1` from midnight, then
+    /// shifted `+86400` so plans carry next-day-clock times and Pareto-dominate the "ride
+    /// partway + huge egress walk" fabrication). Filtered to TRANSIT-bearing plans: a next-day
+    /// street-only copy would survive Pareto as a spurious incomparable duplicate.
     #[allow(clippy::too_many_arguments)]
     fn next_day_transit_fallback(
         &self,
@@ -4711,18 +4244,10 @@ impl Graph {
             }
         }
 
-        // A blind date+1 FORWARD extension would pollute every evening window-less
-        // query: a date+1 trip departs tomorrow (start >= 86400) and, once shifted
-        // up a day, is Pareto-INCOMPARABLE to a same-day plan (its later start is
-        // favorable), so it would survive `finalize_plans` with spurious tomorrow-
-        // morning departures. The next-day fallback is therefore GATED on the query
-        // day genuinely failing: it fires only when NO plan reaches the destination
-        // before the upcoming midnight (`end < 86400`) — the degenerate case where
-        // the same-day search offers only a "ride partway + huge egress walk"
-        // fabrication (or nothing). A normal evening query that reaches the dest
-        // same-day keeps `same_day_ok == true` ⇒ this block is a no-op ⇒ output is
-        // byte-identical. (The date-1 BACKWARD extension above always belongs here:
-        // a >24h prev-service-day trip can genuinely depart at today's query time.)
+        // The date+1 fallback is GATED on `!same_day_ok` (no plan reaches the dest before
+        // midnight): a blind forward extension departs tomorrow and, once shifted, is
+        // Pareto-INCOMPARABLE to a same-day plan, so it would survive `finalize_plans` with
+        // spurious departures. A normal same-day query keeps `same_day_ok` ⇒ no-op.
         let same_day_ok = plans.iter().any(|p| p.end < 86400);
         if !same_day_ok {
             let forward = self.next_day_transit_fallback(
@@ -4818,17 +4343,11 @@ impl Graph {
             }
         }
 
-        // Symmetric FORWARD (date+1) extension for the window driver: when the
-        // requested window crosses midnight, trips the feed lists under the NEXT
-        // service day at early times fall inside the window but are invisible to the
-        // date-day pass. Search date+1 from an effective start of
-        // max(0, start_time-86400) (= 0 for a real <24h query). The forward window is
-        // TRIMMED to exactly the midnight-crossing tail — `start_time + window_secs -
-        // 86400` seconds — so that after the +86400 shift the covered departures land
-        // precisely on `[86400, start_time+window_secs]`, the part of the query window
-        // past midnight, and never past it (blind reuse of `window_secs` would leak
-        // departures beyond the requested window). Gate `start+window > 86400` makes
-        // the pass a strict no-op for a daytime window ⇒ byte-identical output.
+        // Forward (date+1) extension when the window crosses midnight: next-day trips at
+        // early times fall in the window but are invisible to the date-day pass. The forward
+        // window is TRIMMED to the crossing tail so that after the +86400 shift the covered
+        // departures land precisely on `[86400, start_time+window_secs]` and never past it.
+        // Gate `start+window > 86400` makes it a no-op for a daytime window.
         if start_time.saturating_add(window_secs) > 86400 {
             let eff_start = start_time.saturating_sub(86400);
             let fwd_window = start_time
@@ -4853,15 +4372,10 @@ impl Graph {
                 ep,
                 fare_profile,
             );
-            // Enforce the window bound on DEPARTURE. The underlying range driver
-            // falls back to an unbounded earliest-arrival probe when the trimmed
-            // forward window `[0, fwd_window]` on date+1 has NO service departure;
-            // that probe boards an arbitrarily-late date+1 trip which, after the
-            // +86400 shift, can start well past `start_time+window_secs` yet survive
-            // `finalize_plans` (a later start is Pareto-favorable). Drop those: a
-            // legitimate forward gain always DEPARTS within the window (its `start`,
-            // the origin-leave time, is <= the window end — even if its boarding is
-            // later after a long in-window wait). Filter on `start`, not boarding.
+            // Enforce the window bound on DEPARTURE, not boarding: the range driver's
+            // empty-window probe can board an arbitrarily-late date+1 trip that survives
+            // `finalize_plans` after the shift. A legitimate forward gain always has its
+            // `start` (origin-leave time) <= the window end.
             let window_end = start_time.saturating_add(window_secs);
             let normalized: Vec<Plan> = forward
                 .into_iter()
@@ -4874,17 +4388,10 @@ impl Graph {
             }
         }
 
-        // Degenerate fallback: the query day cannot deliver the traveller to the
-        // destination before midnight (every plan so far arrives on the next-day
-        // clock, `end >= 86400`, or none reached the dest) — the case that fabricates
-        // a "ride partway + 100 km egress walk". The crossing block above only helps
-        // when the *window itself* spilled past midnight; a plain evening window (e.g.
-        // 19:04 w30) never triggers it. Surface the genuine next-day service instead:
-        // the earliest-arriving next-day plan Pareto-dominates the fabrication (later
-        // start AND earlier arrival). Gated on `!same_day_ok`, so a normal window that
-        // reaches the dest same-day (some `end < 86400`) is a strict no-op ⇒ output is
-        // byte-identical. Crossing-block plans depart tomorrow (`end >= 86400`), so
-        // they never flip `same_day_ok`; computing it here is safe.
+        // Degenerate fallback when the query day can't reach the dest before midnight (the
+        // crossing block above only helps when the WINDOW itself spilled past midnight).
+        // Gated on `!same_day_ok`, so a normal same-day-reaching window is a no-op. Crossing-
+        // block plans depart tomorrow (`end >= 86400`) so never flip `same_day_ok`.
         let same_day_ok = plans.iter().any(|p| p.end < 86400);
         if !same_day_ok {
             let forward = self.next_day_transit_fallback(
@@ -4934,9 +4441,7 @@ mod label_tests {
 
     #[test]
     fn labelset_dominance_is_price_blind() {
-        // Price is no longer a dominance axis (it is annotated post-hoc), so the
-        // label set decides purely on (arrival ↓, bucket ↑): a strictly-later
-        // same-bucket label is dominated regardless of any fare it would carry.
+        // Search is price-blind: a strictly-later same-bucket label is dominated.
         let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
         assert!(s.insert(lbl(100, 1.0), &b));
@@ -4947,18 +4452,14 @@ mod label_tests {
         assert_eq!(s.iter().count(), 1);
     }
 
-    /// `next_weekday` is the exact inverse of `prev_weekday` and wraps
-    /// Sun(0x40)→Mon(0x01). Together they form a bijection on the 7-bit ring, which
-    /// is what makes the date+1 / date-1 overnight passes land on the right service
-    /// day.
+    /// `next_weekday` is the exact inverse of `prev_weekday` and wraps Sun→Mon (a bijection
+    /// on the 7-bit ring, so the date±1 overnight passes land on the right service day).
     #[test]
     fn next_weekday_rotates_and_wraps() {
-        // Mon→Tue→…→Sun→Mon
-        assert_eq!(Graph::next_weekday(0x01), 0x02); // Mon → Tue
-        assert_eq!(Graph::next_weekday(0x10), 0x20); // Fri → Sat
-        assert_eq!(Graph::next_weekday(0x20), 0x40); // Sat → Sun
+        assert_eq!(Graph::next_weekday(0x01), 0x02);
+        assert_eq!(Graph::next_weekday(0x10), 0x20);
+        assert_eq!(Graph::next_weekday(0x20), 0x40);
         assert_eq!(Graph::next_weekday(0x40), 0x01); // Sun → Mon (wrap)
-        // Inverse of prev_weekday for every single-day mask.
         for i in 0..7u8 {
             let wd = 1u8 << i;
             assert_eq!(Graph::prev_weekday(Graph::next_weekday(wd)), wd);
@@ -4968,17 +4469,13 @@ mod label_tests {
 
     #[test]
     fn trip_active_memo_tristate_roundtrip() {
-        // Opt A container contract: a fresh memo reads `unknown` (0) for every
-        // slot; a filled slot reads back the exact bool it was set with; and the
-        // fill is idempotent (storing the same pure value again is stable). This
-        // is the invariant `is_trip_active_memo` relies on — end-to-end equality
-        // with `is_trip_active` is covered by the oracle-equivalence tests.
+        // Memo contract: fresh reads `unknown` (0); a filled slot reads back its bool; fill
+        // is idempotent. This is the invariant `is_trip_active_memo` relies on.
         use std::sync::atomic::Ordering::Relaxed;
         let m = TripActiveMemo::new(4);
         for slot in &m.states {
             assert_eq!(slot.load(Relaxed), 0, "fresh slot must be unknown");
         }
-        // Simulate the exact fill/read the method performs.
         let fill = |i: usize, active: bool| {
             let slot = &m.states[i];
             if slot.load(Relaxed) == 0 {
@@ -4992,7 +4489,7 @@ mod label_tests {
         };
         assert!(fill(0, true));
         assert!(!fill(1, false));
-        // Cache hit: value is stable and independent of the re-passed truth.
+        // Cache hit: value is stable, independent of the re-passed truth.
         assert!(fill(0, false));
         assert!(!fill(1, true));
         assert_eq!(m.states[2].load(Relaxed), 0, "untouched slot stays unknown");
@@ -5020,12 +4517,9 @@ mod label_tests {
         assert_eq!(s.iter().count(), 2);
     }
 
-    /// R3 exactness: the compact per-bucket-min `best` backend must return
-    /// BIT-IDENTICAL `is_reached` / `earliest` / `dominates` to the legacy
-    /// `Vec<LabelSet>` backend for every cell after any same-stamp insert stream —
-    /// this is what makes the whole optimization byte-preserving. We drive the two
-    /// backends with the same deterministic-pseudorandom insert sequence (spanning
-    /// every bucket and a wide arrival range) and cross-check every read.
+    /// R3 exactness: the compact `best` backend must return BIT-IDENTICAL
+    /// `is_reached`/`earliest`/`dominates` to the legacy backend after any same-stamp
+    /// insert stream. Driven with a deterministic pseudo-random sequence.
     #[test]
     fn bestgrid_compact_matches_labels_exactly() {
         let b = ReliabilityBuckets::default();
@@ -5040,8 +4534,6 @@ mod label_tests {
 
         // Reliabilities chosen to land in each bucket, incl. the CERTAIN band.
         let rels = [0.05f32, 0.40, 0.55, 0.70, 0.85, 0.92, 0.97, 0.999, 1.0];
-        // Deterministic LCG so the stream is reproducible and interleaves cells,
-        // arrivals and reliabilities without any RNG dependency.
         let mut state: u64 = 0x9E3779B97F4A7C15;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -5053,11 +4545,10 @@ mod label_tests {
             let time = 30_000 + (next() % 12_000);
             let rel = rels[(next() as usize) % rels.len()];
             let mut cand = lbl(time, rel);
-            cand.at_stop = cell as u32; // irrelevant to best, but realistic
+            cand.at_stop = cell as u32;
             compact.insert(cell, cand, &b);
             legacy.insert(cell, cand, &b);
 
-            // Cross-check all reads on the touched cell against a battery of probes.
             assert_eq!(compact.is_reached(cell), legacy.is_reached(cell), "is_reached cell {cell}");
             assert_eq!(compact.earliest(cell), legacy.earliest(cell), "earliest cell {cell}");
             for &pr in &rels {
@@ -5071,7 +4562,6 @@ mod label_tests {
                 }
             }
         }
-        // Final full-grid sweep of every read.
         for cell in 0..n_cells {
             assert_eq!(compact.is_reached(cell), legacy.is_reached(cell));
             assert_eq!(compact.earliest(cell), legacy.earliest(cell));
@@ -5086,7 +4576,6 @@ mod label_tests {
             }
         }
 
-        // `reset` returns both backends to the fully-unreached state.
         compact.reset();
         legacy.reset();
         for cell in 0..n_cells {
@@ -5114,8 +4603,6 @@ mod label_tests {
     fn labelset_earlier_scheduled_wins_over_better_expected() {
         let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
-        // Same reliability bucket (both CERTAIN). First: scheduled 100 but expected 910
-        // (90% chance of a late miss). Second: scheduled & expected 200.
         let risky_early = Label {
             bag: ScenarioBag::with_scenarios(100, 0.1, 1000, 0.9),
             route_type: None,
@@ -5148,18 +4635,15 @@ mod label_tests {
     /// extensions can quantize to different final buckets (the ~4% range misses).
     #[test]
     fn labelset_cross_stamp_prune_requires_precise_reliability() {
-        let b = ReliabilityBuckets::default(); // edges [0.5, 0.8, 0.95]
+        let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
-        // Carried ghost from stamp 0: bucket 2 (0.80..0.95), arrival 100.
         assert!(s.insert(lbl_stamped(100, 0.81, 0), &b));
-        // New pass (stamp 1), same bucket & arrival but HIGHER precise reliability:
-        // must be inserted, not bucket-pruned.
+        // Same bucket & arrival, HIGHER precise reliability: must NOT be bucket-pruned.
         assert!(
             s.insert(lbl_stamped(100, 0.94, 1), &b),
             "cross-stamp bucket prune dropped a higher-precise-reliability label"
         );
-        // Same situation but the ghost's precise reliability is >= the candidate's:
-        // the prune IS sound and must still fire.
+        // Ghost precise reliability >= candidate's: the prune IS sound and must fire.
         let mut s2 = LabelSet::EMPTY;
         assert!(s2.insert(lbl_stamped(100, 0.94, 0), &b));
         assert!(!s2.insert(lbl_stamped(100, 0.81, 1), &b));
@@ -5173,18 +4657,17 @@ mod label_tests {
     fn labelset_cross_stamp_prune_respects_transfer_count() {
         let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
-        // Ghost from stamp 0: 3 transit legs, arrival 100, reliability 0.99.
         let mut ghost = lbl_stamped(100, 0.99, 0);
         ghost.round = 3;
         assert!(s.insert(ghost, &b));
-        // Carried label from stamp 1 with only 1 leg, worse arrival/rel: must coexist.
+        // Fewer-leg label with worse arrival/rel must coexist (not pruned by more legs).
         let mut cand = lbl_stamped(120, 0.85, 1);
         cand.round = 1;
         assert!(
             s.insert(cand, &b),
             "ghost with more transit legs pruned a fewer-leg label (transfers axis)"
         );
-        // Same ghost but with <= legs soundly dominates.
+        // Ghost with <= legs soundly dominates.
         let mut s2 = LabelSet::EMPTY;
         let mut g2 = lbl_stamped(100, 0.99, 0);
         g2.round = 1;
@@ -5213,18 +4696,14 @@ mod label_tests {
     fn labelset_full_cell_evicts_ghost_before_current_stamp() {
         let b = ReliabilityBuckets::default();
         let mut s = LabelSet::EMPTY;
-        // Fill the cell with ghosts from MAX_LABELS earlier departures, all in the
-        // top bucket, arrival and precise reliability both increasing — pairwise
-        // non-dominated cross-stamp, so they all coexist.
+        // MAX_LABELS ghosts, pairwise non-dominated cross-stamp, so all coexist.
         for i in 0..MAX_LABELS {
             let g = lbl_stamped(100 + i as u32, 0.951 + 0.003 * i as f32, i as u32);
             assert!(s.insert(g, &b), "ghost {i} should coexist");
         }
         assert_eq!(s.iter().count(), MAX_LABELS);
-        // Current-stamp candidate: latest arrival but the highest precise reliability
-        // in the cell — no ghost soundly dominates it. The bucket-based worst-
-        // replacement would reject it (same bucket, latest arrival); it must instead
-        // displace a ghost, because ghosts can never appear in output again.
+        // Current-stamp candidate no ghost dominates: must displace a ghost (ghosts can
+        // never appear in output again), not lose the bucket-based worst-replacement.
         let stamp = MAX_LABELS as u32;
         let cand = lbl_stamped(100 + MAX_LABELS as u32 + 5, 0.9999, stamp);
         assert!(
@@ -5246,11 +4725,8 @@ mod street_time_tests {
     fn vehicle_access_budget_scales_then_clamps() {
         // Defaults: floor 1200 s, fraction 0.06, ceiling 2700 s.
         let g = Graph::new();
-        // Short trip ⇒ floored to the local radius.
         assert_eq!(g.vehicle_access_budget(10_000), 1200, "short trip keeps the floor");
-        // Mid/long trip ⇒ scales with the crow-flies time (0.06 × 30000 = 1800).
         assert_eq!(g.vehicle_access_budget(30_000), 1800, "long trip rides farther");
-        // Very long trip ⇒ clamped to the ceiling.
         assert_eq!(g.vehicle_access_budget(100_000), 2700, "ceiling bounds the search");
     }
 

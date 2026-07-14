@@ -11,9 +11,6 @@ use crate::structures::{
 
 use super::Graph;
 
-/// Street traversal profile for access/egress/direct routing.
-/// `Bike` rides `bike` edges at cycling speed and falls back to `foot` edges
-/// at walking speed (dismount and push), so pedestrian-only shortcuts stay usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreetProfile {
     Foot,
@@ -22,9 +19,6 @@ pub enum StreetProfile {
 }
 
 impl Graph {
-    /// Traversal time of a street edge under `profile` in integer milliseconds
-    /// per meter math (same arithmetic as the historical walk path), or `None`
-    /// when the profile cannot use the edge.
     #[inline]
     pub(super) fn edge_secs(&self, street: &StreetEdgeData, profile: StreetProfile) -> Option<u32> {
         let speed_mps = match profile {
@@ -33,10 +27,7 @@ impl Graph {
             StreetProfile::Bike if street.bike => self.raptor.cycling_speed_mps,
             StreetProfile::Bike if street.foot => self.raptor.walking_speed_mps,
             StreetProfile::Bike => return None,
-            // Car drives car edges, and falls back to foot edges at walking speed
-            // (park near the station and walk the last stretch) — the stop→street
-            // snap connectors are foot-only, so without this a car could never
-            // reach a platform for park & ride / kiss & ride.
+            // Car falls back to foot edges (snap connectors are foot-only).
             StreetProfile::Car if street.car => self.raptor.driving_speed_mps,
             StreetProfile::Car if street.foot => self.raptor.walking_speed_mps,
             StreetProfile::Car => return None,
@@ -53,11 +44,6 @@ impl Graph {
         }
     }
 
-    /// Coordinate of a node, g-free once the interior arrays are dropped. Every NodeID
-    /// reachable post-drop (query endpoints, transit stops, junction path nodes) is a
-    /// junction, so its position survives in the contracted graph's `junction_coord`.
-    /// With `g` present (flag-off or pre-drop) this is byte-identical to
-    /// `self.nodes[id].loc()`.
     pub(super) fn node_loc(&self, id: NodeID) -> crate::structures::LatLng {
         if self.nodes.is_empty() {
             let cg = self
@@ -70,20 +56,11 @@ impl Graph {
         }
     }
 
-    /// Inter-stop segment length (meters) for a transit leg, g-free post-drop. Mirrors
-    /// [`Graph::nodes_distance`]'s `* 0.99` haversine discount.
+    /// Must mirror [`Graph::nodes_distance`]'s `* 0.99` haversine discount.
     pub(super) fn transit_seg_length(&self, a: NodeID, b: NodeID) -> usize {
         (self.node_loc(a).dist(self.node_loc(b)) * 0.99) as usize
     }
 
-    /// Profile-aware leg geometry that routes over the contracted graph when present,
-    /// else the full-graph `street_path`.
-    ///
-    /// When `contracted.is_some()`, the polyline is rebuilt from super-edge segment coords
-    /// (`street_path_arena`) — g-free traversal. The endpoint COORDS still come from
-    /// `node_coord` here (a `g.nodes` read, valid until the P3f drop); the snapping
-    /// cutover (T2) swaps that coord source to the arena snap. A transit-stop endpoint's
-    /// coord comes from its junction coord (stops are junctions), so it survives the drop.
     pub(super) fn street_path_geom(
         &self,
         origin: NodeID,
@@ -100,10 +77,6 @@ impl Graph {
             .collect()
     }
 
-    /// Profile-aware leg geometry between two PROJECTED snap coordinates over the
-    /// contracted graph (`street_path_arena`). Used for a coord-snapped origin/destination
-    /// whose interior node is gone, so the polyline survives the drop. The endpoints are
-    /// the exact projection points (never a junction shortcut).
     pub(super) fn street_path_geom_coords(
         &self,
         origin: crate::structures::LatLng,
@@ -126,10 +99,6 @@ impl Graph {
         .collect()
     }
 
-    /// Coordinate of a snapped endpoint for contracted geometry: a junction (incl. every
-    /// transit stop) resolves to its g-free `junction_coord`; any other node falls back to
-    /// `node_coord` (valid until the P3f drop — T2 replaces interior-node coords with the
-    /// arena snap point). Keeps geometry endpoints stable across the flag.
     fn geom_node_coord(
         &self,
         id: NodeID,
@@ -151,10 +120,8 @@ impl Graph {
         max_seconds: u32,
         profile: StreetProfile,
     ) -> HashMap<NodeID, u32> {
-        // Car routing is phased: a car may go Driving → (park) → Walking, but
-        // never Walking → Driving (a car left at the kerb can't be picked back
-        // up). The phase is carried in the search state; `walking == false` means
-        // still in the car. Foot/Bike are single-phase (the flag stays false).
+        // Car is phased Drive → (park) → Walk, never reversed; the state `bool`
+        // is `walking` (`false` = still in the car). Foot/Bike stay `false`.
         let car = matches!(profile, StreetProfile::Car);
         let mut dist: HashMap<(NodeID, bool), u32> = HashMap::new();
         let mut pq: BinaryHeap<Reverse<(u32, (NodeID, bool))>> = BinaryHeap::new();
@@ -177,7 +144,6 @@ impl Graph {
             for edge in neighbors {
                 match edge {
                     EdgeData::Street(street) => {
-                        // (time, next-phase) for this edge under the profile.
                         let step = if car {
                             self.car_edge_step(street, walking)
                         } else {
@@ -209,7 +175,6 @@ impl Graph {
             }
         }
 
-        // Collapse the (node, phase) distances to the best arrival per node.
         let mut best: HashMap<NodeID, u32> = HashMap::new();
         for (&(node, _), &d) in &dist {
             let e = best.entry(node).or_insert(u32::MAX);
@@ -218,9 +183,7 @@ impl Graph {
         best
     }
 
-    /// One car step: `(seconds, next-phase)` or `None` if impassable. Driving may
-    /// stay on car edges or *park and walk* onto a foot edge (→ Walking); once
-    /// Walking, only foot edges are usable (the car has been left behind).
+    /// Once `walking`, only foot edges are usable (the car is left behind).
     #[inline]
     pub(super) fn car_edge_step(&self, street: &StreetEdgeData, walking: bool) -> Option<(u32, bool)> {
         let secs = |speed_mps: f64| {
@@ -240,8 +203,6 @@ impl Graph {
         self.nearest_stop_secs_coord(self.node_loc(node), straight_line_secs)
     }
 
-    /// `nearest_stop_secs` keyed directly on a coordinate (the projected arena snap),
-    /// avoiding a `g.nodes` read so it survives the interior-node drop.
     pub(super) fn nearest_stop_secs_coord(
         &self,
         loc: crate::structures::LatLng,
@@ -259,8 +220,6 @@ impl Graph {
             .unwrap_or(straight_line_secs)
     }
 
-    /// Unit direction vector from `from` to `to` in lat/lon space (adequate for
-    /// turn-angle dot products at Belgian latitudes; not great-circle exact).
     pub(super) fn dir_between(&self, from: NodeID, to: NodeID) -> (f64, f64) {
         let a = self.nodes[from.0].loc();
         let b = self.nodes[to.0].loc();
@@ -269,9 +228,6 @@ impl Graph {
         (dx / n, dy / n)
     }
 
-    /// A synthetic partial-length copy of `e` (a stub of `len` meters along it),
-    /// elevation prorated. Used to charge the bit of an edge between a projected
-    /// endpoint and the edge's node.
     pub(super) fn partial_edge(e: &StreetEdgeData, len: usize) -> StreetEdgeData {
         let frac = if e.length == 0 {
             0.0
@@ -293,7 +249,6 @@ impl Graph {
         }
     }
 
-    /// Bike variant of `nearby_stops`, cost-routed (carries kinematic time).
     pub fn bike_nearby_stops(
         &self,
         origin: NodeID,
@@ -332,10 +287,8 @@ impl Graph {
                 stops.push((compact as usize, walk_secs));
             }
         }
-        // `walk_times` is a HashMap (random per-process seed), so its iteration order
-        // varies between runs. RAPTOR seeds sources in this order and `LabelSet::insert`
-        // keeps the first label on ties, so unsorted output makes routing results
-        // nondeterministic across processes. Sort by stop id for a stable order.
+        // Stable sort by stop id: RAPTOR keeps the first label on ties, so HashMap
+        // iteration order would make results nondeterministic across processes.
         stops.sort_unstable_by_key(|&(stop, _)| stop);
         stops
     }

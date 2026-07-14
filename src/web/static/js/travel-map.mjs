@@ -1,12 +1,3 @@
-// Travel-time map page logic. Standalone from index.html: reuses only the
-// shared `/maas.js` helpers (`gql`) via globals, plus Leaflet from the same CDN
-// the main app uses. Renders a continuous green(0)->red(maxSeconds) heatmap of
-// the `travelTimeMap` GraphQL query onto a Leaflet canvas overlay.
-
-// Travel-mode grid (mirrors index.html): rows = vehicle, columns = how the
-// vehicle relates to transit. Each populated cell is one Mode enum value; null
-// cells are impossible combos and render disabled. Headers toggle a whole
-// row/column at once.
 const MODE_COLS = [
   { col: 'SOLO', label: 'Solo' },
   { col: 'ON',   label: 'On transit' },
@@ -53,28 +44,17 @@ const TRAVEL_QUERY = `query T(
   }
 }`;
 
-// Canvas opacity so the OSM basemap (streets, labels, landmarks) reads through
-// the colour field. Applied as a CSS opacity on the whole overlay canvas, so it
-// survives the zoom-animation transform (which only writes `transform`) and the
-// post-zoom setPosition. This is the single translucency knob for the filled-
-// square heatmap — tuned so the fill is clearly coloured yet the basemap shows.
 const HEAT_OPACITY = 0.55;
 
-// Per-cell square fill alpha. Kept fully opaque here so touching squares don't
-// darken at their overlap; the whole-canvas HEAT_OPACITY provides translucency.
 const CELL_ALPHA = 1;
 
-// Collapse a plan's legs into a compact step list for the click-to-route popup.
-// Consecutive walk legs merge; each transit leg becomes one "Line -> Headsign"
-// step. Returns [{ kind:'walk', mins } | { kind:'transit', line, mode, to, color, textColor }].
-// Pure (no DOM) so it's unit-testable.
 export function summarizeLegs(legs) {
   const out = [];
   for (const leg of legs || []) {
     if (leg.__typename === 'PlanWalkLeg') {
       const mins = Math.round((leg.duration ?? Math.max(0, leg.end - leg.start)) / 60);
       const last = out[out.length - 1];
-      if (last && last.kind === 'walk') last.mins += mins;      // merge adjacent walks
+      if (last && last.kind === 'walk') last.mins += mins;
       else out.push({ kind: 'walk', mins });
     } else if (leg.__typename === 'PlanTransitLeg') {
       const route = leg.trip && leg.trip.route;
@@ -91,14 +71,11 @@ export function summarizeLegs(legs) {
   return out;
 }
 
-// ── green -> yellow -> red ramp on a normalized t in [0,1] ──────────────────
-// t=0 (near) green, t=0.5 yellow, t=1 (max) red. Returns [r,g,b].
 export function ramp(t) {
   t = Math.max(0, Math.min(1, t));
-  // Two-segment linear interpolation through green -> yellow -> red.
-  const green  = [ 22, 163,  74]; // #16a34a
-  const yellow = [234, 179,   8]; // #eab308
-  const red    = [220,  38,  38]; // #dc2626
+  const green  = [ 22, 163,  74];
+  const yellow = [234, 179,   8];
+  const red    = [220,  38,  38];
   let a, b, u;
   if (t < 0.5) { a = green;  b = yellow; u = t / 0.5; }
   else         { a = yellow; b = red;    u = (t - 0.5) / 0.5; }
@@ -109,14 +86,8 @@ export function ramp(t) {
   ];
 }
 
-// ── Grid reconstruction from the flat cell list ─────────────────────────────
-// The backend samples cells on a REGULAR lat/lng lattice anchored at the centre.
-// Reconstruct that 2-D grid so marching squares can run on it: collect the
-// sorted unique lats and lngs (evenly spaced), map each cell to integer (i,j),
-// and fill a `seconds` matrix with a +Infinity sentinel for unreachable/missing
-// cells. Returns { lats, lngs, sec, rows, cols } (sec[i][j], i over lats asc).
 export function buildGrid(cells) {
-  const EPS = 1e-6; // coordinate-equality tolerance (lattice is far coarser)
+  const EPS = 1e-6;
   const uniq = (vals) => {
     const out = [];
     for (const v of [...vals].sort((a, b) => a - b)) {
@@ -127,7 +98,6 @@ export function buildGrid(cells) {
   const lats = uniq(cells.map((c) => c.lat));
   const lngs = uniq(cells.map((c) => c.lng));
   const rows = lats.length, cols = lngs.length;
-  // Binary-search an evenly spaced axis for the index of `v`.
   const idxOf = (arr, v) => {
     let lo = 0, hi = arr.length - 1;
     while (lo <= hi) {
@@ -145,45 +115,28 @@ export function buildGrid(cells) {
   return { lats, lngs, sec, rows, cols };
 }
 
-// Marching squares on the reconstructed grid at one iso-time `threshold`.
-// Produces a list of line segments [{ a:{i,j fractional}, b:{…} }] in grid
-// coordinates, where a fractional (i,j) is interpolated linearly by seconds
-// along a cell edge. Cells with Infinity seconds are treated as strictly above
-// the threshold (outside the reachable band), so the outer isochrone boundary
-// is drawn where reachable meets unreachable. Returns segments; the caller maps
-// grid coords -> pixels. Cheap: O(rows*cols) per threshold, few hundred cells.
 export function marchingSquares(grid, threshold) {
   const { sec, rows, cols } = grid;
   const segs = [];
   if (rows < 2 || cols < 2) return segs;
-  // Interpolate the fractional position where the iso-value crosses the edge
-  // between two corners with seconds va (at t=0) and vb (at t=1).
   const cross = (va, vb) => {
     if (!isFinite(va) && !isFinite(vb)) return 0.5;
-    if (!isFinite(va)) return 1; // crossing sits at the finite (vb) corner side
+    if (!isFinite(va)) return 1;
     if (!isFinite(vb)) return 0;
     if (va === vb) return 0.5;
     return (threshold - va) / (vb - va);
   };
   for (let i = 0; i < rows - 1; i++) {
     for (let j = 0; j < cols - 1; j++) {
-      // Corner seconds: tl, tr, br, bl (i over lats asc, j over lngs asc).
       const tl = sec[i][j],     tr = sec[i][j + 1];
       const bl = sec[i + 1][j], br = sec[i + 1][j + 1];
-      // Skip a fully-empty cell (no finite corner => nothing to contour).
       if (!isFinite(tl) && !isFinite(tr) && !isFinite(bl) && !isFinite(br)) continue;
-      // Below/equal threshold = inside (bit set). Infinity is always outside.
       let code = 0;
       if (tl <= threshold) code |= 8;
       if (tr <= threshold) code |= 4;
       if (br <= threshold) code |= 2;
       if (bl <= threshold) code |= 1;
       if (code === 0 || code === 15) continue;
-      // Edge crossing points, in fractional grid coords:
-      //   top    edge tl->tr : i,       j + cross(tl,tr)
-      //   right  edge tr->br : i + cross(tr,br), j+1
-      //   bottom edge bl->br : i+1,     j + cross(bl,br)
-      //   left   edge tl->bl : i + cross(tl,bl), j
       const top    = () => ({ i,                     j: j + cross(tl, tr) });
       const right  = () => ({ i: i + cross(tr, br),  j: j + 1 });
       const bottom = () => ({ i: i + 1,              j: j + cross(bl, br) });
@@ -194,12 +147,12 @@ export function marchingSquares(grid, threshold) {
         case 2:  push(bottom(), right()); break;
         case 3:  push(left(), right()); break;
         case 4:  push(top(), right()); break;
-        case 5:  push(top(), left()); push(bottom(), right()); break; // saddle
+        case 5:  push(top(), left()); push(bottom(), right()); break;
         case 6:  push(top(), bottom()); break;
         case 7:  push(top(), left()); break;
         case 8:  push(top(), left()); break;
         case 9:  push(top(), bottom()); break;
-        case 10: push(top(), right()); push(bottom(), left()); break; // saddle
+        case 10: push(top(), right()); push(bottom(), left()); break;
         case 11: push(top(), right()); break;
         case 12: push(left(), right()); break;
         case 13: push(bottom(), right()); break;
@@ -210,21 +163,10 @@ export function marchingSquares(grid, threshold) {
   return segs;
 }
 
-// Iso-time threshold (seconds): a SINGLE contour at the reachability boundary
-// (maxSeconds) to keep the map uncluttered — no intermediate rings. Empty when
-// maxSeconds is non-positive (nothing to draw).
 export function contourThresholds(maxSeconds) {
   return maxSeconds > 0 ? [maxSeconds] : [];
 }
 
-// Exposed-cell-edge outline: the outer boundary of the reachable-cell UNION,
-// following the cell SQUARE edges (so it lines up exactly with the hard-clip
-// fill, which also draws cell squares). For each reachable cell (finite seconds)
-// emit one of its 4 square edges only when the neighbour in that direction is
-// missing/unreachable/off-grid — the union of those edges is precisely the outer
-// border (and any interior holes). Coordinates are fractional grid units: a cell
-// centre is (i, j); its square spans ±0.5 in each axis. Returns segments
-// { a:{i,j}, b:{i,j} } for the caller to map to pixels. Pure — unit-testable.
 export function exposedEdges(grid) {
   const { sec, rows, cols } = grid || {};
   const out = [];
@@ -235,30 +177,19 @@ export function exposedEdges(grid) {
     for (let j = 0; j < cols; j++) {
       if (!reachable(i, j)) continue;
       const t = i - 0.5, b = i + 0.5, l = j - 0.5, r = j + 0.5;
-      // Neighbour above (smaller i) missing -> top edge exposed.
       if (!reachable(i - 1, j)) out.push({ a: { i: t, j: l }, b: { i: t, j: r } });
-      // Neighbour below (larger i) missing -> bottom edge exposed.
       if (!reachable(i + 1, j)) out.push({ a: { i: b, j: l }, b: { i: b, j: r } });
-      // Neighbour left (smaller j) missing -> left edge exposed.
       if (!reachable(i, j - 1)) out.push({ a: { i: t, j: l }, b: { i: b, j: l } });
-      // Neighbour right (larger j) missing -> right edge exposed.
       if (!reachable(i, j + 1)) out.push({ a: { i: t, j: r }, b: { i: b, j: r } });
     }
   }
   return out;
 }
 
-// Sample the isochrone travel time (seconds) at an arbitrary lat/lng from the
-// reconstructed grid, so a click reports EXACTLY what the heatmap colour shows
-// (no re-routing). Bilinear interpolation over the 4 surrounding lattice cells
-// when all are finite; otherwise fall back to the nearest finite corner. Returns
-// a finite seconds value, or Infinity when no usable nearby cell exists (outside
-// the sampled area / all four corners unreachable). Pure (no DOM) — unit-tested.
 export function sampleSeconds(grid, lat, lng) {
   if (!grid) return Infinity;
   const { lats, lngs, sec, rows, cols } = grid;
   if (!rows || !cols) return Infinity;
-  // Locate the bracketing lattice indices (lats/lngs are sorted ascending).
   const bracket = (arr, v) => {
     if (v <= arr[0]) return [0, 0, 0];
     if (v >= arr[arr.length - 1]) return [arr.length - 1, arr.length - 1, 0];
@@ -275,13 +206,11 @@ export function sampleSeconds(grid, lat, lng) {
   const [j0, j1, fj] = bracket(lngs, lng);
   const tl = sec[i0][j0], tr = sec[i0][j1];
   const bl = sec[i1][j0], br = sec[i1][j1];
-  // Bilinear when every surrounding corner is reachable.
   if (isFinite(tl) && isFinite(tr) && isFinite(bl) && isFinite(br)) {
     const top = tl + (tr - tl) * fj;
     const bot = bl + (br - bl) * fj;
     return top + (bot - top) * fi;
   }
-  // Fallback: nearest finite corner (by lattice fraction). If none finite, unreachable.
   const corners = [
     { v: tl, d: fi * fi + fj * fj },
     { v: tr, d: fi * fi + (1 - fj) * (1 - fj) },
@@ -292,18 +221,13 @@ export function sampleSeconds(grid, lat, lng) {
   return corners.reduce((a, b) => (b.d < a.d ? b : a)).v;
 }
 
-// A Leaflet canvas overlay that paints each cell as a soft radial blob so the
-// grid reads as a continuous field rather than scattered dots. The blob radius
-// scales with the on-screen cell pitch so neighbouring cells overlap and blend.
 function makeHeatLayer(L) {
   return L.Layer.extend({
     initialize(data) {
       this._setData(data);
     },
-    // Cache the reconstructed grid alongside the raw cells so marching squares
-    // runs once per dataset (not once per redraw/zoom).
     _setData(data) {
-      this._data = data; // { cells, maxSeconds }
+      this._data = data;
       this._grid = (data && data.cells && data.cells.length) ? buildGrid(data.cells) : null;
     },
     setData(data) {
@@ -315,19 +239,11 @@ function makeHeatLayer(L) {
       const canvas = L.DomUtil.create('canvas', 'tt-heat-canvas');
       canvas.style.position = 'absolute';
       canvas.style.pointerEvents = 'none';
-      // Translucent so the basemap reads through the colour field. This is a CSS
-      // opacity on the whole canvas element, independent of the zoom-animation
-      // transform, so it is never reset by setTransform/setPosition.
       canvas.style.opacity = String(HEAT_OPACITY);
       this._canvas = canvas;
       map.getPanes().overlayPane.appendChild(canvas);
-      // Mark the canvas as zoom-animatable so Leaflet keeps it in the animated
-      // overlayPane during a zoom gesture (parity with L.Canvas / L.ImageOverlay).
       if (L.DomUtil.addClass) L.DomUtil.addClass(canvas, 'leaflet-zoom-animated');
       map.on('moveend zoomend resize', this._reset, this);
-      // Track the basemap smoothly through a zoom animation instead of snapping
-      // only at zoomend: apply the same CSS transform L.Canvas uses so the heat
-      // overlay scales+translates with the tiles for the whole animation.
       if (map.options.zoomAnimation && L.Browser.any3d) {
         map.on('zoomanim', this._onAnimZoom, this);
       }
@@ -340,16 +256,10 @@ function makeHeatLayer(L) {
       this._canvas = null;
       this._map = null;
     },
-    // During a zoom animation Leaflet fires 'zoomanim' with the target
-    // {zoom, center}. Replicate L.Canvas._onAnimZoom/_updateTransform: scale the
-    // canvas by the zoom ratio and translate it so the latlng currently at the
-    // canvas's top-left stays anchored under the animating basemap.
     _onAnimZoom(e) {
       const map = this._map, canvas = this._canvas;
       if (!map || !canvas || this._topLeftLatLng == null) return;
       const scale = map.getZoomScale(e.zoom, map.getZoom());
-      // Where the canvas's top-left latlng lands in the target projection,
-      // relative to the target pixel origin — same math as L.ImageOverlay._animateZoom.
       const offset = map._latLngToNewLayerPoint(this._topLeftLatLng, e.zoom, e.center);
       L.DomUtil.setTransform(canvas, offset, scale);
     },
@@ -358,11 +268,7 @@ function makeHeatLayer(L) {
       if (!map || !canvas) return;
       const size = map.getSize();
       const topLeft = map.containerPointToLayerPoint([0, 0]);
-      // Clear any leftover zoom-animation transform so the post-zoom canvas is
-      // positioned crisply by layer-point (setTransform and setPosition both write
-      // the CSS transform; keep only the latter after the animation settles).
       L.DomUtil.setPosition(canvas, topLeft);
-      // Remember the latlng at the canvas's top-left for the next zoom animation.
       this._topLeftLatLng = map.layerPointToLatLng(topLeft);
       const dpr = window.devicePixelRatio || 1;
       canvas.width = size.x * dpr;
@@ -379,17 +285,9 @@ function makeHeatLayer(L) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (!data || !data.cells || !data.cells.length) return;
 
-      // Per-cell FILLED SQUARE heatmap: each reachable cell paints its own lattice
-      // square (side = one lattice step in px), coloured by the green->red ramp on
-      // seconds/maxSeconds at a fixed translucency so the basemap reads through.
-      // Adjacent squares touch, so contiguous regions read solid; far transit
-      // pockets read as separate patches (that IS the true reachability). No radial
-      // blobs and no clip — a square never bleeds past its own cell.
       const stepPx = latticeStepPx(map, this._grid);
-      const side = (isFinite(stepPx) && stepPx > 0) ? stepPx : 8; // robust fallback
+      const side = (isFinite(stepPx) && stepPx > 0) ? stepPx : 8;
       const half = side / 2;
-      // Overlap by ~1px so anti-aliased seams between touching squares don't leave
-      // faint hairline gaps in a contiguous region.
       const draw = side + 1;
       const maxS = data.maxSeconds || 1;
 
@@ -401,17 +299,8 @@ function makeHeatLayer(L) {
         ctx.fillRect(p.x - half, p.y - half, draw, draw);
       }
 
-      // Subtle outer boundary only (thin, low-opacity) to crisp the reachable
-      // edge without dominating the pockety fill. Interior edges are not drawn.
       this._drawBorder(ctx, map);
     },
-    // Isochrone border: the exposed OUTER EDGES of the reachable-cell union
-    // (exposedEdges), following the cell SQUARE edges so the line lines up
-    // exactly with the hard-clip fill (not the center-to-center marching-squares
-    // contour, which cut inside the clip). Each fractional grid coord (cell
-    // centres at integer i/j, square edges at ±0.5) maps to a lat/lng — with a
-    // half-step extrapolation past the lattice edges — then to a screen point, so
-    // the border scales/pans and re-strokes crisply on every draw.
     _drawBorder(ctx, map) {
       const grid = this._grid;
       if (!grid || !grid.rows || !grid.cols) return;
@@ -419,13 +308,9 @@ function makeHeatLayer(L) {
       if (!segs.length) return;
 
       const lats = grid.lats, lngs = grid.lngs;
-      // Interpolate/extrapolate a fractional lattice index to its coordinate,
-      // using the local step (or the nearest step at the ends) so ±0.5 offsets
-      // land half a cell beyond the outermost lattice lines.
       const coordAt = (arr, g) => {
         const n = arr.length;
         if (n === 1) {
-          // Single line: use a tiny nominal step so a lone cell still has a box.
           return arr[0] + g * 1e-4;
         }
         const i0 = Math.max(0, Math.min(n - 2, Math.floor(g)));
@@ -435,10 +320,6 @@ function makeHeatLayer(L) {
       const at = (gi, gj) =>
         map.latLngToContainerPoint([coordAt(lats, gi), coordAt(lngs, gj)]);
 
-      // Theme-aware, semi-opaque stroke that reads over any ramp colour in both
-      // light and dark schemes (dark line on light basemap, light on dark).
-      // Thin, low-opacity line: just enough to crisp the reachable edge without
-      // dominating the (often pockety) filled squares. Light on dark, dark on light.
       const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
       ctx.save();
       ctx.lineWidth = 1;
@@ -457,13 +338,6 @@ function makeHeatLayer(L) {
   });
 }
 
-// On-screen size (px) of ONE fixed lattice step at the current zoom. The backend
-// samples on a regular lat/lng lattice; `buildGrid` sorts the unique lats/lngs,
-// so the smallest consecutive gap IS the true lattice step in degrees even when
-// interior rows/cols are omitted (sparse isochrone). Project that step from a
-// real cell centre to a point offset by one step, and average the vertical +
-// horizontal pixel distances. Independent of how sparse the reachable cells are,
-// so the blob radius reflects the fixed grid step, not the inter-cell spread.
 function latticeStepPx(map, grid) {
   if (!grid || !grid.lats.length || !grid.lngs.length) return 20;
   const minStep = (arr) => {
@@ -476,7 +350,6 @@ function latticeStepPx(map, grid) {
   };
   const dlat = minStep(grid.lats);
   const dlng = minStep(grid.lngs);
-  // Anchor at the grid's mid latlng so the projection is representative.
   const lat0 = grid.lats[grid.lats.length >> 1];
   const lng0 = grid.lngs[grid.lngs.length >> 1];
   const o = map.latLngToContainerPoint([lat0, lng0]);
@@ -493,16 +366,27 @@ function latticeStepPx(map, grid) {
   return steps.reduce((a, b) => a + b, 0) / steps.length;
 }
 
-// ── Page bootstrap ──────────────────────────────────────────────────────────
 function initTravelMap(L) {
   const map = L.map('map').setView([50.85, 4.35], 12);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '© OpenStreetMap contributors', maxZoom: 19,
+  const DEFAULT_TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+  const DEFAULT_TILE_ATTRIBUTION = '© OpenStreetMap contributors';
+  let tileLayer = L.tileLayer(DEFAULT_TILE_URL, {
+    attribution: DEFAULT_TILE_ATTRIBUTION, maxZoom: 19,
   }).addTo(map);
+  fetch('/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: '{ webConfig { tileUrl tileAttribution } }' }),
+  }).then(r => r.json()).then(j => {
+    const wc = j && j.data && j.data.webConfig;
+    if (!wc || !wc.tileUrl) return;
+    if (wc.tileUrl === DEFAULT_TILE_URL) return;
+    map.removeLayer(tileLayer);
+    tileLayer = L.tileLayer(wc.tileUrl, {
+      attribution: wc.tileAttribution || DEFAULT_TILE_ATTRIBUTION, maxZoom: 19,
+    }).addTo(map);
+  }).catch(() => {});
 
-  // Leaflet sizes its container lazily; the mobile @media stack changes #map's
-  // box, so recompute after initial layout settles and on every (debounced)
-  // window resize / orientation change so the map always fills its box.
   const invalidate = () => map.invalidateSize();
   setTimeout(invalidate, 0);
   let resizeTimer = null;
@@ -514,16 +398,12 @@ function initTravelMap(L) {
   const HeatLayer = makeHeatLayer(L);
   let heat = null;
   let centerMarker = null;
-  let center = null;       // { lat, lng }
-  let centerLabel = null;  // last resolved address label for `center`, if any
-  // Start in the "restoring" (suppressed-write) state: control-setters run during
-  // init (e.g. setAgg('BEST')) call syncUrlState, which would otherwise clobber an
-  // incoming shared query string with defaults BEFORE loadFromUrl() reads it.
-  // loadFromUrl()'s finally clears this once the incoming params are consumed, so
-  // normal URL syncing resumes right after.
-  let restoring = true;    // suppress URL writes until loadFromUrl consumes the query string
+  let center = null;
+  let centerLabel = null;
+  // Must start true: init-time control setters call syncUrlState, which would
+  // clobber the incoming shared query string with defaults before loadFromUrl reads it.
+  let restoring = true;
 
-  // ── DOM refs ──
   const $ = (id) => document.getElementById(id);
   const centerInput = $('center-input');
   const addrDrop    = $('addr-drop');
@@ -540,16 +420,11 @@ function initTravelMap(L) {
   const legendMax   = $('legend-max');
   const modesGrid   = $('modes-grid');
 
-  // Default date/time = now.
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   dateInput.value = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   timeInput.value = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
 
-  // ── Mode grid ──
-  // Reuses the same 3×4 vehicle × transit-relation matrix as the main page.
-  // Each populated cell is a toggle button carrying its Mode enum id in
-  // data-mode; row/column headers flip a whole line at once.
   const mkEl = (tag, cls, text) => {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
@@ -607,7 +482,6 @@ function initTravelMap(L) {
   const selectedModes = () =>
     Array.from(modesGrid.querySelectorAll('.mode-cell.active')).map((c) => c.dataset.mode);
 
-  // ── Aggregation toggle ──
   let aggregation = 'BEST';
   function setAgg(v) {
     aggregation = v;
@@ -619,17 +493,9 @@ function initTravelMap(L) {
   aggAvg.addEventListener('click', () => setAgg('AVERAGE'));
   setAgg('BEST');
 
-  // ── Plain inputs mirror straight into the URL on change ──
-  // Window is a plain minutes number (like the main planner): the map samples
-  // departures over [time, time+window] and aggregates per cell (BEST/AVERAGE);
-  // 0 means a single departure.
   [dateInput, timeInput, maxInput, winInput].forEach((elm) =>
     elm.addEventListener('change', syncUrlState));
 
-  // ── Cell size (grid step, metres) ──
-  // Live-updates the numeric label while dragging; on release mirrors to the URL
-  // and recomputes (a coarser/finer grid needs a fresh backend sample). Sent to
-  // travelTimeMap as gridStepM (backend clamps 10–1000 with a max-cells cap).
   function syncCellLabel() { cellVal.textContent = cellInput.value; }
   cellInput.addEventListener('input', syncCellLabel);
   cellInput.addEventListener('change', () => {
@@ -638,22 +504,18 @@ function initTravelMap(L) {
     if (center) compute();
   });
 
-  // Departure time + window minutes -> absolute HH:MM window end for the backend
-  // (which takes windowEndTime). Returns null for a single departure (window 0)
-  // or when the end would cross midnight (single-departure fallback is fine).
   function windowEndTime() {
     const win = parseInt(winInput.value, 10);
     if (!(win > 0)) return null;
     const m = /^(\d{1,2}):(\d{2})$/.exec(timeInput.value || '');
     if (!m) return null;
     const total = parseInt(m[1], 10) * 60 + parseInt(m[2], 10) + win;
-    if (total >= 24 * 60) return null; // crosses midnight -> single departure
+    if (total >= 24 * 60) return null;
     const hh = String(Math.floor(total / 60)).padStart(2, '0');
     const mm = String(total % 60).padStart(2, '0');
     return `${hh}:${mm}`;
   }
 
-  // ── Center: map click, coord input, address search ──
   function setCenter(lat, lng, labelText) {
     center = { lat, lng };
     centerLabel = labelText || null;
@@ -670,11 +532,6 @@ function initTravelMap(L) {
     syncUrlState();
   }
 
-  // Map interaction split by button:
-  //  · RIGHT-click (contextmenu) sets/moves the isochrone CENTRE and recomputes.
-  //  · LEFT-click reads the travel time at the clicked point straight from the
-  //    already-loaded isochrone cells (no re-routing) so the number ALWAYS
-  //    matches the heatmap colour, and shows it in a small popup.
   map.on('contextmenu', (e) => {
     if (e.originalEvent) e.originalEvent.preventDefault();
     setCenter(e.latlng.lat, e.latlng.lng);
@@ -686,8 +543,6 @@ function initTravelMap(L) {
     showTimeAt(e.latlng.lat, e.latlng.lng);
   });
 
-  // Address autocomplete: same GraphQL query the main app uses. Also accepts a
-  // raw "lat, lng" coordinate pair typed directly.
   let addrSeq = 0, addrTimer = null;
   function closeDrop() { addrDrop.style.display = 'none'; }
   function tryParseCoords(raw) {
@@ -706,7 +561,7 @@ function initTravelMap(L) {
       try {
         const flat = center ? center.lat : null, flng = center ? center.lng : null;
         const d = await gql(
-          'query($q:String!,$flat:Float,$flng:Float){ searchAddresses(query:$q, limit:6, focusLat:$flat, focusLng:$flng){ id label lat lon } }',
+          'query($q:String!,$flat:Float,$flng:Float){ searchAddresses(query:$q, limit:6, focusLat:$flat, focusLng:$flng){ id label lat lng } }',
           { q: raw, flat, flng },
         );
         if (seq !== addrSeq) return;
@@ -719,8 +574,8 @@ function initTravelMap(L) {
           row.textContent = a.label;
           row.addEventListener('mousedown', (ev) => {
             ev.preventDefault();
-            setCenter(a.lat, a.lon, a.label);
-            map.setView([a.lat, a.lon], Math.max(map.getZoom(), 13));
+            setCenter(a.lat, a.lng, a.label);
+            map.setView([a.lat, a.lng], Math.max(map.getZoom(), 13));
             closeDrop();
           });
           addrDrop.appendChild(row);
@@ -735,15 +590,6 @@ function initTravelMap(L) {
     if (c) { setCenter(c.lat, c.lng); map.setView([c.lat, c.lng], Math.max(map.getZoom(), 13)); }
   });
 
-  // ── URL <-> state sync ───────────────────────────────────────────────────
-  // Every control is reflected into the query string (via maas.js's shared
-  // syncUrl/readUrl helpers, same replaceState pattern as the main planner) so
-  // a view is bookmarkable/shareable. Param names reuse the planner's where
-  // equivalent (date/time/modes); travel-map-only knobs get short new names.
-  //   lat,lng   — center coordinate      max     — max minutes
-  //   name      — resolved center label  agg     — best|avg
-  //   window    — departure window (min)  cell    — grid step (m)
-  //   z,mlat,mlng — map zoom + view center
   function syncUrlState() {
     if (restoring) return;
     const c = map.getCenter();
@@ -766,17 +612,12 @@ function initTravelMap(L) {
     });
   }
 
-  // Debounced map-view persistence: a pan/zoom updates z/mlat/mlng without a
-  // reload, mirroring the planner's replaceState-on-change approach.
   let moveTimer = null;
   map.on('moveend', () => {
     clearTimeout(moveTimer);
     moveTimer = setTimeout(syncUrlState, 200);
   });
 
-  // Prefill every control from the query string, then (if a center is present)
-  // run the query so a shared link opens straight to its computed map. Returns
-  // whether a center was restored (so the caller can auto-compute).
   function loadFromUrl() {
     const p = readUrl();
     restoring = true;
@@ -790,15 +631,12 @@ function initTravelMap(L) {
           b.classList.toggle('active', wanted.has(b.dataset.mode)));
       }
       if (p.has('agg')) setAgg(p.get('agg') === 'avg' ? 'AVERAGE' : 'BEST');
-      // Window minutes: round-trip the shared value; default 30 when absent.
       const win = parseInt(p.get('window'), 10);
       winInput.value = Number.isFinite(win) ? win : 30;
-      // Cell size (grid step, m): round-trip; default 200 when absent.
       const cell = parseInt(p.get('cell'), 10);
       cellInput.value = Number.isFinite(cell) ? cell : 200;
       syncCellLabel();
-      // Map view first, so setView's own zoom doesn't clobber a shared framing
-      // when setCenter later nudges the marker (setCenter never moves the view).
+      // Set map view before setCenter, so setCenter's marker nudge doesn't reframe a shared view.
       const z = parseInt(p.get('z'), 10);
       const mlat = parseFloat(p.get('mlat')), mlng = parseFloat(p.get('mlng'));
       if (!isNaN(mlat) && !isNaN(mlng) && !isNaN(z)) map.setView([mlat, mlng], z);
@@ -807,7 +645,6 @@ function initTravelMap(L) {
       let hasCenter = false;
       if (!isNaN(lat) && !isNaN(lng)) {
         setCenter(lat, lng, p.get('name') || null);
-        // No shared map view? Frame the center like an address pick.
         if (isNaN(mlat) || isNaN(mlng)) map.setView([lat, lng], Math.max(map.getZoom(), 13));
         hasCenter = true;
       }
@@ -818,7 +655,6 @@ function initTravelMap(L) {
     }
   }
 
-  // ── Compute ──
   async function compute() {
     if (!center) { setStatus('Pick a center first (click the map or search).', true); return; }
     const modes = selectedModes();
@@ -836,11 +672,11 @@ function initTravelMap(L) {
       maxSeconds,
       modes,
       aggregation,
-      windowEndTime: windowEndTime(), // null = single departure (window 0)
-      gridStepM: Number.isFinite(cellM) ? cellM : null, // backend clamps 10–1000, default 200
+      windowEndTime: windowEndTime(),
+      gridStepM: Number.isFinite(cellM) ? cellM : null,
     };
 
-    syncUrlState(); // flush any not-yet-mirrored control state before running
+    syncUrlState();
     computeBtn.disabled = true;
     setStatus('Computing…');
     try {
@@ -861,14 +697,8 @@ function initTravelMap(L) {
   }
   computeBtn.addEventListener('click', compute);
 
-  // ── Click-to-time: how long to get to a clicked point ──────────────────────
-  // No re-routing. Read the travel time straight from the loaded isochrone cells
-  // (bilinear over the reconstructed grid) so the popup number ALWAYS equals the
-  // heatmap colour there. Drop a marker at the click and show "≈ N min" (or "not
-  // reachable within N min" when outside the sampled/reachable area). The marker
-  // and any leftover overlay are cleared on the next click AND on popup close.
   let clickMarker = null;
-  let clickLine = null; // reserved: any path a click draws (none in this version)
+  let clickLine = null;
   function clearClick() {
     if (clickMarker) { map.removeLayer(clickMarker); clickMarker = null; }
     if (clickLine) { map.removeLayer(clickLine); clickLine = null; }
@@ -889,11 +719,8 @@ function initTravelMap(L) {
       .setContent(timePopupEl(reachable ? { secs } : { unreachable: maxSeconds }))
       .openOn(map);
   }
-  // Clear the click marker/overlay whenever its popup is dismissed (X, click-off,
-  // or Escape) so nothing lingers. Right-click's centre marker is untouched.
   map.on('popupclose', () => clearClick());
 
-  // Build the click popup DOM (reachable time / not-reachable) with --ds-* styling.
   function timePopupEl(state) {
     const root = mkEl('div', 'tt-route');
     if (state.unreachable != null) {
@@ -920,10 +747,6 @@ function initTravelMap(L) {
 
   legendMax.textContent = fmtMinutes(parseInt(maxInput.value, 10) * 60);
 
-  // ── Share view (QR code + copyable link) ──────────────────────────────────
-  // The URL already tracks state on every change (syncUrlState), so location.href
-  // round-trips the current view via loadFromUrl on the target device. The QR is
-  // rendered fully client-side (window.QRCode from qr.mjs; no network).
   (function initShare() {
     const btn = $('share-btn');
     const modal = $('share-modal');
@@ -966,7 +789,7 @@ function initTravelMap(L) {
           await navigator.clipboard.writeText(text);
           ok = true;
         }
-      } catch (_) { /* fall through to legacy path */ }
+      } catch (_) {}
       if (!ok) {
         urlInput.focus();
         urlInput.select();
@@ -982,13 +805,9 @@ function initTravelMap(L) {
     });
   })();
 
-  // Prefill from a shared link and, if it carried a center, compute immediately.
   if (loadFromUrl()) compute();
 }
 
-// Leaflet loads via a classic <script> tag; wait for window.L. Guarded so this
-// module can be imported (pure helpers above) under node for unit tests without
-// a DOM — the bootstrap only runs in a browser.
 if (typeof window !== 'undefined') {
   if (window.L) initTravelMap(window.L);
   else window.addEventListener('load', () => initTravelMap(window.L));

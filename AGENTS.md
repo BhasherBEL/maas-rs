@@ -1,10 +1,10 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents working in this repository.
 
 ## Project Overview
 
-**maas-rs** is a Rust-based Mobility-as-a-Service (MaaS) multi-modal, multi-objective routing engine for Belgium. It ingests OpenStreetMap (OSM), GTFS transit, and Belgian address (BeST) data, builds an in-memory graph, and exposes routing over a GraphQL API. It combines several engines:
+**maas-rs** is a Rust-based Mobility-as-a-Service (MaaS) multi-modal, multi-objective routing engine. The routing algorithms and data model are not region-specific; the engine ships with a Belgium preset (`presets/belgium.yaml`) and a generic runnable default (`config.yaml`). It ingests OpenStreetMap (OSM), GTFS transit, DEM elevation, and Belgian address (BeST) data, builds an in-memory graph, and exposes routing over a GraphQL API. It combines several engines:
 
 - **RAPTOR** — public-transit journeys (bus/tram/metro/rail) with street access/egress.
 - **Multi-objective Pareto street search** — walk / bike / car, ranking non-dominated routes over cost axes (Time, ascent, surface, cycleway-deficit, reliability variance), plus **transit hybrids** (park & ride, bike-to-transit).
@@ -50,7 +50,9 @@ node --test src/web/static/js/*.test.mjs
 cargo clippy
 ```
 
-The GraphQL playground is at `http://127.0.0.1:8000/graphiql` when the server is running (port from `config.yaml`, see below).
+The config path defaults to `config.yaml` (a generic runnable default); select another with `--config <path>`. The full Belgium setup (fares, realtime, addresses, DEM) lives in `presets/belgium.yaml`: `cargo run -- --config presets/belgium.yaml --serve`.
+
+The GraphQL playground is at `http://127.0.0.1:8000/graphiql` when the server is running (port from `config.yaml`, see below). The `/graphiql` route is only mounted when `server.graphiql_enabled: true`, which now defaults OFF.
 
 > **Server startup.** Do not start the server for general use — that is the user's responsibility. The **one exception** is the autonomous API-probing workflow below, used to validate routing end-to-end against the live GraphQL API. Even then, **always detect a server already listening first and reuse it** (the user may be running their own concurrently); never start a second instance.
 
@@ -58,12 +60,12 @@ The GraphQL playground is at `http://127.0.0.1:8000/graphiql` when the server is
 
 Test routing exactly as the UI does, by querying the **same GraphQL API the UI uses** — no separate harness, no new endpoints. The UI is just one client of this API; this workflow is another.
 
-The port comes from `config.yaml` (`server.port`, currently **8000**; the code default when unset is 3000). Adjust the examples below if it changes.
+The port comes from `config.yaml` (`server.port`, currently **8000**; the code default when unset is 8000). Adjust the examples below if it changes. The `MAAS_HOST` / `MAAS_PORT` env vars override `server.host` / `server.port` at load time (docker-compose sets `MAAS_HOST=0.0.0.0` to bind inside the container while publishing only to host loopback).
 
 1. **Detect first.** Before starting anything, check whether a server is already listening:
    `curl -s -X POST http://127.0.0.1:8000/graphql -H 'Content-Type: application/json' -d '{"query":"{ ping }"}'` should return `{"data":{"ping":"pong"}}`.
    If it answers, **reuse it** — never launch a second instance.
-2. **Otherwise start one in the background.** Rebuild if stale (`cargo build --release`), then run `target/release/maas-rs --restore --serve` as a background process. It loads `graph.bin` (~2.7 GB), so poll `{ ping }` until it returns `pong` before querying. Reuse this single instance for all queries in the session.
+2. **Otherwise start one in the background.** Rebuild if stale (`cargo build --release`), then run `target/release/maas-rs --restore --serve` as a background process. It loads `graph.bin` (~2.9 GB), so poll `{ ping }` until it returns `pong` before querying. Reuse this single instance for all queries in the session.
 3. **Query** `http://127.0.0.1:8000/graphql` with `curl`, using the same queries the UI sends — `raptor` (ranked plans) and `raptorExplain` (plans + every candidate's drop/filter reason + access-walk metadata + stops reached). The query bodies (incl. `PLAN_FRAGMENT`) live in `src/web/static/index.html`. Inputs are raw coordinates.
 4. **Parse** the JSON response (e.g. with `jq`) and analyze.
 
@@ -75,7 +77,7 @@ The port comes from `config.yaml` (`server.port`, currently **8000**; the code d
 config.yaml → Ingestion:  phase 0 OSM → phase 1 GTFS → phase 2 BeST addresses
            → Graph build (+ CCH for foot access/egress)
            → serialize graph.bin / osm.bin / cch.bin / address.bin (postcard)
-           → GraphQL server (Poem + async-graphql), default port 8000
+           → GraphQL server (Poem + async-graphql), default port 8000 (from config.yaml; the code default when unset is 8000)
            ↑ Realtime poller (background) folds GTFS-RT/STIB feeds into an ArcSwap index
 ```
 
@@ -96,7 +98,7 @@ Phase order matters: OSM (phase 0) runs first so GTFS stops (phase 1) can snap t
 - **`src/ingestion/`** — parses inputs into nodes/edges:
   - `osm/` — PBF parse (`pbf.rs`), bike classification (`bike_class.rs`), DEM elevation sampling + RDP smoothing (`elevation.rs`, `elevation_smooth.rs`, `lambert.rs`), platform indexing (`platforms.rs`).
   - `gtfs/` — generic GTFS (`gtfs.rs`) plus `sncb.rs` (rail: snaps stops to OSM railway topology) and `stib.rs` (tram/metro: peak-hour bike-allowance rules).
-  - `bestadd/` — BeST Belgian address feed (XML stream parse + Lambert72→WGS84).
+  - `address/bestadd/` — BeST Belgian address feed (XML stream parse + Lambert72→WGS84).
   - `realtime/` — `RealtimeFeed` trait + GTFS-RT protobuf and STIB parsers; rate-limited `fetcher.rs`.
   - `cache.rs` (download/hash caching, `last_checked`), `secrets.rs` (`${ENV}` / `${file:…}` interpolation in URLs/headers).
 - **`src/services/`** — `build.rs` (orchestrates ingestion phases + index construction + `apply_routing_defaults`/`finalize_contraction`), `persistence.rs` (postcard (de)serialization + schema-version headers), `scheduler.rs` (cron-gated feed refresh, freshness gate), `realtime_poller.rs` (background feed polling → ArcSwap `RealtimeIndex`).
@@ -126,9 +128,9 @@ Phase order matters: OSM (phase 0) runs first so GTFS stops (phase 1) can snap t
 
 ## Configuration
 
-**`config.yaml`** is the single source of tunables (it is self-documenting — read it rather than duplicating values here). Sections:
-- `build.inputs` — ordered feeds (`ingestor: gtfs/stib|gtfs/sncb|gtfs/generic`, `osm/pbf`, `best/add`; `url: path:data/…` or remote), each with an optional `phase`.
-- `build` — `output`/`osm_output`, DEM `elevation`, `surface_speed_factors`, `delay_models`.
+The active config (default `config.yaml`, or `--config <path>`) is the single source of tunables (it is self-documenting — read it rather than duplicating values here). The only required key is `build.inputs`; `output` defaults to `graph.bin` and `default_routing` is optional (all tunables have compiled-in defaults). Sections:
+- `build.inputs` — ordered feeds (`ingestor: gtfs/stib|gtfs/sncb|gtfs/generic`, `osm/pbf`, `dem/belgian-lambert-2008`, `address/bestadd`; the `dem/<projection>` tag names the map projection, so other projections would be new `dem/*` ingestors; `url: path:data/…` or remote), each with an optional `phase`.
+- `build` — `output`/`osm_output`/`address_output`, `elevation_smoothing_epsilon`, `surface_speed_factors`, `delay_models`.
 - `default_routing` — walk/bike/car speeds, `min_access_secs`, `station_merge_radius_m`, address-search ranking, bike physics (`bike_profile`), stochastic `street_time`, multi-objective axis/bucket tuning.
 - `server` (`host`/`port`), `auto_update` (cron schedule + cache dir), `realtime` (feeds, poll interval, staleness TTLs).
 

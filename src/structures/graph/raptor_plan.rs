@@ -15,11 +15,6 @@ use crate::{
 
 use super::{Graph, raptor_access::StreetProfile};
 
-/// One transit boarding of a FINISHED plan, in forward (origin→destination) order,
-/// with everything the post-hoc fare pass needs to price it: the pattern + stop
-/// positions (SNCB zone-to-zone distance), the compact board/alight stops (airport /
-/// Brussels-zone detection), the resolved route (operator lookup), and the scheduled
-/// boarding time (SNCB time bucket + ticket windows).
 #[derive(Clone, Copy)]
 struct PostHocBoarding {
     pattern: usize,
@@ -31,14 +26,6 @@ struct PostHocBoarding {
     board_time: u32,
 }
 
-// ── Pass-3 tightening source selection (validation scaffolding) ───────────────
-//
-// The plan-tightening bounds are produced either by the full backward RAPTOR
-// pass (`Lambda`) or the O(k) plan chain sweep (`Chain`, the S1 replacement).
-// `Diff` runs Chain live but *also* recomputes Lambda and asserts they agree
-// wherever a time-consistent Lambda plan requires it — the differential gate.
-// This toggle + the stat counters are temporary validation machinery and are
-// removed once the chain sweep is the sole path.
 pub const TIGHTEN_MODE_CHAIN: u8 = 0;
 pub const TIGHTEN_MODE_LAMBDA: u8 = 1;
 pub const TIGHTEN_MODE_DIFF: u8 = 2;
@@ -56,8 +43,6 @@ static DIFF_SEED_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 fn tighten_mode() -> u8 {
     use std::sync::atomic::Ordering::Relaxed;
-    // First read also honours the MAAS_TIGHTEN_DIFF / MAAS_TIGHTEN_MODE env vars
-    // so the CLI-driven probe run can enable the gate without code changes.
     DIFF_INIT.call_once(|| {
         if std::env::var("MAAS_TIGHTEN_DIFF").is_ok() {
             TIGHTEN_MODE.store(TIGHTEN_MODE_DIFF, Relaxed);
@@ -73,19 +58,13 @@ fn tighten_mode() -> u8 {
     TIGHTEN_MODE.load(Relaxed)
 }
 
-/// Whether the S1 chain sweep should tighten off-table (long) transfers using
-/// the plan's own walk instead of no-oping them (the lambda-identical default).
-/// True when the per-graph `tighten_long_transfers` flag is set OR the
-/// `MAAS_TIGHTEN_LONG_TRANSFERS` env var is present (cached once).
 fn long_transfer_tightening(g: &Graph) -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     g.raptor.tighten_long_transfers
         || *ENV.get_or_init(|| std::env::var("MAAS_TIGHTEN_LONG_TRANSFERS").is_ok())
 }
 
-/// Transfer margins (seconds) between consecutive transit legs of a tightened
-/// plan: `next.start - (prev.end + inter-leg walk)`. Negative ⇒ time-inconsistent
-/// (the plan boards a vehicle it cannot physically catch).
+/// Transfer margins between consecutive transit legs. Negative ⇒ time-inconsistent.
 fn plan_transfer_margins(legs: &[PlanLeg]) -> Vec<i32> {
     let mut margins = Vec::new();
     let mut prev_transit_end: Option<u32> = None;
@@ -109,8 +88,6 @@ fn plan_transfer_margins(legs: &[PlanLeg]) -> Vec<i32> {
     margins
 }
 
-/// Structural timing equality of two tightened plans: same transit trips at the
-/// same times and same walk-leg timings. Ignores float reliability metadata.
 fn legs_timing_eq(a: &[PlanLeg], b: &[PlanLeg]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -126,8 +103,6 @@ fn legs_timing_eq(a: &[PlanLeg], b: &[PlanLeg]) -> bool {
     })
 }
 
-/// Whether any inter-leg transfer walk exceeds the capped reverse-footpath table
-/// distance (`MAX_TRANSFER_DISTANCE_M`) — the lambda-no-op class-2 signature.
 fn plan_has_long_transfer(legs: &[PlanLeg], max_m: f64) -> bool {
     let ti: Vec<usize> = legs
         .iter()
@@ -144,9 +119,6 @@ fn plan_has_long_transfer(legs: &[PlanLeg], max_m: f64) -> bool {
 }
 
 impl Graph {
-    /// Direct walk plan keyed on projected snap coordinates (`ep`) for the geometry, so a
-    /// coord-snapped origin/destination survives the interior-node drop. `None` ⇒ NodeID
-    /// path, byte-identical.
     pub(super) fn build_walk_plan_ep(
         &self,
         origin: NodeID,
@@ -165,8 +137,6 @@ impl Graph {
         )
     }
 
-    /// `build_street_plan` keyed on projected snap coordinates (`ep`) for the geometry.
-    /// `None` ⇒ NodeID path, byte-identical.
     pub(super) fn build_street_plan_ep(
         &self,
         origin: NodeID,
@@ -187,8 +157,6 @@ impl Graph {
         self.build_street_plan_geom(origin, destination, start_time, secs, profile, geometry)
     }
 
-    /// Shared body of `build_street_plan_ep`: assembles the single-leg
-    /// street plan from a precomputed `geometry`.
     fn build_street_plan_geom(
         &self,
         origin: NodeID,
@@ -249,9 +217,6 @@ impl Graph {
         }
     }
 
-    /// Direct bike plan keyed on projected snap coordinates (`ep`) when a contracted query
-    /// supplies them — routes the bike leg over the contracted graph (g-free) so it survives
-    /// the interior-node drop. Production always supplies `ep`; `None` ⇒ `None`.
     pub(super) fn build_bike_plan_ep(
         &self,
         _origin: NodeID,
@@ -265,13 +230,6 @@ impl Graph {
         self.build_bike_plan_arena(ep.origin, ep.destination, start_time, max_secs, bike)
     }
 
-    /// A direct bike plan over the contracted graph from projected snap coords, g-free.
-    /// Bridges each coord to its bounding junction (arena seg R-tree, no g) and routes
-    /// junction-to-junction via the multi-objective engine, whose representatives carry
-    /// the arena per-edge data so the reconstructed leg (geometry/steps/metrics) reads no
-    /// `g`. The street-enrichment post-pass overwrites this leg with its own contracted
-    /// alternatives; this provides the g-free base + the from/to junction scaffold. `None`
-    /// if either coord can't snap or no route exists. `max_secs` is the deadline window.
     fn build_bike_plan_arena(
         &self,
         origin: crate::structures::LatLng,
@@ -292,19 +250,12 @@ impl Graph {
             bike,
             start_time,
         )?;
-        // Honor the deadline window the legacy builder enforced.
         if plan.end.saturating_sub(start_time) > max_secs {
             return None;
         }
         Some(plan)
     }
 
-    /// Convert a label's carried `PriceValue` into the user-facing `PlanPrice`,
-    /// or `None` when the fares feature is disabled (so the Plan carries no price
-    /// field, byte-identical to pre-feature output). `capped_euros == known_euros`
-    /// this increment (day/journey caps come later, spec §9). Each nonzero
-    /// `unknown[slot]` names its operator (with the boarding count) so an
-    /// unpriceable operator is surfaced rather than hidden.
     pub(super) fn plan_price_of(
         &self,
         price: &crate::structures::cost::PriceValue,
@@ -314,15 +265,9 @@ impl Graph {
         if !self.raptor.fare_model.enabled {
             return None;
         }
-        // The Brupass cap (post-hoc, in the breakdown) lowers the whole in-zone
-        // multi-operator total by `brupass_savings_cents`; apply the SAME reduction to
-        // the numeric known/capped totals so they equal the breakdown sum.
         let known_euros =
             price.known_cents.saturating_sub(brupass_savings_cents) as f64 / 100.0;
-        // Display-time SNCB per-journey cap (Train+ peak): the RAW spend is carried
-        // in dominance (spec §9 soundness); display applies `min(raw_sncb, cap)` to
-        // the SNCB portion only. `capped = known − sncb_spend + min(sncb_spend, cap)`.
-        // With no cap in force (`sncb_cap_cents == u32::MAX`) this equals `known`.
+        // capped = known − sncb_spend + min(sncb_spend, cap); no-op when sncb_cap_cents == u32::MAX.
         let capped_sncb = price.sncb_spend_cents.min(price.sncb_cap_cents);
         let capped_cents = price
             .known_cents
@@ -357,10 +302,6 @@ impl Graph {
         })
     }
 
-    /// Collect the plan's transit boardings by walking the arena parent chain from
-    /// the destination label `start_id` back to the root, then reversing to forward
-    /// order. Mirrors `reconstruct`'s trace walk but keeps only what the post-hoc
-    /// fare pass needs. Transfer (footpath) traces are skipped — they carry no fare.
     fn collect_posthoc_boardings(&self, arena: &[Label], start_id: u32) -> Vec<PostHocBoarding> {
         let mut boardings = Vec::new();
         let mut cur = start_id;
@@ -383,8 +324,6 @@ impl Graph {
                 let board_stop = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
                 let alight_stop = self.raptor.transit_node_to_stop[pat_stops[ap].0] as usize;
                 let route_id = self.raptor.transit_patterns[p].route.0 as usize;
-                // Scheduled departure of the boarded trip at the boarding stop — the
-                // exact `board_time` the in-search accrual used (ticket window + bucket).
                 let board_time = times[bp * n_trips + t].departure;
                 boardings.push(PostHocBoarding {
                     pattern: p,
@@ -402,13 +341,8 @@ impl Graph {
         boardings
     }
 
-    /// Price a FIXED boarding sequence forward through the fare model, EXACTLY (no
-    /// ε-bucketing), with a fresh `PriceValue`. Every operator pays its own ticket.
-    /// This is the post-hoc analogue of the in-search accrual, walked over the settled
-    /// legs (no dominance, no back-out/refund beyond the SNCB run recompute the model
-    /// already does). The Brupass CAP is a separate post-pass applied by
-    /// `plan_price_posthoc` / `build_breakdown` (see `apply_brupass_cap`); it never
-    /// enters this per-operator accrual.
+    /// Price a FIXED boarding sequence EXACTLY (identity ε-bucketing, no dominance);
+    /// every operator pays its own ticket. Brupass CAP is a separate post-pass.
     fn price_boardings(
         &self,
         boardings: &[PostHocBoarding],
@@ -416,9 +350,7 @@ impl Graph {
         fare_profile: crate::structures::cost::FareProfile,
     ) -> crate::structures::cost::PriceValue {
         use crate::structures::cost::{KnownEurosEpsilon, OperatorModel, PriceValue};
-        // Post-hoc prices EXACTLY: identity ε-bucketing so cents are not quantized to
-        // the in-search 10-cent tiers. The operators/zones are shared by reference via
-        // clone (cheap: run once per kept plan); only the ε knob is overridden.
+        // Identity ε-bucketing so cents are not quantized to the in-search 10-cent tiers.
         let mut fm = self.raptor.fare_model.clone();
         fm.known_euros_epsilon = KnownEurosEpsilon { a: 0.0, b: 0.0 };
         let ctx = crate::structures::cost::FareContext { profile: fare_profile, weekday };
@@ -429,8 +361,6 @@ impl Graph {
             };
             let board_time = b.board_time;
             fm.charge_board(&mut price, op, board_time, &ctx);
-            // SNCB per-km + airport OD accrual for this ride's alight (the search
-            // recomputes the whole run per alight; here the leg's alight is final).
             if let crate::structures::cost::OperatorFareId::Modeled {
                 model: OperatorModel::DistanceBasePerKm { tariff, rules, airport_od_cents },
             } = op
@@ -473,8 +403,6 @@ impl Graph {
         price
     }
 
-    /// Human display name of the operator for a boarding's route (the agency name,
-    /// e.g. "STIB", "SNCB", "De Lijn", "TEC"), or an empty string if unknown.
     fn operator_display_name(&self, route_id: usize) -> String {
         self.raptor
             .transit_routes
@@ -484,8 +412,6 @@ impl Graph {
             .unwrap_or_default()
     }
 
-    /// A short label for an SNCB stop used in the fare-breakdown OD description:
-    /// its agglomeration zone name if it is in one, else the stop's own name.
     fn sncb_stop_label(&self, stop: usize) -> String {
         use crate::structures::cost::Agglomeration;
         match self.raptor.sncb_stop_zone.get(stop).copied().unwrap_or(Agglomeration::None) {
@@ -500,17 +426,9 @@ impl Graph {
         }
     }
 
-    /// Build the itemized fare "shopping list" for a FIXED boarding sequence, replaying
-    /// the SAME charge decisions as `price_boardings` and attributing each `known_cents`
-    /// delta to a logical ticket. Consecutive same-ticket boardings collapse into one
-    /// item: a STIB/De Lijn time-window is ONE ticket across its window (later in-window
-    /// boards ride on it, no new item); a contiguous SNCB run is ONE item (base + per-km,
-    /// capped at run end). Subscription/pass-covered boardings emit a €0.00 item with
-    /// `coverage` set. Finally the Brupass CAP post-pass (`apply_brupass_cap`) collapses
-    /// the PAID in-zone multi-operator items into one Brupass item when that is cheaper.
-    /// Returns the items plus the Brupass SAVINGS in cents (0 when no cap fired) so the
-    /// caller can lower the plan's known/capped total consistently. The sum of item euros
-    /// (SNCB + Brupass caps applied) equals `capped_euros`.
+    /// Itemized fare breakdown for a FIXED boarding sequence, replaying the same charge
+    /// decisions as `price_boardings`. Returns the items plus the Brupass savings in cents
+    /// (0 when no cap fired). Item euros (SNCB + Brupass caps applied) sum to `capped_euros`.
     fn build_breakdown(
         &self,
         boardings: &[PostHocBoarding],
@@ -528,28 +446,17 @@ impl Graph {
         let ctx = crate::structures::cost::FareContext { profile: fare_profile, weekday };
         let mut price = PriceValue::ZERO;
         let mut items: Vec<FareBreakdownItem> = Vec::new();
-        // Sparse Brupass-cap tags for PAID tickets only: `(item_index, operator_key,
-        // board_stop)`. The post-pass reads each tagged item's FINAL euros, tests its
-        // board stop for Brussels-zone membership, and collapses the paid in-zone
-        // multi-operator group into one Brupass item when that is cheaper. Covered /
-        // subscription / within-window items are left untagged (never replaced).
+        // PAID-ticket Brupass tags only: `(item_index, operator_key, board_stop)`.
+        // Covered / subscription / within-window items stay untagged (never replaced).
         let mut paid_tags: Vec<(usize, String, usize)> = Vec::new();
 
-        // Index into `items` of the open SNCB run item (base+per-km accrue onto it),
-        // and the OD stops of that run so its description can be finalized.
         let mut sncb_item: Option<usize> = None;
         let mut sncb_board_stop = 0usize;
-        // Cumulative RAW SNCB spend recorded when the open run's item was created, so
-        // each SNCB item gets ITS run's raw delta (not the journey-cumulative total,
-        // which would double-count across multiple SNCB runs). The per-JOURNEY cap
-        // (Train+ peak) is applied to the SNCB group as a whole in a post-pass.
+        // Raw SNCB spend when the open run's item was created, so each item gets ITS
+        // run's raw delta (not the journey-cumulative total).
         let mut sncb_spend_at_open: u32 = 0;
-        // Indices of all SNCB run items, for the group-cap post-pass.
         let mut sncb_item_indices: Vec<usize> = Vec::new();
 
-        // Finalize the currently-open SNCB run item: set its raw run spend (the
-        // cumulative delta since the run's item opened) + its OD description. The
-        // journey cap is applied to the SNCB group after the whole walk.
         let finalize_sncb = |items: &mut Vec<FareBreakdownItem>,
                              sncb_item: &mut Option<usize>,
                              price: &PriceValue,
@@ -594,14 +501,11 @@ impl Graph {
                             &mut items, &mut sncb_item, &price, sncb_spend_at_open,
                             sncb_board_stop, b.alight_stop,
                         );
-                        // The raw SNCB spend before THIS run's base charge — the run's
-                        // item euros are measured from here.
                         sncb_spend_at_open = before_sncb_spend;
                         sncb_board_stop = b.board_stop;
                         sncb_item = Some(items.len());
                         sncb_item_indices.push(items.len());
-                        // A PAID SNCB run feeds the Brupass cap (in-zone tested on the
-                        // run's boarding stop); a subscription run does not.
+                        // Only a PAID SNCB run feeds the Brupass cap.
                         if !fare_profile.sncb_subscription {
                             paid_tags.push((items.len(), "SNCB".to_string(), b.board_stop));
                         }
@@ -645,7 +549,6 @@ impl Graph {
                             fm.apply_sncb_airport_od(&mut price, airport_od_cents);
                         }
                     }
-                    // If this alight ended the run (airport OD closes it), finalize now.
                     if !price.sncb_active {
                         let desc_alight = b.alight_stop;
                         if airport_od_cents > 0
@@ -653,8 +556,7 @@ impl Graph {
                                 || self.raptor.sncb_airport_stop.get(b.board_stop).copied().unwrap_or(false))
                         {
                             if let Some(idx) = sncb_item.take() {
-                                // Airport OD is a flat fare that has no per-journey cap;
-                                // its euros are the run's raw spend delta.
+                                // Airport OD is a flat fare with no per-journey cap.
                                 let run_raw =
                                     price.sncb_spend_cents.saturating_sub(sncb_spend_at_open);
                                 items[idx].euros = run_raw as f64 / 100.0;
@@ -671,7 +573,6 @@ impl Graph {
                 OperatorFareId::Modeled {
                     model: OperatorModel::TimeWindowFlat { operator, .. },
                 } => {
-                    // Any non-SNCB board ends a contiguous SNCB run.
                     finalize_sncb(
                         &mut items, &mut sncb_item, &price, sncb_spend_at_open,
                         sncb_board_stop, b.alight_stop,
@@ -701,8 +602,6 @@ impl Graph {
                             coverage: Some(format!("{op_name} subscription")),
                         });
                     } else if charged > 0 {
-                        // A fresh ticket was bought (window was inactive): a PAID ticket
-                        // that feeds the Brupass cap (in-zone on this board's stop).
                         paid_tags.push((items.len(), op_name.to_string(), b.board_stop));
                         items.push(FareBreakdownItem {
                             operator: op_name.to_string(),
@@ -711,7 +610,6 @@ impl Graph {
                             coverage: None,
                         });
                     } else {
-                        // Within the active window: rides on the ticket already bought.
                         items.push(FareBreakdownItem {
                             operator: op_name.to_string(),
                             description: format!("{op_name} (same ticket, within window)"),
@@ -742,7 +640,6 @@ impl Graph {
                             coverage: Some("TEC subscription".to_string()),
                         });
                     } else {
-                        // A PAID TEC ticket feeds the Brupass cap (in-zone on this board).
                         paid_tags.push((items.len(), "TEC".to_string(), b.board_stop));
                         items.push(FareBreakdownItem {
                             operator: "TEC".to_string(),
@@ -757,7 +654,6 @@ impl Graph {
                         &mut items, &mut sncb_item, &price, sncb_spend_at_open,
                         sncb_board_stop, b.alight_stop,
                     );
-                    // An unmodeled operator: price unknown, surface it as an item.
                     items.push(FareBreakdownItem {
                         operator: if display.is_empty() { "Unknown".to_string() } else { display },
                         description: "fare not modeled".to_string(),
@@ -767,7 +663,6 @@ impl Graph {
                 }
             }
         }
-        // Finalize any still-open SNCB run at journey end.
         if let Some(&last) = boardings.last() {
             finalize_sncb(
                 &mut items, &mut sncb_item, &price, sncb_spend_at_open,
@@ -775,18 +670,13 @@ impl Graph {
             );
         }
 
-        // Apply the per-JOURNEY SNCB cap (Train+ peak) to the SNCB item group as a
-        // whole, matching `capped_euros = known - sncb_spend + min(sncb_spend, cap)`.
-        // The SNCB items collectively must sum to `min(total_sncb_raw, cap)`. Any
-        // reduction is taken off the LAST SNCB item so the earlier per-run euros stay
-        // exact; airport-OD items are uncapped (their spend is the flat fare and the
-        // cap sentinel is u32::MAX, so `min` is a no-op). Non-SNCB items are untouched.
+        // Per-JOURNEY SNCB cap (Train+ peak): the SNCB items must sum to
+        // min(total_sncb_raw, cap), matching `capped = known - sncb_spend +
+        // min(sncb_spend, cap)`. Reduction is spilled onto trailing items.
         if price.sncb_cap_cents != u32::MAX && !sncb_item_indices.is_empty() {
             let total_raw: u32 = price.sncb_spend_cents;
             let capped_total = total_raw.min(price.sncb_cap_cents);
             if capped_total < total_raw {
-                // Distribute the capped total across the SNCB items, front to back,
-                // spilling the reduction onto the trailing items.
                 let mut remaining = capped_total;
                 for &idx in &sncb_item_indices {
                     let raw = (items[idx].euros * 100.0).round() as u32;
@@ -797,24 +687,14 @@ impl Graph {
             }
         }
 
-        // Brupass CAP post-pass. Brupass is not a user option: it is an automatic cap on
-        // the Brussels multi-operator fare. Collect the PAID items whose boarding stop is
-        // in the Brussels flat zone (SNCB items now carry their FINAL, SNCB-capped euros).
-        // If those in-zone items span 2+ DISTINCT operators, the traveller could buy ONE
-        // Brupass covering them; cap their sum at `brupass_cents`, replacing them with a
-        // single Brupass item, but ONLY when Brupass is strictly cheaper. Subscription /
-        // covered / within-window legs are untagged, so they never count nor get replaced.
         let brupass_savings = self.apply_brupass_cap(&mut items, &paid_tags);
         (items, brupass_savings)
     }
 
-    /// The Brupass cap over a built breakdown (see `build_breakdown`'s post-pass).
-    /// `paid_tags` are `(item_index, operator_key, board_stop)` for the PAID tickets.
-    /// Returns the SAVINGS in cents (`sum_in_zone − brupass_cents`, `0` when the cap does
-    /// not fire) so the caller can lower the plan's known/capped total to match. When it
-    /// fires: the in-zone paid items become €0 with `coverage = Some("Brupass")` and one
-    /// `Brupass (Brussels)` item priced at `brupass_cents` is inserted at the earliest
-    /// in-zone item's position.
+    /// Automatic Brupass cap over a built breakdown. `paid_tags` are `(item_index,
+    /// operator_key, board_stop)` for PAID tickets. Fires only when the in-Brussels-zone
+    /// paid items span 2+ DISTINCT operators AND Brupass is strictly cheaper than their
+    /// sum. Returns the savings in cents (0 when it does not fire).
     fn apply_brupass_cap(
         &self,
         items: &mut Vec<crate::structures::plan::FareBreakdownItem>,
@@ -826,7 +706,6 @@ impl Graph {
         if brupass_cents == 0 {
             return 0;
         }
-        // Paid items whose boarding stop is in the Brussels flat zone.
         let in_zone: Vec<&(usize, String, usize)> = paid_tags
             .iter()
             .filter(|(_, _, stop)| {
@@ -841,18 +720,14 @@ impl Graph {
         if distinct_ops.len() < 2 {
             return 0;
         }
-        // Sum of the individual in-zone tickets Brupass would replace (final, SNCB-capped
-        // euros), in cents.
         let sum_cents: u32 = in_zone
             .iter()
             .map(|(idx, _, _)| (items[*idx].euros * 100.0).round() as u32)
             .sum();
-        // Only cap when Brupass is strictly cheaper than paying each in-zone ticket.
+        // Only cap when Brupass is strictly cheaper.
         if brupass_cents >= sum_cents {
             return 0;
         }
-        // Fire: zero the replaced items (annotate coverage) and insert one Brupass item at
-        // the earliest replaced item's slot so it reads before the covered legs.
         let mut replaced: Vec<usize> = in_zone.iter().map(|(idx, _, _)| *idx).collect();
         replaced.sort_unstable();
         let insert_at = replaced[0];
@@ -872,20 +747,8 @@ impl Graph {
         sum_cents.saturating_sub(brupass_cents)
     }
 
-    /// Price a FINISHED plan post-hoc: walk its transit legs (via the arena chain
-    /// from the destination label `start_id`) in order and re-run the fare model over
-    /// the fixed sequence, EXACT cents, no dominance. Returns `None` when fares are
-    /// disabled (byte-identical pre-feature output).
-    ///
-    /// Every operator pays its own ticket; the Brupass CAP is then applied
-    /// automatically as a post-pass in `build_breakdown` (`apply_brupass_cap`): when a
-    /// plan's PAID (non-subscription) boardings whose stops are in the Brussels flat
-    /// zone span 2+ DISTINCT operators, their sum is capped at `brupass_cents` (one
-    /// Brupass), but only when Brupass is strictly cheaper. Its savings are folded back
-    /// into the numeric known/capped totals so they equal the breakdown sum.
-    ///
-    /// This REPLACES the in-search-carried price: the search is now price-blind and
-    /// the returned plan set is identical whether fares are on or off; price is only
+    /// Price a FINISHED plan post-hoc from its arena chain, EXACT cents, no dominance.
+    /// Returns `None` when fares are disabled. The search is price-blind; price is only
     /// an annotation computed here.
     pub(super) fn plan_price_posthoc(
         &self,
@@ -898,7 +761,6 @@ impl Graph {
             return None;
         }
         let boardings = self.collect_posthoc_boardings(arena, start_id);
-        // Every operator pays its own ticket; the Brupass cap is a breakdown post-pass.
         let price = self.price_boardings(&boardings, weekday, fare_profile);
         let (breakdown, brupass_savings) =
             self.build_breakdown(&boardings, weekday, fare_profile);
@@ -925,14 +787,10 @@ impl Graph {
         })
     }
 
-    /// Arrival distribution and expected arrival from a scenario bag.
-    ///
-    /// Scenarios with `time == u32::MAX` mean "connection missed, no later trip
-    /// today": they carry probability but no finite arrival, so they are excluded
-    /// from the published distribution *before* the delay-CDF convolution (which
-    /// would otherwise shift the sentinel to a bogus finite time). `expected_end`
-    /// is the expectation conditioned on actually arriving; when no scenario is
-    /// reachable it falls back to `fallback_end`.
+    /// Arrival distribution and expected arrival from a scenario bag. `time == u32::MAX`
+    /// scenarios (missed connection, no later trip) MUST be excluded before the delay-CDF
+    /// convolution, else it shifts the sentinel to a bogus finite time. `expected_end` is
+    /// conditioned on arriving; falls back to `fallback_end` when nothing is reachable.
     pub(crate) fn arrival_stats(
         bag: &ScenarioBag,
         cdf: Option<&DelayCDF>,
@@ -1007,8 +865,8 @@ impl Graph {
         use super::MAX_ROUNDS;
 
         let n_states = mc.n_states();
-        // Mode class: walk-rooted plans must not be suppressed by faster
-        // bike-state arrivals — the burden comparison happens at plan level.
+        // Mode class: walk-rooted plans must not be suppressed by faster bike-state
+        // arrivals (burden comparison happens at plan level).
         let class_of = |vs: VehicleState| -> usize {
             match vs {
                 VehicleState::Walked => 0,
@@ -1019,26 +877,14 @@ impl Graph {
         let n_classes = 3;
 
         let mut candidates: Vec<Plan> = Vec::new();
-        // Parallel to `candidates`: index of each candidate in `debug_sink`.
-        // Populated even when debug_sink is None (dummy values) so the zip works.
+        // Parallel to `candidates`: index in `debug_sink` (dummy when None so the zip works).
         let mut sink_indices: Vec<usize> = Vec::new();
-        // Best arrival seen so far per (mode class, reliability bucket) — the
-        // cross-round pruning, the multi-criteria analogue of the old single
-        // `pareto_best`.
+        // Best arrival per (mode class, reliability bucket): the cross-round pruning bound.
         let n_buckets = buckets.bucket(1.0) as usize + 1;
         let n_keys = n_classes * n_buckets;
         let mut bucket_best = vec![u32::MAX; n_keys];
 
-        // `bw_cache` (passed in) memoizes `raptor_backward`, a pure function of
-        // (target stop, target arrival, leg count, date, weekday). Within one extract the
-        // reliability-bucket variants of an arrival share keys; ACROSS the range driver's
-        // per-departure extracts, adjacent departures rediscover the same trips (same
-        // alighting stop + arrival), so a cache scoped to the whole range query collapses
-        // both. Exact — pure function, same labels, same output.
-
         for k in 0..=MAX_ROUNDS {
-            // For this round, the earliest arrival (incl. egress walk/ride) per
-            // (class, bucket), and which (stop, walk, state) achieves it.
             let mut per_key: Vec<Option<(u32, bool, usize, u32, usize)>> = vec![None; n_keys];
             for (sidx, vs) in mc.am.states() {
                 let class = class_of(vs);
@@ -1085,8 +931,6 @@ impl Graph {
                     }
                     continue;
                 }
-                // The destination-stop label this candidate was built from; its arena
-                // chain is the EXACT journey (no grid re-lookup → no bucket drift).
                 let cell = best_stop * n_states + dest_sidx;
                 let chosen = Self::pick_label(
                     &labels[k].cell(cell),
@@ -1096,16 +940,9 @@ impl Graph {
                     arena,
                 );
 
-                // Drop candidates whose arena chain carries no transit leg BEFORE
-                // committing `bucket_best` or reconstructing. Committing first let a
-                // zero-transit chain (e.g. an access+transfer walk-chain — always
-                // dropped below as a degenerate direct ride) poison the (class, bucket)
-                // cross-round bound and suppress a genuine transit candidate at another
-                // egress cell in a later round. `chain_has_transit` is exact: reconstruct
-                // emits a Transit leg iff a transit trace is in the chain, and chosen=None
-                // ⇔ empty legs — so this subsumes the old `legs.is_empty()` /
-                // `transit_count == 0` drops with the identical `ReconstructionEmpty` tag,
-                // and also skips the wasted `street_path_geom` work reconstruct would do.
+                // Drop zero-transit chains BEFORE committing `bucket_best`: committing
+                // first would let a degenerate walk-chain poison the (class, bucket)
+                // cross-round bound and suppress a genuine transit candidate later.
                 if !chosen.is_some_and(|l| Self::chain_has_transit(arena, l.arena_id)) {
                     if let Some(ref mut sink) = debug_sink {
                         sink.push(PlanCandidate {
@@ -1131,20 +968,9 @@ impl Graph {
                 let dest_vs = mc.am.state_at(dest_sidx);
                 let mode = match root_vs {
                     VehicleState::Walked => Mode::WalkTransit,
-                    // Car states never transition, so the root state names the mode:
-                    // CarParked = drove & parked (park & ride); CarEgress = picked
-                    // up by car at the destination station (kiss & ride).
                     VehicleState::CarParked => Mode::CarDropOff,
                     VehicleState::CarEgress => Mode::CarPickup,
-                    // BikeEgress = walked to the access stop, took transit, then a
-                    // bike waiting at the destination station for the final leg
-                    // (the bike mirror of CarPickup / kiss & ride).
                     VehicleState::BikeEgress => Mode::BikePickup,
-                    // Bike-rooted: the egress state tells park-and-ride apart from
-                    // carry-on-board. BikeInHand egress = bike ridden to the
-                    // destination; BikeDropped egress = parked at the station and
-                    // walked. The explicit BikeToTransit label takes precedence
-                    // over the BikeTransit union when selected.
                     VehicleState::BikeInHand | VehicleState::BikeDropped => match dest_vs {
                         VehicleState::BikeInHand if mc.am.selected(Mode::BikeOnTransit) => {
                             Mode::BikeOnTransit
@@ -1155,23 +981,15 @@ impl Graph {
                     },
                 };
 
-                // Guaranteed non-empty with ≥1 transit leg: the pre-reconstruct
-                // `chain_has_transit` gate dropped every zero-transit / empty chain
-                // (degenerate access+transfer+egress "direct rides" the search can reach
-                // with a wide vehicle access radius). Direct rides are emitted by the
-                // direct-plan machinery instead.
                 let transit_count = legs
                     .iter()
                     .filter(|l| matches!(l, PlanLeg::Transit(_)))
                     .count();
-                // The backward pass is bike-unaware (it would re-board trips a carried
-                // bike is not allowed on), so only walk-rooted plans are tightened.
+                // The backward pass is bike-unaware, so only walk-rooted plans are tightened.
                 if transit_count > 0 && mode == Mode::WalkTransit {
                     let target = best_arr.saturating_sub(best_walk);
                     let tmode = tighten_mode();
                     if tmode == TIGHTEN_MODE_CHAIN {
-                        // S1: O(k) plan chain sweep — no backward pass. Timed under the
-                        // profiler's `backward` phase so the decomposition shows the collapse.
                         let bounds = super::latency_profile::time_backward(|| {
                             self.chain_bounds(&legs, best_stop, target, date, weekday, rt)
                         });
@@ -1179,7 +997,6 @@ impl Graph {
                             &mut legs, &bounds, date, weekday, rt, onboard, true,
                         );
                     } else {
-                        // Lambda / Diff: recompute the full backward pass (timed).
                         let bw_key = (best_stop, target, transit_count, date, weekday);
                         let lambda = bw_cache.entry(bw_key).or_insert_with(|| {
                             super::latency_profile::time_backward(|| {
@@ -1224,13 +1041,9 @@ impl Graph {
                     }
                 }
 
-                // Realtime post-pass: shift leg times by live delays, re-chain the
-                // timeline, and recompute transfer reliability on the new margins.
                 self.apply_realtime(&mut legs, rt, onboard);
 
-                // Record each transit leg's downstream connection *after* tighten and
-                // realtime have settled the final scheduled times, so the outbound
-                // margin used to score alternatives matches the leg's actual arrival.
+                // After tighten + realtime settle the times, so the outbound margin matches.
                 Self::link_following_connections(&mut legs);
 
                 let (access_profile, access_mode) = match root_vs {
@@ -1341,9 +1154,6 @@ impl Graph {
                     legs.push(PlanLeg::Walk(egress_leg));
                 }
 
-                // Re-chain trailing walks onto the realtime-settled legs and read the
-                // plan bounds off the final timeline, so a live delay can never leave
-                // `end` lagging behind `start` (the historical negative-duration bug).
                 let (departure, arrival) = Self::plan_timeline(&mut legs);
 
                 let arrival_bag = chosen_bag.shifted_by(best_walk);
@@ -1352,12 +1162,8 @@ impl Graph {
                     chosen_rt.and_then(|rt| self.raptor.transit_delay_models.get(&rt)),
                     arrival,
                 );
-                // The expected (mean) arrival must never precede the deterministic
-                // realtime arrival the legs actually show.
+                // Expected arrival must never precede the deterministic realtime arrival.
                 let expected_end = expected_end.max(arrival);
-                // Price the finished plan post-hoc by re-walking its transit legs
-                // through the fare model (present only when fares are enabled). The
-                // SEARCH is price-blind; price is an annotation, not a dominance axis.
                 let price = chosen
                     .and_then(|l| self.plan_price_posthoc(arena, l.arena_id, weekday, mc.fare_profile));
                 let plan = Plan {
@@ -1380,7 +1186,7 @@ impl Graph {
                         status: CandidateStatus::Kept,
                     });
                 } else {
-                    sink_indices.push(candidates.len()); // dummy — never used to index sink
+                    sink_indices.push(candidates.len()); // dummy
                 }
                 candidates.push(plan);
             }
@@ -1403,17 +1209,10 @@ impl Graph {
         candidates
     }
 
-    /// Re-chains any walk leg that *follows* another leg onto that leg's end
-    /// (preserving its duration), then returns `(plan.start, plan.end)` read off
-    /// the final legs. The first leg is the anchor and is never shifted.
-    ///
-    /// The realtime post-pass (`apply_realtime`) settles the transit/transfer
-    /// chain, but the egress walk is attached afterwards from the *scheduled*
-    /// alight time. Under a live delay this leaves the egress (and the plan's
-    /// `end`) lagging the realtime arrival, which can make the displayed
-    /// duration negative. Re-chaining trailing walks here keeps the timeline
-    /// monotonic; for schedule-only plans every leg already chains, so it is a
-    /// no-op.
+    /// Re-chains any walk leg that follows another leg onto that leg's end (preserving
+    /// duration), then returns `(plan.start, plan.end)`. The first leg is the anchor and
+    /// is never shifted. Keeps the timeline monotonic after a realtime delay shifts an
+    /// egress walk's scheduled base; a no-op for schedule-only plans.
     pub(super) fn plan_timeline(legs: &mut [PlanLeg]) -> (u32, u32) {
         let mut cursor: Option<u32> = None;
         for leg in legs.iter_mut() {
@@ -1449,7 +1248,6 @@ impl Graph {
         (start, end)
     }
 
-    /// Merge any two consecutive `PlanLeg::Walk` segments into one.
     pub(super) fn merge_consecutive_walks(legs: Vec<PlanLeg>) -> Vec<PlanLeg> {
         let mut out: Vec<PlanLeg> = Vec::with_capacity(legs.len());
         for leg in legs {
@@ -1497,15 +1295,8 @@ impl Graph {
         out
     }
 
-    /// Picks the label in bucket `b` at `(k, stop)`, falling back to the fastest label.
-    /// Selects the reconstruction label at `(k, stop)` for bucket `b`, considering
-    /// only labels created by departure `stamp`. Single-pass queries stamp every
-    /// label `0` and pass `stamp = 0`, so the filter is a no-op there; the range
-    /// driver passes the current departure index so reconstruction follows only
-    /// that departure's traces through the grid shared across departures.
-    /// Whether the arena parent chain rooted at `start_id` contains any transit
-    /// trace. Equivalent to "reconstruct would emit ≥1 Transit leg", but computed
-    /// without building any legs or street geometry.
+    /// Whether the arena parent chain rooted at `start_id` contains any transit trace.
+    /// Equivalent to "reconstruct would emit ≥1 Transit leg", without building any legs.
     fn chain_has_transit(arena: &[Label], start_id: u32) -> bool {
         let mut cur = start_id;
         while cur != u32::MAX {
@@ -1525,17 +1316,14 @@ impl Graph {
         stamp: u32,
         arena: &[Label],
     ) -> Option<Label> {
-        // The search is price-blind (price is annotated post-hoc), so reconstruction
-        // selects exactly as the pre-feature engine did.
-        // Primary: first current-stamp member in bucket `b` (order-sensitive `find`).
+        // Primary: first current-stamp member in bucket `b`.
         for i in 0..set.count() {
             let sm = set.summary_at(i);
             if sm.created_by == stamp && buckets.bucket(sm.reliability) == b {
                 return Some(set.full_at(i, arena));
             }
         }
-        // Fallback: min-earliest among current-stamp members (first-wins on ties,
-        // matching `min_by_key`).
+        // Fallback: min-earliest among current-stamp members (first-wins on ties).
         let mut best: Option<(usize, u32)> = None;
         for i in 0..set.count() {
             let sm = set.summary_at(i);
@@ -1550,11 +1338,8 @@ impl Graph {
         best.map(|(i, _)| set.full_at(i, arena))
     }
 
-    /// Rebuilds the ordered legs of a journey by following EXACT parent pointers
-    /// through the per-pass `arena` from the destination label `start_id`. Unlike the
-    /// old grid re-lookup (which re-found predecessors by `(round, stop, bucket)` and
-    /// could drift to an overwritten label), this reproduces the precise trips the
-    /// search used, so the reconstructed reliability matches the search reliability.
+    /// Rebuilds the ordered legs of a journey by following exact parent pointers through
+    /// the per-pass `arena` from the destination label `start_id`.
     pub(super) fn reconstruct(
         &self,
         arena: &[Label],
@@ -1645,7 +1430,6 @@ impl Graph {
             let bs = self.raptor.transit_node_to_stop[pat_stops[bp].0] as usize;
             let boarding_col = &times[bp * n_trips..(bp + 1) * n_trips];
 
-            // EXACT predecessor label this leg boarded from (the arena parent).
             let preceding_rt = parent_node.and_then(|l| l.route_type);
             let preceding_arr = parent_node.map(|l| l.bag.earliest());
 
@@ -1797,8 +1581,7 @@ impl Graph {
                 },
                 preceding_route_type: preceding_rt,
                 route_type: self.route_type_of_trip(trip_ids[t]),
-                // Populated by `link_following_connections` once the legs are in
-                // forward order (the next transit leg isn't known yet here).
+                // Populated later by `link_following_connections`.
                 following_route_type: None,
                 following_margin_secs: None,
                 bikes_allowed: self.get_trip(trip_ids[t]).and_then(|t| t.bikes_allowed),
@@ -1811,21 +1594,16 @@ impl Graph {
 
         legs.reverse();
 
-        // `cur` is now the source/root label this journey was seeded from; its
-        // state identifies the access profile (walk vs bike).
+        // `cur` is the source/root label; its state identifies the access profile.
         let root_state = arena.get(cur as usize).map(|l| l.state).unwrap_or(0);
 
         (legs, origin_stop, root_state)
     }
 
-    /// Fills `following_route_type` / `following_margin_secs` on each transit leg
-    /// from the next transit leg in the (forward-ordered) chain. The margin is the
-    /// scheduled outbound slack: next boarding − this leg's scheduled arrival −
-    /// intervening transfer walk. Last transit leg keeps `None` (no connection to
-    /// make). Operates on the transit/transfer chain only — access/egress walks are
-    /// attached later and never follow a transit leg here.
+    /// Fills `following_route_type` / `following_margin_secs` on each transit leg from
+    /// the next transit leg. The margin is next boarding − this leg's scheduled arrival −
+    /// intervening transfer walk. Requires forward-ordered legs (transit/transfer only).
     fn link_following_connections(legs: &mut [PlanLeg]) {
-        // (index, scheduled_start, route_type) of each transit leg, in order.
         let transit: Vec<(usize, u32, Option<gtfs_structures::RouteType>)> = legs
             .iter()
             .enumerate()
@@ -1838,7 +1616,6 @@ impl Graph {
         for w in transit.windows(2) {
             let (i, _, _) = w[0];
             let (j, next_start, next_rt) = w[1];
-            // Sum any transfer-walk durations sitting between the two transit legs.
             let walk: u32 = legs[i + 1..j]
                 .iter()
                 .map(|l| match l {
@@ -1854,14 +1631,10 @@ impl Graph {
         }
     }
 
-    /// Realtime post-pass: rewrite each transit leg's times from scheduled to
-    /// effective (scheduled + live delay), re-chain the whole timeline, and
-    /// recompute transfer reliability on the new margins. Walks between legs
-    /// follow the (possibly delayed) preceding arrival. With an empty index this
-    /// is a no-op, so schedule-only behaviour is preserved exactly.
-    ///
-    /// Runs *before* the access/egress walks are attached, so `legs` here is the
-    /// transit/transfer chain only; `cursor` is the running effective arrival.
+    /// Realtime post-pass: rewrite each transit leg's times to effective (scheduled +
+    /// live delay), re-chain the timeline, and recompute transfer reliability on the new
+    /// margins. No-op with an empty index. Runs before access/egress walks are attached,
+    /// so `legs` is the transit/transfer chain only.
     pub(super) fn apply_realtime(&self, legs: &mut [PlanLeg], rt: &RealtimeIndex, onboard: bool) {
         if rt.is_empty() {
             return;
@@ -1879,11 +1652,9 @@ impl Graph {
                     let is_first_transit = first_transit;
                     first_transit = false;
 
-                    // After the forward-search cancellation guards (A1/B1/B2), the
-                    // only way a reconstructed plan can carry a CANCELED transit leg
-                    // is as the ONBOARD first leg — the vehicle the user is
-                    // physically riding. Any other canceled leg means the search
-                    // boarded a dead trip; this tripwire catches a regression.
+                    // INVARIANT: a reconstructed plan may carry a CANCELED transit leg
+                    // only as the ONBOARD first leg; any other means the search boarded
+                    // a dead trip (regression tripwire below).
                     let canceled = rt.is_canceled(t.trip_id);
                     debug_assert!(
                         !canceled || (onboard && is_first_transit),
@@ -1892,10 +1663,8 @@ impl Graph {
                         t.trip_id,
                     );
                     if canceled && onboard && is_first_transit {
-                        // Cancellation outranks stale per-stop delays: keep the
-                        // scheduled times and do not flag the leg realtime (mirrors
-                        // live_refresh in app.rs). The boarded trip itself is NOT
-                        // excluded — it is the user's reality.
+                        // Cancellation outranks stale per-stop delays: keep scheduled
+                        // times, don't flag realtime. The boarded trip is the user's reality.
                         t.scheduled_start = t.start;
                         t.scheduled_end = t.end;
                         t.realtime = false;
@@ -1931,7 +1700,6 @@ impl Graph {
                         }
                     }
 
-                    // Recompute the transfer onto this leg from the realtime arrival.
                     if let (Some(prev_arr), Some(prt)) = (cursor, t.preceding_route_type) {
                         let margin = t.start as i32 - prev_arr as i32;
                         let next_dep = t.transfer_risk.as_ref().and_then(|r| r.next_departure);
@@ -1977,7 +1745,8 @@ impl Graph {
         }
     }
 
-    /// Pass 3 of three-pass RAPTOR: tighten transit legs using backward labels.
+    /// Latest alighting (≤ `max_alighting`) whose onward transfer stays at or above
+    /// `TIGHTEN_MIN_RELIABILITY`; binary-searched. Uncapped when the feeder has no CDF.
     fn reliability_capped_alighting(
         &self,
         feeder_rt: Option<gtfs_structures::RouteType>,
@@ -2019,11 +1788,9 @@ impl Graph {
         lo
     }
 
-    /// Per-transit-leg alighting bounds `B[i]` derived from the backward labels
-    /// `lambda[remaining][stop]`, exactly as the tighten loop read them before
-    /// the S1 chain-sweep replacement. `B[i] = lambda[k-i-1][alighting_stop_i]`
-    /// (raw, pre-reliability-cap; 0 = no bound). Kept only for the differential
-    /// gate that validates `chain_bounds` against the full backward pass.
+    /// Per-transit-leg alighting bounds `B[i] = lambda[k-i-1][alighting_stop_i]` (raw,
+    /// pre-reliability-cap; 0 = no bound). Kept for the differential gate validating
+    /// `chain_bounds` against the full backward pass.
     pub(super) fn bounds_from_lambda(&self, legs: &[PlanLeg], lambda: &[Vec<u32>]) -> Vec<u32> {
         let transit_indices: Vec<usize> = legs
             .iter()
@@ -2048,11 +1815,10 @@ impl Graph {
         bounds
     }
 
-    /// O(k) chain-bounds sweep (S1): the plan-consistent replacement for the full
-    /// backward pass. Returns `B[i]` = latest permitted arrival at transit leg
-    /// `i`'s alighting stop, computed purely from the plan's own fixed legs and
-    /// inter-leg walks. Cap-unaware (mirrors lambda); the reliability cap is
-    /// applied downstream in `tighten_with_bounds`.
+    /// O(k) chain-bounds sweep (S1): plan-consistent replacement for the full backward
+    /// pass. Returns `B[i]` = latest permitted arrival at transit leg `i`'s alighting
+    /// stop, from the plan's own legs/walks. Cap-unaware (mirrors lambda); the
+    /// reliability cap is applied downstream in `tighten_with_bounds`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn chain_bounds(
         &self,
@@ -2074,9 +1840,7 @@ impl Graph {
             return bounds;
         }
 
-        // B[k-1]: reproduce lambda[0][alighting_of_last_leg] exactly — the seed
-        // target arrival, minus the egress reverse-transfer walk when the last
-        // leg alights at a sibling of the destination stop.
+        // B[k-1]: reproduce lambda[0][alighting_of_last_leg] exactly.
         let last_ti = transit_indices[k - 1];
         let last_alight = match &legs[last_ti] {
             PlanLeg::Transit(t) => t.to.node_id,
@@ -2086,10 +1850,7 @@ impl Graph {
         bounds[k - 1] = if last_compact != u32::MAX && last_compact as usize == target_stop {
             target
         } else if target > 0 && last_compact != u32::MAX {
-            // lambda seeds target_stop then relaxes reverse footpaths one hop:
-            //   lambda[0][source] = target - walk over (source, walk) in
-            //   reverse_transfers[target_stop]. Reproduce for source == the last
-            //   alighting stop. Off-table (long) egress ⇒ lambda has no label ⇒ 0.
+            // lambda relaxes one reverse footpath hop; off-table (long) egress ⇒ 0.
             match self.reverse_transfer_walk(target_stop, last_compact as usize) {
                 Some(walk) => target.saturating_sub(walk),
                 None => 0,
@@ -2098,17 +1859,9 @@ impl Graph {
             0
         };
 
-        // Chain backward through the fixed legs. For leg i, find the latest trip
-        // on its (board, alight) node pair arriving <= B[i] (min boarding = the
-        // original leg start, so the original trip is always feasible); the
-        // earlier leg's arrival bound is that departure minus the inter-leg walk.
-        //
-        // The walk uses the capped reverse-transfer table value (identical to
-        // lambda's reverse footpath) when the transfer is on-table, so the chain
-        // reproduces lambda exactly for short transfers. For an off-table (long,
-        // > MAX_TRANSFER_DISTANCE_M) transfer — where lambda's capped footpath
-        // yields no label (class 2) — it falls back to the plan's reconstructed
-        // walk so the chain still tightens the leg validly.
+        // Chain backward through the fixed legs: for leg i, the latest trip on its
+        // (board, alight) pair arriving <= B[i] (original leg start always feasible);
+        // the earlier leg's bound is that departure minus the inter-leg walk.
         for i in (1..k).rev() {
             let ti = transit_indices[i];
             let (board, alight, leg_start) = match &legs[ti] {
@@ -2128,8 +1881,7 @@ impl Graph {
             };
             let board_compact = self.raptor.transit_node_to_stop[board.0];
             let prev_alight_compact = self.raptor.transit_node_to_stop[prev_alight.0];
-            // Inter-leg transfer: total reconstructed walk (length in metres,
-            // duration in seconds).
+            // Inter-leg transfer: reconstructed walk (metres, seconds).
             let (plan_walk_len, plan_walk_dur) = legs[prev_ti + 1..ti].iter().fold(
                 (0usize, 0u32),
                 |(len, dur), l| match l {
@@ -2137,25 +1889,19 @@ impl Graph {
                     _ => (len, dur),
                 },
             );
-            // A transfer longer than the capped reverse-footpath table
-            // (`MAX_TRANSFER_DISTANCE_M`) is exactly the case lambda cannot
-            // represent: its `apply_reverse_footpaths` has no entry, so the leg's
-            // backward label is 0 (left untightened). Everything ≤ the cap is a
-            // short / same-stop transfer that lambda DOES tighten.
+            // A transfer > MAX_TRANSFER_DISTANCE_M is exactly what lambda's capped
+            // reverse footpath cannot represent (label 0, untightened).
             let off_table = (plan_walk_len as f64) > super::MAX_TRANSFER_DISTANCE_M;
             bounds[i - 1] = if off_table {
-                // Match lambda's no-op by default; opt-in tightens with the plan
-                // walk — surfacing valid plans lambda's capped table hides.
+                // Match lambda's no-op by default; opt-in tightens with the plan walk.
                 if long_transfer_tightening(self) {
                     dep_i.map(|d| d.saturating_sub(plan_walk_dur)).unwrap_or(0)
                 } else {
                     0
                 }
             } else {
-                // Short / same-stop transfer: use the capped table walk (identical
-                // to lambda's reverse footpath) when present, else the plan's own
-                // reconstructed walk (0 for a same-stop transfer ⇒ bound = the
-                // trip departure, exactly as lambda's direct label).
+                // Short / same-stop: capped table walk (== lambda's reverse footpath)
+                // when present, else the plan's own reconstructed walk.
                 let w = if board_compact != u32::MAX && prev_alight_compact != u32::MAX {
                     self.reverse_transfer_walk(board_compact as usize, prev_alight_compact as usize)
                         .unwrap_or(plan_walk_dur)
@@ -2168,12 +1914,8 @@ impl Graph {
         bounds
     }
 
-    /// Capped reverse-transfer table walk (seconds) from `from_stop` to
-    /// `to_stop`, or `None` when the transfer is not on-table (same stop, or a
-    /// transfer beyond `MAX_TRANSFER_DISTANCE_M`). Mirrors the walk lambda's
-    /// reverse footpath applies: `reverse_transfers[to_stop]` lists `(source,
-    /// walk)` for every `source` that can walk to `to_stop`. When several entries
-    /// name the same source, lambda keeps the largest bound ⇒ the smallest walk.
+    /// Capped reverse-transfer table walk (seconds) from `from_stop` to `to_stop`, or
+    /// `None` when off-table. Keeps the smallest walk on duplicate sources (== lambda).
     pub(super) fn reverse_transfer_walk(&self, to_stop: usize, from_stop: usize) -> Option<u32> {
         if to_stop >= self.raptor.transit_idx_stop_reverse_transfers.len() {
             return None;
@@ -2186,29 +1928,23 @@ impl Graph {
             .min()
     }
 
-    /// Public hook: force the pass-3 tightening source (validation scaffolding).
     pub fn set_tighten_mode(mode: u8) {
         TIGHTEN_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
     }
-    /// Use the S1 chain sweep (the default / production path).
     pub fn set_tighten_mode_chain() {
         Self::set_tighten_mode(TIGHTEN_MODE_CHAIN);
     }
-    /// Use the legacy full backward pass (kept for differential review).
     pub fn set_tighten_mode_lambda() {
         Self::set_tighten_mode(TIGHTEN_MODE_LAMBDA);
     }
-    /// Run both and assert the chain plan is consistent + classify divergence.
     pub fn set_tighten_mode_diff() {
         Self::set_tighten_mode(TIGHTEN_MODE_DIFF);
     }
-    /// Opt-in: tighten long (off-table) transfers with the plan's own walk. When
-    /// `false` (default) the chain sweep is byte-identical to the backward pass.
+    /// Opt-in: tighten long (off-table) transfers with the plan's own walk.
     pub fn set_tighten_long_transfers(&mut self, on: bool) {
         self.raptor.tighten_long_transfers = on;
     }
 
-    /// Reset the differential-gate counters.
     pub fn reset_tighten_diff_stats() {
         use std::sync::atomic::Ordering::Relaxed;
         for c in [
@@ -2223,7 +1959,6 @@ impl Graph {
         }
     }
 
-    /// Test hook: chain-sweep bounds for a plan's legs (validation scaffolding).
     #[allow(clippy::too_many_arguments)]
     pub fn chain_bounds_pub(
         &self,
@@ -2237,7 +1972,6 @@ impl Graph {
         self.chain_bounds(legs, target_stop, target, date, weekday, rt)
     }
 
-    /// Test hook: backward-pass (lambda) bounds for a plan's legs.
     #[allow(clippy::too_many_arguments)]
     pub fn bounds_from_lambda_pub(
         &self,
@@ -2253,7 +1987,6 @@ impl Graph {
         self.bounds_from_lambda(legs, &lambda)
     }
 
-    /// Test hook: drive the forward tighten loop with explicit bounds.
     #[allow(clippy::too_many_arguments)]
     pub fn tighten_with_bounds_pub(
         &self,
@@ -2282,10 +2015,8 @@ impl Graph {
         )
     }
 
-    /// Differential gate: tighten a plan under both the backward-pass bounds
-    /// (`bounds_lambda`) and the chain-sweep bounds (`bounds_chain`), assert the
-    /// chain plan is time-consistent, and classify any divergence. Panics on a
-    /// chain inconsistency or an unexplained (neither-class) divergence.
+    /// Differential gate: tighten under both `bounds_lambda` and `bounds_chain`, assert
+    /// the chain plan is time-consistent, and classify any divergence.
     #[allow(clippy::too_many_arguments)]
     fn tighten_diff_check(
         &self,
@@ -2302,10 +2033,7 @@ impl Graph {
         let k = bounds_lambda.len();
 
         // Seed fidelity (recorded, not fatal): chain's last-leg bound should
-        // reproduce lambda[0][last-alight]. A mismatch means the egress-transfer
-        // walk was reconstructed differently from the capped reverse-footpath
-        // table — benign as long as the chain plan stays consistent (asserted
-        // below), so it is counted and surfaced rather than aborting.
+        // reproduce lambda[0][last-alight].
         if k > 0 && bounds_chain[k - 1] != bounds_lambda[k - 1] {
             DIFF_SEED_MISMATCH.fetch_add(1, Relaxed);
             eprintln!(
@@ -2320,8 +2048,8 @@ impl Graph {
         self.tighten_with_bounds(&mut l, bounds_lambda, date, weekday, rt, onboard, false);
         self.tighten_with_bounds(&mut c, bounds_chain, date, weekday, rt, onboard, true);
 
-        // THE net (hard gate): the chain plan must be time-consistent everywhere.
-        // A negative margin here is a genuine chain_bounds bug — stop and report.
+        // Hard gate: the chain plan must be time-consistent everywhere; a negative
+        // margin is a genuine chain_bounds bug.
         for (idx, m) in plan_transfer_margins(&c).into_iter().enumerate() {
             assert!(
                 m >= 0,
@@ -2335,17 +2063,10 @@ impl Graph {
             return;
         }
 
-        // Divergence classification (reporting only — the chain plan is already
-        // proven consistent above):
-        //   class 1: the lambda plan is time-INCONSISTENT (the bug S1 fixes) —
-        //            lambda over-tightened via a parallel line / bound it could
-        //            not honour.
-        //   class 2: a long (> MAX_TRANSFER_DISTANCE_M) transfer that lambda's
-        //            capped reverse footpath left untightened (bound 0) while the
-        //            chain tightened it validly.
-        //   class 3: both plans consistent but differ — the chain used a walk
-        //            value (plan-reconstructed) that differs from lambda's capped
-        //            table walk, tightening a leg to a different still-valid trip.
+        // Divergence classification (reporting only):
+        //   1: lambda plan time-inconsistent (the bug S1 fixes)
+        //   2: long transfer lambda left untightened
+        //   3: walk-value drift, both consistent
         let l_consistent = plan_transfer_margins(&l).into_iter().all(|m| m >= 0);
         let lambda_noop = (0..k).any(|i| bounds_lambda[i] == 0 && bounds_chain[i] > 0);
         let long_transfer = plan_has_long_transfer(&c, super::MAX_TRANSFER_DISTANCE_M);
@@ -2367,11 +2088,9 @@ impl Graph {
         }
     }
 
-    /// Pass-3 tightening driven by per-leg alighting bounds `bounds[i]` (the
-    /// latest arrival permitted at transit leg `i`'s alighting stop). The bounds
-    /// are produced either by the backward pass (`bounds_from_lambda`) or the
-    /// O(k) plan chain sweep (`chain_bounds`); this forward loop is agnostic to
-    /// their origin. The reliability cap and all timing wrinkles live here.
+    /// Forward tightening driven by per-leg alighting bounds `bounds[i]` (latest arrival
+    /// permitted at transit leg `i`'s alighting stop), agnostic to their origin
+    /// (`bounds_from_lambda` or `chain_bounds`). The reliability cap and all timing lives here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn tighten_with_bounds(
         &self,
@@ -2381,11 +2100,8 @@ impl Graph {
         weekday: u8,
         rt: &RealtimeIndex,
         onboard: bool,
-        // When true (the S1 chain-sweep live path), assert every recomputed
-        // transfer margin is non-negative — the chain bounds must never re-time a
-        // leg past a downstream connection. Left false for the legacy backward
-        // (lambda) path, which can legitimately emit a negative margin (the bug
-        // S1 fixes), so the differential gate can still observe it.
+        // When true (S1 chain-sweep), assert every recomputed transfer margin is
+        // non-negative. False for the lambda path, which can legitimately emit one.
         debug_check: bool,
     ) {
         let transit_indices: Vec<usize> = legs
@@ -2453,8 +2169,7 @@ impl Graph {
             };
 
             // Onboard plans must never re-time leg[0]: the user is already aboard
-            // that specific vehicle, so swapping it to a later same-pattern
-            // departure would put them on a trip they are not riding.
+            // that specific vehicle.
             if max_alighting > 0 && !(onboard && i == 0) {
                 let min_dep = if i == 0 { leg_start } else { current_time };
 
@@ -2513,8 +2228,7 @@ impl Graph {
                 if let PlanLeg::Transit(next_t) = &mut legs[next_ti] {
                     next_t.preceding_arrival = Some(cursor);
                     // S1 invariant: a bound must never re-time this leg past its
-                    // downstream connection. `cursor` is the arrival at this leg's
-                    // boarding stop after the (re-chained) transfer walk.
+                    // downstream connection.
                     debug_assert!(
                         !debug_check || next_t.start >= cursor,
                         "tighten produced a negative transfer margin: start={} cursor={} (margin={})",
@@ -2554,13 +2268,8 @@ impl Graph {
         }
     }
 
-    /// Remove dominated plans from `plans`.
-    ///
-    /// Plan A dominates plan B when A is at least as good on all four Pareto axes
-    /// (departure ↑, arrival ↓, transfer count ↓, reliability bucket ↑) and strictly
-    /// better in at least one; walking duration is a tie-break attribute, not an axis.
     /// Plan reliability = product of each transit leg's `transfer_risk.reliability`
-    /// (legs without a risk count as 1.0). Walk-only plans = 1.0.
+    /// (legs without a risk, and walk-only plans, count as 1.0).
     pub fn plan_reliability(plan: &Plan) -> f32 {
         plan.legs
             .iter()
@@ -2574,7 +2283,6 @@ impl Graph {
             .product::<f32>()
     }
 
-    /// Total street (non-transit) seconds of a plan.
     fn plan_street_secs(plan: &Plan) -> u32 {
         plan.legs
             .iter()
@@ -2588,8 +2296,8 @@ impl Graph {
             .sum()
     }
 
-    /// The plan's transit core: the exact sequence of boarded trip segments.
-    /// Plans sharing a core are the same journey with different street legs.
+    /// The plan's transit core (boarded trip segments); plans sharing it are the same
+    /// journey with different street legs.
     fn transit_core(plan: &Plan) -> Vec<(u32, usize, usize)> {
         plan.legs
             .iter()
@@ -2600,14 +2308,10 @@ impl Graph {
             .collect()
     }
 
-    /// Collapses same-transit-core plans that differ only in street access/egress
-    /// into one plan with `access_alternatives`. The primary is the
-    /// lightest-burden member; a member stays a standalone plan when it arrives
-    /// strictly earlier than the primary (a genuine Pareto endpoint, e.g. a
-    /// ridden egress) — otherwise its only possible advantage is departure time
-    /// or street comfort, which is exactly what the alternatives convey.
-    /// Same-mode non-primary members are exact time-duplicates and are dropped.
-    /// Direct plans (empty core) pass through untouched.
+    /// Collapses same-transit-core plans differing only in street access/egress into one
+    /// plan with `access_alternatives`. Primary = lightest-burden member; a member
+    /// arriving strictly earlier stays standalone (a genuine Pareto endpoint). Direct
+    /// plans (empty core) pass through untouched.
     pub(super) fn group_access_alternatives(plans: Vec<Plan>) -> Vec<Plan> {
         use std::collections::HashMap;
 
@@ -2645,7 +2349,7 @@ impl Graph {
                     continue;
                 }
                 if slots[i].as_ref().unwrap().end < primary_end {
-                    continue; // genuinely earlier arrival: stays a standalone plan
+                    continue; // earlier arrival: stays standalone
                 }
                 let member = slots[i].take().unwrap();
                 let alt = AccessAlternative {
@@ -2682,20 +2386,16 @@ impl Graph {
         slots.into_iter().flatten().collect()
     }
 
-    /// Final plan pipeline: collapse access twins, drop transit plans no faster
-    /// than an equal-or-lighter-burden direct ride, then burden-aware Pareto.
+    /// Final pipeline: collapse access twins, drop transit plans no faster than an
+    /// equal-or-lighter-burden direct ride, then burden-aware Pareto.
     pub(super) fn finalize_plans(plans: Vec<Plan>, buckets: &ReliabilityBuckets) -> Vec<Plan> {
         let grouped = Self::group_access_alternatives(plans);
         Self::pareto_filter(Self::prune_slower_than_direct(grouped), buckets)
     }
 
-    /// Drops any transit plan whose total duration is *strictly longer* than a
-    /// direct street plan of equal-or-lighter burden. In a windowed search a
-    /// later-departing transit plan can survive Pareto on the departure axis
-    /// even though just walking/cycling/driving straight there is quicker; such
-    /// a plan is never worth showing. A lighter-burden direct ride suppresses a
-    /// heavier transit plan, but never the reverse (cycling-direct cannot bump a
-    /// walk+transit option).
+    /// Drops any transit plan strictly longer than a direct street plan of
+    /// equal-or-lighter burden. A lighter-burden direct ride suppresses a heavier
+    /// transit plan, never the reverse.
     pub(super) fn prune_slower_than_direct(plans: Vec<Plan>) -> Vec<Plan> {
         let is_direct = |p: &Plan| !p.legs.iter().any(|l| matches!(l, PlanLeg::Transit(_)));
         let dur = |p: &Plan| p.end.saturating_sub(p.start);
@@ -2741,12 +2441,9 @@ impl Graph {
 
         let rel_bucket = |p: &Plan| buckets.bucket(Self::plan_reliability(p));
 
-        // 4-D Pareto: (transfers ↓, end ↓, start ↑, reliability_bucket ↑), guarded
-        // by mode burden: a plan may only dominate plans of equal-or-heavier
-        // burden, so a bike/car plan must strictly beat every lighter-mode plan
-        // on some axis to survive, while a walk plan can never be deleted by a
-        // heavier one. Walk seconds and burden are NOT axes — they only break
-        // exact 4-axis ties: lower burden first, then lower walk.
+        // 4-D Pareto (transfers ↓, end ↓, start ↑, reliability_bucket ↑), guarded by
+        // burden: a plan may only dominate equal-or-heavier-burden plans. Burden and
+        // walk seconds are NOT axes; they only break exact 4-axis ties.
         let dominates = |a: &Plan, b: &Plan| {
             let (tc_a, tc_b) = (transfer_count(a), transfer_count(b));
             let (rb_a, rb_b) = (rel_bucket(a), rel_bucket(b));
@@ -2798,10 +2495,8 @@ impl Graph {
         result
     }
 
-    /// Debug-aware pareto filter.
-    ///
-    /// `plan_to_sink_idx[i]` is the index of `plans[i]` in `sink`.
-    /// Dominated plans have their `sink` entry updated with the dominator's index.
+    /// Debug-aware pareto filter. `plan_to_sink_idx[i]` is the index of `plans[i]` in
+    /// `sink`; dominated plans get their `sink` entry updated with the dominator's index.
     pub(super) fn pareto_filter_with_debug(
         plans: Vec<Plan>,
         plan_to_sink_idx: &[usize],
@@ -2865,7 +2560,6 @@ impl Graph {
             let tc_p = transfer_count(&plan);
             let rb_p = rel_bucket(&plan);
 
-            // Check if `plan` is dominated by (or a higher-walk twin of) any result.
             for (i, existing) in result.iter().enumerate() {
                 if dominates(existing, &plan)
                     || (equal_4(existing, &plan) && tie_break_wins(existing, &plan))
@@ -2883,7 +2577,6 @@ impl Graph {
                 }
             }
 
-            // Mark result members dominated by `plan`.
             let mut dominated = vec![false; result.len()];
             for (i, existing) in result.iter().enumerate() {
                 if dominates(&plan, existing) {
@@ -2933,12 +2626,73 @@ mod tests {
     #[test]
     fn plan_price_of_none_when_fares_disabled() {
         use crate::structures::cost::PriceValue;
-        let g = Graph::new(); // fare_model default = disabled
+        let g = Graph::new();
         let p = PriceValue { known_cents: 210, ..PriceValue::ZERO };
         assert!(
             g.plan_price_of(&p, Vec::new(), 0).is_none(),
             "disabled fares surface no Plan.price (byte-identical output)"
         );
+    }
+
+    fn brupass_graph() -> Graph {
+        use crate::structures::cost::{Agglomeration, FareModel};
+        let mut g = Graph::new();
+        g.raptor.fare_model = FareModel {
+            enabled: true,
+            brupass_cents: 270,
+            ..FareModel::default()
+        };
+        // Stop 5 is inside the Brussels flat zone; stop 6 is outside.
+        g.raptor.sncb_stop_zone = vec![Agglomeration::None; 8];
+        g.raptor.sncb_stop_zone[5] = Agglomeration::Brussels;
+        g
+    }
+
+    fn paid_item(operator: &str, euros: f64) -> crate::structures::plan::FareBreakdownItem {
+        crate::structures::plan::FareBreakdownItem {
+            operator: operator.to_string(),
+            description: format!("{operator} single"),
+            euros,
+            coverage: None,
+        }
+    }
+
+    #[test]
+    fn brupass_does_not_cap_single_operator_in_zone_journey() {
+        // Brupass is a MULTI-OPERATOR Brussels product: a lone in-zone operator stays on
+        // its own ticket even when Brupass would be numerically cheaper.
+        let g = brupass_graph();
+        let mut items = vec![paid_item("TEC", 2.80)];
+        let paid_tags = vec![(0usize, "TEC".to_string(), 5usize)];
+        let savings = g.apply_brupass_cap(&mut items, &paid_tags);
+        assert_eq!(savings, 0, "single-operator in-zone journey is not a Brupass trip");
+        assert_eq!(items.len(), 1, "no Brupass item inserted");
+        assert_eq!(items[0].euros, 2.80, "TEC ticket left untouched");
+    }
+
+    #[test]
+    fn brupass_does_not_cap_single_operator_out_of_zone() {
+        let g = brupass_graph();
+        let mut items = vec![paid_item("TEC", 2.80)];
+        let paid_tags = vec![(0usize, "TEC".to_string(), 6usize)];
+        let savings = g.apply_brupass_cap(&mut items, &paid_tags);
+        assert_eq!(savings, 0, "out-of-zone boarding does not qualify for Brupass");
+        assert_eq!(items.len(), 1, "no Brupass item inserted");
+        assert_eq!(items[0].euros, 2.80, "ticket left untouched");
+    }
+
+    #[test]
+    fn brupass_multi_operator_in_zone_still_caps() {
+        let g = brupass_graph();
+        let mut items = vec![paid_item("TEC", 2.80), paid_item("De Lijn", 2.50)];
+        let paid_tags = vec![
+            (0usize, "TEC".to_string(), 5usize),
+            (1usize, "De Lijn".to_string(), 5usize),
+        ];
+        let savings = g.apply_brupass_cap(&mut items, &paid_tags);
+        assert_eq!(savings, 530 - 270, "5.30 - 2.70 = 2.60 saved");
+        assert_eq!(items[0].operator, "Brupass");
+        assert_eq!(items[0].euros, 2.70);
     }
 
     #[test]
@@ -2965,10 +2719,6 @@ mod tests {
         assert_eq!(price.unknown_operators, vec!["De Lijn x2".to_string(), "TEC".to_string()]);
     }
 
-    /// `chain_has_transit` is the exact pre-reconstruct predicate that gates the
-    /// `bucket_best` commit: a candidate is committed and reconstructed only if its
-    /// arena parent chain carries ≥1 transit trace. It must match "reconstruct emits
-    /// a Transit leg", following `parent` pointers and stopping at `u32::MAX`.
     #[test]
     fn chain_has_transit_matches_transit_trace_in_arena_chain() {
         use crate::structures::raptor::Trace;
@@ -2980,8 +2730,6 @@ mod tests {
             from_stop: 7,
             ..Trace::NONE
         };
-        // arena[0] = access root (Trace::NONE), arena[1] = transfer off the root,
-        // arena[2] = transit boarding off the transfer.
         let root = Label {
             trace: Trace::NONE,
             parent: u32::MAX,
@@ -2999,13 +2747,9 @@ mod tests {
         };
         let arena = vec![root, transfer, transit];
 
-        // Chain transit → transfer → root contains a transit trace.
         assert!(Graph::chain_has_transit(&arena, 2));
-        // Chain transfer → root is all-walk (access + footpath) — no transit.
         assert!(!Graph::chain_has_transit(&arena, 1));
-        // The root alone (a pure access/walk-chain candidate) — no transit.
         assert!(!Graph::chain_has_transit(&arena, 0));
-        // Empty/absent chain.
         assert!(!Graph::chain_has_transit(&arena, u32::MAX));
     }
 
@@ -3037,7 +2781,6 @@ mod tests {
             })
         };
 
-        // Board 1000, mid stop dwells 1100→1130, alight 1300.
         let leg = PlanTransitLeg {
             length: 0,
             start: 1000,
@@ -3072,7 +2815,6 @@ mod tests {
             panic!("expected a transit leg");
         };
 
-        // Endpoints: scheduled preserved, effective shifted by the stop delay.
         assert!(t.realtime);
         assert_eq!((t.scheduled_start, t.scheduled_end), (1000, 1300));
         assert_eq!((t.start, t.end), (1060, 1480));
@@ -3083,11 +2825,10 @@ mod tests {
             PlanLegStep::Transit(s) => s,
             _ => panic!("mid step"),
         };
-        // scheduled_* is the untouched timetable (dwell 1100→1130 intact)…
+        // scheduled_* untouched; place.* carries effective (delayed) times.
         assert_eq!(mid.scheduled_arrival, Some(1100));
         assert_eq!(mid.scheduled_departure, Some(1130));
         assert_ne!(mid.scheduled_arrival, mid.scheduled_departure);
-        // …while place.* carries the effective (delayed) times.
         assert_eq!(mid.place.arrival, Some(1220));
         assert_eq!(mid.place.departure, Some(1250));
 
@@ -3210,8 +2951,6 @@ mod tests {
         assert_eq!(expected_end, 36150);
     }
 
-    // ── grouping + burden-aware pareto ───────────────────────────────────────
-
     use crate::ingestion::gtfs::TripId;
     use crate::structures::Mode;
 
@@ -3289,13 +3028,11 @@ mod tests {
 
     #[test]
     fn plan_timeline_rechains_trailing_walk_after_realtime_shift() {
-        // Transit leg delayed to 720..800 by realtime; the egress walk still
-        // carries its stale scheduled times (200..260). The plan summary must
-        // follow the realtime legs, not the stale ones.
+        // Transit delayed to 720..800; egress still carries stale times (200..260).
         let mut legs = vec![
-            walk_leg(Mode::Walk, 100, 120),   // access (anchor — not re-chained)
-            transit_leg(7, 10, 11, 720, 800), // realtime-delayed boarding
-            walk_leg(Mode::Walk, 200, 260),   // egress, stale 60s walk
+            walk_leg(Mode::Walk, 100, 120),   // access anchor
+            transit_leg(7, 10, 11, 720, 800), // realtime-delayed
+            walk_leg(Mode::Walk, 200, 260),   // egress, stale
         ];
         let (start, end) = Graph::plan_timeline(&mut legs);
         assert_eq!(start, 100);
@@ -3327,7 +3064,6 @@ mod tests {
     #[test]
     fn burden_tie_goes_to_lighter_mode() {
         let core = || vec![transit_leg(7, 10, 11, 100, 200)];
-        // Different cores would be needed to dodge grouping; use pareto directly.
         let walk = plan(Mode::WalkTransit, 90, 210, core());
         let bike = plan(Mode::BikeTransit, 90, 210, core());
         let out = Graph::pareto_filter(vec![bike, walk], &buckets());
@@ -3355,7 +3091,6 @@ mod tests {
 
     #[test]
     fn lighter_mode_never_dominated_by_heavier() {
-        // Bike strictly better on every axis — the walk plan must still survive.
         let walk = plan(
             Mode::WalkTransit,
             80,
@@ -3410,7 +3145,6 @@ mod tests {
 
     #[test]
     fn same_core_earlier_arrival_stays_standalone() {
-        // Ridden egress arrives earlier: a genuine Pareto endpoint, not a twin.
         let walk = plan(
             Mode::WalkTransit,
             80,
@@ -3448,9 +3182,6 @@ mod tests {
 
     #[test]
     fn direct_shorter_duration_suppresses_longer_same_burden_transit() {
-        // Bike-direct: 21 min, leave now (burden 1). Bike+transit: 24 min but
-        // departs later (burden 1) — it only survived Pareto on the later
-        // departure. Since cycling straight there is shorter, drop it.
         let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
         let bike_transit = plan(
             Mode::BikeOnTransit,
@@ -3470,8 +3201,6 @@ mod tests {
 
     #[test]
     fn direct_does_not_suppress_lighter_burden_transit() {
-        // Bike-direct (burden 1) must NOT suppress a longer WALK+transit (burden
-        // 0) — a lighter mode is always worth offering.
         let bike_direct = plan(Mode::Bike, 0, 1260, vec![walk_leg(Mode::Bike, 0, 1260)]);
         let walk_transit = plan(
             Mode::WalkTransit,
@@ -3488,7 +3217,6 @@ mod tests {
 
     #[test]
     fn direct_does_not_suppress_faster_transit() {
-        // Transit beats cycling direct on duration here — it must survive.
         let bike_direct = plan(Mode::Bike, 0, 1500, vec![walk_leg(Mode::Bike, 0, 1500)]);
         let bike_transit = plan(
             Mode::BikeOnTransit,
@@ -3511,10 +3239,8 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// Real-graph smoke: load OSM PBF + STIB GTFS, run a transit-mode route between
-    /// two Brussels points ~3 km apart, and verify that the access leg carries
-    /// non-empty multiobj `alternatives` + `leave_by`, and the egress leg carries
-    /// non-empty `alternatives`. Run with:
+    /// Real-graph smoke: verify access leg carries multiobj `alternatives` + `leave_by`
+    /// and the egress leg carries `alternatives`.
     ///   cargo test --release --lib access_egress_smoke -- --ignored --nocapture
     #[test]
     #[ignore]

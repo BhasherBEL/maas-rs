@@ -1,11 +1,3 @@
-// DB-agnostic persistence/history store for the Live (realtime) journey view.
-//
-// Adapter contract (both node:sqlite and sqlite-wasm SAHPool satisfy it):
-//   db.exec(sql)            -> void              raw, possibly multi-statement
-//   db.run(sql, params=[])  -> {lastInsertRowid, changes}
-//   db.all(sql, params=[])  -> row objects[]     positional `?` params
-// Single-row / scalar reads use all(sql, params)[0]. Synchronous only.
-
 export const schemaVersion = 1;
 
 export function initSchema(db) {
@@ -45,7 +37,6 @@ export function saveSelectedJourney(db, journey, { logSelect = true } = {}) {
   }
   const createdAt = journey.createdAt ?? nowIso();
   const payload = JSON.stringify(journey.payload ?? null);
-  // Single active journey: replacing overwrites whatever was there. The
   // DELETE + INSERT + change-event must commit together or not at all.
   db.exec("BEGIN");
   try {

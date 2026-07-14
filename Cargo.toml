@@ -1,7 +1,11 @@
 [package]
 name = "maas-rs"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
+description = "Multi-modal, multi-objective routing engine for Belgium (RAPTOR transit + Pareto street search) with a GraphQL API and web UI."
+repository = "https://codeberg.org/Bhasher/maas-rs"
+homepage = "https://codeberg.org/Bhasher/maas-rs"
 
 [dev-dependencies]
 gtfs-structures = "0.46.1"

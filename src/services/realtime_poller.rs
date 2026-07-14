@@ -21,30 +21,78 @@ use crate::structures::{Config, Graph, RealtimeConfig, RealtimeFeedConfig, Realt
 
 pub type SharedRealtime = Arc<ArcSwap<RealtimeIndex>>;
 
+/// True when every URL/header value in `f` interpolates today. A deterministic
+/// interpolation failure (an unset `${VAR}`/missing secret) never fixes itself
+/// mid-run, so such a feed is disabled up front rather than re-attempted — and
+/// re-logged — every poll cycle. Pure config → network failures are unaffected.
+fn feed_config_resolvable(f: &RealtimeFeedConfig) -> Result<(), String> {
+    let (urls, headers): (Vec<&str>, &HashMap<String, String>) = match f {
+        RealtimeFeedConfig::GtfsRt { url, headers, .. } => (vec![url.as_str()], headers),
+        RealtimeFeedConfig::Stib {
+            waiting_time_url,
+            vehicle_position_url,
+            headers,
+            ..
+        } => {
+            let mut u = vec![waiting_time_url.as_str()];
+            if let Some(vp) = vehicle_position_url {
+                u.push(vp.as_str());
+            }
+            (u, headers)
+        }
+    };
+    for u in urls {
+        crate::ingestion::secrets::interpolate(u)?;
+    }
+    for v in headers.values() {
+        crate::ingestion::secrets::interpolate(v)?;
+    }
+    Ok(())
+}
+
 /// Build the feed objects from config. STIB feeds need the graph (for schedule
 /// matching) and so are constructed with a clone of the current graph snapshot.
+/// A feed whose URL/header secrets cannot be resolved (e.g. an unset key) is
+/// DISABLED here — logged once at warn and never built — so it cannot spam an
+/// interpolation error every poll cycle forever.
 pub fn build_feeds(cfg: &RealtimeConfig, graph: Arc<Graph>) -> Vec<Box<dyn RealtimeFeed>> {
     cfg.feeds
         .iter()
-        .map(|f| match f {
-            RealtimeFeedConfig::GtfsRt { name, url, headers } => {
-                Box::new(GtfsRtFeed::new(name.clone(), url.clone(), headers.clone()))
-                    as Box<dyn RealtimeFeed>
+        .filter_map(|f| {
+            if let Err(e) = feed_config_resolvable(f) {
+                tracing::warn!(
+                    feed = feed_name(f),
+                    "realtime feed disabled: its URL/header secrets are unresolvable ({e}); \
+                     set the missing variable and restart to re-enable"
+                );
+                return None;
             }
-            RealtimeFeedConfig::Stib {
-                name,
-                waiting_time_url,
-                vehicle_position_url,
-                headers,
-            } => Box::new(StibFeed::new(
-                name.clone(),
-                waiting_time_url.clone(),
-                vehicle_position_url.clone(),
-                headers.clone(),
-                graph.clone(),
-            )) as Box<dyn RealtimeFeed>,
+            Some(match f {
+                RealtimeFeedConfig::GtfsRt { name, url, headers } => {
+                    Box::new(GtfsRtFeed::new(name.clone(), url.clone(), headers.clone()))
+                        as Box<dyn RealtimeFeed>
+                }
+                RealtimeFeedConfig::Stib {
+                    name,
+                    waiting_time_url,
+                    vehicle_position_url,
+                    headers,
+                } => Box::new(StibFeed::new(
+                    name.clone(),
+                    waiting_time_url.clone(),
+                    vehicle_position_url.clone(),
+                    headers.clone(),
+                    graph.clone(),
+                )) as Box<dyn RealtimeFeed>,
+            })
         })
         .collect()
+}
+
+fn feed_name(f: &RealtimeFeedConfig) -> &str {
+    match f {
+        RealtimeFeedConfig::GtfsRt { name, .. } | RealtimeFeedConfig::Stib { name, .. } => name,
+    }
 }
 
 /// Parent-station identity of a GTFS `stop_id`: the prefix before the last `_`
@@ -339,6 +387,13 @@ pub fn spawn(graph: SharedGraph, realtime: SharedRealtime, config: Arc<Config>) 
     }
 
     let feeds = Arc::new(build_feeds(&cfg, graph.load_full()));
+    if feeds.is_empty() {
+        tracing::warn!(
+            "realtime enabled but every configured feed was disabled (unresolvable \
+             secrets); not starting the poller"
+        );
+        return;
+    }
     let fetcher = Arc::new(Fetcher::new(
         RateLimitConfig {
             consecutive_failure_threshold: cfg.rate_limit.consecutive_failure_threshold,
@@ -426,6 +481,51 @@ mod tests {
     use super::*;
     use crate::ingestion::gtfs::TripId;
     use crate::ingestion::realtime::{ActualStopId, TripDelay, VehicleObservation};
+
+    #[test]
+    fn feed_with_plain_url_is_resolvable() {
+        let f = RealtimeFeedConfig::GtfsRt {
+            name: "bus".into(),
+            url: "https://example.com/rt.pb".into(),
+            headers: HashMap::new(),
+        };
+        assert!(feed_config_resolvable(&f).is_ok());
+    }
+
+    #[test]
+    fn feed_with_unset_key_is_disabled() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".into(),
+            "Bearer ${MAAS_RT_UNSET_KEY_XYZ}".into(),
+        );
+        let f = RealtimeFeedConfig::GtfsRt {
+            name: "bus".into(),
+            url: "https://example.com/rt.pb".into(),
+            headers,
+        };
+        assert!(feed_config_resolvable(&f).is_err(), "unset key ⇒ feed disabled");
+    }
+
+    #[test]
+    fn build_feeds_drops_unresolvable_feed() {
+        let cfg: RealtimeConfig = serde_yaml_ng::from_str(
+            "enabled: true\n\
+             feeds:\n\
+             \x20 - type: gtfs-rt\n\
+             \x20   name: ok\n\
+             \x20   url: \"https://example.com/ok.pb\"\n\
+             \x20 - type: gtfs-rt\n\
+             \x20   name: broken\n\
+             \x20   url: \"https://example.com/broken.pb\"\n\
+             \x20   headers:\n\
+             \x20     Authorization: \"${MAAS_RT_UNSET_KEY_ABC}\"\n",
+        )
+        .unwrap();
+        let feeds = build_feeds(&cfg, Arc::new(Graph::new()));
+        assert_eq!(feeds.len(), 1, "only the resolvable feed is built");
+        assert_eq!(feeds[0].name(), "ok");
+    }
 
     fn base_graph() -> Graph {
         let mut g = Graph::new();

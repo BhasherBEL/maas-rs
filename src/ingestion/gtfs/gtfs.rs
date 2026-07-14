@@ -16,8 +16,6 @@ use crate::{
 
 static MAX_NEIGHBOR_DISTANCE: f64 = 1000.0;
 
-// Identifiers
-
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgencyId(pub u16);
 
@@ -30,8 +28,6 @@ pub struct RouteId(pub u32);
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceId(pub u32);
 
-// Structures
-
 fn bool_true() -> bool {
     true
 }
@@ -40,10 +36,8 @@ fn bool_true() -> bool {
 pub struct StopTime {
     pub arrival: u32,
     pub departure: u32,
-    /// `false` when GTFS `pickup_type == 1` (passengers may not board here).
     #[serde(default = "bool_true")]
     pub board_allowed: bool,
-    /// `false` when GTFS `drop_off_type == 1` (passengers may not alight here).
     #[serde(default = "bool_true")]
     pub alight_allowed: bool,
 }
@@ -88,9 +82,7 @@ pub struct RouteInfo {
     pub route_long_name: String,
     pub route_type: RouteType,
     pub agency_id: AgencyId,
-    /// GTFS `route_color` as (R, G, B), `None` if absent or black (#000000).
     pub route_color: Option<(u8, u8, u8)>,
-    /// GTFS `route_text_color` as (R, G, B), `None` if absent or white (#FFFFFF).
     pub route_text_color: Option<(u8, u8, u8)>,
 }
 
@@ -130,8 +122,6 @@ impl ServicePattern {
     }
 }
 
-/// Transit feed provider, used to dispatch the per-provider `parent_station`
-/// preprocessing seam in [`preprocess_parent_stations`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GtfsProvider {
     Sncb,
@@ -139,12 +129,7 @@ pub enum GtfsProvider {
     Generic,
 }
 
-/// Per-provider preprocessing seam: a discoverable extension point where a
-/// provider MAY synthesize `parent_station` for stops that lack it, using
-/// provider-specific logic, before stations are grouped. Dispatched on the
-/// provider variant. `radius_m` bounds how far an orphan stop may be merged into
-/// a same-named station. Operates within the single feed only — never merges
-/// across operators (the seam is invoked once per feed).
+/// Operates within the single feed only; never merges across operators.
 pub fn preprocess_parent_stations(
     provider: GtfsProvider,
     stops: &mut HashMap<String, std::sync::Arc<gtfs_structures::Stop>>,
@@ -156,15 +141,11 @@ pub fn preprocess_parent_stations(
     }
 }
 
-/// SNCB feeds carry native `parent_station` values; pass them through unchanged.
 fn preprocess_parent_stations_sncb(
     _stops: &mut HashMap<String, std::sync::Arc<gtfs_structures::Stop>>,
 ) {
 }
 
-/// Lowercase, trim, and collapse internal whitespace runs to a single space.
-/// Deliberately stupid matching (no accent/punctuation folding) — fuzzy name
-/// matching is a later concern.
 fn normalize_station_name(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
@@ -172,20 +153,6 @@ fn normalize_station_name(name: &str) -> String {
         .to_lowercase()
 }
 
-/// Synthesize `parent_station` for parent-less ("orphan") stops within a single
-/// feed (STIB surface tram/bus stops, all DeLijn stops), so the downstream
-/// station index collapses same-named neighbours that the feed left ungrouped.
-///
-/// Two paths, both radius-capped at `radius_m` so genuinely distinct same-named
-/// stops far apart stay separate:
-/// 1. SEED-FROM-NATIVE: clusters are seeded from stops that ALREADY carry a
-///    native `parent_station`. An orphan whose normalized name matches a native
-///    member's and that lies within `radius_m` of that member is attached to the
-///    native group (its parent id is preserved; native groups are never re-keyed).
-/// 2. ORPHAN CLUSTER: orphans whose name has no native seed group are clustered
-///    by single-linkage within `radius_m`; each cluster of ≥2 gets a synthesized
-///    parent id (`maas:synth:…`, which cannot collide with native ids). Lone
-///    orphans, and same-named orphans farther than `radius_m` apart, stay separate.
 fn absorb_orphan_stops(
     stops: &mut HashMap<String, std::sync::Arc<gtfs_structures::Stop>>,
     radius_m: f64,
@@ -309,7 +276,13 @@ pub(crate) fn load_gtfs_with_hook<F>(
 where
     F: Fn(&gtfs_structures::Trip, RouteType) -> Option<bool>,
 {
-    let mut gtfs = gtfs_structures::Gtfs::new(gtfs_path)?;
+    let mut gtfs = gtfs_structures::Gtfs::new(gtfs_path).map_err(|e| {
+        tracing::error!(
+            "failed to open GTFS '{gtfs_path}': {e}. If this is a cached download, the file may \
+             be corrupt or an HTML error page; delete '{gtfs_path}' to force a re-download."
+        );
+        e
+    })?;
     preprocess_parent_stations(provider, &mut gtfs.stops, g.station_merge_radius_m());
 
     let mut gtfs_nodes_mapper = HashMap::<String, NodeID>::new();
@@ -383,9 +356,6 @@ where
         let nearest_node = *nearest_node_dist.1;
         let distance = nearest_node_dist.0 as usize;
 
-        // Stage B2a: a platform-matched stop is relocated onto its OSM platform node
-        // and re-priced; it then SKIPS the default free street snap below. Unmatched
-        // stops (and stops with no usable platform geometry) keep today's snap exactly.
         if raw.parent_station.is_some()
             && relocate_matched_stop(
                 g,
@@ -516,8 +486,7 @@ where
             route_text_color: None,
         });
 
-        // Treat black (#000000) as "no color" since it is the GTFS default for
-        // routes that do not define a colour.
+        // GTFS default black (#000000) means "no colour".
         let route_color = route.color.and_then(|c| {
             if c.r == 0 && c.g == 0 && c.b == 0 {
                 None
@@ -525,7 +494,7 @@ where
                 Some((c.r, c.g, c.b))
             }
         });
-        // Treat white (#FFFFFF) as "no text color" (GTFS default).
+        // GTFS default white (#FFFFFF) means "no text colour".
         let route_text_color = route.text_color.and_then(|c| {
             if c.r == 255 && c.g == 255 && c.b == 255 {
                 None
@@ -554,7 +523,6 @@ where
     let mut pattern_sequences: Vec<Vec<NodeID>> = Vec::new();
     let mut pattern_route_ids: Vec<RouteId> = Vec::new();
     let mut pattern_trip_data: Vec<Vec<(TripId, Vec<StopTime>)>> = Vec::new();
-    // For each pattern: the shape_id and per-stop shape_dist_traveled values (from the first trip).
     let mut pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> = Vec::new();
 
     for (_, trip) in gtfs.trips {
@@ -702,7 +670,6 @@ where
             len: n_stops * n_trips,
         });
 
-        // ── Shape geometry ────────────────────────────────────────────────────
         let stop_coords: Vec<LatLng> = sequence
             .iter()
             .map(|&node_id| {
@@ -757,10 +724,6 @@ where
     Ok(())
 }
 
-/// A foot connector edge mirroring the GTFS stop-snap edge flags exactly
-/// (`partial`, foot-only, neutral surface/elevation), so Stage B2a's boarding and
-/// fallback edges traverse identically to today's snap and foot time is exactly
-/// `length / walking_speed`.
 fn foot_connector_edge(origin: NodeID, destination: NodeID, length: usize) -> EdgeData {
     EdgeData::Street(StreetEdgeData {
         origin,
@@ -777,29 +740,11 @@ fn foot_connector_edge(origin: NodeID, destination: NodeID, length: usize) -> Ed
     })
 }
 
-/// Foot-Dijkstra budget (raw metres) for B2a reachability probe. Chosen to cover
-/// realistic station concourse depths while keeping per-stop search cost tight
-/// (~1 500 stops at build time). Raw metres because `bake_connector_lengths` runs
-/// after the GTFS phase, so connector edge lengths are still physical metres here.
+/// Raw metres: `bake_connector_lengths` runs after this phase, so lengths here are still physical metres.
 const B2A_FOOT_BUDGET_M: usize = 500;
 
-/// Stage B2a: relocate a Stage-A platform-matched transit `stop` onto its matched
-/// OSM platform node so boarding happens at the platform.
-///
-/// **Reachability logic**: runs a bounded foot Dijkstra from `orig_street_node`
-/// over the real foot graph (street + platform-way + B1 connector edges, raw metres).
-/// - If ≥1 platform node is reachable within budget: relocates the stop to the
-///   LOWEST-COST reachable node. The real mapped path (stairs/elevator/ground)
-///   is the only access; NO synthetic straight fallback connector is added.
-/// - If NO platform node is reachable (truly islanded): relocates to the
-///   nearest-by-distance node (previous behaviour) and adds the re-priced
-///   straight fallback connector to `orig_street_node` so the stop is never
-///   marooned.
-///
-/// Returns `true` when relocated (caller SKIPS the default free street snap),
-/// `false` for an unmatched stop or one whose matched platform carries no graph
-/// geometry (caller keeps today's snap byte-for-byte). On the `false` path this
-/// performs NO mutation. B1's real stair/elevator edges are left untouched.
+/// Returns `true` when relocated (caller SKIPS the default free street snap);
+/// `false` (no mutation) for an unmatched stop or one whose platform has no graph geometry.
 pub fn relocate_matched_stop(
     g: &mut Graph,
     stop: NodeID,
@@ -822,8 +767,6 @@ pub fn relocate_matched_stop(
         }
     };
 
-    // Collect platform node IDs + the nearest-by-distance node (immutable borrow ends
-    // before any mutation so the Dijkstra can safely borrow `&g` next).
     let (node_ids, nearest_by_dist, plat_level) = {
         let idx = g.platform_index();
         let Some(p) = idx.platform(platform) else {
@@ -847,7 +790,6 @@ pub fn relocate_matched_stop(
         return false;
     };
 
-    // Bounded foot Dijkstra from orig_street_node → lowest-cost reachable platform node.
     let target_set: HashSet<NodeID> = node_ids.iter().copied().collect();
     let reachable = g.foot_reach_to_targets(orig_street_node, &target_set, B2A_FOOT_BUDGET_M);
 
@@ -858,20 +800,16 @@ pub fn relocate_matched_stop(
         (fallback_plat_node, fallback_plat_loc, true)
     };
 
-    // Relocate the stop anchor onto the chosen platform node and pin its storey.
     g.relocate_transit_stop(stop, plat_loc);
     if let Some(lvl) = plat_level {
         g.set_node_level(stop, lvl);
     }
 
-    // Boarding edges: stop ↔ platform node (colocated ⇒ free).
     g.add_edge(stop, foot_connector_edge(stop, plat_node, 0));
     g.add_edge(plat_node, foot_connector_edge(plat_node, stop, 0));
 
-    // Straight fallback connector only when no real mapped path was found.
-    // When a real path exists the Dijkstra already guarantees reachability via
-    // the mapped edges — adding a second (cheaper straight) connector here would
-    // let the teleport compete with and beat the real stairs.
+    // Fallback connector only when no real mapped path exists (else a straight edge
+    // would undercut the real stairs and let the teleport beat them).
     if add_fallback && plat_node != orig_street_node {
         let orig_loc = g
             .get_node(orig_street_node)
@@ -892,18 +830,12 @@ pub fn relocate_matched_stop(
     true
 }
 
-/// A platform-stop candidate captured during stop ingestion (only stops with a
-/// `parent_station`). Used by [`report_platform_match`] after the mutating stop
-/// loop completes so the (immutable) platform index can be queried.
 struct PlatQuery {
     platform_code: Option<String>,
     level_id: Option<String>,
     loc: LatLng,
 }
 
-/// Stage A measure-only deliverable: match every GTFS platform stop to its OSM
-/// platform and log a grep-able (`platform-match:`) coverage + offset summary.
-/// Changes no routing state.
 fn report_platform_match(g: &Graph, queries: &[PlatQuery], feed: &str) {
     let idx = g.platform_index();
     let child_stops = queries.len();
@@ -922,8 +854,6 @@ fn report_platform_match(g: &Graph, queries: &[PlatQuery], feed: &str) {
     let mut unmatched = 0usize;
     let mut offsets: Vec<f64> = Vec::new();
     let mut geo_offsets: Vec<f64> = Vec::new();
-    // Platform indices matched to ≥1 GTFS platform stop (unique), for the B1
-    // connector-coverage measurement.
     let mut matched_platforms: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for q in queries {
@@ -978,16 +908,8 @@ fn report_platform_match(g: &Graph, queries: &[PlatQuery], feed: &str) {
     report_connector_coverage(g, &matched_platforms, feed);
 }
 
-/// Connector budget (m) for the B1 coverage BFS: how far a pedestrian path from a
-/// platform may walk to reach a ground street node. Generous — concourse↔platform
-/// access at a large station is rarely more than a couple hundred metres.
 const CONNECTOR_BUDGET_M: usize = 500;
 
-/// Stage B1 deliverable + B2 go/no-go: for each matched platform, decide whether
-/// it is reachable from the ground street graph via a level-continuous pedestrian
-/// path crossing ≥1 vertical connector (stairs/elevator/ramp), and report the
-/// extra walk distance/time that path adds. Also logs the reachability
-/// non-regression check (transit stops reachable before vs after B1).
 fn report_connector_coverage(g: &Graph, matched: &std::collections::HashSet<usize>, feed: &str) {
     let idx = g.platform_index();
     let platform_nodes = g.all_platform_nodes();
@@ -1012,8 +934,6 @@ fn report_connector_coverage(g: &Graph, matched: &std::collections::HashSet<usiz
             if let (Some(path), Some(straight)) = (reach.path_dist_m, reach.straight_m) {
                 let extra = (path - straight).max(0.0);
                 added_dist.push(extra);
-                // Time the whole connector path at walking speed as a floor, then add
-                // the realistic stairs penalty for the run (documented in ConnectorCost).
                 let walk_s = path / g.walking_speed_mps();
                 let stairs_extra = cost.seconds(crate::structures::Connector::Steps, extra)
                     - extra / g.walking_speed_mps();
@@ -1024,10 +944,8 @@ fn report_connector_coverage(g: &Graph, matched: &std::collections::HashSet<usiz
         }
     }
 
-    // Coverage counts only platforms reached via a path crossing ≥1 connector edge,
-    // so a level-0 surface platform flush with the street (reachable on the flat, no
-    // stairs needed) lands in `no_vertical_path`. The reported % is therefore a
-    // CONSERVATIVE LOWER BOUND on real pedestrian accessibility, not the full figure.
+    // Counts only platforms reached via a path crossing ≥1 connector edge (flat surface
+    // platforms land in no_vertical_path), so coverage is a lower bound, not the full figure.
     let matched_n = reachable + no_vertical_path + no_geometry;
     let coverage = if matched_n > 0 {
         reachable as f64 / matched_n as f64 * 100.0
@@ -1062,7 +980,6 @@ fn report_connector_coverage(g: &Graph, matched: &std::collections::HashSet<usiz
     );
 }
 
-/// (trips with an explicit bikes_allowed value, total trips).
 fn bikes_allowed_coverage(trips: &[TripInfo]) -> (usize, usize) {
     let set = trips.iter().filter(|t| t.bikes_allowed.is_some()).count();
     (set, trips.len())
@@ -1101,7 +1018,6 @@ fn compute_pattern_shape(
         stop_dists.iter().any(|d| d.is_some()) && sorted.iter().all(|s| s.dist_traveled.is_some());
 
     let stop_shape_indices: Vec<usize> = if has_dist {
-        // Case A: use shape_dist_traveled
         stop_dists
             .iter()
             .map(|d| {
@@ -1111,7 +1027,6 @@ fn compute_pattern_shape(
             })
             .collect()
     } else {
-        // Case B: nearest-neighbor with monotonic forward scan
         let mut cursor = 0usize;
         stop_coords
             .iter()
@@ -1166,18 +1081,6 @@ pub fn date_to_days(date: chrono::NaiveDate) -> u32 {
     (date - epoch).num_days().max(0) as u32
 }
 
-// ── TEC fare model (operator-specific fare interpretation) ─────────────────────
-//
-// TEC arrives through the generic GTFS path (matched by agency name), so its
-// fare specifics — the classic/express tier split and the route-name express
-// classification rule — are co-located here with the generic/TEC ingestor,
-// composing the operator-agnostic `TimeWindowFlatTiered` primitive in
-// `structures::cost::fares`.
-
-/// The compiled TEC operator: the CLASSIC-tier `OperatorModel` template, the
-/// uppercased express-route classification tokens/prefixes, and the EXPRESS-tier
-/// price triple (single, 6-journey, 6-journey reduced) in cents. A route classified
-/// express at lookup build swaps the express prices into the template.
 pub struct TecOperator {
     pub model: crate::structures::cost::OperatorModel,
     pub express_route_names: Vec<String>,
@@ -1187,11 +1090,6 @@ pub struct TecOperator {
     pub express_card6_reduced_cents: u32,
 }
 
-/// Build a `time_window_flat_tiered` `OperatorModel` (TEC) from its config block.
-/// The compiled template carries the CLASSIC tier and `is_express = false`; the
-/// per-route tier is resolved later at operator-lookup build via
-/// [`tec_route_is_express`], which swaps the express prices in when a route matches.
-/// `cents` converts an optional euro amount to integer cents.
 pub fn build_tec_operator(
     op: &crate::structures::FareOperatorConfig,
     cents: impl Fn(Option<f64>) -> u32,
@@ -1224,15 +1122,11 @@ pub fn build_tec_operator(
     }
 }
 
-/// TEC express-route classification: `true` when a route's `route_short_name` or
-/// `route_long_name` contains any configured express token (uppercased substring
-/// match) OR its `route_short_name` starts with any configured express prefix
-/// (e.g. "E" ⇒ E12, E45). The prefix match is intentionally short-name-only:
-/// many classic routes carry an E-initial destination in `route_long_name`
-/// (Eupen, Eghezée, Esneux) and must not be misclassified as express.
-/// Config-driven (project policy) — both lists empty ⇒ never express (all
-/// classic). Resolves a `TimeWindowFlatTiered` template's per-route `is_express`
-/// at lookup build.
+/// TEC express classification. Express if an express token matches short/long name
+/// (substring), OR the SHORT name starts with an express prefix IMMEDIATELY FOLLOWED
+/// BY A DIGIT (E12 yes, bare "E" = Arlon urban line no). Prefix is short-name-only:
+/// classic routes with E-initial destinations in the long name (Eupen, Esneux) must
+/// not misclassify. Empty lists ⇒ never express.
 pub fn tec_route_is_express(
     route: &super::RouteInfo,
     express_names: &[String],
@@ -1246,17 +1140,19 @@ pub fn tec_route_is_express(
     express_names
         .iter()
         .any(|n| short.contains(n.as_str()) || long.contains(n.as_str()))
-        || express_prefixes
-            .iter()
-            .any(|p| short.starts_with(p.as_str()))
+        || express_prefixes.iter().any(|p| {
+            !p.is_empty()
+                && short
+                    .strip_prefix(p.as_str())
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|c| c.is_ascii_digit())
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-
-    // ── bikes_allowed_coverage ────────────────────────────────────────────────
 
     fn trip_with_bikes(bikes_allowed: Option<bool>) -> TripInfo {
         TripInfo {
@@ -1489,8 +1385,6 @@ mod tests {
         assert_eq!(bikes_allowed_coverage(&unset), (0, 2));
     }
 
-    // ── compute_pattern_shape ─────────────────────────────────────────────────
-
     fn shape_pt(seq: usize, lat: f64, lon: f64, dist: Option<f32>) -> gtfs_structures::Shape {
         gtfs_structures::Shape {
             id: "s1".into(),
@@ -1510,8 +1404,6 @@ mod tests {
 
     #[test]
     fn test_compute_shape_with_dist_traveled() {
-        // 3 stops, shape has 7 points at dists 0..=6
-        // stop 0 → dist 0.0, stop 1 → dist 3.0, stop 2 → dist 6.0
         let shape_pts: Vec<gtfs_structures::Shape> = (0usize..7)
             .map(|i| shape_pt(i, i as f64, 0.0, Some(i as f32)))
             .collect();
@@ -1535,8 +1427,6 @@ mod tests {
 
     #[test]
     fn test_compute_shape_without_dist_traveled_proximity() {
-        // 2 stops, 5 shape points, no dist_traveled
-        // stop 0 is near shape_pt[0], stop 1 is near shape_pt[4]
         let shape_pts: Vec<gtfs_structures::Shape> = (0usize..5)
             .map(|i| shape_pt(i, i as f64 * 0.01, 0.0, None))
             .collect();
@@ -1544,8 +1434,8 @@ mod tests {
         gtfs_shapes.insert("s1".to_string(), shape_pts);
 
         let stop_coords = vec![
-            dummy_coord(0.0, 0.0),  // near shape_pt[0] at (0.0, 0.0)
-            dummy_coord(0.04, 0.0), // near shape_pt[4] at (0.04, 0.0)
+            dummy_coord(0.0, 0.0),
+            dummy_coord(0.04, 0.0),
         ];
         let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> =
             vec![Some(("s1".to_string(), vec![None, None]))];
@@ -1580,7 +1470,6 @@ mod tests {
 
     #[test]
     fn test_compute_shape_monotonicity_guard() {
-        // stop 0 maps to shape index 5, stop 1 maps to index 1 → to_idx < from_idx
         let shape_pts: Vec<gtfs_structures::Shape> = (0usize..6)
             .map(|i| shape_pt(i, 0.0, 0.0, Some(i as f32)))
             .collect();
@@ -1588,7 +1477,6 @@ mod tests {
         gtfs_shapes.insert("s1".to_string(), shape_pts);
 
         let stop_coords = vec![dummy_coord(0.0, 0.0), dummy_coord(0.0, 0.0)];
-        // stop 0 has dist 5.0 → index 5; stop 1 has dist 1.0 → index 1
         let pattern_shape_data: Vec<Option<(String, Vec<Option<f32>>)>> =
             vec![Some(("s1".to_string(), vec![Some(5.0), Some(1.0)]))];
 
@@ -1597,17 +1485,14 @@ mod tests {
         assert!(idx.is_empty());
     }
 
-    // Weekday bit encoding (matches ingestion code):
-    //   Mon=0x01, Tue=0x02, Wed=0x04, Thu=0x08, Fri=0x10, Sat=0x20, Sun=0x40
+    // Weekday bits must match the ingestion encoding (Mon=0x01 .. Sun=0x40).
     const MON: u8 = 0x01;
     const TUE: u8 = 0x02;
     const WED: u8 = 0x04;
     const FRI: u8 = 0x10;
     const SAT: u8 = 0x20;
     const SUN: u8 = 0x40;
-    const WEEKDAYS: u8 = MON | TUE | WED | 0x08 | FRI; // Mon–Fri = 0x1F
-
-    // ── date_to_days ──────────────────────────────────────────────────────────
+    const WEEKDAYS: u8 = MON | TUE | WED | 0x08 | FRI;
 
     #[test]
     fn date_to_days_epoch_is_zero() {
@@ -1623,7 +1508,6 @@ mod tests {
 
     #[test]
     fn date_to_days_leap_year_2000() {
-        // 2000 is a leap year (366 days); 2001-01-01 is day 366 from epoch
         let d = NaiveDate::from_ymd_opt(2001, 1, 1).unwrap();
         assert_eq!(date_to_days(d), 366);
     }
@@ -1636,14 +1520,10 @@ mod tests {
 
     #[test]
     fn date_to_days_known_value() {
-        // 2026-03-27 = 9582 days after 2000-01-01
         let d = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
         let days = date_to_days(d);
-        // Rough sanity check: 26 years × 365 ≈ 9490, accounting for leap years
         assert!(days > 9400 && days < 9700, "Unexpected value: {days}");
     }
-
-    // ── ServicePattern::is_active ─────────────────────────────────────────────
 
     fn weekday_service() -> ServicePattern {
         ServicePattern {
@@ -1691,15 +1571,15 @@ mod tests {
     #[test]
     fn service_overridden_by_added_date() {
         let sp = ServicePattern {
-            days_of_week: 0x00, // no regular service days
+            days_of_week: 0x00,
             start_date: 100,
             end_date: 200,
             added_dates: vec![50, 150],
             removed_dates: vec![],
         };
         assert!(sp.is_active(50, MON));
-        assert!(sp.is_active(150, SUN)); // weekday doesn't matter for added dates
-        assert!(!sp.is_active(100, MON)); // not in added_dates, weekday mask is 0
+        assert!(sp.is_active(150, SUN));
+        assert!(!sp.is_active(100, MON));
     }
 
     #[test]
@@ -1711,13 +1591,12 @@ mod tests {
             added_dates: vec![],
             removed_dates: vec![150],
         };
-        assert!(!sp.is_active(150, MON)); // explicitly removed
-        assert!(sp.is_active(151, MON)); // adjacent date still active
+        assert!(!sp.is_active(150, MON));
+        assert!(sp.is_active(151, MON));
     }
 
     #[test]
     fn service_removed_takes_priority_over_added() {
-        // A date in both added and removed: removed wins (checked first in is_active)
         let sp = ServicePattern {
             days_of_week: 0,
             start_date: 0,
@@ -1730,7 +1609,6 @@ mod tests {
 
     #[test]
     fn service_added_date_outside_regular_range() {
-        // Exceptional service on a date outside the normal window
         let sp = ServicePattern {
             days_of_week: WEEKDAYS,
             start_date: 100,
@@ -1738,11 +1616,9 @@ mod tests {
             added_dates: vec![300],
             removed_dates: vec![],
         };
-        assert!(sp.is_active(300, SUN)); // added beats out-of-range check
-        assert!(!sp.is_active(250, MON)); // in-range but between end_date and added date
+        assert!(sp.is_active(300, SUN));
+        assert!(!sp.is_active(250, MON));
     }
-
-    // --- TEC express classification by route-number prefix "E" ---
 
     fn route_named(short: &str) -> RouteInfo {
         route_named_long(short, "")
@@ -1762,7 +1638,6 @@ mod tests {
     #[test]
     fn tec_express_prefix_classifies_and_prices() {
         use crate::structures::cost::{FareContext, KnownEurosEpsilon, OperatorFareId, PriceValue};
-        // TEC config: classic 2.80 / express 5.50, express by prefix "E".
         let op = crate::structures::FareOperatorConfig {
             name: "LETEC".to_string(),
             model: "time_window_flat_tiered".to_string(),
@@ -1779,13 +1654,22 @@ mod tests {
         let cents = |e: Option<f64>| (e.unwrap_or(0.0) * 100.0).round() as u32;
         let tec = build_tec_operator(&op, cents);
 
-        // "E12" starts with the prefix -> express.
         assert!(tec_route_is_express(
             &route_named("E12"),
             &tec.express_route_names,
             &tec.express_route_prefixes
         ));
-        // "12" and "132" do not start with "E" and contain no express name -> classic.
+        // Bare "E" (Arlon urban line) = prefix with NO following digit -> classic.
+        assert!(!tec_route_is_express(
+            &route_named("E"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
+        assert!(tec_route_is_express(
+            &route_named("E5"),
+            &tec.express_route_names,
+            &tec.express_route_prefixes
+        ));
         assert!(!tec_route_is_express(
             &route_named("12"),
             &tec.express_route_names,
@@ -1796,8 +1680,7 @@ mod tests {
             &tec.express_route_names,
             &tec.express_route_prefixes
         ));
-        // Classic route whose long name starts with "E" (real letec.zip cases:
-        // Eupen, Eghezée, Esneux) must NOT match the prefix -> classic.
+        // Classic route with E-initial long name (Eupen/Esneux) must NOT match the prefix.
         assert!(!tec_route_is_express(
             &route_named_long("710", "Eupen - Kelmis"),
             &tec.express_route_names,
@@ -1809,9 +1692,6 @@ mod tests {
             &tec.express_route_prefixes
         ));
 
-        // Resolve each route's tier onto the template (mirroring the per-route
-        // lookup build in `RaptorIndex`: swap the express price set when express)
-        // and price a single boarding.
         let priced = |route: &RouteInfo| -> u32 {
             use crate::structures::cost::OperatorModel;
             let is_express = tec_route_is_express(
@@ -1857,6 +1737,7 @@ mod tests {
             p.known_cents
         };
         assert_eq!(priced(&route_named("E12")), 550, "E12 prices as express 5.50");
+        assert_eq!(priced(&route_named("E")), 280, "bare E prices as classic 2.80");
         assert_eq!(priced(&route_named("12")), 280, "12 prices as classic 2.80");
         assert_eq!(priced(&route_named("132")), 280, "132 prices as classic 2.80");
         assert_eq!(
@@ -1870,8 +1751,6 @@ mod tests {
             "short 42 / long Esneux prices as classic 2.80"
         );
 
-        // The express_names substring path must still match long names, so a
-        // genuine "Express" line keeps its express tier.
         let op_named = crate::structures::FareOperatorConfig {
             express_route_names: vec!["EXPRESS".to_string()],
             express_route_prefixes: vec![],
@@ -1882,6 +1761,45 @@ mod tests {
             &route_named_long("450", "Express Namur - Bruxelles"),
             &tec_named.express_route_names,
             &tec_named.express_route_prefixes
+        ));
+    }
+
+    #[test]
+    fn tec_express_by_name_marker_not_prefix() {
+        // Live rule (belgium.yaml): express by the "Express" name marker only, no prefix
+        // rule, so regional/urban E-numbered lines are NOT express.
+        let op = crate::structures::FareOperatorConfig {
+            name: "LETEC".to_string(),
+            model: "time_window_flat_tiered".to_string(),
+            classic_single_euros: Some(2.80),
+            express_single_euros: Some(5.50),
+            express_route_names: vec!["Express".to_string()],
+            express_route_prefixes: vec![],
+            ..Default::default()
+        };
+        let cents = |e: Option<f64>| (e.unwrap_or(0.0) * 100.0).round() as u32;
+        let tec = build_tec_operator(&op, cents);
+        let is_express = |r: &RouteInfo| {
+            tec_route_is_express(r, &tec.express_route_names, &tec.express_route_prefixes)
+        };
+
+        assert!(is_express(&route_named_long("E12", "Namur - Bruxelles (Express)")));
+        assert!(!is_express(&route_named_long("E20", "Liège - Marche - Marloie")));
+        assert!(!is_express(&route_named_long(
+            "E",
+            "Arlon - Clinique (ligne urbaine)"
+        )));
+
+        let broken = crate::structures::FareOperatorConfig {
+            express_route_names: vec![],
+            express_route_prefixes: vec![],
+            ..op.clone()
+        };
+        let broken = build_tec_operator(&broken, cents);
+        assert!(!tec_route_is_express(
+            &route_named_long("E12", "Namur - Bruxelles (Express)"),
+            &broken.express_route_names,
+            &broken.express_route_prefixes
         ));
     }
 }

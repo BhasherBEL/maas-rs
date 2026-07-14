@@ -1,22 +1,17 @@
-//! STIB realtime → schedule matching.
+//! STIB realtime → schedule matching. The feed has no trip id or delay; both are
+//! recovered by matching each predicted arrival to the GTFS static schedule:
 //!
-//! STIB's waiting-times feed gives `(pointid, lineid, expectedArrivalTime)` with
-//! no trip id or delay. We recover both by matching each predicted arrival to the
-//! GTFS static schedule (the maas-rt approach), using maas-rs's own index:
-//!
-//! * **line:** STIB `lineid` equals GTFS `route_short_name` (not `route_id`).
-//! * **stop:** STIB `pointid` equals a GTFS `stop_id`, or is a prefix of one or
-//!   more platform-suffixed stop ids (`0470` → `0470701`, `0470101`, …).
-//! * **delay:** `predicted − scheduled`, accepted within tolerance, picking the
-//!   scheduled arrival that minimises |delay|.
+//! * **line:** STIB `lineid` equals GTFS `route_short_name` (NOT `route_id`).
+//! * **stop:** STIB `pointid` equals a `stop_id`, or is a prefix of platform-
+//!   suffixed ids (`0470` → `0470701`, `0470101`, …).
+//! * **delay:** `predicted − scheduled`, within tolerance, minimising |delay|.
 
 use crate::ingestion::gtfs::TripId;
 
 use super::Graph;
 
-/// Tolerances for accepting a predicted↔scheduled match (seconds). Vehicles run
-/// late far more often than early, so the early bound is tight (prevents matching
-/// a late vehicle onto the *next* scheduled departure).
+/// Match tolerances (seconds). Early bound is tight so a late vehicle isn't matched
+/// onto the *next* scheduled departure.
 #[derive(Debug, Clone, Copy)]
 pub struct MatchParams {
     pub early_tolerance_secs: i64,
@@ -32,17 +27,15 @@ impl Default for MatchParams {
     }
 }
 
-/// A scheduled arrival candidate for matching: which trip, and its scheduled
-/// arrival (seconds since the service-day midnight; may exceed 86400).
+/// `scheduled_secs` is seconds since service-day midnight (may exceed 86400).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledArrival {
     pub trip: TripId,
     pub scheduled_secs: u32,
 }
 
-/// Pick the candidate whose scheduled arrival best matches `predicted_secs`,
-/// where `delay = predicted − scheduled` lies in `[-early_tolerance, max_late]`.
-/// Ties broken by smallest |delay|. Pure — unit-testable without a graph.
+/// Pick the candidate whose `delay = predicted − scheduled` lies in
+/// `[-early_tolerance, max_late]`, ties broken by smallest |delay|.
 pub fn best_match(
     candidates: &[ScheduledArrival],
     predicted_secs: i64,
@@ -63,8 +56,7 @@ pub fn best_match(
 }
 
 impl Graph {
-    /// Compact stop indices a STIB `pointid` resolves to: an exact `stop_id`
-    /// match, else every stop whose id is prefixed by `pointid` (platform
+    /// Exact `stop_id` match, else every stop id prefixed by `pointid` (platform
     /// suffixes). Empty if neither matches.
     pub fn stib_stop_indices(&self, pointid: &str) -> Vec<usize> {
         if let Some(idx) = self.raptor.stop_index_of(pointid) {
@@ -79,8 +71,6 @@ impl Graph {
             .collect()
     }
 
-    /// All scheduled arrivals at compact `stop` for the line whose
-    /// `route_short_name` equals `line`, among trips active on `(date, weekday)`.
     pub fn stib_scheduled_arrivals(
         &self,
         stop: usize,
@@ -134,9 +124,8 @@ mod tests {
             ScheduledArrival {
                 trip: TripId(2),
                 scheduled_secs: 30_300,
-            }, // +5 min
+            },
         ];
-        // Predicted 30_120: delay vs trip1 = +120 (late, ok); vs trip2 = -180 (too early).
         let (trip, delay) = best_match(&cands, 30_120, &params).unwrap();
         assert_eq!(trip, TripId(1));
         assert_eq!(delay, 120);
@@ -149,7 +138,6 @@ mod tests {
             trip: TripId(1),
             scheduled_secs: 30_000,
         }];
-        // Predicted 200s before schedule — beyond the 90s early tolerance.
         assert!(best_match(&cands, 29_800, &params).is_none());
     }
 
@@ -163,7 +151,7 @@ mod tests {
             trip: TripId(1),
             scheduled_secs: 30_000,
         }];
-        assert!(best_match(&cands, 31_000, &params).is_none()); // +1000s > 600s
+        assert!(best_match(&cands, 31_000, &params).is_none());
     }
 
     #[test]

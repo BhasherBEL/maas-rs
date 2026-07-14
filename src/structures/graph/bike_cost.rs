@@ -1,19 +1,9 @@
-//! Turns a `BikeProfile` + edge `BikeAttrs` into (a) a routing cost and (b) a
-//! kinematic travel time. Cost drives route choice; time drives ETA + budget.
-
 use crate::structures::{BikeAttrs, BikeProfile, HighwayClass, StreetEdgeData, Surface};
 
-const G: f64 = 9.81; // gravity (m/s^2)
-const RHO: f64 = 1.225; // air density (kg/m^3)
-const IMPASSABLE: f64 = 1.0e7; // cost sentinel ≥ this ⇒ edge unusable
+const G: f64 = 9.81;
+const RHO: f64 = 1.225;
+const IMPASSABLE: f64 = 1.0e7;
 
-/// Context of the edge arrived on, threaded so the per-vertex speed-change cost
-/// (corner slow-down / dismount stop) can be charged at the boundary into the
-/// current edge. `len`/`dir`/`cruise` describe the previous ride edge; `push`
-/// flags whether it was a dismount stretch; `speed` is the carried (exit) speed
-/// the bike actually leaves that edge at — the bend's safe speed when cornering,
-/// `0` mid-push, the edge's cruise on a straight — so a sustained curve charges
-/// one decel in and one accel out instead of a full slow-down per segment.
 #[derive(Debug, Clone, Copy)]
 pub struct PrevCtx {
     pub dir: (f64, f64),
@@ -36,25 +26,18 @@ impl BikeCost {
         self.profile
     }
 
-    /// A push (dismount) edge: foot-accessible but not bike-accessible. Such ways
-    /// are walked with the bike — pushed — so they are timed at the push speed.
     pub(crate) fn is_push(a: &BikeAttrs) -> bool {
         !a.bikeaccess && a.footaccess
     }
 
-    /// BRouter-style cost factor for an edge (before multiplying by length).
     fn cost_factor(&self, a: &BikeAttrs) -> f64 {
         let p = &self.profile;
-        // Hard exclusions.
         if matches!(
             a.highway,
             HighwayClass::Motorway | HighwayClass::MotorwayLink | HighwayClass::Other
         ) {
             return IMPASSABLE;
         }
-        // No legal bike access: you can neither ride (bikeaccess) nor walk it pushed
-        // (footaccess). Catches motorways/trunks and `bicycle=use_sidepath` carriageways
-        // (use the parallel cycleway) that the ingest `bike` flag marks naively rideable.
         if !a.bikeaccess && !a.footaccess {
             return IMPASSABLE;
         }
@@ -65,9 +48,8 @@ impl BikeCost {
                 IMPASSABLE
             };
         }
-        // Push (dismount) ways are impassable when the rider forbids dismounting.
         // Checked before the cycle-route shortcut so a push edge on a cycle route
-        // is still blocked.
+        // is still blocked when dismount is forbidden.
         if !p.allow_dismount && Self::is_push(a) {
             return IMPASSABLE;
         }
@@ -75,12 +57,8 @@ impl BikeCost {
             return IMPASSABLE;
         }
         let unpaved = matches!(a.surface, Surface::Unpaved);
-        // On a cycle route BRouter sets costfactor = 1 flat ("magnetic"),
-        // bypassing the baseline, highway value, unsafe surcharge and access
-        // penalty. The wrong-way one-way penalty is the exception: cycle-route
-        // membership does not license riding against a one-way, so it is still
-        // charged on top. (Genuine cyclist exemptions — oneway:bicycle=no,
-        // cycleway=opposite* — already clear `wrong_way` upstream at ingest.)
+        // Cycle route: flat cf=1, bypassing baseline/highway/unsafe/access; the
+        // wrong-way penalty is still charged on top.
         if !p.ignore_cycleroutes && a.cycleroute {
             let oneway = if a.wrong_way {
                 self.oneway_penalty(a.highway)
@@ -91,11 +69,9 @@ impl BikeCost {
         }
         let base = if p.stick_to_cycleroutes { 0.5 } else { 0.05 };
         let mut cf = base + self.highway_part(a, unpaved);
-        // Avoid-unsafe surcharge on hintless ways.
         if p.avoid_unsafe && !a.isbike && self.is_road_class(a.highway) {
             cf += p.unsafe_penalty;
         }
-        // Oneway + access penalties (max of the two, BRouter-style).
         let oneway = if a.wrong_way {
             self.oneway_penalty(a.highway)
         } else {
@@ -113,7 +89,6 @@ impl BikeCost {
         }
     }
 
-    /// Track-like ways graded by tracktype × surface quality (`probablyGood`).
     fn track_factor(&self, a: &BikeAttrs) -> f64 {
         let good = a.probably_good();
         match a.tracktype {
@@ -202,25 +177,17 @@ impl BikeCost {
         }
     }
 
-    /// Faithful port of BRouter's `StdPath` elevation cost. Two one-sided
-    /// hysteresis buffers carry along the path in meters: `ehbd` (descent) and
-    /// `ehbu` (ascent). Per section of length `dist` and signed elevation change
-    /// `delta`, each buffer fills net of a `cutoff·dist` allowance; the part above
-    /// `elevation_max_buffer` (or bled by `elevation_buffer_reduce`) is charged at
-    /// `downhillcost`/`uphillcost` **per meter** of elevation. Returns
-    /// `(added_cost, ehbd, ehbu)`. Climbs are free when `uphillcost == 0`.
+    /// Port of BRouter's `StdPath` elevation cost. `ehbd`/`ehbu` are path-carried
+    /// descent/ascent hysteresis buffers (meters).
     pub fn elevation_step(&self, ehbd: f64, ehbu: f64, delta: f64, dist: f64) -> (f64, f64, f64) {
         let p = &self.profile;
         if !p.consider_elevation || dist <= 0.0 {
             return (0.0, ehbd, ehbu);
         }
-        // cutoff is a percent grade; `dist * cutoff/100` is the per-section
-        // elevation allowance that never enters the buffer.
         let mut ehbd = ehbd + (-delta) - dist * p.downhillcutoff / 100.0;
         let mut ehbu = ehbu + delta - dist * p.uphillcutoff / 100.0;
         let mut cost = 0.0;
 
-        // Descent buffer.
         if ehbd > p.elevation_penalty_buffer {
             let excess = ehbd - p.elevation_penalty_buffer;
             let mut reduce = dist * p.elevation_buffer_reduce;
@@ -229,7 +196,7 @@ impl BikeCost {
             }
             let excess2 = ehbd - p.elevation_max_buffer;
             if reduce < excess2 {
-                reduce = excess2; // force-drain everything above the ceiling
+                reduce = excess2;
             }
             ehbd -= reduce;
             cost += reduce * p.downhillcost;
@@ -237,7 +204,6 @@ impl BikeCost {
             ehbd = 0.0;
         }
 
-        // Ascent buffer (symmetric).
         if ehbu > p.elevation_penalty_buffer {
             let excess = ehbu - p.elevation_penalty_buffer;
             let mut reduce = dist * p.elevation_buffer_reduce;
@@ -257,12 +223,8 @@ impl BikeCost {
         (cost, ehbd, ehbu)
     }
 
-    /// Denoised per-edge ascent (metres) for the walk D+ axis, using the bike's
-    /// `elevation_penalty_buffer` hysteresis: an ascent buffer `ehbu` absorbs
-    /// reversible DEM-noise bumps (a rise of `b` immediately undone charges nothing),
-    /// while sustained climb past the buffer is counted. No grade cutoff is applied —
-    /// for walking a cutoff would erase genuine gentle climbs. Returns
-    /// `(charged_ascent_m, new_ehbu)`. With buffer = 0 this is raw `max(0, delta)`.
+    /// Denoised per-edge ascent (metres) for the walk D+ axis, via the
+    /// `elevation_penalty_buffer` hysteresis. No grade cutoff (would erase gentle climbs).
     pub fn walk_ascent_step(&self, ehbu: f64, delta: f64, dist: f64) -> (f64, f64) {
         if dist <= 0.0 {
             return (0.0, ehbu);
@@ -278,8 +240,7 @@ impl BikeCost {
         (charged, ehbu)
     }
 
-    /// Routing cost of an edge given the incoming direction (unit vector) for
-    /// turn cost, or `None` for the first edge. Returns `None` if impassable.
+    /// Routing cost of an edge; `None` if impassable.
     pub fn edge_cost(
         &self,
         e: &StreetEdgeData,
@@ -291,27 +252,20 @@ impl BikeCost {
             return None;
         }
         let length = e.length as f64;
-        // Elevation is NOT charged here — it is path-dependent (see `elevation_step`,
-        // which the bike search threads through a hysteresis buffer). Charging it
-        // per-edge would over-count every dip on rolling terrain.
+        // Elevation is NOT charged here: it is path-dependent (`elevation_step` threads
+        // a hysteresis buffer); per-edge charging would over-count dips.
         let mut cost = length * cf;
-        // BRouter zeroes turncost on a cycle route ("magnetic" — no turn penalty
-        // for staying on the route). Mirror that.
         let on_cycleroute = !self.profile.ignore_cycleroutes && e.attrs.cycleroute;
         if let Some(inc) = incoming
             && !on_cycleroute
         {
             let dot = (inc.0 * this_dir.0 + inc.1 * this_dir.1).clamp(-1.0, 1.0);
-            // turncost × (1 - cos θ) / 2  →  0 straight, turncost for 90°+.
             cost += self.profile.turncost * (1.0 - dot) / 2.0;
         }
         Some(cost)
     }
 
-    /// Per-edge surface speed multiplier in `[0, 1]`, read from the baked
-    /// `surface_speed` byte. `0` means "unset" (old cache / non-bike edge) and
-    /// resolves to the unknown default (0.90), keeping the read side consistent
-    /// with the ingest default. A ridden gravel edge cruises at `factor·v`.
+    /// `0` means unset (old cache / non-bike edge) and resolves to the unknown default.
     fn surface_factor(e: &StreetEdgeData) -> f64 {
         if e.surface_speed == 0 {
             crate::structures::UNKNOWN_SURFACE_FACTOR
@@ -320,24 +274,13 @@ impl BikeCost {
         }
     }
 
-    /// Steady-state cruise speed (m/s) on a ride edge: the forward speed solving the
-    /// cyclist power equation for this edge's grade, capped at `max_speed`, then
-    /// scaled by the edge's baked `surface_speed` factor (asphalt 1.0 ≫ gravel
-    /// ≫ mud). Shared by `edge_time` and the speed-change (corner/stop) model so
-    /// both see one speed.
+    /// Cruise speed (m/s): grade power-solve, then surface factor (AFTER the solve).
     pub fn cruise_speed(&self, e: &StreetEdgeData) -> f64 {
-        // Surface multiplies the solved cruise AFTER the gradient power-solve, so a
-        // gravel uphill is `gravel_factor × uphill_speed`. Pushes never reach here:
-        // `edge_time` returns at push speed before calling `cruise_speed`, and the
-        // distribution/multiobj callers pass `cruise: 0.0` for push edges.
         (self.cruise_speed_geom(e) * Self::surface_factor(e)).max(0.5)
     }
 
-    /// Cruise speed from the grade power-solve ONLY, before the surface factor. This is
-    /// the reference for the corner/stop speed-change model: braking is driven by
-    /// geometry (a bend) and stops (a dismount), NOT by pavement texture. Surface
-    /// belongs in `edge_time` (rough pavement just takes longer); letting it cap the
-    /// corner speed would charge a phantom brake/accelerate at every surface change.
+    /// Cruise speed from the grade power-solve ONLY (before surface factor): the
+    /// reference for the corner/stop model, so surface changes don't fake a brake/accel.
     pub fn cruise_speed_geom(&self, e: &StreetEdgeData) -> f64 {
         let p = &self.profile;
         let length = e.length as f64;
@@ -347,16 +290,13 @@ impl BikeCost {
             0.0
         };
         let m = p.total_mass;
-        let v_max = p.max_speed / 3.6; // km/h → m/s
-        // Solve P = (C_r*m*g*cosθ + m*g*sinθ)*v + 0.5*ρ*S_C_x*v^3 for v in (0, v_max].
+        let v_max = p.max_speed / 3.6;
         let f_lin = p.c_r * m * G * theta.cos() + m * G * theta.sin();
         let c_cube = 0.5 * RHO * p.s_c_x;
         let power = |v: f64| f_lin * v + c_cube * v * v * v;
         let v = if power(v_max) <= p.biker_power {
             v_max
         } else {
-            // Bisection on [eps, v_max]; power() is increasing for v>0 when f_lin>=0,
-            // and still crosses biker_power once on descents within this range.
             let (mut lo, mut hi) = (0.01_f64, v_max);
             for _ in 0..40 {
                 let mid = 0.5 * (lo + hi);
@@ -371,8 +311,6 @@ impl BikeCost {
         v.max(0.5)
     }
 
-    /// Speed at which a push (dismount) edge is timed: `steps_push_speed_mps` on
-    /// stairs (hauling a bike up steps is very slow), else `push_speed_mps`.
     fn push_speed(&self, a: &BikeAttrs) -> f64 {
         if matches!(a.highway, HighwayClass::Steps) {
             self.profile.steps_push_speed_mps
@@ -382,21 +320,13 @@ impl BikeCost {
         .max(0.1)
     }
 
-    /// Time (s) to re-accelerate from `v0` to `v1` (`v1 ≥ v0`), from the kinetic-
-    /// energy / available-power relation `t ≈ ½·m·(v1²−v0²)/P`. Zero when `v1 ≤ v0`.
     pub fn accel_secs(&self, v0: f64, v1: f64) -> f64 {
         if v1 <= v0 {
             return 0.0;
         }
-        // A cyclist surges (well above cruise power) to get going, so model the time
-        // to re-accelerate as a comfortable constant rate, symmetric with braking —
-        // NOT energy/cruise-power, which (at the easy ~70 W commuter power) absurdly
-        // bills ~16 s to reach cruise and over-charges every corner/restart.
         (v1 - v0) / self.profile.accel_rate.max(0.1)
     }
 
-    /// Time (s) to brake from `v0` down to `v1` (`v0 ≥ v1`) at `brake_decel`. Zero
-    /// when `v0 ≤ v1`.
     pub fn decel_secs(&self, v0: f64, v1: f64) -> f64 {
         if v0 <= v1 {
             return 0.0;
@@ -404,15 +334,9 @@ impl BikeCost {
         (v0 - v1) / self.profile.brake_decel.max(0.1)
     }
 
-    /// Speed (m/s) the bike must be travelling at to traverse `this` edge, given the
-    /// previous edge's context. This is the carried (exit) speed once on the edge — a
-    /// curve is held at its safe speed, not braked-and-resumed per segment:
-    /// - push edge ⇒ `0` (pushed on foot / stopped),
-    /// - remount after a push ⇒ this edge's cruise (you accelerate back up),
-    /// - a ride turn ⇒ `v_turn = sqrt(lateral_accel · r)` capped at cruise, where the
-    ///   radius `r = min(L_prev, L_this) / θ` comes from geometry (a sweep over long
-    ///   edges has huge r ⇒ cruise; a tight short corner has small r ⇒ slow),
-    /// - a straight ride (θ≈0) or the first edge ⇒ this edge's cruise.
+    /// Carried (exit) speed (m/s) for `this` edge: push ⇒ 0, a ride turn ⇒
+    /// `v_turn = sqrt(lateral_accel · r)` capped at cruise (`r = min(L_prev,L_this)/θ`),
+    /// else cruise. A curve is held at its safe speed, not braked per segment.
     pub fn required_speed(
         &self,
         prev: Option<PrevCtx>,
@@ -422,16 +346,10 @@ impl BikeCost {
         if Self::is_push(&this.attrs) {
             return 0.0;
         }
-        // Surface-independent cruise: corners/stops drive braking, not pavement texture
-        // (which lives in `edge_time`). Capping the corner speed at the surface-laden
-        // cruise would charge a phantom decel/accel at every surface change.
         let v_c = self.cruise_speed_geom(this);
         let Some(prev) = prev else {
             return v_c;
         };
-        // Coming off a push: remount, so the bend (if any) is irrelevant — the binding
-        // constraint is accelerating from rest back to cruise, charged below as the gap
-        // from carried speed (0) to v_c.
         if prev.push {
             return v_c;
         }
@@ -441,9 +359,6 @@ impl BikeCost {
         if theta <= 1e-6 || min_len <= 0.0 {
             return v_c;
         }
-        // Following bike infrastructure is efficient by design: take its curves and
-        // through-junctions near cruise (only a true hairpin slows), so use the higher
-        // infra lateral tolerance. Roads keep the conservative everyday-cornering value.
         let on_infra = this.attrs.cycleroute
             || this.attrs.isbike
             || matches!(this.attrs.highway, HighwayClass::Cycleway);
@@ -456,15 +371,9 @@ impl BikeCost {
         (lat.max(0.0) * r).sqrt().min(v_c)
     }
 
-    /// Lost time (s) at the vertex into `this` edge: the change between the carried
-    /// (exit) speed of the previous edge (`prev.speed`) and the speed THIS edge
-    /// requires (`required_speed`). Only the change is charged — a sustained curve or
-    /// roundabout holds a steady reduced speed, so consecutive same-radius segments
-    /// (carried ≈ required) cost ≈ 0; the bike brakes once entering and accelerates
-    /// once leaving. The dismount stop (required 0) and remount restart (required
-    /// cruise) are the same mechanism, not a separate branch. Every term is a decel or
-    /// accel time ≥ 0, keeping the A* Time heuristic admissible. Returns 0 with no
-    /// previous edge, so the backward heuristic underestimates.
+    /// Lost time (s) into `this` edge: the accel/decel between the carried speed and
+    /// `required_speed`. Every term is >= 0 and it is 0 with no previous edge, so the
+    /// A* Time heuristic stays admissible.
     pub fn speed_change_secs(
         &self,
         prev: Option<PrevCtx>,
@@ -483,16 +392,13 @@ impl BikeCost {
         }
     }
 
-    /// Kinematic travel time (seconds) for an edge, at steady-state cruise speed
-    /// (`cruise_speed`) for a ride edge or the push speed for a dismount stretch.
-    /// The per-vertex speed-change cost (corners, stops) is added separately by the
-    /// caller via `speed_change_secs`, since it needs the previous edge's context.
+    /// Kinematic travel time (seconds) at cruise (ride) or push speed. The per-vertex
+    /// speed-change cost is added separately via `speed_change_secs`.
     pub fn edge_time(&self, e: &StreetEdgeData) -> u32 {
         let length = e.length as f64;
         if length <= 0.0 {
             return 0;
         }
-        // Push (dismount) stretches are pushed on foot, not ridden.
         if Self::is_push(&e.attrs) {
             return (length / self.push_speed(&e.attrs)).round() as u32;
         }
@@ -531,7 +437,6 @@ mod tests {
 
     #[test]
     fn walk_ascent_step_absorbs_noise_bumps() {
-        // A +2 m / −2 m wiggle over short edges (DEM noise) must net ~0 ascent, not 2.
         let bc = BikeCost::new(BikeProfile::default());
         let (a1, b1) = bc.walk_ascent_step(0.0, 2.0, 50.0);
         let (a2, _b2) = bc.walk_ascent_step(b1, -2.0, 50.0);
@@ -541,7 +446,6 @@ mod tests {
 
     #[test]
     fn walk_ascent_step_counts_sustained_climb() {
-        // A real 30 m climb over 600 m (5% grade) must register most of its ascent.
         let bc = BikeCost::new(BikeProfile::default());
         let mut ehbu = 0.0;
         let mut total = 0.0;
@@ -558,7 +462,6 @@ mod tests {
 
     #[test]
     fn walk_ascent_step_zero_params_is_raw_max0() {
-        // With cutoff and buffer disabled, denoising is exactly raw max(0, Δ).
         let mut prof = BikeProfile::default();
         prof.uphillcutoff = 0.0;
         prof.elevation_penalty_buffer = 0.0;
@@ -589,9 +492,6 @@ mod tests {
 
     #[test]
     fn wrong_way_impassable_by_default() {
-        // Riding against a one-way (where cyclists are not exempt — exemptions clear
-        // `wrong_way` at ingest) must be forbidden by default, not merely penalised,
-        // so neither the scalar nor the multi-objective search routes contraflow.
         let bc = BikeCost::new(BikeProfile::default());
         let mut a = attrs(HighwayClass::Tertiary, true, Surface::Paved);
         a.cycleroute = true;
@@ -604,8 +504,6 @@ mod tests {
 
     #[test]
     fn wrong_way_penalized_even_on_cycleroute() {
-        // With respect_oneway disabled, a cycle-route edge gets the "magnetic" base,
-        // but riding it against a one-way must still cost more than the legal direction.
         let mut prof = BikeProfile::default();
         prof.respect_oneway = false;
         let bc = BikeCost::new(prof);
@@ -634,8 +532,6 @@ mod tests {
 
     #[test]
     fn dismount_blocked_when_disallowed() {
-        // A push edge is usable (at a penalty) by default, but impassable when the
-        // rider forbids dismounting.
         let allow = BikeCost::new(BikeProfile::default());
         assert!(
             allow
@@ -655,8 +551,6 @@ mod tests {
 
     #[test]
     fn dismount_disallowed_blocks_cycleroute_push() {
-        // The block must apply even to a push edge that is also a cycle route
-        // (i.e. before the magnetic cycle-route shortcut).
         let mut a = push_attrs();
         a.cycleroute = true;
         let mut prof = BikeProfile::default();
@@ -670,8 +564,6 @@ mod tests {
 
     #[test]
     fn push_edge_timed_at_push_speed() {
-        // A push edge (foot-accessible, not bike-accessible) is timed at the bike's
-        // push speed (slower than free walking), not the kinematic cycling model.
         let bc = BikeCost::new(BikeProfile::default());
         let mut push = attrs(HighwayClass::Footway, false, Surface::Paved);
         push.bikeaccess = false;
@@ -689,7 +581,6 @@ mod tests {
 
     #[test]
     fn steps_push_is_slower_than_flat_push() {
-        // Hauling a bike up steps is timed at the (slower) steps push speed.
         let bc = BikeCost::new(BikeProfile::default());
         let mut flat = attrs(HighwayClass::Footway, false, Surface::Paved);
         flat.bikeaccess = false;
@@ -706,24 +597,18 @@ mod tests {
     #[test]
     fn accel_decel_helpers_monotone_and_closed_form() {
         let bc = BikeCost::new(BikeProfile::default());
-        // Zero when v0 == v1, and zero in the wrong direction.
         assert_eq!(bc.accel_secs(5.0, 5.0), 0.0);
         assert_eq!(bc.accel_secs(8.0, 5.0), 0.0);
         assert_eq!(bc.decel_secs(5.0, 5.0), 0.0);
         assert_eq!(bc.decel_secs(3.0, 5.0), 0.0);
-        // Monotone in the speed gap.
         assert!(bc.accel_secs(0.0, 6.0) > bc.accel_secs(0.0, 4.0));
         assert!(bc.decel_secs(6.0, 0.0) > bc.decel_secs(4.0, 0.0));
-        // Closed forms: accel = (v1−v0)/accel_rate, decel = (v0−v1)/brake_decel.
         let p = BikeProfile::default();
         let a = 6.0 / p.accel_rate;
         assert!((bc.accel_secs(0.0, 6.0) - a).abs() < 1e-9);
         assert!((bc.decel_secs(6.0, 0.0) - 6.0 / p.brake_decel).abs() < 1e-9);
     }
 
-    // A plain rideable ROAD edge (not bike infra), so the geometric corner model
-    // (radius from segment length) governs its turns — bike infra takes corners near
-    // cruise via `lateral_accel_infra` and is covered separately.
     fn ride_edge(len: usize) -> StreetEdgeData {
         edge(attrs(HighwayClass::Tertiary, false, Surface::Paved), len, 0)
     }
@@ -733,8 +618,6 @@ mod tests {
         let bc = BikeCost::new(BikeProfile::default());
         let this = ride_edge(8);
         let v_c = bc.cruise_speed(&this);
-        // A 90° turn over SHORT edges (8 m) ⇒ small radius ⇒ slow-down cost. (At the
-        // commuter cruise ~5 m/s a 20 m-edge 90° is gentle enough to take at speed.)
         let short_prev = PrevCtx {
             dir: (1.0, 0.0),
             len: 8.0,
@@ -745,7 +628,6 @@ mod tests {
         let right = (0.0, 1.0);
         let c_short = bc.speed_change_secs(Some(short_prev), &this, right);
         assert!(c_short > 0.0, "a tight 90° corner over short edges costs time");
-        // The SAME 90° over LONG edges (a 400 m sweep) ⇒ large radius ⇒ ≈ free.
         let long_this = ride_edge(400);
         let long_prev = PrevCtx {
             dir: (1.0, 0.0),
@@ -760,11 +642,8 @@ mod tests {
 
     #[test]
     fn infra_corner_is_near_free_unlike_road() {
-        // Following bike infrastructure is efficient by design: the same tight 90° turn
-        // over short edges that costs time on a road is taken near cruise on a cycleway
-        // (higher `lateral_accel_infra`), so it costs ~0.
         let bc = BikeCost::new(BikeProfile::default());
-        let road = ride_edge(8); // isbike = false
+        let road = ride_edge(8);
         let infra = edge(attrs(HighwayClass::Cycleway, true, Surface::Paved), 8, 0);
         let right = (0.0, 1.0);
         let prev = |e: &StreetEdgeData| PrevCtx {
@@ -792,10 +671,8 @@ mod tests {
             push: false,
             speed: v_c,
         };
-        // A gentle 10° bend over 20 m edges is below the cornering-speed cap ⇒ free.
         let gentle = (10f64.to_radians().cos(), 10f64.to_radians().sin());
         assert_eq!(bc.speed_change_secs(Some(prev(20.0)), &this, gentle), 0.0);
-        // For a fixed 90° angle, the cost grows as the edges (hence radius) shrink.
         let right = (0.0, 1.0);
         let c40 = {
             let e = ride_edge(40);
@@ -828,10 +705,6 @@ mod tests {
         assert!(c10 > c40, "tighter radius (shorter edges) costs more: {c10} > {c40}");
     }
 
-    /// Fold a chain of ride edges through the carried-speed model exactly as the search
-    /// does: each step charges `speed_change_secs(prev, edge, dir)` then carries the
-    /// edge's `required_speed` as the next `prev.speed`. Returns the summed speed-change
-    /// time over the whole chain.
     fn chain_speed_change(
         bc: &BikeCost,
         seg_len: usize,
@@ -840,7 +713,6 @@ mod tests {
     ) -> f64 {
         let e = ride_edge(seg_len);
         let v_c = bc.cruise_speed(&e);
-        // Start cruising straight, then take `n` identical turns over identical edges.
         let mut prev = Some(PrevCtx {
             dir: (1.0, 0.0),
             len: seg_len as f64,
@@ -851,7 +723,6 @@ mod tests {
         let mut dir = (1.0, 0.0);
         let mut total = 0.0;
         for _ in 0..n {
-            // Rotate the heading by the per-vertex turn (compose the rotation).
             let (c, s) = turn_each;
             let ndir = (dir.0 * c - dir.1 * s, dir.0 * s + dir.1 * c);
             total += bc.speed_change_secs(prev, &e, ndir);
@@ -870,20 +741,12 @@ mod tests {
 
     #[test]
     fn sustained_curve_charges_one_decel_not_per_segment() {
-        // A roundabout / curvy road = many short same-radius tight turns. The carried-
-        // speed model brakes ONCE on entry and holds the bend speed; consecutive same-
-        // radius segments require ≈ the carried speed ⇒ ≈ 0 each. So a 6-segment curve
-        // costs ≈ a single decel-into-the-bend, NOT 6×.
         let bc = BikeCost::new(BikeProfile::default());
         let seg = 8;
-        // 90° per vertex over short 8 m edges: a tight, sustained same-radius curve
-        // (the same geometry the single-corner fixture proves requires slowing).
         let deg = 90f64;
         let turn = (deg.to_radians().cos(), deg.to_radians().sin());
         let e = ride_edge(seg);
         let v_c = bc.cruise_speed(&e);
-        // The corner radius floors the segment length (a short connector can't pivot
-        // tighter than ~a bike length), matching the model's `corner_min_len_m`.
         let p = BikeProfile::default();
         let r = (seg as f64).max(p.corner_min_len_m) / deg.to_radians();
         let v_turn = (p.lateral_accel * r).sqrt().min(v_c);
@@ -891,12 +754,10 @@ mod tests {
         assert!(one_decel > 0.0, "the bend is tight enough to require slowing");
 
         let total = chain_speed_change(&bc, seg, turn, 6);
-        // Entry decel only (interior segments are free); a hair of float slack.
         assert!(
             (total - one_decel).abs() < 1e-6,
             "6-segment same-radius curve costs one decel-in ({one_decel}), got {total}"
         );
-        // Emphatically not 6× a full slow-down-and-speed-up corner.
         let six_full = 6.0 * (bc.decel_secs(v_c, v_turn) + bc.accel_secs(v_turn, v_c));
         assert!(
             total < six_full / 3.0,
@@ -906,9 +767,6 @@ mod tests {
 
     #[test]
     fn isolated_corner_brakes_in_then_accelerates_out_once() {
-        // A single tight corner embedded in a straight: brake into the bend on the turn
-        // vertex, then re-accelerate to cruise on the next (straight) vertex. The two
-        // halves sum to the classic decel(v_c→v_turn)+accel(v_turn→v_c) of one corner.
         let bc = BikeCost::new(BikeProfile::default());
         let e = ride_edge(8);
         let v_c = bc.cruise_speed(&e);
@@ -920,10 +778,8 @@ mod tests {
             push: false,
             speed: v_c,
         };
-        // Vertex 1: enter the bend (heading turns 90°) → decel to v_turn.
         let into = bc.speed_change_secs(Some(straight_prev), &e, right);
         let v_turn = bc.required_speed(Some(straight_prev), &e, right);
-        // Vertex 2: leave onto a straight (heading stays `right`) → accel back to cruise.
         let bend_prev = PrevCtx {
             dir: right,
             len: 8.0,
@@ -962,13 +818,10 @@ mod tests {
             push: true,
             speed: 0.0,
         };
-        // ride → push: decelerate to a standstill (the dismount stop).
         let stop = bc.speed_change_secs(Some(ride_prev), &push_edge, (1.0, 0.0));
         assert!((stop - bc.decel_secs(v_c, 0.0)).abs() < 1e-9, "stop = decel to 0");
-        // push → push (interior of a run): no second stop.
         let interior = bc.speed_change_secs(Some(push_prev), &push_edge, (1.0, 0.0));
         assert_eq!(interior, 0.0, "no extra stop between two consecutive pushes");
-        // push → ride: re-accelerate from rest (the remount restart).
         let restart = bc.speed_change_secs(Some(push_prev), &ride, (1.0, 0.0));
         assert!(
             (restart - bc.accel_secs(0.0, v_c)).abs() < 1e-9,
@@ -978,8 +831,6 @@ mod tests {
 
     #[test]
     fn micro_dismount_costs_more_than_it_saves() {
-        // A 3 m push shortcut that nominally saves a few seconds also pays the
-        // stop+restart, so the speed-change time dwarfs the saving ⇒ not worth it.
         let bc = BikeCost::new(BikeProfile::default());
         let ride = ride_edge(30);
         let v_c = bc.cruise_speed(&ride);
@@ -1006,7 +857,6 @@ mod tests {
 
     #[test]
     fn speed_change_zero_without_incoming() {
-        // No previous edge ⇒ no speed-change cost (keeps the heuristic admissible).
         let bc = BikeCost::new(BikeProfile::default());
         assert_eq!(bc.speed_change_secs(None, &ride_edge(50), (0.0, 1.0)), 0.0);
     }
@@ -1026,14 +876,11 @@ mod tests {
 
     #[test]
     fn no_bike_and_no_foot_access_is_impassable() {
-        // A carriageway you can neither ride (e.g. bicycle=use_sidepath ⇒ !bikeaccess)
-        // nor walk pushed (foot=no ⇒ !footaccess) must be impassable, not ridden.
         let bc = BikeCost::new(BikeProfile::default());
         let mut a = attrs(HighwayClass::Primary, false, Surface::Paved);
         a.bikeaccess = false;
         a.footaccess = false;
         assert!(bc.edge_cost(&edge(a, 100, 0), None, (1.0, 0.0)).is_none());
-        // With foot access it becomes a (legal) push, not impassable.
         a.footaccess = true;
         assert!(bc.edge_cost(&edge(a, 100, 0), None, (1.0, 0.0)).is_some());
     }
@@ -1055,8 +902,6 @@ mod tests {
 
     #[test]
     fn edge_cost_excludes_elevation() {
-        // Elevation is no longer charged per-edge; flat and steep edges of the
-        // same class/length now cost the same from `edge_cost` alone.
         let bc = BikeCost::new(BikeProfile::default());
         let flat = bc
             .edge_cost(
@@ -1077,11 +922,8 @@ mod tests {
 
     #[test]
     fn elevation_two_buffer_model() {
-        // defaults: downhillcost 100, downhillcutoff 0.5, uphillcost 0,
-        // uphillcutoff 1.5, penalty_buffer 5, max_buffer 10, buffer_reduce 0.
         let bc = BikeCost::new(BikeProfile::default());
 
-        // consider_elevation off ⇒ identity (buffers untouched, no cost).
         let mut prof = BikeProfile::default();
         prof.consider_elevation = false;
         assert_eq!(
@@ -1089,8 +931,6 @@ mod tests {
             (0.0, 3.0, 3.0)
         );
 
-        // A 20 m descent over 100 m: ehbd = 20 − 100·0.5/100 = 19.5; charged part is
-        // (19.5 − max_buffer 10) = 9.5 m at downhillcost 100/m ⇒ 950 (NOT /100).
         let (c, ehbd, _) = bc.elevation_step(0.0, 0.0, -20.0, 100.0);
         assert!((c - 950.0).abs() < 1e-6, "descent cost {c}");
         assert!(
@@ -1098,12 +938,10 @@ mod tests {
             "descent buffer drained to ceiling"
         );
 
-        // A 20 m climb is free in cost (uphillcost = 0) though the ascent buffer fills.
         let (c2, _, ehbu) = bc.elevation_step(0.0, 0.0, 20.0, 100.0);
         assert_eq!(c2, 0.0, "climbs are free when uphillcost = 0");
         assert!(ehbu > 5.0);
 
-        // A gentle descent within the cutoff allowance is absorbed: no cost, buffer ~0.
         let (c3, ehbd3, _) = bc.elevation_step(0.0, 0.0, -0.4, 100.0);
         assert_eq!(c3, 0.0);
         assert_eq!(ehbd3, 0.0);
@@ -1112,7 +950,6 @@ mod tests {
     #[test]
     fn kinematic_time_flat_is_reasonable() {
         let bc = BikeCost::new(BikeProfile::default());
-        // 100 m flat: with 100 W and the default drag/rolling, ~5-6 m/s → ~17-20 s.
         let t = bc.edge_time(&edge(
             attrs(HighwayClass::Cycleway, true, Surface::Paved),
             100,
@@ -1140,7 +977,6 @@ mod tests {
     #[test]
     fn kinematic_time_capped_at_max_speed() {
         let bc = BikeCost::new(BikeProfile::default());
-        // Steep descent: speed capped at max_speed (45 km/h = 12.5 m/s) → 1000m ≥ 80s.
         let t = bc.edge_time(&edge(
             attrs(HighwayClass::Secondary, true, Surface::Paved),
             1000,
@@ -1157,9 +993,6 @@ mod tests {
 
     #[test]
     fn surface_factor_slows_ride_time_by_the_factor() {
-        // On a FLAT edge the cruise sits between the 0.5 m/s floor and the max-speed
-        // cap, so the surface factor flows linearly: gravel (60) takes ~1/0.6× the
-        // asphalt time, mud (20) ~1/0.2×, and the ride times order asphalt < gravel < mud.
         let bc = BikeCost::new(BikeProfile::default());
         let t_asphalt = bc.edge_time(&surf_edge(300, 100)) as f64;
         let t_gravel = bc.edge_time(&surf_edge(300, 60)) as f64;
@@ -1168,7 +1001,6 @@ mod tests {
             t_asphalt < t_gravel && t_gravel < t_mud,
             "asphalt {t_asphalt} < gravel {t_gravel} < mud {t_mud}"
         );
-        // Time is inversely proportional to the factor: t_gravel/t_asphalt ≈ 100/60.
         assert!(
             (t_gravel / t_asphalt - 100.0 / 60.0).abs() < 0.05,
             "gravel/asphalt ratio {} ≈ 1.667",
@@ -1194,11 +1026,6 @@ mod tests {
 
     #[test]
     fn surface_factor_feeds_corner_speed() {
-        // The corner model uses `cruise_speed`, so a tight corner is evaluated at the
-        // gravel cruise: a 90° bend over short edges that is free on the (faster?) —
-        // actually slower-cornering — asphalt must still register on gravel. We simply
-        // assert the corner cost on gravel uses the gravel cruise, i.e. differs from
-        // asphalt for the identical geometry.
         let bc = BikeCost::new(BikeProfile::default());
         let right = (0.0, 1.0);
         let mk_prev = |e: &StreetEdgeData| PrevCtx {
@@ -1212,8 +1039,6 @@ mod tests {
         let gravel = surf_edge(8, 60);
         let c_asphalt = bc.speed_change_secs(Some(mk_prev(&asphalt)), &asphalt, right);
         let c_gravel = bc.speed_change_secs(Some(mk_prev(&gravel)), &gravel, right);
-        // Slower gravel cruise means a smaller speed gap to bleed at the corner ⇒ the
-        // corner cost differs; either way it must reflect the gravel cruise, not asphalt.
         assert_ne!(
             c_asphalt, c_gravel,
             "corner cost must use the surface-scaled cruise, not the asphalt cruise"
@@ -1222,8 +1047,6 @@ mod tests {
 
     #[test]
     fn unset_surface_speed_reads_unknown_default() {
-        // A `0` byte (old cache / untagged) resolves to the unknown default (0.90),
-        // not zero speed — so cruise is 0.90× asphalt, never the 0.5 m/s floor artefact.
         let bc = BikeCost::new(BikeProfile::default());
         let v_unset = bc.cruise_speed(&surf_edge(300, 0));
         let v_asphalt = bc.cruise_speed(&surf_edge(300, 100));
@@ -1235,8 +1058,6 @@ mod tests {
 
     #[test]
     fn push_edge_ignores_surface_factor() {
-        // A push (dismount) edge is timed at push speed regardless of surface_speed —
-        // pushing is walking, unaffected by the cruise factor.
         let bc = BikeCost::new(BikeProfile::default());
         let mut push = attrs(HighwayClass::Footway, false, Surface::Paved);
         push.bikeaccess = false;

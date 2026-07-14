@@ -8,7 +8,6 @@ use crate::structures::{AddressIndex, AddressIndexBuilder, Named};
 
 use super::convert::Lambert72Converter;
 
-/// Decode an XML text node and resolve entity references into an owned `String`.
 fn decode_text(e: &BytesText) -> Result<String, String> {
     let decoded = e.decode().map_err(|err| format!("decode: {err}"))?;
     let unescaped =
@@ -16,7 +15,6 @@ fn decode_text(e: &BytesText) -> Result<String, String> {
     Ok(unescaped.into_owned())
 }
 
-/// Local (namespace-stripped) name of an XML element as a `String`.
 fn local_name(raw: &[u8]) -> String {
     let name = match raw.iter().rposition(|&b| b == b':') {
         Some(i) => &raw[i + 1..],
@@ -25,9 +23,8 @@ fn local_name(raw: &[u8]) -> String {
     String::from_utf8_lossy(name).into_owned()
 }
 
-/// Composite lookup key joining a BeST `namespace` (region) with an
-/// `objectIdentifier`. BeST ids are only unique within a region's namespace, so
-/// joins must key on the pair to avoid cross-region collisions.
+/// BeST ids are only unique within a region's namespace, so FK joins must key on
+/// the (namespace, id) pair to avoid cross-region collisions.
 fn composite_key(namespace: &str, id: &str) -> String {
     let mut key = String::with_capacity(namespace.len() + 1 + id.len());
     key.push_str(namespace);
@@ -36,10 +33,6 @@ fn composite_key(namespace: &str, id: &str) -> String {
     key
 }
 
-/// Pick a single display spelling from the per-language aliases, preferring
-/// French, then Dutch, then German, then whatever is present. BeST records carry
-/// `nl`/`fr`/`de` spellings of the same entity; the display is cosmetic (the label)
-/// while every spelling is interned as a searchable alias.
 fn display_of(by_lang: &HashMap<String, String>, order: &[&str]) -> String {
     for lang in order {
         if let Some(v) = by_lang.get(*lang)
@@ -51,10 +44,8 @@ fn display_of(by_lang: &HashMap<String, String>, order: &[&str]) -> String {
     by_lang.values().find(|v| !v.is_empty()).cloned().unwrap_or_default()
 }
 
-/// Parse a BeST `streetName` / `municipality` lookup XML into `id → Named`.
-/// `record_tag` is the repeating element's local name (e.g. `streetName`). The id
-/// is the `objectIdentifier` whose parent is the `code` block; every
-/// `language`/`spelling` pair inside a `name` block adds a searchable alias.
+/// BeST layout: id is the `objectIdentifier` whose parent is the `code` block;
+/// each `language`/`spelling` pair inside a `name` block is a searchable alias.
 fn parse_named_lookup(xml: &[u8], record_tag: &str) -> Result<HashMap<String, Named>, String> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -123,9 +114,8 @@ fn parse_named_lookup(xml: &[u8], record_tag: &str) -> Result<HashMap<String, Na
     Ok(out)
 }
 
-/// Parse a BeST `postalInfo` lookup into `id → postcode`. In BeST the postal
-/// `objectIdentifier` (the id under the `code` block) is the numeric postcode
-/// itself, so it doubles as the stored code.
+/// In BeST the postal `objectIdentifier` (id under the `code` block) is the
+/// numeric postcode itself, so it doubles as the stored code.
 fn parse_postal_lookup(xml: &[u8]) -> Result<HashMap<String, String>, String> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -178,37 +168,21 @@ fn parse_postal_lookup(xml: &[u8]) -> Result<HashMap<String, String>, String> {
     Ok(out)
 }
 
-/// Rough WGS84 bounding box that comfortably contains all of Belgium (including the
-/// Baarle-Hertog enclaves and the eastern cantons). Used as a data-validity net to
-/// reject BeST records whose Lambert72→WGS84 coordinate lands outside the country —
-/// notably the ~140 k un-geocoded records the feed stores with a placeholder
-/// `<pos>0 0</pos>`, which transform to a point in northern France (~49.29, 2.31).
-/// This is a hard geographic validity bound (not a tuning knob), so it lives as
-/// documented consts rather than in `config.yaml`.
+/// WGS84 bounds containing all of Belgium, used to reject BeST records whose
+/// coordinate lands outside the country. Notably the ~140k un-geocoded records
+/// shipped with placeholder `<pos>0 0</pos>` transform to northern France
+/// (~49.29, 2.31). A hard geographic validity bound, not a tuning knob.
 const BELGIUM_LAT_MIN: f64 = 49.4;
 const BELGIUM_LAT_MAX: f64 = 51.6;
 const BELGIUM_LON_MIN: f64 = 2.5;
 const BELGIUM_LON_MAX: f64 = 6.5;
 
-/// How many address records `stream_addresses` dropped as invalid, split by cause so
-/// the ingestion log can report the (expected, large) placeholder count separately
-/// from any other out-of-country junk.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DropCounts {
-    /// Records whose raw `<pos>` was the `0 0` un-geocoded placeholder.
     placeholder: usize,
-    /// Records whose converted coordinate fell outside the Belgium bounding box.
     out_of_belgium: usize,
 }
 
-/// Stream a BeST `address` XML into the index builder, joining each address to the
-/// pre-parsed street / municipality / postal lookup tables by FK id and converting
-/// its Lambert72 position to WGS84. The reader is consumed incrementally with
-/// buffer reuse so memory stays flat across the millions of addresses in the large
-/// regional files. Records whose street FK is unknown are skipped (cannot be
-/// labelled). Records with the `0 0` placeholder position (un-geocoded addresses) or
-/// a converted coordinate outside Belgium are dropped as invalid; the returned
-/// [`DropCounts`] tallies both causes.
 fn stream_addresses<R: std::io::BufRead>(
     reader: R,
     streets: &HashMap<String, Named>,
@@ -290,11 +264,8 @@ fn stream_addresses<R: std::io::BufRead>(
                     let (Ok(x), Ok(y)) = (xs.parse::<f64>(), ys.parse::<f64>()) else {
                         continue;
                     };
-                    // Primary net: the raw `0 0` un-geocoded placeholder. Belgian
-                    // Lambert72 coordinates never legitimately sit at the origin, so
-                    // this exactly targets the ~140 k addresses BeST ships without a
-                    // surveyed location (they would otherwise transform to a point in
-                    // northern France and poison street centroids).
+                    // Belgian Lambert72 never legitimately sits at the origin; `0 0`
+                    // is the un-geocoded placeholder (~140k records).
                     if x == 0.0 && y == 0.0 {
                         drops.placeholder += 1;
                         continue;
@@ -303,8 +274,6 @@ fn stream_addresses<R: std::io::BufRead>(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    // Secondary net: any converted coordinate outside Belgium is junk
-                    // (a bad projection or other non-placeholder garbage).
                     if !(BELGIUM_LAT_MIN..=BELGIUM_LAT_MAX).contains(&lat)
                         || !(BELGIUM_LON_MIN..=BELGIUM_LON_MAX).contains(&lon)
                     {
@@ -337,9 +306,8 @@ fn stream_addresses<R: std::io::BufRead>(
     Ok(drops)
 }
 
-/// BeST file kind, classified from the OUTER zip entry name. The real FULL feed is
-/// a zip-of-zips: each top-level entry is a per-region/type `.zip` whose single
-/// `.xml` member carries the records.
+/// The FULL feed is a zip-of-zips: each top-level entry is a per-region/type
+/// `.zip` whose single `.xml` member carries the records.
 enum Kind {
     Street,
     Municipality,
@@ -347,8 +315,7 @@ enum Kind {
     Address,
 }
 
-/// Classify a top-level entry of the FULL feed by case-insensitive substring of its
-/// name. Only `.zip` members are considered; the license `.docx` and the Wallonia
+/// Only `.zip` members are considered; the license `.docx` and the
 /// `PartOfMunicipality` zip are ignored.
 fn classify(name: &str) -> Option<Kind> {
     let lower = name.to_ascii_lowercase();
@@ -378,7 +345,6 @@ fn read_entry(archive: &mut zip::ZipArchive<std::fs::File>, idx: usize) -> Resul
     Ok(bytes)
 }
 
-/// Index of the single `.xml` member inside a nested region/type zip.
 fn xml_member_index<R: Read + std::io::Seek>(
     inner: &mut zip::ZipArchive<R>,
 ) -> Result<usize, String> {
@@ -393,8 +359,6 @@ fn xml_member_index<R: Read + std::io::Seek>(
         .ok_or_else(|| "nested zip has no .xml member".to_string())
 }
 
-/// Read the single `.xml` member of a nested region/type zip into memory. Used for
-/// the small lookup files (street / municipality / postal).
 fn nested_xml_bytes(outer_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut inner = zip::ZipArchive::new(Cursor::new(outer_bytes))
         .map_err(|e| format!("failed to read nested zip: {e}"))?;
@@ -408,13 +372,8 @@ fn nested_xml_bytes(outer_bytes: &[u8]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Parse a BeST-Add FULL XML zip into a ready-to-query [`AddressIndex`], keeping
-/// only the top-level entries whose name satisfies `keep`. The FULL feed is a
-/// zip-of-zips: every matching outer entry is opened as a nested zip and its single
-/// `.xml` member parsed. Lookups (streets / municipalities / postals) are parsed
-/// first across all matching files, then every `Address` member is streamed and
-/// FK-joined. Multiple regional files of the same kind accumulate into the shared
-/// tables.
+/// Lookups (streets / municipalities / postals) are parsed first across all
+/// matching files, then every `Address` member is streamed and FK-joined.
 fn load_bestadd_zip_filtered(
     zip_path: &str,
     box_coord_epsilon_m: f64,
@@ -497,8 +456,6 @@ fn load_bestadd_zip_filtered(
     Ok(builder.finish())
 }
 
-/// Parse a BeST-Add FULL XML zip into a ready-to-query [`AddressIndex`].
-/// `box_coord_epsilon_m` is the representative-coordinate divergence epsilon.
 pub fn load_bestadd_zip(zip_path: &str, box_coord_epsilon_m: f64) -> Result<AddressIndex, String> {
     load_bestadd_zip_filtered(zip_path, box_coord_epsilon_m, |_| true)
 }
@@ -577,8 +534,6 @@ mod tests {
   </tns:address>
 </tns:addressResponseBySource>"#;
 
-    /// Wrap one XML string in a nested region/type `.zip`, mirroring the real feed's
-    /// zip-of-zips layout, and return the nested zip's bytes.
     fn nested_zip(base: &str, xml: &str) -> Vec<u8> {
         let mut out = Vec::new();
         {
@@ -591,9 +546,6 @@ mod tests {
         out
     }
 
-    /// Build the FULL outer zip (zip-of-zips) with two regions' worth of
-    /// streets/addresses plus shared municipality/postal lookups, and a couple of
-    /// entries the parser must ignore (license docx, PartOfMunicipality).
     fn write_fixture_zip(path: &std::path::Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -786,10 +738,6 @@ mod tests {
         assert!(wal[0].label.contains("VilleWal"), "label {}", wal[0].label);
     }
 
-    /// Three addresses on the same street: a valid Brussels position, the
-    /// un-geocoded `0 0` placeholder, and a non-zero position (`1 1`) that converts
-    /// to the same northern-France point outside Belgium. Only the valid one must
-    /// survive, and the drop counts must attribute one to each cause.
     const ADDR_VALIDITY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <tns:addressResponseBySource xmlns:com="http://fsb.belgium.be/data/common" xmlns:tns="http://fsb.belgium.be/mappingservices/FullDownload/v1_00">
   <tns:address>
@@ -836,12 +784,9 @@ mod tests {
         )
         .unwrap();
 
-        // (a) the `0 0` placeholder is dropped, (b) the `1 1` out-of-Belgium coord is
-        // dropped, each attributed to its own cause.
         assert_eq!(drops.placeholder, 1, "one 0 0 placeholder dropped");
         assert_eq!(drops.out_of_belgium, 1, "one out-of-Belgium coord dropped");
 
-        // (c) the valid in-Belgium record is kept — and nothing else.
         let idx = builder.finish();
         assert_eq!(idx.record_count(), 1, "only the valid record survives");
         let ok = idx.search("rue de la loi 16", 10, None);
@@ -849,7 +794,6 @@ mod tests {
         assert_eq!(ok[0].id, "OK");
         assert!((49.4..=51.6).contains(&ok[0].lat), "kept lat {}", ok[0].lat);
         assert!((2.5..=6.5).contains(&ok[0].lon), "kept lon {}", ok[0].lon);
-        // The dropped house numbers resolve to nothing.
         assert!(idx.search("rue de la loi 2", 10, None).is_empty());
         assert!(idx.search("rue de la loi 4", 10, None).is_empty());
     }
@@ -938,10 +882,6 @@ mod tests {
         eprintln!("Wallonia sample: {}", wal[0].label);
     }
 
-    /// Building aggregation on the real feed: a street query collapses to a single
-    /// street-in-municipality entry (not one row per house number), and a house
-    /// number collapses its apartment/box rows to one building. Reports the
-    /// building-record count for the whole feed so the row→building drop is visible.
     #[test]
     #[ignore]
     fn real_data_collapses_to_buildings() {
@@ -1004,11 +944,6 @@ mod tests {
         );
     }
 
-    /// The regression gate. On the real feed, "Rue de la Gare, 6800
-    /// Libramont-Chevigny" (street-level, no house number) must resolve to the
-    /// Libramont station area (~49.921, 5.379), NOT the border point (~49.860,
-    /// 5.082) the un-geocoded placeholders used to drag the centroid to; and the
-    /// building-level "Rue de la Gare 2" must land in Belgium, not northern France.
     #[test]
     #[ignore]
     fn real_libramont_gare_resolves_on_street() {
@@ -1020,8 +955,6 @@ mod tests {
         let idx =
             load_bestadd_zip_filtered(path, 5.0, |name| name.starts_with("Wallonia")).unwrap();
 
-        // Street-level (no house/postcode number token) exercises group_by_street /
-        // Part B's median. "libramont" disambiguates the municipality.
         let street = idx.search("rue de la gare libramont", 20, None);
         let hit = street
             .iter()
@@ -1034,7 +967,6 @@ mod tests {
             hit.lat,
             hit.lon
         );
-        // Explicitly reject the pre-fix border-straddling centroid (~49.860, 5.082).
         assert!(
             (hit.lat - 49.860).abs() > 0.02 || (hit.lon - 5.082).abs() > 0.05,
             "must not be the old placeholder-poisoned centroid, got {},{}",

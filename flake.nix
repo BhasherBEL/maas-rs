@@ -1,9 +1,10 @@
 {
-  description = "maas-rs — multi-modal MaaS routing engine (A* + RAPTOR)";
+  description = "maas-rs — multi-modal, multi-objective routing engine for Belgium (RAPTOR transit + Pareto street search) with a GraphQL API and web UI";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -11,40 +12,75 @@
       self,
       nixpkgs,
       flake-utils,
+      crane,
     }:
     let
-      # Standalone package build — reused by eachDefaultSystem and the NixOS module.
       mkPackage =
         pkgs:
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "maas-rs";
-          version = "0.0.1";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+        let
+          craneLib = crane.mkLib pkgs;
+        in
+        craneLib.buildPackage {
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./proto
+              ./src/web/static
+              ./src/ingestion/realtime/fixtures
+              ./config.yaml
+              ./presets
+            ];
+          };
+          strictDeps = true;
 
           nativeBuildInputs = [ pkgs.pkg-config ];
-          # openssl-sys is a transitive dependency (via poem/hyper-tls).
           buildInputs = [ pkgs.openssl ];
 
           meta = with pkgs.lib; {
-            description = "Multi-modal MaaS routing engine (A* + RAPTOR) over OSM + GTFS";
-            license = licenses.mit;
+            description = "Multi-modal MaaS routing engine";
+            license = licenses.agpl3Only;
             mainProgram = "maas-rs";
           };
         };
     in
 
-    # ── Per-system outputs (packages, devShell) ───────────────────────────────
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+
+        maas-rs = mkPackage pkgs;
+
+        dockerImage = pkgs.dockerTools.buildLayeredImage {
+          name = "maas-rs";
+          tag = "latest";
+          contents = [
+            maas-rs
+            pkgs.cacert
+            pkgs.tzdata
+          ];
+          config = {
+            Entrypoint = [ "${maas-rs}/bin/maas-rs" ];
+            Cmd = [ "--serve" ];
+            WorkingDir = "/app";
+            ExposedPorts = {
+              "8000/tcp" = { };
+            };
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "TZDIR=${pkgs.tzdata}/share/zoneinfo"
+            ];
+          };
+        };
       in
       {
-        packages.default = mkPackage pkgs;
+        packages.default = maas-rs;
+        packages.maas-rs = maas-rs;
+        packages.dockerImage = dockerImage;
+        packages.docker = dockerImage;
 
         devShells.default = pkgs.mkShell {
-          # Inherit all build inputs from the package.
           inputsFrom = [ self.packages.${system}.default ];
           packages = with pkgs; [
             rust-analyzer
@@ -52,13 +88,11 @@
             clippy
             python3
           ];
-          # Replicate .envrc: expose openssl for cargo build outside nix.
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
         };
       }
     )
 
-    # ── System-independent outputs (NixOS module) ─────────────────────────────
     // {
       nixosModules.default =
         {
@@ -74,7 +108,6 @@
           configFile = yamlFormat.generate "maas-rs.yaml" cfg.settings;
         in
         {
-          # ── Options ──────────────────────────────────────────────────────────
           options.services.maas-rs = {
             enable = lib.mkEnableOption "maas-rs multi-modal routing engine";
 
@@ -112,6 +145,10 @@
                 `config.yaml` for the full, authoritative schema (`build.inputs`,
                 `build.delay_models`, `default_routing`, `server`, `auto_update`,
                 `realtime`, `log_level`).
+
+                The only required key is `build.inputs`; `build.output`
+                (graph.bin) and `default_routing` both default in code, so a
+                module user may set just `settings.build.inputs`.
 
                 Only one key is interpreted by this module: `settings.server.port`,
                 read by `openFirewall` (falls back to 3000 when unset).
@@ -164,7 +201,6 @@
             };
           };
 
-          # ── Implementation ───────────────────────────────────────────────────
           config = lib.mkIf cfg.enable {
 
             users.users.maas-rs = {
@@ -182,7 +218,7 @@
 
             systemd.services.maas-rs = {
               description = "maas-rs multi-modal routing engine";
-              documentation = [ "https://github.com/bdubois/maas-rs" ];
+              documentation = [ "https://codeberg.org/Bhasher/maas-rs" ];
               wantedBy = [ "multi-user.target" ];
               after = [ "network.target" ];
 
@@ -192,10 +228,6 @@
                 Group = "maas-rs";
                 WorkingDirectory = cfg.dataDir;
 
-                # Deploy the generated config.yaml into the data directory.
-                # The `!` prefix runs this step as root so we can write into
-                # a directory that may not yet be writable by the service user
-                # (e.g. on first boot before createHome has run).
                 ExecStartPre = lib.escapeShellArgs [
                   "${pkgs.coreutils}/bin/cp"
                   "--no-preserve=all"
@@ -203,21 +235,15 @@
                   "${cfg.dataDir}/config.yaml"
                 ];
 
-                # Self-healing startup: restore the cached graph.bin, or rebuild
-                # it (reusing osm.bin when possible), then serve. A cron-gated
-                # GTFS refresh runs in the background per `settings.auto_update`.
-                ExecStart = "${cfg.package}/bin/maas-rs --serve";
+                ExecStart = "${cfg.package}/bin/maas-rs --config ${cfg.dataDir}/config.yaml --serve";
 
                 Restart = "on-failure";
                 RestartSec = "5s";
 
-                # ── Hardening ──────────────────────────────────────────────
                 NoNewPrivileges = true;
                 PrivateTmp = true;
                 ProtectSystem = "strict";
                 ProtectHome = true;
-                # The data directory must be writable (graph.bin, osm.bin,
-                # downloaded data files, and the generated config.yaml).
                 ReadWritePaths = [ cfg.dataDir ];
                 ProtectKernelTunables = true;
                 ProtectKernelModules = true;
@@ -234,8 +260,6 @@
           };
         };
 
-      # Compatibility alias for consumers that do
-      # `imports = [ maas-rs.nixosModule ]` (without the `s`).
       nixosModule = self.nixosModules.default;
     };
 }

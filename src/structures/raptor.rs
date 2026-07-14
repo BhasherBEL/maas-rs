@@ -30,8 +30,7 @@ pub struct Trace {
     pub boarded_at: u32,
     pub alighted_at: u32,
     pub from_stop: u32,
-    /// Reliability bucket of the predecessor label this leg was reached from
-    /// (used during reconstruction to pick the right predecessor in a label set).
+    /// Predecessor's reliability bucket; selects the right predecessor during reconstruction.
     pub from_bucket: u8,
 }
 
@@ -60,8 +59,6 @@ impl Trace {
 mod tests {
     use super::*;
 
-    // ── Lookup ────────────────────────────────────────────────────────────────
-
     #[test]
     fn lookup_of_extracts_correct_slice() {
         let data = [10u32, 20, 30, 40, 50];
@@ -89,8 +86,6 @@ mod tests {
         let l = Lookup { start: 0, len: 4 };
         assert_eq!(l.of(&data), &[5, 6, 7, 8]);
     }
-
-    // ── Trace ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn trace_none_is_neither_transit_nor_transfer() {
@@ -129,7 +124,6 @@ mod tests {
 
     #[test]
     fn trace_with_both_pattern_and_from_stop_is_transit_not_transfer() {
-        // pattern != MAX → is_transit() wins, is_transfer() requires !is_transit()
         let t = Trace {
             pattern: 1,
             trip: 0,

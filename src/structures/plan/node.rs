@@ -11,6 +11,7 @@ pub enum PlanNodeType {
 #[derive(Debug, SimpleObject)]
 pub struct PlanNode {
     lat: f64,
+    #[graphql(name = "lng")]
     lon: f64,
     mode: PlanNodeType,
     name: Option<String>,

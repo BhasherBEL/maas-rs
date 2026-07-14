@@ -1,8 +1,7 @@
 //! Lambert Conformal Conic (2SP) forward projection for Belge Lambert 2008
-//! (EPSG:3812), used to map OSM node lat/lng onto the GeoTIFF DEM raster.
-//! Parameters are embedded in `data/belgium-DTM-20m.tif`.
+//! (EPSG:3812), mapping OSM lat/lng onto the GeoTIFF DEM raster.
 
-/// GRS80 ellipsoid + Belge-Lambert-2008 projection constants.
+// GRS80 ellipsoid + Belge-Lambert-2008 projection constants.
 const A: f64 = 6_378_137.0; // semi-major axis (m)
 const INV_F: f64 = 298.257_222_101; // inverse flattening
 const LAT0: f64 = 50.797_815; // latitude of origin (deg)
@@ -12,8 +11,6 @@ const LAT2: f64 = 51.166_666_666_666_664; // standard parallel 2 (deg)
 const FALSE_EASTING: f64 = 649_328.0;
 const FALSE_NORTHING: f64 = 665_262.0;
 
-/// Projects geographic (lat, lon) in degrees to Belge-Lambert-2008 (easting,
-/// northing) in meters, using the standard LCC-2SP closed-form formulas.
 pub fn project(lat_deg: f64, lon_deg: f64) -> (f64, f64) {
     let e = {
         let f = 1.0 / INV_F;
@@ -58,8 +55,6 @@ mod tests {
 
     #[test]
     fn projects_origin_to_false_origin() {
-        // At the latitude of origin on the central meridian, easting == false
-        // easting and northing == false northing (theta = 0, r_lat = r0).
         let (e, n) = project(LAT0, LON0);
         assert!((e - FALSE_EASTING).abs() < 1.0, "easting {e}");
         assert!((n - FALSE_NORTHING).abs() < 1.0, "northing {n}");
@@ -67,8 +62,6 @@ mod tests {
 
     #[test]
     fn brussels_is_in_plausible_range() {
-        // Brussels ~ 50.85N, 4.35E should land near the false origin (a few km),
-        // with positive, finite coordinates.
         let (e, n) = project(50.85, 4.35);
         assert!(e.is_finite() && n.is_finite());
         assert!((e - FALSE_EASTING).abs() < 50_000.0, "easting {e}");

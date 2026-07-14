@@ -15,16 +15,14 @@ use crate::{
 
 use super::Graph;
 
-/// One same-station backup departure: a trip leaving the same boarding stop and
-/// reaching the same alighting stop as a reference leg, possibly on a different
-/// route. Scheduled times only — realtime is layered on by the resolver.
+/// One same-station backup departure: a trip serving the same board→alight as a
+/// reference leg, possibly on a different route. Scheduled times only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StationBackup {
     pub trip: TripId,
     pub route: crate::ingestion::gtfs::RouteId,
     pub scheduled_departure: u32,
     pub scheduled_arrival: u32,
-    /// True when this backup runs on the same route as the reference trip.
     pub same_route: bool,
 }
 
@@ -53,33 +51,27 @@ impl Graph {
         self.raptor.transit_trips.extend(trips);
     }
 
-    /// Append GTFS `trip_id` strings, aligned 1:1 with `add_transit_trips` so the
-    /// nth appended string corresponds to the nth appended `TripInfo`.
+    /// Append GTFS `trip_id` strings, aligned 1:1 with `add_transit_trips`.
     pub fn add_transit_trip_ids(&mut self, ids: Vec<String>) {
         self.raptor.transit_trip_ids.extend(ids);
     }
 
-    /// Original GTFS `trip_id` for an internal `TripId`, if known.
     pub fn trip_id_str(&self, trip: TripId) -> Option<&str> {
         self.raptor.trip_id_str(trip)
     }
 
-    /// Internal `TripId` for a GTFS `trip_id` string, if known.
     pub fn trip_index_of(&self, trip_id: &str) -> Option<TripId> {
         self.raptor.trip_index_of(trip_id)
     }
 
-    /// Compact stop index for a GTFS `stop_id` string, if known.
     pub fn stop_index_of(&self, stop_id: &str) -> Option<usize> {
         self.raptor.stop_index_of(stop_id)
     }
 
-    /// GTFS `stop_id` string for a compact stop index, if known.
     pub fn stop_id_str(&self, stop: usize) -> Option<&str> {
         self.raptor.transit_stop_ids.get(stop).map(|s| s.as_str())
     }
 
-    /// GTFS `stop_id` string for a `NodeID`, if it is a transit stop.
     pub fn stop_id_of_node(&self, id: NodeID) -> Option<&str> {
         let compact = *self.raptor.transit_node_to_stop.get(id.0)?;
         if compact == u32::MAX {
@@ -88,7 +80,6 @@ impl Graph {
         self.stop_id_str(compact as usize)
     }
 
-    /// Compact stop index for a `NodeID`, if it is a transit stop.
     pub fn compact_stop_of_node(&self, id: NodeID) -> Option<usize> {
         match self.raptor.transit_node_to_stop.get(id.0) {
             Some(&c) if c != u32::MAX => Some(c as usize),
@@ -96,7 +87,6 @@ impl Graph {
         }
     }
 
-    /// GTFS `platform_code` for a `NodeID`, if it is a transit stop with a platform.
     pub fn platform_code_of_node(&self, id: NodeID) -> Option<&str> {
         let compact = *self.raptor.transit_node_to_stop.get(id.0)?;
         if compact == u32::MAX {
@@ -105,7 +95,6 @@ impl Graph {
         self.raptor.transit_stop_platform_codes.get(compact as usize)?.as_deref()
     }
 
-    /// GTFS `platform_code` for a compact stop index.
     pub fn platform_code_of_stop(&self, stop: usize) -> Option<&str> {
         self.raptor.transit_stop_platform_codes.get(stop)?.as_deref()
     }
@@ -118,9 +107,8 @@ impl Graph {
         self.raptor.transit_routes.extend(routes);
     }
 
-    /// Append raw GTFS `route_id` strings, aligned 1:1 with `add_transit_routes` so
-    /// index `i` corresponds to the ith appended `RouteInfo`. Required by route-level
-    /// alert matching; old graphs without this field silently skip route alerts.
+    /// Append raw GTFS `route_id` strings, aligned 1:1 with `add_transit_routes`
+    /// (index `i` ↔ ith `RouteInfo`); required by route-level alert matching.
     pub fn add_transit_route_ids(&mut self, ids: Vec<String>) {
         self.raptor.transit_route_ids.extend(ids);
     }
@@ -133,11 +121,9 @@ impl Graph {
         self.raptor.transit_agencies.extend(agencies);
     }
 
-    /// Returns all transit stops as (stop_index, name, lat, lon, mode) tuples.
-    /// Mode is derived from the RAPTOR pattern index: each stop is assigned the
-    /// route type of the first pattern that serves it.
+    /// All transit stops as (stop_index, name, lat, lon, mode); mode is the route
+    /// type of the first pattern serving the stop.
     pub fn gtfs_stops(&self) -> Vec<(usize, String, f64, f64, String)> {
-        // Build compact_stop_idx → RouteType from the pattern index.
         let mut stop_mode: Vec<Option<RouteType>> =
             vec![None; self.raptor.transit_stop_to_node.len()];
         for (pattern_idx, lookup) in self.raptor.transit_idx_pattern_stops.iter().enumerate() {
@@ -170,10 +156,8 @@ impl Graph {
     }
 
     /// Deduped physical stations as (id, name, lat, lon, operators, modes, lines,
-    /// platform_count). Platforms are grouped by GTFS `parent_station`; standalone
-    /// stops each form one station. Operators are the distinct agency names serving
-    /// any member; modes are the distinct transport-type labels served by any member;
-    /// lines are the distinct routes (with mode + colours) serving any member.
+    /// platform_count). Platforms grouped by GTFS `parent_station`; standalone stops
+    /// each form one station.
     #[allow(clippy::type_complexity)]
     pub fn gtfs_stations(
         &self,
@@ -205,15 +189,13 @@ impl Graph {
             .collect()
     }
 
-    /// Compact platform stop indices for a station id, for future zero-cost-hub
-    /// access/egress routing to any platform of a chosen station.
+    /// Compact platform stop indices for a station id.
     pub fn station_platforms(&self, station_id: &str) -> Option<Vec<usize>> {
         self.raptor.station_platforms(station_id)
     }
 
-    /// A chosen station's representative coordinate and its member platform
-    /// compact indices, for zero-cost station-hub access/egress. `None` when the
-    /// id is unknown or the station has no platforms.
+    /// A station's representative coordinate and its member platform compact indices;
+    /// `None` when the id is unknown or the station has no platforms.
     pub fn station_endpoint(&self, station_id: &str) -> Option<(crate::structures::LatLng, Vec<usize>)> {
         let idx = *self.raptor.station_id_to_index.get(station_id)?;
         let st = &self.raptor.transit_stations[idx];
@@ -223,10 +205,9 @@ impl Graph {
         Some((st.lat_lng, st.platform_stop_indices.clone()))
     }
 
-    /// G-free plan-node resolution for a `NodeID`: its coordinate (via `node_loc`,
-    /// so it survives the interior-node drop) and, when the node is a transit stop,
-    /// its display name (from the serialized `transit_stop_names`, not `g.nodes`).
-    /// With `g` present this is byte-identical to reading `NodeData` directly.
+    /// G-free plan-node resolution: coordinate via `node_loc` (survives the
+    /// interior-node drop) plus, for a transit stop, its name from the serialized
+    /// `transit_stop_names` (not `g.nodes`).
     pub fn plan_node_info(&self, id: NodeID) -> Option<(crate::structures::LatLng, Option<String>)> {
         if self.nodes.is_empty() {
             self.contracted.as_ref()?;
@@ -243,9 +224,8 @@ impl Graph {
         Some((loc, name))
     }
 
-    /// Returns all agencies with their routes as owned data.
-    /// Each entry: (agency_idx, name, url, routes)
-    /// Each route: (route_idx, short_name, long_name, mode_string, color_hex, text_color_hex)
+    /// All agencies with their routes: (agency_idx, name, url, routes), each route
+    /// (route_idx, short_name, long_name, mode_string, color_hex, text_color_hex).
     pub fn gtfs_agencies_with_routes(
         &self,
     ) -> Vec<(
@@ -339,8 +319,6 @@ impl Graph {
         initial_index: usize,
     ) -> impl Iterator<Item = (usize, &TripSegment)> {
         let slice = &self.raptor.transit_departures[tt.start..tt.start + tt.len];
-        // Guard against an out-of-segment index (saturating, never underflows): an
-        // inconsistent `initial_index` yields no previous departures rather than panicking.
         let relative_index = initial_index.saturating_sub(tt.start).min(slice.len());
         let base = tt.start + relative_index;
 
@@ -362,7 +340,6 @@ impl Graph {
         initial_index: usize,
     ) -> impl Iterator<Item = (usize, &TripSegment)> {
         let slice = &self.raptor.transit_departures[tt.start..tt.start + tt.len];
-        // Guard against an out-of-segment index (saturating, never underflows).
         let relative_index = initial_index.saturating_sub(tt.start).min(slice.len());
         let base = tt.start + relative_index;
 
@@ -377,15 +354,9 @@ impl Graph {
             .map(move |(i, dep)| (base + 1 + i, dep))
     }
 
-    /// Returns up to `count` departures from RAPTOR patterns that serve both
-    /// `boarding_node` and `alighting_node` (boarding before alighting), excluding
-    /// trips already covered by `exclude_timetable` (the same-route timetable
-    /// segment of the original leg's first hop).
-    ///
-    /// `after = true`  → next departures (departure >= reference_time)
-    /// `after = false` → previous departures (departure < reference_time)
-    ///
-    /// Returns `(TripId, boarding_departure_secs, alighting_arrival_secs)` tuples.
+    /// Up to `count` departures from patterns serving `boarding_node`→`alighting_node`,
+    /// excluding trips in `exclude_timetable`. `after = true` → departure >=
+    /// reference_time, else < reference_time. Returns `(TripId, board_dep, alight_arr)`.
     pub fn cross_route_departures(
         &self,
         boarding_node: NodeID,
@@ -404,7 +375,6 @@ impl Graph {
             return vec![];
         }
 
-        // Build the set of trip_ids already covered by the same-route timetable.
         let exclude_slice = &self.raptor.transit_departures
             [exclude_timetable.start..exclude_timetable.start + exclude_timetable.len];
         let excluded_trips: HashSet<TripId> = exclude_slice.iter().map(|s| s.trip_id).collect();
@@ -423,7 +393,6 @@ impl Graph {
             let pat_stops = self.raptor.transit_idx_pattern_stops[pattern_id.0 as usize]
                 .of(&self.raptor.transit_pattern_stops);
 
-            // Find alighting_node in the stops that come after boarding_pos.
             let alighting_offset = match pat_stops[boarding_pos as usize + 1..]
                 .iter()
                 .position(|&n| n == alighting_node)
@@ -438,7 +407,7 @@ impl Graph {
             let trip_ids = self.raptor.transit_idx_pattern_trips[pattern_id.0 as usize]
                 .of(&self.raptor.transit_pattern_trips);
 
-            // Stop-time columns: layout is [stop_pos * n_trips + trip_idx].
+            // Stop-time column layout: [stop_pos * n_trips + trip_idx].
             let boarding_col =
                 &all_times[boarding_pos as usize * n_trips..(boarding_pos as usize + 1) * n_trips];
             let alighting_col = &all_times[alighting_pos * n_trips..(alighting_pos + 1) * n_trips];
@@ -491,18 +460,11 @@ impl Graph {
         candidates
     }
 
-    /// Same-station backups for a reference transit leg identified by GTFS handles
-    /// (`original_trip` boarding compact stop `board`, alighting compact stop
-    /// `alight`): every OTHER trip leaving `board` and reaching `alight` — including
-    /// trips on different routes — active on `(date, weekday)`. The reference trip
-    /// itself is excluded; same-route sibling trips are kept (they are the obvious
-    /// "next one from this platform"). Trips that serve `board` but never reach
-    /// `alight` are excluded.
-    ///
-    /// `before` latest departures strictly before, and `after` earliest departures
-    /// at or after, the reference trip's scheduled departure are returned, merged
-    /// and sorted chronologically by scheduled departure. Returns an empty vector
-    /// when a handle is unknown or `original_trip` does not serve `board → alight`.
+    /// Same-station backups for a reference leg (`original_trip`, compact stops
+    /// `board`→`alight`): every OTHER trip serving `board`→`alight` active on
+    /// `(date, weekday)`. The reference trip is excluded; same-route siblings kept.
+    /// Returns `before` latest departures before and `after` earliest at/after the
+    /// reference departure, merged and sorted; empty when a handle is unknown.
     pub fn station_backups(
         &self,
         original_trip: TripId,
@@ -592,8 +554,6 @@ impl Graph {
         out
     }
 
-    // RAPTOR pattern management
-
     pub fn push_transit_pattern(&mut self, p: PatternInfo) {
         self.raptor.transit_patterns.push(p);
     }
@@ -642,19 +602,11 @@ impl Graph {
         self.raptor.transit_delay_models.get(&route_type)
     }
 
-    /// Probability that an alternative for one transit leg still makes the *next*
-    /// (unchanged) transit leg of the journey — the "outbound" half of an
-    /// alternative's marginal swap reliability.
-    ///
-    /// `following_margin_secs` is the original plan's outbound slack (next
-    /// boarding − this leg's scheduled arrival at the boarding stop). `arrival_shift`
-    /// is `original_scheduled_end − alternative_end`: positive when the alternative
-    /// arrives earlier (more slack), negative when it arrives later (less slack).
-    /// The feeder is this alternative's own vehicle (`leg_route_type`); the boarding
-    /// vehicle is the next leg's (`following_route_type`).
-    ///
-    /// Returns `1.0` when there is no following transit leg (last leg of the
-    /// journey) or no delay model for the alternative's own route type.
+    /// Probability that an alternative for one leg still makes the next (unchanged)
+    /// transit leg. `following_margin_secs` is the original outbound slack;
+    /// `arrival_shift = original_end − alternative_end` (positive = earlier = more
+    /// slack). Feeder = this leg's vehicle, boarding = the next leg's. Returns `1.0`
+    /// when there is no following leg or no delay model for the feeder.
     pub(crate) fn outbound_reliability(
         &self,
         leg_route_type: Option<RouteType>,
@@ -677,12 +629,9 @@ impl Graph {
         self.get_route(route_id).map(|r| r.route_type)
     }
 
-    /// Scheduled `(board departure, alight arrival)` in seconds since the service
-    /// midnight for `trip` travelling from compact stop `board` to compact stop
-    /// `alight`, read straight from the static column-major pattern stop-time
-    /// arrays (the same source RAPTOR plan reconstruction uses). `None` when no
-    /// pattern carries `trip` with `board` preceding `alight` — i.e. the leg
-    /// descriptor does not match the static schedule.
+    /// Scheduled `(board departure, alight arrival)` (seconds since service midnight)
+    /// for `trip` from compact stop `board` to `alight`; `None` when no pattern carries
+    /// `trip` with `board` preceding `alight`.
     pub fn scheduled_trip_leg_times(
         &self,
         trip: TripId,
@@ -725,13 +674,9 @@ impl Graph {
         None
     }
 
-    /// Returns the latest trip across all RAPTOR patterns serving both
-    /// `boarding_node` → `alighting_node` (in that order) where:
-    ///   - boarding departure ≥ min_boarding
-    ///   - alighting arrival  ≤ max_alighting
-    ///   - trip is active on date/weekday
-    ///
-    /// Returns (dep_abs_idx_in_transit_departures, boarding_dep, alighting_arr).
+    /// Latest trip serving `boarding_node`→`alighting_node` with boarding ≥
+    /// `min_boarding`, alighting ≤ `max_alighting`, active on date/weekday. Returns
+    /// (dep_abs_idx_in_transit_departures, boarding_dep, alighting_arr).
     #[allow(clippy::too_many_arguments)]
     pub fn latest_departure_before_arrival(
         &self,
@@ -761,7 +706,6 @@ impl Graph {
             let pat_stops = self.raptor.transit_idx_pattern_stops[pattern_id.0 as usize]
                 .of(&self.raptor.transit_pattern_stops);
 
-            // Find alighting_node after boarding_pos.
             let alighting_offset = match pat_stops[boarding_pos as usize + 1..]
                 .iter()
                 .position(|&n| n == alighting_node)
@@ -782,8 +726,8 @@ impl Graph {
 
             let start_t = boarding_col.partition_point(|st| st.departure < min_boarding);
 
-            // Timetable_segment for the first hop, to translate trip_id → absolute
-            // dep_idx in transit_departures, read from the precomputed side-table.
+            // Side-table timetable segment for the first hop, to translate
+            // trip_id → absolute dep_idx in transit_departures.
             let from_table = || {
                 self.raptor
                     .transit_pattern_segment_timetables
@@ -804,7 +748,6 @@ impl Graph {
                 None => continue,
             };
 
-            // Scan backwards from the latest trip to find the latest feasible one.
             for t in (start_t..n_trips).rev() {
                 let arr = alighting_col[t].arrival;
                 if arr > max_alighting {
@@ -812,27 +755,18 @@ impl Graph {
                 }
 
                 let trip_id = trip_ids[t];
-                // Schedule activity AND realtime cancellation, evaluated with the
-                // SAME predicate that chain_bounds and tighten_with_bounds use (both
-                // route through this fn), so the tightening oracle never selects a
-                // CANCELED trip and the two passes cannot disagree — the S1
-                // non-negative-margin invariant depends on that agreement. Inert on
-                // an empty index (is_canceled == false) → byte-identical with no feed.
+                // INVARIANT (S1): chain_bounds and tighten_with_bounds must agree, so
+                // this shared oracle applies the SAME schedule + cancellation predicate;
+                // the tightening pass must never select a CANCELED trip.
                 let svc = self.raptor.transit_trips[trip_id.0 as usize].service_id;
                 if !self.raptor.transit_services[svc.0 as usize].is_active(date, weekday)
                     || rt.is_canceled(trip_id)
                 {
                     continue;
                 }
-                // GTFS pickup_type==1 / drop_off_type==1: the candidate must be
-                // boardable at the boarding stop AND alightable at the alighting
-                // stop, exactly as the forward scan (`scan_route_collect`) enforces.
-                // Absent this, tightening could re-time a leg onto a same-pattern
-                // later trip that cannot be boarded/alighted here (common at rail /
-                // tram terminals) → an un-boardable output plan. Kept in this one
-                // shared oracle so chain_bounds and tighten_with_bounds stay in
-                // lock-step (S1 invariant). Inert on a feed-free corpus where every
-                // stop-time defaults to board_allowed == alight_allowed == true.
+                // INVARIANT (S1): the candidate must be boardable AND alightable here
+                // (GTFS pickup/drop_off type 1), matching the forward scan; else
+                // tightening could re-time onto an un-boardable trip at a terminal.
                 if !boarding_col[t].board_allowed || !alighting_col[t].alight_allowed {
                     continue;
                 }
@@ -849,22 +783,20 @@ impl Graph {
                 if best.is_none_or(|(_, best_dep, _)| dep > best_dep) {
                     best = Some((dep_abs_idx, dep, arr));
                 }
-                break; // Latest feasible trip for this pattern found.
+                break;
             }
         }
 
         best
     }
 
-    /// Push shape data for the next pattern (call once per pattern, in order).
+    /// Push shape data for the next pattern (once per pattern, in order).
     pub fn push_transit_pattern_shape(&mut self, points: Vec<LatLng>, stop_idx: Vec<u32>) {
         self.raptor.transit_pattern_shapes.push(points);
         self.raptor.transit_pattern_shape_stop_idx.push(stop_idx);
     }
 
-    /// Returns `(shape_points, stop_indices)` for pattern `p`, or `None` if
-    /// no shape data was stored (pattern was pushed without a shape, or vecs are
-    /// shorter than `p` for backward-compat reasons).
+    /// `(shape_points, stop_indices)` for pattern `p`, or `None` if no shape stored.
     pub fn get_pattern_shape(&self, p: usize) -> Option<(&[LatLng], &[u32])> {
         let pts = self.raptor.transit_pattern_shapes.get(p)?;
         let idx = self.raptor.transit_pattern_shape_stop_idx.get(p)?;
@@ -875,18 +807,16 @@ impl Graph {
         }
     }
 
-    /// Number of transit patterns currently in the graph.
     pub fn transit_pattern_count(&self) -> usize {
         self.raptor.transit_patterns.len()
     }
 
-    /// Returns the ordered stop-node sequence for pattern `p`.
+    /// Ordered stop-node sequence for pattern `p`.
     pub fn get_pattern_stop_nodes(&self, p: usize) -> &[NodeID] {
         self.raptor.transit_idx_pattern_stops[p].of(&self.raptor.transit_pattern_stops)
     }
 
-    /// Overwrites the shape for pattern `p` (must already exist — generic loader
-    /// always pushes an empty shape, so this is safe for any pattern it loaded).
+    /// Overwrite the shape for pattern `p` (must already exist).
     pub fn set_pattern_shape(&mut self, p: usize, pts: Vec<LatLng>, stop_idx: Vec<u32>) {
         if p < self.raptor.transit_pattern_shapes.len() {
             self.raptor.transit_pattern_shapes[p] = pts;
@@ -894,17 +824,14 @@ impl Graph {
         }
     }
 
-    /// WGS84 coordinate of compact stop `stop`, or `None` when out of range.
     pub fn stop_lat_lng(&self, stop: usize) -> Option<LatLng> {
         let node_id = *self.raptor.transit_stop_to_node.get(stop)?;
         Some(self.node_loc(node_id))
     }
 
-    /// Interpolated vehicle position: `distance_m` metres ahead of compact stop
-    /// `stop_compact` along the stored shape polyline for the pattern that owns
-    /// `trip`. Returns `None` when the trip has no stored shape, the stop is not
-    /// found in any serving pattern, or the shape data is inconsistent — callers
-    /// should fall back to the stop coordinate in that case.
+    /// Interpolated vehicle position `distance_m` ahead of compact stop
+    /// `stop_compact` along `trip`'s pattern shape; `None` when there is no usable
+    /// shape (caller falls back to the stop coordinate).
     pub fn interpolate_along_trip_shape(
         &self,
         trip: TripId,
@@ -935,11 +862,9 @@ impl Graph {
     }
 }
 
-/// Advances `distance_m` metres forward along `shape` starting from
-/// `start_vertex`, walking segment by segment with haversine lengths. Returns
-/// the interpolated point when the distance is consumed, or the last shape
-/// vertex if the polyline runs out. Returns `(0, 0)` when the shape is empty
-/// or `start_vertex` is out of range.
+/// Advance `distance_m` forward along `shape` from `start_vertex` (haversine
+/// segments); clamps to the last vertex if the polyline runs out, `(0, 0)` when the
+/// shape is empty or `start_vertex` is out of range.
 pub(crate) fn advance_along_shape(
     shape: &[LatLng],
     start_vertex: usize,
@@ -1005,16 +930,11 @@ mod advance_along_shape_tests {
 
     #[test]
     fn advances_past_first_vertex_into_second_segment() {
-        // Three vertices going north: A(50.0) → B(50.001) → C(50.002)
-        // Segment A→B ≈ 111 m, total 222 m.
-        // Advance 150 m: consumes A→B then 39 m into B→C.
         let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0), pt(50.002, 4.0)];
         let r = advance_along_shape(&shape, 0, 150.0);
-        // Must be past B (lat > 50.001) and before C (lat < 50.002).
         assert!(r.latitude > 50.001, "should be past B: lat={}", r.latitude);
         assert!(r.latitude < 50.002, "should be before C: lat={}", r.latitude);
         assert!((r.longitude - 4.0).abs() < 1e-9);
-        // Total haversine distance from A should be ≈ 150 m (within 5 m).
         let a = pt(50.0, 4.0);
         let dist = a.dist(r);
         assert!((dist - 150.0).abs() < 5.0, "expected ~150 m, got {dist}");
@@ -1030,7 +950,6 @@ mod advance_along_shape_tests {
     #[test]
     fn start_from_middle_vertex() {
         let shape = vec![pt(50.0, 4.0), pt(50.001, 4.0), pt(50.002, 4.0)];
-        // Start from B, advance 50 m into B→C.
         let r = advance_along_shape(&shape, 1, 50.0);
         assert!(r.latitude > 50.001);
         assert!(r.latitude < 50.002);
@@ -1041,7 +960,6 @@ mod advance_along_shape_tests {
 mod outbound_reliability_tests {
     use super::*;
 
-    /// A bus-mode CDF: ~62% on time (delay ≤ 0), rising with slack.
     fn bus_cdf() -> DelayCDF {
         DelayCDF {
             bins: vec![
@@ -1065,7 +983,6 @@ mod outbound_reliability_tests {
     #[test]
     fn last_leg_has_no_following_so_reliability_is_one() {
         let g = graph_with_bus_model();
-        // No following route type / margin ⇒ outbound term is identity.
         assert_eq!(
             g.outbound_reliability(Some(RouteType::Bus), None, None, 0),
             1.0
@@ -1075,8 +992,6 @@ mod outbound_reliability_tests {
     #[test]
     fn missed_downstream_connection_collapses_to_near_zero() {
         let g = graph_with_bus_model();
-        // Original slack 60s, but the alternative arrives 600s later than planned
-        // ⇒ effective margin −540s ⇒ essentially impossible to make the next leg.
         let rel =
             g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), -600);
         assert!(rel < 0.05, "expected near-zero, got {rel}");
@@ -1085,8 +1000,6 @@ mod outbound_reliability_tests {
     #[test]
     fn earlier_arrival_loosens_the_connection() {
         let g = graph_with_bus_model();
-        // Arriving 300s earlier than planned adds slack ⇒ more reliable than the
-        // same connection at the original margin.
         let base = g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 0);
         let earlier =
             g.outbound_reliability(Some(RouteType::Bus), Some(RouteType::Bus), Some(60), 300);
@@ -1099,7 +1012,6 @@ mod outbound_reliability_tests {
     #[test]
     fn unknown_leg_route_type_is_treated_as_certain() {
         let g = graph_with_bus_model();
-        // No delay model for the alternative's own vehicle ⇒ outbound term = 1.0.
         assert_eq!(
             g.outbound_reliability(Some(RouteType::Ferry), Some(RouteType::Bus), Some(60), -600),
             1.0

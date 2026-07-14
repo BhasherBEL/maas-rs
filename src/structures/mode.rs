@@ -1,8 +1,6 @@
 use async_graphql::Enum;
 use serde::{Deserialize, Serialize};
 
-/// A user-selectable travel mode. Each `Plan` is labeled with the mode that
-/// produced it; the burden ordering is the only cross-mode comparison axis.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Enum, Serialize, Deserialize,
 )]
@@ -20,9 +18,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Vehicle burden: 0 = on foot, 1 = bike, (future: 2 = car). A heavier-mode
-    /// plan must strictly beat every lighter-mode plan on some Pareto axis to
-    /// survive — this is the only cross-mode rule, never a time penalty.
+    /// Burden 0=foot, 1=bike, 2=car; a heavier mode must strictly beat lighter on some Pareto axis.
     pub fn burden(self) -> u8 {
         match self {
             Mode::Walk | Mode::WalkTransit => 0,
@@ -36,11 +32,6 @@ impl Mode {
     }
 }
 
-/// Vehicle state carried by RAPTOR labels. States that behave identically inside
-/// the search (e.g. `Walked` / `BikeDropped` / `CarParked` all board on foot)
-/// stay separate so the plan-level burden comparison can tell the modes apart.
-/// `CarParked` = drove to the access stop and parked (park & ride); `CarEgress`
-/// = a car picks the rider up at the egress stop (kiss & ride).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VehicleState {
     Walked,
@@ -52,10 +43,7 @@ pub enum VehicleState {
 }
 
 impl VehicleState {
-    /// Vehicle burden of a label's state: 0 on foot, 1 bike, 2 car — matching
-    /// `Mode::burden`. The RAPTOR arrival cutoff is computed per burden so a
-    /// heavier state (e.g. a fast park&ride drive) can never prune a lighter
-    /// state's exploration, mirroring the plan-level burden Pareto guard.
+    /// Must match `Mode::burden`; RAPTOR arrival cutoff is per burden so a heavier state never prunes a lighter one.
     pub fn burden(self) -> u8 {
         match self {
             VehicleState::Walked => 0,
@@ -74,8 +62,6 @@ pub const ALL_STATES: [VehicleState; 6] = [
     VehicleState::BikeEgress,
 ];
 
-/// Resolved view of the user's mode selection: which RAPTOR vehicle states are
-/// active (with compact indices 0..n_states) and which direct plans are wanted.
 #[derive(Debug, Clone)]
 pub struct ActiveModes {
     modes: Vec<Mode>,
@@ -134,14 +120,12 @@ impl ActiveModes {
         (idx != u8::MAX).then_some(idx as usize)
     }
 
-    /// Active states as (compact index, state) pairs, in `ALL_STATES` order.
     pub fn states(&self) -> impl Iterator<Item = (usize, VehicleState)> + '_ {
         ALL_STATES
             .iter()
             .filter_map(|&s| self.state_of(s).map(|i| (i, s)))
     }
 
-    /// The `VehicleState` behind a compact index.
     pub fn state_at(&self, idx: usize) -> VehicleState {
         ALL_STATES
             .iter()
@@ -170,9 +154,6 @@ impl ActiveModes {
         self.selected(Mode::Car)
     }
 
-    /// True when any active state rides a vehicle (bike or car) on the access or
-    /// egress side. Such modes are worth a wider access radius, since their value
-    /// is reaching a better-connected hub farther than the nearest stops.
     pub fn uses_vehicle(&self) -> bool {
         [
             VehicleState::BikeInHand,
@@ -219,8 +200,6 @@ mod tests {
 
     #[test]
     fn bike_to_transit_activates_only_dropped() {
-        // Park & ride: bike to the station, drop it, ride transit + walk. Never
-        // carries the bike on board, so only the dropped state is active.
         let am = ActiveModes::new(&[Mode::BikeToTransit]);
         assert_eq!(am.n_states(), 1);
         assert_eq!(am.state_of(VehicleState::BikeDropped), Some(0));
@@ -257,19 +236,16 @@ mod tests {
 
     #[test]
     fn car_modes_activate_expected_states() {
-        // CAR is a direct drive — no transit state.
         let car = ActiveModes::new(&[Mode::Car]);
         assert_eq!(car.n_states(), 0);
         assert!(car.wants_direct_car());
         assert!(!car.wants_transit());
 
-        // Park & ride: drive to a station, park, then transit on foot.
         let dropoff = ActiveModes::new(&[Mode::CarDropOff]);
         assert_eq!(dropoff.n_states(), 1);
         assert_eq!(dropoff.state_of(VehicleState::CarParked), Some(0));
         assert_eq!(dropoff.state_of(VehicleState::CarEgress), None);
 
-        // Kiss & ride: transit, then a car picks you up at the destination station.
         let pickup = ActiveModes::new(&[Mode::CarPickup]);
         assert_eq!(pickup.n_states(), 1);
         assert_eq!(pickup.state_of(VehicleState::CarEgress), Some(0));
@@ -278,8 +254,6 @@ mod tests {
 
     #[test]
     fn uses_vehicle_true_for_any_non_walk_state() {
-        // Vehicle modes travel fast and far to a better-connected hub, so the
-        // access search must widen its radius for them.
         assert!(!ActiveModes::new(&[Mode::Walk]).uses_vehicle());
         assert!(!ActiveModes::new(&[Mode::WalkTransit]).uses_vehicle());
         assert!(!ActiveModes::new(&[Mode::Walk, Mode::WalkTransit]).uses_vehicle());

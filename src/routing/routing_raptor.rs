@@ -14,57 +14,22 @@ pub struct RouteQuery {
     pub to_lng: f64,
     pub date: NaiveDate,
     pub time: NaiveTime,
-    /// When `> 0`, run Range-RAPTOR over this window (seconds).
     pub window_minutes: Option<u32>,
-    /// Per-query override for the minimum walk-radius used for access/egress
-    /// stop discovery (seconds).  `None` → use the graph's configured default.
     pub min_access_secs: Option<u32>,
-    /// Per-query override for the arrival-slack (seconds). `None` → graph default.
     pub arrival_slack_secs: Option<u32>,
-    /// Per-query override for MCR unrestricted (uncapped) inter-stop transfers.
-    /// `None` → graph default (`graph.raptor.unrestricted_transfers`). Lets MCR on/off
-    /// be A/B'd on the same binary + `graph.bin` without a rebuild.
     pub unrestricted_transfers: Option<bool>,
-    /// Per-query override for exact CCH foot access/egress.
-    /// `None` → graph default (`graph.raptor.use_cch_access`). Lets the CCH seam be
-    /// A/B'd on the same binary + `graph.bin` without a rebuild.
     pub use_cch_access: Option<bool>,
-    /// Per-query override for reliability bucket edges. `None`/invalid → graph default.
     pub reliability_bucket_edges: Option<Vec<f32>>,
-    /// Travel modes the router may use. `None` → `[WALK, WALK_TRANSIT]`
-    /// (the historical behavior). Empty is rejected.
     pub modes: Option<Vec<Mode>>,
-    /// Per-query bike cost profile. `None` → the graph's configured default.
     pub bike_profile: Option<crate::structures::BikeProfile>,
-    /// When true, direct walk/bike plans are built with `LegRole::Deadline`
-    /// (variance-proxy axis active) rather than `LegRole::Neutral`.
     pub terminal_deadline: bool,
-    /// When `Some`, route from a position ABOARD a transit trip (between stops)
-    /// instead of `from_lat`/`from_lng` (which are then ignored). The destination
-    /// stays the lat/lng `to_*`.
     pub onboard_origin: Option<OnboardOrigin>,
-    /// When `Some` and resolvable, the origin is the chosen station: every member
-    /// platform is reachable with zero access walk (no 50 m line, no access leg),
-    /// overriding `from_lat`/`from_lng`. An unknown id falls back to the coordinate.
     pub from_station_id: Option<String>,
-    /// As `from_station_id`, for the destination (zero-cost egress).
     pub to_station_id: Option<String>,
-    /// When `Some(true)`, emit a per-phase wall-clock decomposition of this query
-    /// (discovery/grid_alloc/forward/extract/backward, plus per-pass probe/range/
-    /// departure counts) as one structured log line. Purely additive observability
-    /// — never changes routing behavior or results. `None` → graph default
-    /// (`graph.raptor.profile_latency`, itself defaulting to off).
     pub profile_latency: Option<bool>,
-    /// Pre-committed fare products (passenger category, passes, reduction/N-trip
-    /// cards, Train+, Brupass) that select each operator's marginal fare. FIXED per
-    /// query, so every boarding's fare stays deterministic and additive. `None` ⇒
-    /// full single-ticket adult price, no products.
     pub fare_profile: Option<FareProfile>,
 }
 
-/// A pre-committed user fare profile. Mirrors the GraphQL `FareProfileInput` and
-/// maps into the cost-layer [`crate::structures::cost::FareProfile`] the fare
-/// functions consume (via [`FareProfile::to_cost`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FareProfile {
     pub category: crate::structures::cost::PassengerCategory,
@@ -75,12 +40,10 @@ pub struct FareProfile {
     pub sncb_train_plus: bool,
     pub delijn_10_journey: bool,
     pub tec_6_journey: bool,
-    /// SNCB travel class (default `Second`). Affects ONLY SNCB fares.
     pub travel_class: crate::structures::cost::TravelClass,
 }
 
 impl FareProfile {
-    /// Map into the cost-layer profile consumed by the RAPTOR fare charging.
     pub fn to_cost(&self) -> crate::structures::cost::FareProfile {
         crate::structures::cost::FareProfile {
             category: self.category,
@@ -96,9 +59,6 @@ impl FareProfile {
     }
 }
 
-/// A position aboard a transit trip: the boarded GTFS `trip_id`, plus an optional
-/// advisory current stop (id or stop sequence). When neither is given the current
-/// position is the last pattern stop whose realtime departure is `<= now` (`time`).
 #[derive(Clone, Debug)]
 pub struct OnboardOrigin {
     pub trip_id: String,
@@ -106,15 +66,10 @@ pub struct OnboardOrigin {
     pub from_stop_seq: Option<u32>,
 }
 
-/// Effective bike cost profile for a query: the per-request override if present,
-/// else the graph's configured default.
 fn resolve_bike_profile(graph: &Graph, query: &RouteQuery) -> crate::structures::BikeProfile {
     query.bike_profile.unwrap_or(graph.raptor.bike_profile)
 }
 
-/// The cost-layer fare profile for a query: the request's profile if present,
-/// else the default (full single-ticket adult price, no products). FIXED per
-/// query so every boarding's marginal fare stays deterministic and additive.
 fn resolve_fare_profile(query: &RouteQuery) -> crate::structures::cost::FareProfile {
     query
         .fare_profile
@@ -122,8 +77,6 @@ fn resolve_fare_profile(query: &RouteQuery) -> crate::structures::cost::FareProf
         .unwrap_or_default()
 }
 
-/// Resolves the effective buckets + slack for a query, honouring per-request overrides
-/// (validated) and falling back to the graph's configured defaults.
 fn resolve_tuning(
     graph: &Graph,
     query: &RouteQuery,
@@ -143,7 +96,6 @@ fn resolve_tuning(
     Ok((buckets, slack))
 }
 
-/// Resolves the mode selection, rejecting an explicitly empty list.
 fn resolve_modes(query: &RouteQuery) -> Result<ActiveModes, async_graphql::Error> {
     match &query.modes {
         None => Ok(ActiveModes::default()),
@@ -152,15 +104,10 @@ fn resolve_modes(query: &RouteQuery) -> Result<ActiveModes, async_graphql::Error
     }
 }
 
-/// Range-RAPTOR window in seconds, clamped to the configured maximum.
 fn effective_window_secs(window_minutes: u32, max_window_secs: u32) -> u32 {
     window_minutes.saturating_mul(60).min(max_window_secs)
 }
 
-/// Arena snap of a query coordinate when contraction is on: the projected snap point +
-/// a bounding-junction NodeID (stable identity; geometry/cost use the projection). Rejects
-/// coordinates farther than the snap-distance guard, matching `snap_node`. `g` may have its
-/// interior-node arrays dropped — this reads only the contracted segment R-tree.
 fn arena_snap_node(
     graph: &Graph,
     lat: f64,
@@ -189,12 +136,6 @@ fn arena_snap_node(
 
 use crate::structures::QueryEndpoints;
 
-/// Resolves one journey endpoint to its snap `NodeID`, geometry coordinate, and
-/// optional zero-cost station platform set. When `station_id` resolves to a known
-/// station with platforms, the station's representative coordinate is used for
-/// snapping/geometry (so no spurious access line is drawn) and its platforms are
-/// returned for zero-cost hub access/egress. An unknown id, or one that fails to
-/// snap, falls back to the supplied coordinate (no station).
 fn resolve_endpoint(
     graph: &Graph,
     lat: f64,
@@ -213,9 +154,6 @@ fn resolve_endpoint(
         && let Some((coord, platforms)) = graph.station_endpoint(id)
         && let Ok((node, _snapped)) = arena_snap_node(graph, coord.latitude, coord.longitude, endpoint)
     {
-        // Use the station's own representative coordinate (not its street
-        // projection) for the endpoint marker/geometry, so no spurious access line
-        // is ever drawn to a chosen station.
         return Ok((node, coord, Some(platforms)));
     }
     let (node, coord) = arena_snap_node(graph, lat, lng, endpoint)?;
@@ -275,9 +213,6 @@ fn resolve_query_params(
     Ok((origin, destination, time, date, weekday, min_access, endpoints))
 }
 
-/// Routes from a position ABOARD a transit trip to the lat/lng destination.
-/// Seeds the boarded trip's downstream stops and re-plans onward, surfacing in
-/// one shot: stay-on, alight-and-transfer, and alight-and-walk.
 fn route_onboard(
     graph: &Graph,
     query: &RouteQuery,
@@ -350,7 +285,6 @@ fn route_onboard(
     Ok(plans)
 }
 
-/// Wall-clock unix seconds; `0` if the clock is somehow before the epoch.
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -358,9 +292,6 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Brussels-local calendar date of `now_unix`, as days since 2000-01-01 — the same
-/// convention `date_to_days(query.date)` uses. GTFS service dates are Brussels-local,
-/// so this is the service date the live snapshot is currently relevant to.
 fn brussels_service_days(now_unix: i64) -> u32 {
     use chrono::TimeZone;
     match chrono_tz::Europe::Brussels.timestamp_opt(now_unix, 0).single() {
@@ -369,32 +300,9 @@ fn brussels_service_days(now_unix: i64) -> u32 {
     }
 }
 
-/// Consumer-boundary realtime gate. Returns the index routing should actually apply:
-/// either the live snapshot or an inert empty index (`RealtimeIndex::new()`), so a
-/// stale or wrong-date snapshot is never applied. The poller is never modified.
-///
-/// - **Already inert** (`rt.is_empty()`): returned as-is. The no-feed path is thus
-///   byte-identical to schedule-only and never consults the clock.
-/// - **Staleness (#2):** `now - generated_at > max_age_secs` → empty. A cycle where
-///   every feed fails keeps the last good index in the poller with no TTL of its
-///   own; this boundary supplies the config TTL (`realtime.index_max_age_secs`,
-///   stamped on the snapshot) so hours-old delays/cancellations stop being applied.
-/// - **Service date (#3):** realtime carries no service-date dimension (keyed
-///   `(TripId, compact_stop)` only), so it may only be applied when the query's
-///   calendar service date equals the Brussels service date of `now`. A query for
-///   another day (tomorrow / last week) must not inherit today's delays or today's
-///   cancellations.
-///
-/// Overnight nuance: `raptor_tuned_rt_overnight_modes` runs the after-midnight
-/// (`date - 1`) sub-pass with the SAME index handed to the main pass. Because a
-/// same-day query legitimately covers "now" — including just-after-midnight runs of
-/// the previous service day — handing the live index to a same-day query is exactly
-/// what serves that overnight sub-pass; we deliberately do NOT also accept
-/// `date == now + 1` (that would leak realtime into tomorrow's MAIN pass, re-opening
-/// #3). Keying the date on `now` (not on `generated_at`) keeps the immediate
-/// post-midnight window live: a query dated D+1 at 00:05, against a still-fresh
-/// snapshot generated at 23:58 on day D, matches `now`'s date D+1 and keeps its
-/// realtime.
+/// Realtime has no service-date dimension, so it applies only when the query's
+/// service date equals the Brussels service date of `now` (keyed on `now`, not
+/// `generated_at`, to keep the post-midnight window live).
 fn gate_realtime<'a>(
     rt: &'a RealtimeIndex,
     empty: &'a RealtimeIndex,
@@ -435,9 +343,6 @@ pub fn route(
         .unwrap_or(graph.raptor.use_cch_access);
     let am = resolve_modes(query)?;
 
-    // Flag read ONCE per query (never per-call/per-departure): resolves the
-    // per-query override or the graph default, then arms the thread-local
-    // profiler for the duration of this query only.
     let profiling = query
         .profile_latency
         .unwrap_or(graph.raptor.profile_latency);
@@ -505,8 +410,7 @@ pub fn route(
     Ok(plans)
 }
 
-/// Like `route`, but returns all intermediate candidates and access metadata.
-/// Does NOT return an error for empty results — an empty result is itself a debug signal.
+/// Unlike `route`, does NOT error on empty results (empty is itself a debug signal).
 pub fn route_explain(
     graph: &Graph,
     query: &RouteQuery,
@@ -526,8 +430,8 @@ pub fn route_explain(
         .unwrap_or(graph.raptor.use_cch_access);
     let am = resolve_modes(query)?;
 
-    // Note: the explain path does not apply the overnight pass — it's a debug view
-    // of a single RAPTOR run and overnight merging would complicate candidate provenance.
+    // The explain path deliberately skips the overnight pass (it would complicate
+    // candidate provenance).
     let bike = crate::structures::BikeCost::new(resolve_bike_profile(graph, query));
     let fare_profile = resolve_fare_profile(query);
     let mut result = match query.window_minutes {
@@ -604,8 +508,7 @@ mod tests {
                 longitude: lon,
             },
         }));
-        // Add a second node a few metres away so the contracted seg index has a segment
-        // to return (an isolated node produces an empty seg index).
+        // Second node so the contracted seg index has a segment (isolated node = empty index).
         let n2 = g.add_node(NodeData::OsmNode(OsmNodeData {
             eid: "n2".to_string(),
             lat_lng: LatLng {
@@ -616,10 +519,8 @@ mod tests {
         street(&mut g, n1, n2, 15, true, true);
         street(&mut g, n2, n1, 15, true, true);
         g.build_raptor_index();
-        // Extend snap-search radius to the whole world so a far-away query (e.g. Paris)
-        // still finds the segment and returns a large dist_m → "too far" distance error
-        // rather than "no node near".  Default radius (300 m) would let the distant query
-        // exit the R-tree before reaching any segment, silencing the guard we're testing.
+        // Whole-world snap radius so a far query hits the segment and yields "too far"
+        // (not "no node near"); the default 300 m would silence the guard under test.
         g.raptor.edge_snap_radius_m = f64::MAX;
         enable_contraction(&mut g);
         g
@@ -650,13 +551,10 @@ mod tests {
         }
     }
 
-    // --- Realtime consumer-boundary gate (bugs #2 stale-index, #3 wrong-date) ---
-
     use crate::ingestion::gtfs::TripId;
 
-    /// A non-empty synthetic snapshot (one delay) generated at `gen_unix` with TTL
-    /// `ttl`. Non-empty so it does NOT hit the `is_empty()` short-circuit — the
-    /// staleness/date checks are actually exercised.
+    /// Non-empty snapshot (one delay) so it does NOT hit the `is_empty()`
+    /// short-circuit; the staleness/date checks are actually exercised.
     fn rt_snapshot(gen_unix: i64, ttl: i64) -> RealtimeIndex {
         RealtimeIndex::from_updates(gen_unix, [((TripId(1), 0), 60)], [])
             .with_max_age_secs(ttl)
@@ -672,9 +570,6 @@ mod tests {
 
     #[test]
     fn gate_fresh_today_applies_realtime() {
-        // (a) FRESH snapshot + query for TODAY → the real index is applied
-        // (returned handle is the snapshot itself). This is the common live case
-        // and the byte-identity requirement: routing sees exactly the passed rt.
         let now = now_unix_secs();
         let today = brussels_service_days(now);
         let rt = rt_snapshot(now - 10, 600);
@@ -685,16 +580,10 @@ mod tests {
 
     #[test]
     fn gate_sticky_only_index_is_inert_for_routing() {
-        // A snapshot carrying ONLY sticky (tracked-journey) delays must look empty to
-        // the routing gate: is_empty() short-circuits (returns the snapshot, which is
-        // itself empty), so apply_realtime no-ops and planning is byte-identical to
-        // no-feed. Retention lives solely for the live-refresh overlay.
         let now = now_unix_secs();
         let today = brussels_service_days(now);
         let mut sticky = std::collections::HashMap::new();
         sticky.insert((TripId(1), 0), (120, now));
-        // Fresh generated_at + today, so the ONLY thing that could make it apply is a
-        // non-empty index — which sticky must NOT provide.
         let rt = RealtimeIndex::new()
             .with_max_age_secs(600)
             .with_sticky_delays(sticky);
@@ -702,14 +591,11 @@ mod tests {
         let got = gate_realtime(&rt, &empty, today, now);
         assert!(got.is_empty(), "sticky-only snapshot is empty for routing");
         assert_eq!(got.delay(TripId(1), 0), 0, "routing accessor never sees sticky");
-        // Sticky is still reachable via the live-refresh accessor on the same handle.
         assert_eq!(rt.delay_with_sticky(TripId(1), 0), 120);
     }
 
     #[test]
     fn gate_stale_index_is_ignored() {
-        // (b) snapshot older than its TTL → ignored (empty substituted), even for a
-        // today query. A feed outage must not serve hours-old delays/cancellations.
         let now = now_unix_secs();
         let today = brussels_service_days(now);
         let rt = rt_snapshot(now - 1000, 600); // 1000s old, TTL 600s
@@ -720,9 +606,6 @@ mod tests {
 
     #[test]
     fn gate_future_date_query_is_ignored() {
-        // (c) query for TOMORROW against a fresh snapshot → ignored: realtime has no
-        // service-date dimension, so today's delays/cancellations must not apply to
-        // a future day.
         let now = now_unix_secs();
         let tomorrow = brussels_service_days(now) + 1;
         let rt = rt_snapshot(now - 10, 600);
@@ -733,12 +616,9 @@ mod tests {
 
     #[test]
     fn gate_after_midnight_window_keeps_realtime() {
-        // (d) The legitimate after-midnight window. `now` = 00:05 on day D+1,
-        // snapshot generated at 23:58 on day D (7 min old, still fresh). The query
-        // is dated D+1 (the current calendar day). Keying the date on `now` keeps
-        // realtime live across the midnight boundary — a `generated_at`-based date
-        // would (wrongly) drop it, since gen's date is D. The single applied index
-        // also feeds RAPTOR's internal `date-1` overnight sub-pass.
+        // `now` = 00:05 on D+1, snapshot from 23:58 on D (fresh). Keying the date on
+        // `now` keeps realtime live across midnight; a `generated_at`-based date would
+        // wrongly drop it.
         let now = brussels_unix(2026, 1, 15, 0, 5); // winter → no DST ambiguity
         let gen_unix = brussels_unix(2026, 1, 14, 23, 58);
         let now_days = brussels_service_days(now);
@@ -748,7 +628,6 @@ mod tests {
 
         let rt = rt_snapshot(gen_unix, 600);
         let empty = RealtimeIndex::new();
-        // Query dated D+1 (current calendar day) at/after midnight still gets rt.
         let got = gate_realtime(&rt, &empty, now_days, now);
         assert!(
             std::ptr::eq(got, &rt),
@@ -758,9 +637,6 @@ mod tests {
 
     #[test]
     fn gate_empty_index_short_circuits_regardless_of_clock() {
-        // Byte-identity guarantee for the no-feed path: an empty index is returned
-        // as-is (never the substitute), and the clock/date are never consulted —
-        // even a nominally "stale" or wrong-date call returns the same empty handle.
         let empty_in = RealtimeIndex::new(); // gen=0, ttl=0
         let empty_sub = RealtimeIndex::new();
         let now = now_unix_secs();
@@ -862,9 +738,7 @@ mod tests {
         g.add_edge(a, e(a, b, 100, Surface::Unpaved));
         g.add_edge(a, e(a, c, 90, Surface::Paved));
         g.add_edge(c, e(c, b, 90, Surface::Paved));
-        // b has no outgoing edges in the one-directional test graph, so the contracted
-        // graph builder skips it (k=0) and no super-edge reaches b.  A back-edge makes
-        // b a proper junction so both forward paths (a→b direct, a→c→b) are findable.
+        // Back-edge makes b a proper junction so both forward paths are findable.
         g.add_edge(b, e(b, a, 100, Surface::Unpaved));
         enable_contraction(&mut g);
         let q = RouteQuery {
@@ -903,8 +777,6 @@ mod tests {
         );
     }
 
-    // Phase B (done): bike street legs are enriched like walk legs — the multi-objective
-    // post-pass now runs for bike, so a direct bike plan surfaces route alternatives.
     #[test]
     fn direct_bike_plan_has_alternatives() {
         use crate::structures::cost::VarGen;
@@ -947,15 +819,12 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        // Climb trade-off (D+ is a bike front axis; Surface is display-only): the
-        // short direct edge climbs, the long flat detour avoids the climb. Both
+        // Climb trade-off: short direct edge climbs, long flat detour avoids it. Both
         // survive the 3-axis front as a faster-hillier vs flatter-slower pair.
         g.add_edge(a, e(a, b, 100, 8));
         g.add_edge(a, e(a, c, 400, 0));
         g.add_edge(c, e(c, b, 400, 0));
-        // b has no outgoing edges in the one-directional test graph, so the contracted
-        // graph builder skips it (k=0) and no super-edge reaches b.  A back-edge makes
-        // b a proper junction so both forward paths (a→b direct, a→c→b) are findable.
+        // Back-edge makes b a proper junction so both forward paths are findable.
         g.add_edge(b, e(b, a, 100, -8));
         enable_contraction(&mut g);
         let q = RouteQuery {
@@ -995,17 +864,9 @@ mod tests {
         assert_eq!(leg.street_mode, Mode::Bike, "stays a bike leg");
     }
 
-    /// COORD-ROUTED drop gate (the snapping oracle): route from raw lat/lng with node
-    /// contraction on, DROP the interior-node arrays, and re-route the SAME coordinates —
-    /// the full plans (including endpoint geometry) must be BYTE-IDENTICAL. This fails
-    /// today because snapping (`snap_node` → `nearest_node_dist`) reads the dropped g
-    /// kdtree. It passes once snapping is arena-based and gated on `contracted.is_some()` so
-    /// it snaps via the segment R-tree whether or not g is present — making the drop
-    /// behaviorally a no-op (the same uniform-arena discipline as traversal/geometry/
-    /// transit). Bike is baked so the bike-snap path is actually exercised.
-    ///
-    /// The completion oracle: when green, the full street-leg reconstruction/enrichment
-    /// path (walk + bike, search + plan + alternatives + geometry) is g-free.
+    /// Coord-routed drop gate: route from raw lat/lng with contraction on, DROP the
+    /// interior-node arrays, re-route the SAME coordinates; the full plans (including
+    /// geometry) must be BYTE-IDENTICAL, proving arena snapping is g-free.
     #[test]
     fn coord_routed_drop_gate_identical() {
         let g = coord_drop_gate_graph(true);
@@ -1024,8 +885,7 @@ mod tests {
         );
     }
 
-    /// Chain a — i1 — i2 — i3 — b: i1..i3 are degree-2 interior (contracted away),
-    /// a and b are degree-1 junctions. A coordinate near i2 snaps mid-super-edge.
+    /// Chain a — i1 — i2 — i3 — b: i1..i3 are degree-2 interior (contracted away).
     /// `contract` ⇒ build + bake the union contracted graph.
     fn coord_drop_gate_graph(contract: bool) -> Graph {
         use crate::structures::contraction::ContractedGraph;

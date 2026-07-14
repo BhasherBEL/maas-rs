@@ -1,8 +1,4 @@
-//! Mode-parametrized multi-objective (Pareto) street search over the Phase-0
-//! `CostVector`. Martins-style label-setting: a lexicographically-ordered queue
-//! makes each popped label permanent; per-node `LabelSet`s hold the non-dominated
-//! frontier, ε-pruned to stay sparse. Probability never enters here — the cost
-//! vector is fully deterministic.
+//! Mode-parametrized multi-objective (Pareto) street search.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -15,12 +11,8 @@ use crate::structures::{BikeCost, BikeProfile, EdgeData, LatLng, NodeID, StreetE
 use super::contraction::SuperEdge;
 use super::{Graph, PrevCtx};
 
-/// Objective-space grid for bucket pruning. Cell size `sizes[i] > 0.0` snaps axis
-/// `i` to fixed cells; `0.0` leaves it un-bucketed. Unlike ε-dominance (relative,
-/// non-transitive — a chain of near-neighbours each survive, and a faster
-/// neighbour can *absorb* an axis extreme), a fixed grid keeps one representative
-/// per cell, so the extreme cell keeps its own point. Used to bound the per-node
-/// frontier on the diversity axes while preserving the span the user routes on.
+/// Objective-space grid for bucket pruning. `sizes[i] > 0.0` snaps axis `i` to fixed
+/// cells; `0.0` leaves it un-bucketed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Buckets {
     sizes: [f64; crate::structures::cost::AXIS_COUNT],
@@ -36,11 +28,7 @@ impl Buckets {
         self.sizes.iter().any(|&s| s > 0.0)
     }
 
-    /// Exact integer cell key over the bucketed axes (20 bits each, ≤3 axes ⇒
-    /// fits u64 with no collision). Costs are non-negative, so the floored index
-    /// is non-negative. Inactive axes contribute nothing. The index is naturally
-    /// ~1/k (cell size and axis value both scale with route distance), far below
-    /// the 20-bit field; the clamp is defensive against a pathological tiny cell.
+    /// Integer cell key over the bucketed axes (20 bits each, ≤3 axes ⇒ fits u64).
     #[inline]
     fn cell(&self, c: &CostVector) -> u64 {
         let mut key = 0u64;
@@ -54,8 +42,7 @@ impl Buckets {
     }
 }
 
-/// The non-dominated label frontier at a single node. Small (ε-pruned, optionally
-/// bucket-capped), so a linear scan on insert is the right data structure.
+/// The non-dominated label frontier at a single node.
 #[derive(Debug, Default)]
 pub(super) struct LabelSet {
     costs: Vec<CostVector>,
@@ -72,13 +59,9 @@ impl LabelSet {
         self.costs.len()
     }
 
-    /// Try to admit `c`. Returns false (rejecting `c`) when an existing label
-    /// *weakly* dominates it (≤ on every axis, equality included) or ε-dominates
-    /// it. The weak test is essential: `dominates` requires a strict improvement,
-    /// so two equal cost vectors neither dominate nor ε-dominate each other — and
-    /// without weak rejection a hot node accumulates tens of thousands of byte-
-    /// identical labels, turning every scan over it quadratic. Otherwise inserts
-    /// `c`, evicting every existing label that `c` strictly or ε-dominates.
+    /// Rejects `c` when an existing label *weakly* dominates it (weak rejection is
+    /// essential: without it equal cost vectors accumulate and scans go quadratic)
+    /// or ε-dominates it. Otherwise inserts, evicting labels `c` strictly/ε-dominates.
     pub(super) fn try_add(&mut self, c: CostVector, eps: &Epsilon, buckets: &Buckets) -> bool {
         if self
             .costs
@@ -89,10 +72,7 @@ impl LabelSet {
         }
         self.costs
             .retain(|e| !c.dominates(e) && !c.eps_dominates(e, eps));
-        // Bucket cap: at most one label per objective-space cell. `c` is already
-        // non-dominated here; if it shares a cell with a survivor, keep the
-        // lexicographically smaller one (Time-first ⇒ "fastest for this trade-off"),
-        // so the per-node frontier is bounded by the cell count, not the ε grid.
+        // Bucket cap: at most one label per cell; on a tie keep the lex-smaller.
         if buckets.active() {
             let ck = buckets.cell(&c);
             if let Some(pos) = self.costs.iter().position(|e| buckets.cell(e) == ck) {
@@ -107,17 +87,14 @@ impl LabelSet {
         true
     }
 
-    /// Exact membership (used by the search's stale-label check).
     pub(super) fn contains(&self, c: &CostVector) -> bool {
         self.costs.iter().any(|e| e == c)
     }
 }
 
 /// Per-node admissible lower bounds on each active axis' remaining cost to the
-/// destination. Each entry is a `CostVector` whose active-axis components never
-/// exceed the true minimum remaining cost on that axis, so adding it to a label's
-/// `g` yields an admissible `f` key. Inactive/unreachable axes stay at 0.0 (always
-/// a valid underestimate).
+/// destination. Components must never exceed the true minimum remaining cost on
+/// that axis (admissibility); inactive/unreachable axes stay at 0.0.
 #[derive(Debug, Default)]
 pub(super) struct Heuristics {
     per_node: Vec<CostVector>,
@@ -130,39 +107,28 @@ impl Heuristics {
     }
 }
 
-/// One path in the destination Pareto front.
 #[derive(Debug, Clone)]
 pub struct ParetoPath {
     pub nodes: Vec<NodeID>,
-    /// Per-step `(arena edge, dir, far coord)` aligned to `nodes.windows(2)`, carried
-    /// from the arena so reconstruction (geometry/length/surface/dismount) is g-free.
-    /// Empty when the search ran off-contract (reconstruction falls back to `path_edges`).
+    /// Per-step `(edge, dir, far coord)` aligned to `nodes.windows(2)`; empty off-contract.
     pub edges: Vec<(StreetEdgeData, (f64, f64), LatLng)>,
     pub cost: CostVector,
-    /// Bike elevation hysteresis buffer state at the destination `(ehbd, ehbu)`.
     pub elev_buffer: (f64, f64),
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MultiObjResult {
     pub front: Vec<ParetoPath>,
-    /// Number of labels popped from the queue (test-only diagnostic; proves that
-    /// target pruning bounds the search instead of exploring the whole envelope).
     #[cfg(test)]
     pub expansions: u64,
-    /// Total labels created (test-only diagnostic for the perf bottleneck study).
     #[cfg(test)]
     pub total_labels: usize,
-    /// Largest per-node Pareto frontier surviving at search end (test-only).
     #[cfg(test)]
     pub max_labels_per_node: usize,
-    /// Number of distinct nodes that received at least one label (test-only).
     #[cfg(test)]
     pub nodes_explored: usize,
 }
 
-// Test-only profiler: total time + calls spent in `street_edge_transition`, to see
-// whether the per-segment cost (not label/Pareto-set ops) is the multiobj bottleneck.
 #[cfg(test)]
 thread_local! {
     pub(super) static TRANS_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -175,30 +141,24 @@ struct Label {
     parent: Option<usize>,
     len: u32,
     var_accum: f64,
-    /// First node entered from the parent junction (the start of the degree-2 chain
-    /// this label's edge contracts). Equals `node` for an un-contracted single hop.
-    /// Lets path reconstruction re-walk the chain to recover the shape geometry.
+    /// First node entered from the parent junction (start of the contracted degree-2
+    /// chain); equals `node` for an un-contracted hop. Lets reconstruction re-walk it.
     first_step: NodeID,
-    /// Direction of the actual last edge arriving at `node` — the incoming vector for
-    /// the turn-variance term. Under contraction the parent is several nodes back, so
-    /// this cannot be derived from the parent and must be carried explicitly.
+    /// Direction of the actual last edge arriving at `node` (turn-variance term). Under
+    /// contraction the parent is several nodes back, so it must be carried explicitly.
     arrive_dir: (f64, f64),
-    /// Length (m), cruise speed (m/s) and push-state of that last arriving edge, so the
-    /// per-vertex speed-change cost (corner radius needs `min(L_prev, L_this)`; the
-    /// dismount stop needs the prev ride's cruise) can be charged at the next edge.
+    /// Length/cruise/push of that last arriving edge, so the per-vertex speed-change cost
+    /// (corner needs `min(L_prev, L_this)`; dismount stop needs prev cruise) can be charged.
     arrive_len: f64,
     arrive_cruise: f64,
     arrive_push: bool,
-    /// Carried (exit) speed of that last arriving edge — the speed the bike actually
-    /// leaves it at (bend's safe speed / 0 mid-push / cruise on a straight). Lets the
-    /// next vertex charge only the change to its required speed, so a sustained curve
-    /// is one decel-in + one accel-out rather than a slow-down per segment.
+    /// Carried (exit) speed of that last arriving edge, so the next vertex charges only
+    /// the change to its required speed (a sustained curve = one decel-in + accel-out).
     arrive_speed: f64,
 }
 
-/// Heap entry. The `BinaryHeap` is a max-heap, so `Ord` is reversed to pop the
-/// lexicographically smallest cost vector first — the ordering that makes
-/// label-setting sound for multi-objective search.
+/// Heap entry. `BinaryHeap` is a max-heap, so `Ord` is reversed to pop the
+/// lexicographically smallest cost vector first — required for sound label-setting.
 struct QLabel {
     key: CostVector,
     idx: usize,
@@ -230,10 +190,9 @@ fn lex_cmp(a: &CostVector, b: &CostVector) -> Ordering {
     Ordering::Equal
 }
 
-/// Retain only paths whose cost is not strictly dominated by another path's cost.
-/// Record-on-pop can leave a transiently-recorded path in the front if its
-/// dominator arrived later, so this final pass makes the front non-dominated by
-/// construction — independent of pop order or heuristic admissibility.
+/// Retain only paths whose cost is not strictly dominated by another's. Record-on-pop
+/// can leave a transiently-recorded path in the front, so this final pass makes it
+/// non-dominated by construction, independent of pop order or heuristic admissibility.
 fn pareto_filter(front: Vec<ParetoPath>) -> Vec<ParetoPath> {
     let costs: Vec<CostVector> = front.iter().map(|p| p.cost).collect();
     front
@@ -273,13 +232,10 @@ impl Graph {
         )
     }
 
-    /// Build per-axis admissible heuristics toward `destination`. For each axis in
-    /// `mode.axes()`, run a backward Dijkstra (over reversed mode-usable edges) that
-    /// minimizes the SUM of that axis' per-edge contribution, with the turn penalty
-    /// disabled (`incoming = None`) so the Variance axis is underestimated. Edge weights are
-    /// scaled to integer bits by truncation (`(value*1000.0) as u64`), so descaling
-    /// floors the bound ⇒ admissible. Unreachable nodes keep a 0.0 bound (still a
-    /// valid lower bound; never INFINITY, which would corrupt `added`).
+    /// Per-axis admissible heuristics toward `destination`: a backward Dijkstra per
+    /// `mode.axes()` axis, turn penalty disabled so Variance is underestimated. Weights
+    /// truncate to integer bits (`(value*1000.0) as u64`) so descaling floors ⇒
+    /// admissible. Unreachable nodes keep 0.0 (valid lower bound, never INFINITY).
     #[cfg(test)]
     fn build_heuristics(
         &self,
@@ -394,10 +350,9 @@ impl Graph {
         )
     }
 
-    /// Mode-parametrized multi-objective search. Returns the ε-Pareto front of
-    /// paths from `origin` to `destination`. `distance_budget` δ is the RCSP
-    /// detour factor: only paths whose length ≤ (1+δ)·shortest are explored.
-    /// Pass `f64::INFINITY` to disable the budget (identical to prior behavior).
+    /// Mode-parametrized multi-objective search: the ε-Pareto front from `origin` to
+    /// `destination`. `distance_budget` δ is the RCSP detour factor (only paths with
+    /// length ≤ (1+δ)·shortest are explored); `f64::INFINITY` disables it.
     #[allow(clippy::too_many_arguments)]
     pub fn multiobj_search(
         &self,
@@ -425,10 +380,9 @@ impl Graph {
         )
     }
 
-    /// Core label-setting loop. `heuristic = None` is the uninformed search (the
-    /// public default, bit-identical to prior behavior). `Some(h)` keys the heap by
-    /// `f = g.added(&h(node))`; dominance, `try_add`, and the stale-check stay on `g`,
-    /// so the Pareto front is invariant to the heuristic (it only reorders pops).
+    /// Core label-setting loop. `heuristic = None` is the uninformed search. `Some(h)`
+    /// keys the heap by `f = g.added(&h(node))`; dominance/`try_add`/stale-check stay on
+    /// `g`, so the Pareto front is invariant to the heuristic (it only reorders pops).
     #[allow(clippy::too_many_arguments)]
     fn multiobj_search_core(
         &self,
@@ -444,30 +398,23 @@ impl Graph {
         astar: bool,
     ) -> MultiObjResult {
         let _ = role;
-        // A* Time heuristic helps Walk/Bike but is pathological for Drive (label churn on
-        // the un-prunable Variance axis; slower and collapses the front), so force it off.
+        // A* Time heuristic is pathological for Drive (label churn on the un-prunable
+        // Variance axis), so force it off there.
         let astar = astar && mode != RoutingMode::Drive;
         let front_axes = mode.effective_front_axes(self.raptor.bike_select_dplus);
         let speed = self.mode_speed(mode);
         let profile = bike.profile();
         let cv = self.raptor.systematic_cv;
 
-        // RCSP distance budget without an O(graph) precompute. `cap` is the maximum
-        // admissible accumulated length, set lazily from the first (lexicographically-
-        // smallest, ≈ shortest) destination arrival; a label whose own length exceeds
-        // it is pruned. No reverse-adjacency build, no per-node lower-bound table —
-        // the prior O(nodes+edges) precompute made every call scale with the whole
-        // graph, which is fatal when a search runs per access/egress or direct leg
-        // over a country-sized network. `INFINITY` budget disables the cap entirely.
+        // RCSP distance budget without an O(graph) precompute: `cap` is the max
+        // admissible accumulated length, set lazily from the first (≈ shortest)
+        // destination arrival. `INFINITY` disables it.
         let budget_active = distance_budget.is_finite();
         let mut cap: Option<u64> = None;
 
         let mut labels: Vec<Label> = Vec::new();
-        // Sparse per-node label frontier: only nodes actually reached get an entry,
-        // so the search costs O(explored), not O(graph). A dense Vec sized to every
-        // node makes each call O(nodes) just to allocate — fine on a small graph,
-        // catastrophic when the search runs repeatedly over a country-sized graph
-        // (e.g. per access/egress leg during plan reconstruction).
+        // Sparse per-node frontier: only reached nodes get an entry, so the search costs
+        // O(explored), not O(graph) (critical over a country-sized graph).
         let mut sets: HashMap<usize, LabelSet> = HashMap::new();
         let mut heap: BinaryHeap<QLabel> = BinaryHeap::new();
 
@@ -488,15 +435,11 @@ impl Graph {
         sets.entry(origin.0)
             .or_default()
             .try_add(CostVector::ZERO, eps, &Buckets::NONE);
-        // On-the-fly degree-2 contraction: skip creating labels at forced single-successor
-        // shape vertices, following the chain to the next junction (replayed from the arena).
-        // All modes contract on the union cg (`g.contracted`). A direct/access street leg is
-        // single-phase, so drive replays the same per-segment cost as walk. `bike_cg()` returns
-        // the cg the search reads.
+        // On-the-fly degree-2 contraction: skip labels at forced single-successor shape
+        // vertices, following the chain to the next junction (replayed from the arena).
         let contract = self.contracted.is_some();
-        // Cost-baked super-edges available ⇒ the front paths' demoted axes (D+/Surface/
-        // Variance) are canonical during search and must be recomputed exactly at the end.
-        // Baking is bike-only; walk/drive replay the per-segment cost exactly in-search.
+        // Cost-baked super-edges ⇒ front paths' demoted axes (D+/Surface/Variance) are
+        // canonical in-search and must be recomputed exactly at the end. Baking is bike-only.
         let baked_mode = contract && mode == RoutingMode::Bike && self.bike_cg().is_some();
         // Junctions bounding an interior destination's chain — re-walk (not bake) there.
         let dest_guard = if baked_mode {
@@ -505,22 +448,17 @@ impl Graph {
             Vec::new()
         };
         let dest_loc = self.node_loc(destination);
-        // Distance-adaptive grid bucketing on each mode's diversity axes. Cell size ∝
-        // origin→dest straight-line distance, so the per-node frontier stays bounded
-        // regardless of route length while the relevant trade-off span (which the
-        // user routes on) is preserved cell-by-cell. Bike buckets CyclewayDeficit/
-        // Dplus; Drive buckets Variance; Walk buckets Surface — the axes measured to
-        // grow combinatorially with distance on each mode's un-bucketed front. A
-        // coefficient of 0 disables bucketing on that axis (strict no-op ⇒ unchanged
-        // behavior).
+        // Distance-adaptive grid bucketing on each mode's diversity axes: cell size ∝
+        // origin→dest distance, bounding the per-node frontier regardless of route
+        // length. Bike buckets CyclewayDeficit/Dplus; Drive Variance; Walk Surface. A
+        // coefficient of 0 disables bucketing on that axis (strict no-op).
         let buckets = {
             let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
             let mut active = false;
             match mode {
                 RoutingMode::Bike => {
                     let kc = self.raptor.bike_bucket_cyc_k;
-                    // Drop the Dplus bucket dimension when D+ is demoted from the
-                    // front axes (it is no longer a selection/diversity axis).
+                    // Drop the Dplus bucket dimension when D+ is demoted from the front axes.
                     let kd = if front_axes.contains(&Axis::Dplus) {
                         self.raptor.bike_bucket_dpl_k
                     } else {
@@ -557,12 +495,9 @@ impl Graph {
             }
             if active { Buckets { sizes } } else { Buckets::NONE }
         };
-        // A* lower bound on remaining Time = straight-line distance / the FASTEST
-        // speed the cost model can produce, so it can never exceed the true remaining
-        // time (admissible ⇒ the Pareto front is unchanged). Bike time is kinematic
-        // and capped at `profile.max_speed`, so that cap — not the configured cruising
-        // speed — is the ceiling. (Per-edge times are integer-rounded by ≤1 s; that
-        // slack sits below the ε Time floor, so it never moves the ε-front.)
+        // A* lower bound on remaining Time = straight-line dist / FASTEST possible speed,
+        // so it never exceeds true remaining time (admissible ⇒ front unchanged). Bike's
+        // ceiling is `profile.max_speed`, not the cruising speed.
         let max_speed = match mode {
             RoutingMode::Walk => self.raptor.walking_speed_mps,
             RoutingMode::Bike => bike.profile().max_speed / 3.6,
@@ -589,12 +524,9 @@ impl Graph {
         });
 
         let mut front: Vec<ParetoPath> = Vec::new();
-        // Costs of completed destination paths. A label whose admissible lower
-        // bound on its own destination cost is weakly dominated by one of these
-        // can never contribute a new non-dominated path, so it is pruned. Edge
-        // costs are non-negative, so a label's `f` key (`g`, or `g + h` when
-        // informed) is a valid lower bound — making this pruning exact: the front
-        // is unchanged, only the explored region shrinks.
+        // Costs of completed destination paths. A label's `f` key is a valid lower bound
+        // (non-negative edge costs), so pruning against these is exact: front unchanged,
+        // explored region shrinks.
         let mut dest_front: Vec<CostVector> = Vec::new();
         #[cfg(test)]
         let mut expand_count: u64 = 0;
@@ -614,17 +546,14 @@ impl Graph {
             {
                 continue;
             }
-            // Distance-budget cap (lazy): a label may have been enqueued before the
-            // cap was set on the first destination arrival, so re-check at pop. The
-            // corridor form (len so far + straight-line remainder to dest) catches
-            // labels that can no longer complete within budget — see the enqueue site.
+            // Distance-budget cap (lazy, re-checked at pop): corridor form len +
+            // straight-line remainder > cap can't complete within budget.
             if let Some(cap_val) = cap {
                 let d_remain = self.node_loc(node).dist(dest_loc);
                 if cur_len as f64 + d_remain > cap_val as f64 {
                     continue;
                 }
             }
-            // Target pruning: drop labels already covered by the destination front.
             if dest_front.iter().any(|d| d.weakly_dominates(&key)) {
                 continue;
             }
@@ -634,21 +563,16 @@ impl Graph {
                 }
                 dest_front.retain(|d| !g_cost.project(front_axes).weakly_dominates(d));
                 dest_front.push(g_cost.project(front_axes));
-                // Flush the walk ascent buffer at the destination: the residual ehbu
-                // (sustained climb not yet charged because it never exceeded the
-                // buffer) is real ascent, so add it — D+ then reflects the true net
-                // gain instead of undercounting small climbs by up to the buffer.
                 let (nodes, edges) = self.expand_path(&labels, idx, contract);
-                // Under cost-baking the label's demoted axes (D+/Surface/Variance) are
-                // canonical; recompute the full exact cost over the reconstructed path so
-                // the reported front matches the un-contracted search bit-for-bit. Replays
-                // the arena edges `expand_path` carried — g-free.
+                // Under cost-baking the demoted axes are canonical; recompute the exact
+                // cost over the reconstructed path so the front matches un-contracted search.
                 let mut rec_cost = if baked_mode {
                     self.replay_path_exact(&edges, mode, bike, weights, &profile, speed, cv)
                 } else {
                     g_cost
                 };
                 if mode == RoutingMode::Walk {
+                    // Flush residual walk-ascent buffer (real ascent not yet charged).
                     rec_cost.set(Axis::Dplus, rec_cost.get(Axis::Dplus) + elev.1);
                 }
                 front.push(ParetoPath {
@@ -662,9 +586,8 @@ impl Graph {
             if node != origin && self.raptor.transit_node_to_stop[node.0] != u32::MAX {
                 continue;
             }
-            // Previous-edge context = the actual last edge arriving at `node` (carried on
-            // the label, since under contraction the parent is several nodes back). Feeds
-            // the turn-variance term AND the per-vertex speed-change (corner/stop) cost.
+            // Prev-edge context = the last edge arriving at `node` (carried on the label,
+            // since under contraction the parent is several nodes back).
             let prev_ctx = labels[idx].parent.map(|_| PrevCtx {
                 dir: labels[idx].arrive_dir,
                 len: labels[idx].arrive_len,
@@ -673,10 +596,9 @@ impl Graph {
                 speed: labels[idx].arrive_speed,
             });
             let guard_junction = !dest_guard.is_empty() && dest_guard.contains(&node);
-            // Neighbour list as `(first edge, first-step coord, Option<super-edge>)`. Under
-            // contraction a **junction** expands its arena super-edges directly (g-free —
-            // edge + coord from `segs`); an interior node (e.g. a snapped origin) still
-            // falls back to `g.edges`. Off contraction this is exactly the old g.edges scan.
+            // Neighbours as `(first edge, first-step coord, Option<super-edge>)`. Under
+            // contraction a junction expands its arena super-edges; an interior node falls
+            // back to `g.edges`.
             let cgref = self.bike_cg();
             let arena_ses = if contract {
                 cgref.and_then(|cg| {
@@ -709,7 +631,6 @@ impl Graph {
                         .collect()
                 }
             };
-            // `node`'s own coordinate, arena-sourced when it's a contracted junction.
             let node_loc = match cgref {
                 Some(cg) if contract && cg.junction_of[node.0] != u32::MAX => {
                     cg.junction_coord[cg.junction_of[node.0] as usize]
@@ -718,32 +639,18 @@ impl Graph {
             };
             for (street, first_step_loc, se_direct) in neigh {
                 let first_step = street.destination;
-                // First edge of the (possibly contracted) super-edge.
                 let new_len0 = cur_len.saturating_add(street.length as u32);
-                // Geometric length corridor (ellipse, foci origin/dest, major axis =
-                // cap): a path through a node needs at least the straight-line remainder
-                // to reach dest, so `len + d_remain > cap` can never complete within
-                // budget. This cuts the lateral fan-out that multi-objective target
-                // pruning structurally cannot (an off-axis label is behind on Time but
-                // ahead on the accumulation axes Cyc/Dplus, so no dest path dominates
-                // it). Reuses the haversine the A* Time heuristic needs. Admissibility
-                // note: edge lengths are *floored* haversines (pbf.rs), so the stored
-                // remaining length can sit up to ~1 m/edge below the exact straight
-                // line — the corridor is thus exact only to that sub-metre-per-edge
-                // truncation, far below the ε floor and the 15% budget slack, so in
-                // practice it does not move the ε-approximate front. Checked at the
-                // first step (here, cheap early-skip) and again at the terminal node.
+                // Geometric length corridor: len + straight-line remainder > cap can't
+                // complete within budget. Cuts lateral fan-out target pruning cannot.
                 if let Some(cap_val) = cap {
                     let dr0 = first_step_loc.dist(dest_loc);
                     if new_len0 as f64 + dr0 > cap_val as f64 {
                         continue;
                     }
                 }
-                // A cost-baked super-edge (≥2 segments) adds its precomputed cost in O(1)
-                // and jumps to the far junction — UNLESS this junction bounds the chain
-                // containing the destination (then we must re-walk to stop at the interior
-                // destination). Front axes (Time, Cyc) are exact; demoted axes are
-                // canonical and recomputed for the final paths.
+                // A cost-baked super-edge (≥2 segments) adds its cost in O(1) and jumps to
+                // the far junction, unless this junction bounds the destination's chain
+                // (then re-walk to stop at the interior dest).
                 let se_opt = if se_direct.is_some() {
                     se_direct
                 } else if contract {
@@ -751,11 +658,8 @@ impl Graph {
                 } else {
                     None
                 };
-                // In baked-mode (bike) an un-bakeable ≥2-segment super-edge contains an
-                // impassable segment, so the chain is a dead-end (its interior nodes have no
-                // other exit) — skip it. (At a guard junction we still re-walk, to reach an
-                // interior destination that may lie before the block.) Walk/Drive never bake,
-                // so this skip does not apply — they always seg-replay through the chain.
+                // In baked-mode, an un-bakeable ≥2-segment super-edge holds an impassable
+                // segment ⇒ dead-end, skip (but re-walk at a guard junction).
                 if baked_mode
                     && !guard_junction
                     && se_opt.is_some_and(|se| se.baked.is_none() && se.nodes.len() >= 2)
@@ -773,8 +677,7 @@ impl Graph {
                         let cg = self.bike_cg().unwrap();
                         let tn = cg.junctions[to as usize];
                         let tn_loc = cg.junction_coord[to as usize];
-                        // elev / var carried unchanged: they feed only the demoted
-                        // D+/Variance axes (recomputed exactly for the final paths).
+                        // elev / var carried unchanged (feed only the demoted axes).
                         (
                             g_cost.added(&delta),
                             elev,
@@ -786,9 +689,8 @@ impl Graph {
                             tn_loc,
                         )
                     } else {
-                        // `dir_coords(node_loc, first_step_loc)` == `dir_between(node,
-                        // first_step)` (same formula, same coords) but arena-sourced — pass it
-                        // in so the transition is g-free (no internal `dir_between`).
+                        // Arena-sourced `dir_coords` == `dir_between(node, first_step)`,
+                        // passed in so the transition is g-free.
                         let first_dir =
                             super::contraction::dir_coords(node_loc, first_step_loc);
                         let Some((mut t_cost, mut t_elev, mut t_var)) = self
@@ -804,11 +706,10 @@ impl Graph {
                         let mut t_arrive = first_dir;
                         let mut t_ctx = self.arrival_ctx(bike, prev_ctx, street, t_arrive);
                         let mut t_node_loc = first_step_loc;
-                        // Re-walk the degree-2 chain (un-baked single-edge, or a guard
-                        // junction): same per-segment cost, stopping at an interior dest.
+                        // Re-walk the degree-2 chain (un-baked, or guard junction),
+                        // stopping at an interior dest.
                         if let (true, Some(se), Some(cg)) = (contract, se_opt, cgref) {
-                            // Arena seg-replay (g-free): the super-edge's segments after the
-                            // first, threading direction from consecutive far-coords.
+                            // Arena seg-replay (g-free): segments after the first.
                             let mut prev_far = first_step_loc;
                             let lo = se.seg_start as usize + 1;
                             let hi = (se.seg_start + se.seg_len) as usize;
@@ -837,8 +738,8 @@ impl Graph {
                                 prev_far = seg.far;
                             }
                         } else if contract {
-                            // g-fallback re-walk (no known super-edge, e.g. an interior
-                            // snapped origin). Anchors on `junction_of` like the arena path.
+                            // g-fallback re-walk (no known super-edge, e.g. interior
+                            // snapped origin).
                             let junc_of = self.bike_cg().map(|cg| &cg.junction_of);
                             let mut prev = node;
                             let mut cur = first_step;
@@ -877,14 +778,10 @@ impl Graph {
                         }
                         (t_cost, t_elev, t_var, t_len, t_node, t_arrive, t_ctx, t_node_loc)
                     };
-                // A replay that stopped at an interior node (not a junction, the
-                // destination, or a stop) hit a segment impassable for this mode mid-chain
-                // — a dead-end (its interior nodes have no other exit). Don't seed a label
-                // there: it can never reach the dest, would re-walk the whole chain again
-                // (O(chain²) blow-up), and — post node-array drop — its interior id has no
-                // `junction_coord`, so `node_loc` would panic. Applies to every contracted
-                // mode (walk/drive seg-replay can dead-end on a foot/car-impassable segment
-                // just as a baked bike chain can).
+                // A replay stopping at an interior node (not a junction/dest/stop) hit a
+                // mid-chain impassable segment — a dead-end. Don't seed a label there:
+                // it can't reach dest, causes O(chain²) re-walk, and its interior id has
+                // no `junction_coord` so `node_loc` would panic.
                 if contract
                     && t_node != destination
                     && self.raptor.transit_node_to_stop[t_node.0] == u32::MAX
@@ -894,7 +791,6 @@ impl Graph {
                 {
                     continue;
                 }
-                // Corridor + target pruning + admission at the terminal node.
                 let d_remain = t_node_loc.dist(dest_loc);
                 if let Some(cap_val) = cap {
                     if t_len as f64 + d_remain > cap_val as f64 {
@@ -955,12 +851,9 @@ impl Graph {
         }
     }
 
-    /// If `cur` is a degree-2 bike pass-through — exactly two *distinct* bikeable
-    /// street neighbours — return the one that continues the chain away from `prev`,
-    /// with a bikeable edge to it. Returns `None` at junctions (≥3 neighbours),
-    /// dead-ends (<2), or if `prev` isn't a neighbour. Used to contract forced
-    /// single-successor chains so the search creates a label only at the next
-    /// junction, not at every shape vertex. No allocation (two fixed slots).
+    /// If `cur` is a degree-2 bike pass-through (exactly two distinct bikeable
+    /// neighbours), return the one continuing the chain away from `prev`. `None` at
+    /// junctions (≥3), dead-ends (<2), or if `prev` isn't a neighbour.
     fn bike_chain_next(&self, prev: NodeID, cur: NodeID) -> Option<(NodeID, &StreetEdgeData)> {
         let neigh = self.edges.get(cur.0)?;
         let mut n1: Option<NodeID> = None;
@@ -997,12 +890,9 @@ impl Graph {
         Some((next, edge))
     }
 
-    /// Reconstruct the full node path (including the shape vertices skipped by
-    /// degree-2 contraction) for the label at `idx`. Walks the parent chain of
-    /// junction labels, and for each hop re-walks the unique degree-2 chain from the
-    /// parent junction via the stored `first_step` to the label's node. With
-    /// `contract == false` every hop is a single edge (`first_step == node`), so this
-    /// degenerates to the plain junction-to-junction backtrack.
+    /// Reconstruct the full node path (including contraction-skipped shape vertices) for
+    /// the label at `idx`, re-walking each hop's degree-2 chain from the parent junction
+    /// via `first_step`. With `contract == false` every hop is a single edge.
     fn expand_path(
         &self,
         labels: &[Label],
@@ -1017,12 +907,10 @@ impl Graph {
         }
         chain.reverse(); // origin … destination
         let cg = self.bike_cg();
-        // `out` is the node path; `incoming[n]` is the (edge, dir) reaching `n` on the
-        // walk — recorded on first visit so it survives `strip_cycles` (which keeps the
-        // first occurrence). Lets the exact replay run from arena edges, g-free.
+        // `incoming[n]` is the (edge, dir) reaching `n`, recorded on first visit so it
+        // survives `strip_cycles` (which keeps the first occurrence).
         let mut out = vec![labels[chain[0]].node];
         let mut incoming: HashMap<NodeID, (StreetEdgeData, (f64, f64), LatLng)> = HashMap::new();
-        // `pj`'s coordinate, arena-sourced when it is a junction.
         let loc_of = |n: NodeID| match cg {
             Some(c) if c.junction_of[n.0] != u32::MAX => {
                 c.junction_coord[c.junction_of[n.0] as usize]
@@ -1038,7 +926,7 @@ impl Graph {
                 continue;
             }
             if fs == nj {
-                // Single-edge super-edge pj→nj; edge + dir from the arena (g fallback).
+                // Single-edge super-edge pj→nj.
                 let e = match cg.and_then(|c| c.super_edge(pj, fs)) {
                     Some(se) => {
                         let s0 = cg.unwrap().segs[se.seg_start as usize];
@@ -1053,9 +941,7 @@ impl Graph {
                 out.push(nj);
                 continue;
             }
-            // Expand the super-edge pj → fs → … → nj from the arena (its node chain is
-            // exactly what the search followed), stopping at nj (the far junction or an
-            // interior dest). g-free when pj is a junction.
+            // Expand the super-edge pj → fs → … → nj from the arena, stopping at nj.
             if let (Some(c), Some(se)) = (cg, cg.and_then(|c| c.super_edge(pj, fs))) {
                 let mut prev_far = loc_of(pj);
                 for k in 0..se.nodes.len() {
@@ -1071,8 +957,7 @@ impl Graph {
                 }
                 continue;
             }
-            // Fallback (pj not a junction, e.g. a snapped interior origin): re-walk the
-            // degree-2 chain on the full graph.
+            // Fallback (pj not a junction): re-walk the degree-2 chain on the full graph.
             if let Some(edge) = super::contraction::ContractedGraph::bike_edge(self, pj, fs) {
                 incoming
                     .entry(fs)
@@ -1099,9 +984,8 @@ impl Graph {
             }
         }
         let nodes = Self::strip_cycles(out);
-        // Edges aligned to the (cycle-stripped) node path: each kept node's first-visit
-        // incoming edge, which — because `strip_cycles` keeps the first occurrence —
-        // correctly connects it to its predecessor in the simplified path.
+        // Each kept node's first-visit incoming edge; correct because `strip_cycles`
+        // keeps the first occurrence.
         let edges: Vec<(StreetEdgeData, (f64, f64), LatLng)> = nodes
             .windows(2)
             .filter_map(|w| incoming.get(&w[1]).copied())
@@ -1109,11 +993,9 @@ impl Graph {
         (nodes, edges)
     }
 
-    /// Remove node revisits from a reconstructed walk, leaving a simple path. A label
-    /// whose parent chain re-enters a node survives ε-dominance/bucketing without being
-    /// pruned; splicing the loop is always cost-non-increasing (additive non-negative
-    /// edge costs) and keeps the path connected (the kept occurrence is adjacent to
-    /// whatever followed the later one).
+    /// Remove node revisits from a reconstructed walk, leaving a simple path. Splicing a
+    /// loop is always cost-non-increasing (additive non-negative edge costs) and keeps
+    /// the path connected (kept occurrence adjacent to what followed the later one).
     fn strip_cycles(walk: Vec<NodeID>) -> Vec<NodeID> {
         let mut out: Vec<NodeID> = Vec::with_capacity(walk.len());
         let mut pos: std::collections::HashMap<NodeID, usize> = std::collections::HashMap::new();
@@ -1131,10 +1013,9 @@ impl Graph {
         out
     }
 
-    /// Exact full cost of a reconstructed bike node path, replayed from a null entry via
-    /// the same `street_edge_transition` the search uses. Used to recompute the demoted
-    /// axes for the few final front paths under cost-baking (where the search carried
-    /// them only canonically).
+    /// Exact full cost of a reconstructed bike node path, replayed via the same
+    /// `street_edge_transition` the search uses. Recomputes the demoted axes for the
+    /// final front paths under cost-baking.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn replay_path_exact(
         &self,
@@ -1161,16 +1042,9 @@ impl Graph {
         cost
     }
 
-    /// Per-edge cost + carried-state transition, shared by the Pareto search and the
-    /// scalar representative search so the ride/push + elevation-hysteresis logic
-    /// lives in exactly one place. Given the accumulated `g_cost`/`elev`/`var_accum`
-    /// at `street.origin`, returns the extended `(cost, elev_buffer, var_accum)` at
-    /// `street.destination`, or `None` if the edge is impassable in `mode`.
-    /// Build the `PrevCtx` describing an edge just traversed in direction `dir`: its
-    /// length, push-state, cruise speed, and the carried (exit) speed the bike leaves it
-    /// at. The exit speed is the edge's `required_speed` given the context it was entered
-    /// from (`prev`) — the bend's safe speed on a curve, `0` on a push, cruise on a
-    /// straight — so the next vertex charges only the change, not a full slow-down.
+    /// Build the `PrevCtx` for an edge just traversed in direction `dir`: its length,
+    /// push-state, cruise speed, and carried exit speed (`required_speed` given `prev`),
+    /// so the next vertex charges only the change.
     fn arrival_ctx(
         &self,
         bike: &BikeCost,
@@ -1208,9 +1082,8 @@ impl Graph {
         )
     }
 
-    /// As [`street_edge_transition`], with the edge direction supplied (g-free). `dir
-    /// = None` recomputes it from the edge endpoints via `dir_between` (reads `g`,
-    /// byte-identical to before); `Some(d)` uses the carried arena direction.
+    /// As [`street_edge_transition`], with the edge direction supplied (g-free). `dir =
+    /// None` recomputes it from the endpoints via `dir_between`; `Some(d)` uses the arena dir.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn street_edge_transition_dir(
         &self,
@@ -1242,15 +1115,11 @@ impl Graph {
             this_dir,
         )?;
         if mode == RoutingMode::Bike {
-            // Physically-grounded speed-change time: the corner slow-down (decel to the
-            // bend's safe speed + re-accel) and the dismount stop / remount restart, all
-            // charged at the boundary into this edge. Needs the previous edge's length
-            // and cruise speed, which is why it lives here (the fold) and not per-edge.
+            // Speed-change time (corner slow-down + dismount/remount) charged at the
+            // boundary into this edge; needs the previous edge's length and cruise speed.
             let extra = bike.speed_change_secs(prev, street, this_dir);
             edge_cv.set(Axis::Time, edge_cv.get(Axis::Time) + extra);
-            // Dismount uncertainty: a once-per-run variance bump at the ride→push
-            // boundary (the same boundary the stop is charged on), so a route that
-            // dismounts is honestly shown as less predictable.
+            // Dismount uncertainty: once-per-run variance bump at the ride→push boundary.
             if let Some(p) = prev {
                 if !p.push && BikeCost::is_push(&street.attrs) {
                     let ps = self.raptor.variance_model.push_sigma;
@@ -1259,17 +1128,12 @@ impl Graph {
             }
         }
         let new_elev = if mode == RoutingMode::Bike {
-            // D+ is the denoised per-edge ascent baked at ingestion (smoothed
-            // `elev_delta` → `dplus(e)`); no in-search hysteresis is added. The old
-            // path-coupled `elevation_step` buffer was unsound for label-setting and
-            // is dropped. NOTE: it also carried BRouter's descent-SAFETY penalty
-            // (`downhillcost`); removing it drops descent-avoidance from route
-            // selection — a candidate follow-up (per-edge additive descent penalty).
+            // D+ is the denoised per-edge ascent baked at ingestion; no in-search
+            // hysteresis (the old path-coupled buffer was unsound for label-setting).
             elev
         } else if mode == RoutingMode::Walk {
-            // Denoise walk D+ with the bike's elevation hysteresis so a noisy
-            // DEM can't inflate ascent on the direct path (and make a detour
-            // look "flatter"). Replaces the raw per-edge max(0, Δ).
+            // Denoise walk D+ with the bike's elevation hysteresis so a noisy DEM can't
+            // inflate ascent on the direct path. Replaces the raw per-edge max(0, Δ).
             let (asc, ehbu) =
                 bike.walk_ascent_step(elev.1, street.elev_delta as f64, street.length as f64);
             edge_cv.set(Axis::Dplus, asc);
@@ -1280,11 +1144,9 @@ impl Graph {
         let edge_var = edge_cv.get(Axis::Variance);
         let new_var_accum = var_accum + edge_var;
         let mut new_cost = g_cost.added(&edge_cv);
-        // The Variance slot carries the full reliability variance — additive crossing
-        // variance PLUS the systematic (cv·time)² term, matching the displayed
-        // [p50,p95] bracket. It is a non-decreasing function of the additive
-        // (Σvar, time) pair, and Time is also a dominance axis, so dominance is
-        // preserved under extension and the front stays sound.
+        // Variance slot = additive crossing variance + systematic (cv·time)². It is
+        // non-decreasing in the additive (Σvar, time) pair and Time is also a dominance
+        // axis, so dominance is preserved under extension and the front stays sound.
         new_cost.set(
             Axis::Variance,
             new_var_accum + cv * cv * new_cost.get(Axis::Time) * new_cost.get(Axis::Time),
@@ -1313,21 +1175,15 @@ mod tests {
 
     #[test]
     fn strip_cycles_splices_revisited_nodes() {
-        // A reconstructed walk that revisits a node (ε-dominance can keep a
-        // node-cyclic label) must be spliced to a simple path — removing the loop
-        // is always cost-non-increasing on additive non-negative costs.
         let n = |i: u32| NodeID(i as usize);
-        // 1→2→3→2→4 : the 2→3→2 loop is spliced out.
         assert_eq!(
             Graph::strip_cycles(vec![n(1), n(2), n(3), n(2), n(4)]),
             vec![n(1), n(2), n(4)]
         );
-        // Already simple: unchanged.
         assert_eq!(
             Graph::strip_cycles(vec![n(1), n(2), n(3)]),
             vec![n(1), n(2), n(3)]
         );
-        // Nested/again-revisited origin: 1→2→3→1→2→4 collapses correctly.
         assert_eq!(
             Graph::strip_cycles(vec![n(1), n(2), n(3), n(1), n(2), n(4)]),
             vec![n(1), n(2), n(4)]
@@ -1365,11 +1221,8 @@ mod tests {
         );
     }
 
-    // Documents a known lossy property of the (CyclewayDeficit, Dplus) grid bucket:
-    // it can evict a label that *dominates* a worse label sitting in a different cell,
-    // so the dominated label can survive in the final frontier. This bounds the
-    // per-node frontier for performance at the cost of exactness; the test pins the
-    // behaviour so any change to the bucket rule is a deliberate, visible decision.
+    // Pins a known lossy property: the (CyclewayDeficit, Dplus) bucket can evict a label
+    // that dominates a worse label in a different cell, so the dominated one survives.
     #[test]
     fn bucket_eviction_can_keep_a_dominated_label() {
         let axes = [
@@ -1381,12 +1234,9 @@ mod tests {
         let mk = |t: f64, cyc: f64, dpl: f64, surf: f64| {
             CostVector::from_active(&axes, &[t, cyc, dpl, surf])
         };
-        // Both diversity axes (Cyc, Dplus) are bucketed, as in the live bike search.
-        // z & ride share BOTH bucket cells (same Cyc and Dplus cell) and differ only on
-        // the un-bucketed Surface axis: z is faster but rougher, ride slower but smooth —
-        // a genuine trade-off the bucket nonetheless collapses (keeps lex-min Time = z).
-        // push has a higher deficit ⇒ a different Cyc cell, smooth like ride, and is
-        // tied with ride on Dplus, so ride strictly dominates push.
+        // z & ride share both bucket cells, differ only on un-bucketed Surface (a
+        // trade-off the bucket collapses to lex-min Time = z). push sits in a different
+        // Cyc cell and is strictly dominated by ride.
         let z = mk(10.0, 50.0, 50.0, 99.0);
         let ride = mk(20.0, 60.0, 55.0, 5.0);
         let push = mk(100.0, 150.0, 55.0, 5.0);
@@ -1395,8 +1245,6 @@ mod tests {
         assert!(!z.dominates(&push), "z must not dominate push (Surface trade-off)");
         let eps = Epsilon::uniform(0.0, 0.0);
 
-        // Cells size 100 on both diversity axes ⇒ z & ride share cell (0,0); push is in
-        // a different Cyc cell (deficit 150 ⇒ cell 1).
         let mut sizes = [0.0; crate::structures::cost::AXIS_COUNT];
         sizes[Axis::CyclewayDeficit.index()] = 100.0;
         sizes[Axis::Dplus.index()] = 100.0;
@@ -1404,7 +1252,7 @@ mod tests {
 
         let mut bucketed = LabelSet::new();
         bucketed.try_add(z, &eps, &buckets);
-        bucketed.try_add(ride, &eps, &buckets); // bucket-evicted by z (same cell, z lex-smaller)
+        bucketed.try_add(ride, &eps, &buckets); // bucket-evicted by z
         bucketed.try_add(push, &eps, &buckets); // survives alone in cell 1
         let has_push = bucketed.contains(&push);
         let has_ride = bucketed.contains(&ride);
@@ -1413,7 +1261,7 @@ mod tests {
             "bucketing drops the dominating ride label and keeps the dominated push label"
         );
 
-        // Without buckets, ride survives and weakly-dominates push ⇒ push never enters.
+        // Without buckets, ride weakly-dominates push ⇒ push never enters.
         let mut exact = LabelSet::new();
         exact.try_add(z, &eps, &Buckets::NONE);
         exact.try_add(ride, &eps, &Buckets::NONE);
@@ -1534,7 +1382,6 @@ mod tests {
                 },
             })
         };
-        // Compact coords: a→b ~7 m straight-line, edges 100/90/90 m ⇒ haversine ≤ length.
         let a = g.add_node(mk("a", 50.00000, 4.00000));
         let b = g.add_node(mk("b", 50.00000, 4.00010));
         let c = g.add_node(mk("c", 50.00005, 4.00005));
@@ -1619,10 +1466,8 @@ mod tests {
         );
     }
 
-    // Bike rides a steep descent at the profile's `max_speed` cap (12.5 m/s by
-    // default), which is FASTER than the configured cruising speed — so the A* bound
-    // must come from that cap or it over-estimates remaining time and breaks the
-    // front. Realistic coords (haversine ≈ edge length) keep the bound tight.
+    // Bike descends at the profile's max_speed cap (> cruising speed), so the A* bound
+    // must use that cap or it over-estimates remaining time and breaks the front.
     #[cfg(test)]
     fn bike_descent_fixture() -> (Graph, NodeID, NodeID) {
         use crate::structures::cost::VarGen;
@@ -1640,7 +1485,6 @@ mod tests {
                 },
             })
         };
-        // ~2 km straight east; detour bows north. Edge lengths ≈ haversine.
         let a = g.add_node(mk("a", 50.0000, 4.0000));
         let b = g.add_node(mk("b", 50.0000, 4.0280));
         let c = g.add_node(mk("c", 50.0010, 4.0140));
@@ -1663,9 +1507,9 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        g.add_edge(a, edge(a, b, 2008, Surface::Unpaved, -150)); // fast-but-rough descent
+        g.add_edge(a, edge(a, b, 2008, Surface::Unpaved, -150));
         g.add_edge(a, edge(a, c, 1100, Surface::Paved, -75));
-        g.add_edge(c, edge(c, b, 1100, Surface::Paved, -75)); // smoother detour
+        g.add_edge(c, edge(c, b, 1100, Surface::Paved, -75));
         (g, a, b)
     }
 
@@ -1674,8 +1518,7 @@ mod tests {
         let (g, a, b) = bike_descent_fixture();
         let bike = g.default_bike_cost();
         let w = g.raptor.cost_weights;
-        // Production-like ε absorbs the ≤1 s/edge time rounding; the descent-speed
-        // bound bug (if reintroduced) is multi-second and would still show.
+        // ε absorbs the ≤1 s/edge time rounding; the descent-speed bound bug is multi-second.
         let eps = Epsilon::uniform(2.0, 0.0);
         let plain = g.multiobj_search(
             a,
@@ -1794,11 +1637,8 @@ mod tests {
         );
     }
 
-    /// `a` reaches the destination `b` by one short paved edge. From `a` a long
-    /// chain of `field_len` paved nodes also fans out; every chain label has
-    /// strictly higher Time AND Surface than `b`, so `b` weakly dominates them
-    /// all. Target pruning must settle `b` first and then refuse to expand the
-    /// chain. Without it, the search walks the entire chain.
+    /// `a`→`b` by one short paved edge, plus a long dominated chain off `a`. Target
+    /// pruning must settle `b` first and refuse to expand the chain.
     #[cfg(test)]
     fn tiny_target_prune_graph(field_len: usize) -> (Graph, NodeID, NodeID) {
         use crate::structures::cost::VarGen;
@@ -1840,9 +1680,8 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        // Cheap direct route a→b (10 m).
         g.add_edge(a, edge(a, b, 10));
-        // Long chain a→f0→f1→… (50 m hops) — every node strictly worse than b.
+        // Long chain a→f0→f1→… (50 m hops), every node strictly worse than b.
         let mut prev = a;
         for &f in &field {
             g.add_edge(prev, edge(prev, f, 50));
@@ -1857,7 +1696,7 @@ mod tests {
         let bike = BikeCost::new(g.raptor.bike_profile);
         let w = g.raptor.cost_weights;
         let eps = Epsilon::uniform(0.0, 0.0);
-        // No distance budget, so only target pruning can stop the 2000-node chain.
+        // No budget, so only target pruning can stop the 2000-node chain.
         let res = g.multiobj_search(
             a,
             b,
@@ -1909,10 +1748,8 @@ mod tests {
 
     #[test]
     fn labelset_rejects_exact_duplicates() {
-        // Distinct paths routinely reach a node with byte-identical cost vectors
-        // (same integer Time, same Surface). A duplicate must NOT be re-admitted —
-        // otherwise a hot node accumulates tens of thousands of identical labels
-        // and every scan over it turns the search quadratic.
+        // A duplicate cost must NOT be re-admitted, else a hot node accumulates identical
+        // labels and every scan over it turns the search quadratic.
         let eps = Epsilon::uniform(0.0, 0.0);
         let mut set = LabelSet::new();
         assert!(set.try_add(cv(298.0, 398.0), &eps, &Buckets::NONE));
@@ -1946,8 +1783,6 @@ mod tests {
         assert!(!set.contains(&cv(10.0, 6.0)));
     }
 
-    // ---- bucket pruning (grid-cap on diversity axes) ----
-
     fn cvc(time: f64, cyc: f64) -> CostVector {
         CostVector::from_active(&[Axis::Time, Axis::CyclewayDeficit], &[time, cyc])
     }
@@ -1959,9 +1794,7 @@ mod tests {
 
     #[test]
     fn bucket_collapses_same_cell_tradeoff_keeps_min_time() {
-        // (300,150) and (250,180) are a genuine trade-off (neither dominates), so
-        // ε-Pareto alone keeps both. They share cyc cell 1 (150,180 → ⌊x/100⌋=1),
-        // so bucketing collapses them to one, keeping the lower-Time representative.
+        // A trade-off sharing cyc cell 1 collapses to the lower-Time representative.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_cyc(100.0);
         let mut set = LabelSet::new();
@@ -1973,17 +1806,13 @@ mod tests {
             250.0,
             "the cell keeps the lower-Time (fastest-for-this-trade-off) representative"
         );
-        // A higher-Time newcomer in the same cell is rejected.
         assert!(!set.try_add(cvc(400.0, 110.0), &eps, &bk));
         assert_eq!(set.len(), 1);
     }
 
     #[test]
     fn bucket_keeps_distinct_cells_preserves_extreme() {
-        // Three trade-off labels (cyc up as time down) in DIFFERENT cyc cells
-        // (50→0, 150→1, 250→2). All survive, so the cycleway extreme (cyc=50) is
-        // preserved — the failure mode coarse ε-dominance exhibits (absorbing the
-        // min-cyc length-detour into a faster, higher-cyc neighbour).
+        // Three trade-offs in DIFFERENT cyc cells all survive, preserving the cyc=50 extreme.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_cyc(100.0);
         let mut set = LabelSet::new();
@@ -2001,8 +1830,7 @@ mod tests {
 
     #[test]
     fn bucket_none_is_strict_noop() {
-        // With NONE, the same-cell trade-off that bucketing would collapse must
-        // both survive — bucketing is opt-in and never changes ε-Pareto behavior.
+        // With NONE, a same-cell trade-off survives (bucketing is opt-in).
         let eps = Epsilon::uniform(0.0, 0.0);
         let mut set = LabelSet::new();
         assert!(set.try_add(cvc(300.0, 150.0), &eps, &Buckets::NONE));
@@ -2012,8 +1840,7 @@ mod tests {
 
     #[test]
     fn bucket_still_dominance_prunes() {
-        // A strictly-dominated label is rejected regardless of which cell it lands
-        // in — bucketing is layered on top of (not instead of) Pareto dominance.
+        // A strictly-dominated label is rejected regardless of cell.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_cyc(100.0);
         let mut set = LabelSet::new();
@@ -2021,10 +1848,6 @@ mod tests {
         assert!(!set.try_add(cvc(300.0, 250.0), &eps, &bk));
         assert_eq!(set.len(), 1);
     }
-
-    // ---- bucket pruning on Drive's Variance axis / Walk's Surface axis ----
-    // Mirrors the CyclewayDeficit bucket tests above: same generic mechanism
-    // (`Buckets`/`LabelSet`), applied to the axes each mode buckets.
 
     fn cvv(time: f64, variance: f64) -> CostVector {
         CostVector::from_active(&[Axis::Time, Axis::Variance], &[time, variance])
@@ -2037,10 +1860,7 @@ mod tests {
 
     #[test]
     fn bucket_collapses_variance_tradeoff_on_drive_axis() {
-        // (300,150) and (250,180) trade Time against Variance (neither dominates),
-        // so ε-Pareto alone keeps both. They share variance cell 1 (150,180 →
-        // ⌊x/100⌋=1), so bucketing collapses them to the lower-Time representative —
-        // exactly the CyclewayDeficit bucket behavior, on Drive's axis instead.
+        // A Time↔Variance trade-off sharing variance cell 1 collapses to lower-Time.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_var(100.0);
         let mut set = LabelSet::new();
@@ -2056,10 +1876,7 @@ mod tests {
 
     #[test]
     fn bucket_keeps_distinct_variance_cells_preserves_extreme() {
-        // Three trade-off labels (variance up as time down) in DIFFERENT variance
-        // cells (50→0, 150→1, 250→2) all survive, preserving the low-variance
-        // extreme — the reliability-conscious route stays on the frontier instead
-        // of being absorbed by a faster, higher-variance neighbour.
+        // Three trade-offs in DIFFERENT variance cells all survive, preserving the low-variance extreme.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_var(100.0);
         let mut set = LabelSet::new();
@@ -2086,8 +1903,7 @@ mod tests {
 
     #[test]
     fn bucket_collapses_surface_tradeoff_on_walk_axis() {
-        // Same mechanism, on Walk's Surface axis: a paved-but-slower vs. faster-but-
-        // rougher trade-off sharing a surface cell collapses to the faster one.
+        // A Surface trade-off sharing a cell collapses to the faster one.
         let eps = Epsilon::uniform(0.0, 0.0);
         let bk = buckets_surf(100.0);
         let mut set = LabelSet::new();
@@ -2455,8 +2271,7 @@ mod tests {
                 var_gen: VarGen::NONE,
             })
         };
-        // +2 m then −2 m over 80 m edges: raw max(0,Δ) sum = 2 m of phantom ascent;
-        // the hysteresis (5 m buffer) must absorb it → ~0 m on the Dplus axis.
+        // +2 m then −2 m: raw max(0,Δ)=2 m phantom ascent the 5 m hysteresis must absorb.
         g.add_edge(a, mk_edge(a, b, 80, 2));
         g.add_edge(b, mk_edge(b, c, 80, -2));
         let bike = BikeCost::new(g.raptor.bike_profile);
@@ -2507,8 +2322,7 @@ mod tests {
         let mut at = BikeAttrs::road_default();
         at.highway = HighwayClass::Residential;
         at.surface = Surface::Paved;
-        // A real +3 m net climb (below the 5 m buffer): the residual must be flushed
-        // at the destination so D+ = 3, not 0.
+        // +3 m net climb (below the 5 m buffer): residual must be flushed so D+ = 3.
         g.add_edge(
             a,
             EdgeData::Street(StreetEdgeData {
@@ -2624,10 +2438,7 @@ mod tests {
         };
         let mut g = Graph::new();
         g.set_distance_budget(f64::INFINITY);
-        // Zero the search epsilon so the only collapse mechanism under test is the
-        // 3-axis projection, not ε-domination: the default Variance ε floor (150) is
-        // far larger than a single residential edge's variance (~0.6), which would
-        // otherwise ε-collapse the genuine Surface↔Variance trade-off on its own.
+        // Zero ε so the only collapse mechanism under test is the 3-axis projection.
         g.raptor.epsilon = Epsilon::uniform(0.0, 0.0);
         let mk = |id: &str, lat: f64, lon: f64| {
             NodeData::OsmNode(OsmNodeData {
@@ -2648,8 +2459,7 @@ mod tests {
                 foot: true, bike: true, car: false, attrs: at, elev_delta: 0, var_gen: vg,
             })
         };
-        // Two parallel a->b edges: equal on the 3 core axes (Time, CyclewayDeficit, D+),
-        // trading off on the demoted axes — A smoother but noisier, B rougher but calmer.
+        // Two parallel a->b edges equal on the 3 core axes, trading off on the demoted axes.
         g.add_edge(a, edge(Surface::Paved, VarGen::SIGNALIZED));
         g.add_edge(a, edge(Surface::Unpaved, VarGen::NONE));
         let bike = g.default_bike_cost();
@@ -2659,25 +2469,9 @@ mod tests {
         assert_eq!(front.len(), 1, "3-axis front collapses Surface/Variance-only trade-offs");
     }
 
-    // ---- synthetic diagnostic: distance-adaptive bucketing bounds the frontier
-    // regardless of route length (Drive/Variance, Walk/Surface) ----
-    //
-    // K disjoint origin→hub_i→destination branches (private hub/sub-chain per
-    // branch, sharing no intermediate node), each a genuine Time↔diversity-axis
-    // trade-off: as i increases, Time strictly decreases and the diversity axis
-    // (Variance or Surface) strictly increases, so all K branches are mutually
-    // non-dominated. This is the combinatorial-with-distance blowup the design
-    // notes describe: every branch is a candidate route (e.g. "take i more
-    // signalized junctions to save a little time"), so the un-bucketed frontier
-    // grows with the number of branches (i.e. with route length/complexity), while
-    // distance-adaptive bucketing (cell ∝ origin→dest straight-line distance)
-    // should keep the frontier roughly constant as that grows, instead of scaling
-    // with it. Branches are disjoint (only O and D are shared) so bucket eviction
-    // is exercised exactly once, at the destination — matching how the bucket cap
-    // is meant to pick representatives from otherwise-independent alternatives,
-    // not how it behaves when forced to arbitrate at every hop of a shared path
-    // (see `bucket_eviction_can_keep_a_dominated_label` for that lossy property).
-
+    // K disjoint origin→hub_i→destination branches, each a mutually non-dominated
+    // Time↔diversity-axis trade-off. Un-bucketed the frontier grows with branch count
+    // (route length); distance-adaptive bucketing should keep it roughly constant.
     #[cfg(test)]
     fn drive_fanout_graph(n: usize, hop_m: f64) -> (Graph, NodeID, NodeID) {
         use crate::structures::cost::VarGen;
@@ -2696,12 +2490,8 @@ mod tests {
             eid: "d".into(),
             lat_lng: LatLng { latitude: lat, longitude: 4.300 + (n as f64 * hop_m) / m_per_deg },
         }));
-        // Branch i: i private zero-length signalized (SIGNALIZED, Secondary) hops
-        // — each a fixed, realistic +324 s² (secondary-road signal σ=18) — followed
-        // by one non-signalized "safe distance" edge whose length (and therefore
-        // Time) strictly decreases with i. Variance and Time are controlled by
-        // fully independent knobs (hop count vs. final edge length), so every
-        // branch i=0..n is a genuine, mutually non-dominated trade-off.
+        // Branch i: i signalized hops (each +324 s² variance) then one safe edge whose
+        // length decreases with i. Independent knobs ⇒ every branch is non-dominated.
         let mut hub_nodes = Vec::new();
         for i in 0..=n {
             let mut cur = o;
@@ -2710,7 +2500,7 @@ mod tests {
                 hub_nodes.push((cur, nxt));
                 cur = nxt;
             }
-            hub_nodes.push((cur, d)); // marker: final safe edge endpoint pair, length filled below
+            hub_nodes.push((cur, d)); // final safe edge endpoint pair
         }
         g.build_raptor_index();
         let signal_edge = |o: NodeID, dn: NodeID| {
@@ -2734,10 +2524,8 @@ mod tests {
             })
         };
         const L0: usize = 20_000;
-        // Speed=11 m/s ⇒ street_secs truncates to whole seconds (speed_mms/1000 = 11 m
-        // per second); DL must exceed that so every branch gets a distinct integer
-        // Time, or truncation ties would let a same-Time, higher-variance branch get
-        // weakly-dominated away — an artifact of the test fixture, not of bucketing.
+        // DL must exceed the per-second truncation (11 m/s) so every branch gets a
+        // distinct integer Time (else truncation ties weakly-dominate branches away).
         const DL: usize = 20;
         let mut idx = 0;
         for i in 0..=n {
@@ -2758,10 +2546,8 @@ mod tests {
         let bike = BikeCost::new(crate::structures::BikeProfile::default());
         let w = CostWeights::default();
         let eps = Epsilon::uniform(0.0, 0.0);
-        // ~700 m/branch-equivalent: N=15 ⇒ ~10.5 km, N=60 ⇒ ~42 km O-D distance
-        // (realistic direct-drive scale); both the Variance range (324·N) and the
-        // O-D distance (700·N) scale linearly with N in lockstep, so the
-        // range/(k·distance) bucket-count ratio is invariant to N by construction.
+        // Variance range (324·N) and O-D distance (700·N) scale with N in lockstep, so
+        // the bucket-count ratio is invariant to N by construction.
         let hop_m = 702.82;
 
         let search = |n: usize, kv: f64| {
@@ -2776,11 +2562,8 @@ mod tests {
 
         let plain_15 = search(15, 0.0);
         let plain_60 = search(60, 0.0);
-        // Not exactly N+1: the Variance axis also carries a systematic (cv·Time)²
-        // term (see `variance_slot_holds_reliability_var_not_raw`) that shrinks
-        // slightly as Time drops, occasionally dominating a close-by branch. The
-        // qualitative property under test is growth with route length/complexity,
-        // not the exact combinatorial count.
+        // Not exactly N+1: the systematic (cv·Time)² term occasionally dominates a
+        // close branch. Property under test is growth with route length, not exact count.
         assert!(
             plain_15 >= 8,
             "at least half the 16 branches must be genuine (non-dominated) trade-offs, got {plain_15}"
@@ -2840,15 +2623,10 @@ mod tests {
                 surface_speed: 100, var_gen: VarGen::NONE,
             })
         };
-        // Branch i: an Unpaved leg of length x_i (roughness) followed by a Paved
-        // leg of length y_i, solved so Time_i = (x_i+y_i)/speed strictly decreases
-        // and Surface_i = 2.5·x_i + y_i strictly increases with i (independent
-        // linear staircases: L_i = L0 - i·DL for total length, S_i = L0 + i·DS for
-        // target Surface, both anchored at branch 0 = all-paved, x_0=0).
+        // Branch i: Unpaved x_i then Paved y_i, solved so Time strictly decreases and
+        // Surface strictly increases with i (independent linear staircases).
         const L0: f64 = 20_000.0;
-        // Speed=1.2 m/s ⇒ street_secs truncates to whole seconds (speed_mms/1000 =
-        // 1.2 m per second); DL must exceed that so every branch gets a distinct
-        // integer Time (see the analogous comment in `drive_fanout_graph`).
+        // DL exceeds the per-second truncation (1.2 m/s) so each branch has a distinct Time.
         const DL: f64 = 5.0;
         const DS: f64 = 88.0;
         for i in 0..=n {
@@ -2881,10 +2659,8 @@ mod tests {
 
         let plain_15 = search(15, 0.0);
         let plain_60 = search(60, 0.0);
-        // Not exactly N+1: Walk's Variance axis also carries the (cv·Time)²
-        // systematic term (constant here, since these edges never set var_gen), so
-        // this is looser than the drive test's caveat, but kept the same shape for
-        // consistency and robustness to future cost-model changes.
+        // Not exactly N+1 (systematic (cv·Time)² term); property under test is growth
+        // with route length, not exact count.
         assert!(
             plain_15 >= 8,
             "at least half the 16 branches must be genuine (non-dominated) trade-offs, got {plain_15}"

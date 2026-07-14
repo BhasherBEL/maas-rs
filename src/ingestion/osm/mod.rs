@@ -5,6 +5,6 @@ mod lambert;
 mod pbf;
 mod platforms;
 
-pub use elevation::Dem;
+pub use elevation::{Dem, DemProjection, DemSet, ElevationSource};
 pub use pbf::*;
 pub use platforms::*;

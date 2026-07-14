@@ -7,7 +7,6 @@
 <title>MaaS Travel-Time Map</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <style>
-/* ── Design-system tokens (shared with index.html; kept in sync) ─────────── */
 :root {
   --bg:        #f6f7f9;
   --panel:     #ffffff;
@@ -70,7 +69,6 @@ button { font: inherit; color: inherit; cursor: pointer; }
 input, select { font: inherit; color: inherit; }
 a { color: var(--ds-accent); }
 
-/* ── Header ──────────────────────────────────────────────────────────────── */
 header {
   display: flex; align-items: center; gap: 12px;
   padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
@@ -85,7 +83,6 @@ header a.head-btn, header button.head-btn {
 header a.head-btn:hover, header button.head-btn:hover { background: var(--panel-2); color: var(--fg); }
 header button.head-btn.active { color: var(--accent); border-color: var(--accent); }
 
-/* ── Share view (QR + link) — mirrors index.html ─────────────────────────── */
 .modal-backdrop {
   display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
   z-index: 9000; align-items: center; justify-content: center; padding: 24px;
@@ -125,7 +122,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 .share-copy:hover { filter: brightness(1.04); }
 .share-copy.done { color: #fff; background: var(--accent); }
 
-/* ── Layout ──────────────────────────────────────────────────────────────── */
 .main { display: flex; flex: 1; overflow: hidden; position: relative; }
 #sidebar {
   width: 340px; flex-shrink: 0;
@@ -142,10 +138,8 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
   .leaflet-control-attribution { background: rgba(20,20,20,.7) !important; color: #aaa !important; }
   .leaflet-control-attribution a { color: #6cf !important; }
 }
-/* The heat canvas must not be tinted by the dark tile filter. */
 .tt-heat-canvas { filter: none !important; }
 
-/* ── Controls ────────────────────────────────────────────────────────────── */
 .field { display: flex; flex-direction: column; gap: 5px; }
 .field > label.lbl {
   font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
@@ -196,7 +190,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 .addr-row:last-child { border-bottom: none; }
 .addr-row:hover { background: var(--ds-accent-soft); }
 
-/* ── Travel-mode grid (mirrors index.html's #modes-grid) ─────────────────── */
 .modes-subhead { display: flex; align-items: center; margin: 0 0 8px; }
 .msh-actions { display: flex; gap: 6px; }
 .msh-actions button {
@@ -232,7 +225,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 }
 .modes-caption { margin: 10px 0 0; font-size: 11px; color: var(--fg-2); line-height: 1.35; }
 
-/* ── Segmented toggle ────────────────────────────────────────────────────── */
 .seg { display: inline-flex; border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm); overflow: hidden; }
 .seg button {
   padding: 7px 14px; background: var(--ds-surface-2); border: none;
@@ -252,9 +244,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 #status { font-size: 12px; color: var(--ds-ink-2); min-height: 1.2em; }
 #status.err { color: var(--danger); }
 
-/* ── Click-to-route popup ──────────────────────────────────────────────────
-   Leaflet builds .leaflet-popup-content-wrapper; retheme it to the --ds-* system
-   so the itinerary reads in both light and dark mode. */
 .tt-route-popup .leaflet-popup-content-wrapper {
   background: var(--ds-surface); color: var(--ds-ink);
   border: 1px solid var(--ds-line); border-radius: var(--ds-radius-sm);
@@ -278,7 +267,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 }
 .tt-route-to { color: var(--ds-ink-2); white-space: nowrap; }
 
-/* ── Legend ──────────────────────────────────────────────────────────────── */
 .legend {
   position: absolute; bottom: 18px; right: 18px; z-index: 1000;
   padding: 10px 12px;
@@ -294,13 +282,11 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 }
 .legend .ends { display: flex; justify-content: space-between; margin-top: 4px; color: var(--ds-ink-3); }
 
-/* ── Mobile (parity with index.html's @media max-width:760px) ────────────── */
 @media (max-width: 760px) {
   header { gap: 8px; padding: 8px 10px; }
   header .logo { font-size: 13px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header a.head-btn { padding: 8px 12px; font-size: 13px; flex-shrink: 0; }
 
-  /* Stack the sidebar above the map; both scroll with the page. */
   .main { flex-direction: column; overflow: visible; }
   #sidebar {
     width: 100%; flex-shrink: 1;
@@ -309,12 +295,10 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
   }
   #map { flex: none; height: 55vh; min-height: 320px; width: 100%; }
 
-  /* Bigger touch targets on the mode/seg controls. */
   .mode-cell { min-height: 48px; }
   .seg button { padding: 10px 16px; font-size: 13px; }
   .msh-actions button { padding: 6px 14px; font-size: 12px; }
 
-  /* Keep the legend out of Leaflet's zoom/attribution controls. */
   .legend {
     bottom: 10px; left: 10px; right: auto; padding: 8px 10px; font-size: 10px;
   }
@@ -401,7 +385,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
   </div>
 </div>
 
-<!-- Share view: QR code + copyable link for the current URL -->
 <div id="share-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Share this view">
   <div class="modal share-modal">
     <div class="modal-head">
@@ -421,7 +404,6 @@ header button.head-btn.active { color: var(--accent); border-color: var(--accent
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/maas.js"></script>
-<!-- Self-contained QR encoder (attaches window.QRCode; no network/CDN). -->
 <script type="module" src="/static/js/vendor/qr.mjs"></script>
 <script type="module" src="/static/js/travel-map.mjs"></script>
 </body>

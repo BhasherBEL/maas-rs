@@ -6,47 +6,23 @@ use serde::{Deserialize, Serialize};
 
 use super::geo::LatLng;
 
-/// CC-BY 4.0 attribution string for the BeST Address open data. Surfaced via the
-/// GraphQL API so clients can display the required credit.
+/// CC-BY 4.0 attribution for the BeST Address open data (required credit, surfaced
+/// via the GraphQL API).
 pub const ADDRESS_ATTRIBUTION: &str =
     "Address data © FPS BOSA — BeSt Address, licensed under CC BY 4.0";
 
-/// Fixed ratio applied to municipality-token match factors relative to a
-/// street-token match: a street-name hit weighs strictly more than a
-/// municipality-only hit (street weight ≥ muni weight). Multiplicative, so
-/// `muni_exact = STREET_MUNI_WEIGHT_RATIO` and `muni_prefix =
-/// STREET_MUNI_WEIGHT_RATIO * prefix_token_weight`.
+/// Municipality match factors relative to a street-token match: a street hit weighs
+/// strictly more than a municipality-only hit (street weight ≥ muni weight).
 const STREET_MUNI_WEIGHT_RATIO: f64 = 0.9;
 
-/// Runtime tuning for [`AddressIndex::search`] proximity/relevance ranking. Held
-/// on the index as a `#[serde(skip)]` field (so `address.bin`'s serialized layout
-/// is unchanged — no schema bump), defaulted on load and overridden from
-/// `config.yaml` (`default_routing.address_*`) at serve time.
+/// Runtime tuning for [`AddressIndex::search`]. `#[serde(skip)]`, defaulted on load,
+/// overridden from `config.yaml` (`default_routing.address_*`) at serve time.
 ///
-/// Defaults encode the researched Stage-1 model:
-/// - `geo_offset_km` 2.0 — full geo score within 2 km of the focus point.
-/// - `geo_half_score_km` 5.0 — a candidate 5 km away keeps half its geo score;
-///   the exponential scale is derived as `(half - offset)/ln(2)`.
-/// - `geo_floor` 0.1 — a far but perfect text match is never fully buried.
-/// - `prefix_token_weight` 0.6 — a prefix-only token match scores 0.6 of an exact.
-/// - `house_number_boost` 1.5 — an exact house-number match outranks a prefix one.
-///
-/// Stage-3 typo tolerance (`fuzzy_*`). The exact/prefix pass runs first; a fuzzy
-/// pass only widens the search when too few streets resolved, so precision and
-/// latency on clean queries are unchanged:
-/// - `fuzzy_trigger_k` 5 — run the fuzzy fallback only when fewer than this many
-///   streets were covered by exact/prefix matching (a clean query that already
-///   resolves ≥ k streets never triggers fuzzy, so its results are byte-identical).
-/// - `fuzzy_min_len_1typo` 3 / `fuzzy_min_len_2typos` 8 — length gate on the query
-///   token (char count): 1–2 chars ⇒ 0 edits (a short token is prefix intent, never
-///   a typo), 3–7 ⇒ 1 edit, ≥8 ⇒ 2 edits. Bounds the candidate set and reflects that
-///   longer words absorb more error.
-/// - `fuzzy_token_weight` 0.4 — a token matched only via fuzzy scores below an exact
-///   (1.0) or prefix (0.6) token, so corrected matches rank under literal ones.
-///
-/// Number tokens (house number / postcode) are NEVER fuzzed, and a fuzzy match is
-/// only accepted when its first character equals the query token's (prefix_length=1:
-/// users rarely mistype the first letter, and it bounds the automaton's matches).
+/// The exact/prefix pass runs first; the fuzzy pass only widens the search when
+/// fewer than `fuzzy_trigger_k` streets resolved, so a clean query's results are
+/// byte-identical. Length gate on the query token: 1–2 chars ⇒ 0 edits, 3–7 ⇒ 1,
+/// ≥8 ⇒ 2. Number tokens are NEVER fuzzed; a fuzzy match is accepted only when its
+/// first character equals the query token's (prefix_length=1).
 #[derive(Debug, Clone, Copy)]
 pub struct AddressSearchParams {
     pub geo_offset_km: f64,
@@ -77,22 +53,18 @@ impl Default for AddressSearchParams {
 }
 
 impl AddressSearchParams {
-    /// Exponential decay scale (km) such that the geo score halves at
-    /// `geo_half_score_km`: `scale = (half - offset)/ln(2)`.
+    /// Exponential decay scale (km) so the geo score halves at `geo_half_score_km`.
     fn geo_scale_km(&self) -> f64 {
         ((self.geo_half_score_km - self.geo_offset_km) / std::f64::consts::LN_2).max(f64::EPSILON)
     }
 
-    /// Distance decay in `[geo_floor, 1.0]` for a candidate at `dist_km` from the
-    /// focus point: full score within `geo_offset_km`, then exponential, floored.
+    /// Distance decay in `[geo_floor, 1.0]` for a candidate at `dist_km`.
     fn geo_decay(&self, dist_km: f64) -> f64 {
         let excess = (dist_km - self.geo_offset_km).max(0.0);
         (-excess / self.geo_scale_km()).exp().max(self.geo_floor)
     }
 
-    /// Maximum edit distance allowed for a query token of `len` characters under
-    /// the length gate: `len ≥ fuzzy_min_len_2typos` ⇒ 2, `len ≥ fuzzy_min_len_1typo`
-    /// ⇒ 1, otherwise 0 (no fuzzy for very short tokens).
+    /// Max edit distance for a `len`-char query token: ≥2typos ⇒ 2, ≥1typo ⇒ 1, else 0.
     fn max_edits(&self, len: usize) -> u32 {
         if len >= self.fuzzy_min_len_2typos {
             2
@@ -104,11 +76,9 @@ impl AddressSearchParams {
     }
 }
 
-/// One mailbox / apartment ("bus" / "bte") inside a building, collapsed into the
-/// building's [`AddressRecord`] as metadata. `label` is the BeST `boxNumber` value
-/// (e.g. `3`, `0023`, `A`). The coordinate is the box's own position when the
-/// building's boxes diverge beyond `address_box_coord_epsilon_m`; when they all sit
-/// within that epsilon the box coordinates are collapsed to the building centroid.
+/// One mailbox / apartment ("bus" / "bte") inside a building. `label` is the BeST
+/// `boxNumber` value. The coordinate is the box's own position when the building's
+/// boxes diverge beyond `address_box_coord_epsilon_m`, else the building centroid.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AddressBox {
     pub label: String,
@@ -116,12 +86,10 @@ pub struct AddressBox {
     pub lon: f64,
 }
 
-/// A geocoded building, keyed at build time by `(street, house_number)` so the
-/// apartment/box rows BeST models as separate addresses collapse into one
-/// candidate. `street`/`municipality`/`postal` are indices into the interned
-/// tables on [`AddressIndex`]; `lat`/`lon` is the representative (centroid)
-/// coordinate; `boxes` carries every box at this house number as metadata (empty
-/// when the building has none).
+/// A geocoded building, keyed at build time by `(street, house_number)` so BeST's
+/// separate apartment/box rows collapse into one candidate.
+/// `street`/`municipality`/`postal` are indices into [`AddressIndex`]'s interned
+/// tables; `lat`/`lon` is the centroid; `boxes` carries every box as metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AddressRecord {
     pub id: String,
@@ -134,7 +102,6 @@ pub struct AddressRecord {
     pub boxes: Vec<AddressBox>,
 }
 
-/// A ranked search result with a display label and resolved fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressHit {
     pub id: String,
@@ -148,7 +115,7 @@ pub struct AddressHit {
 }
 
 /// An interned street / municipality entity: a display name plus every language
-/// spelling, all of which are searchable aliases pointing to the same id.
+/// spelling, all searchable aliases pointing to the same id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Named {
     pub display: String,
@@ -156,8 +123,8 @@ pub struct Named {
 }
 
 /// In-memory address search index. The interned tables and compact rows are
-/// serialized to `address.bin`; the token/prefix lookup structures are rebuilt
-/// from them on load (so they are `#[serde(skip)]`).
+/// serialized to `address.bin`; the `#[serde(skip)]` lookup structures are rebuilt
+/// from them on load.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AddressIndex {
     streets: Vec<Named>,
@@ -165,40 +132,28 @@ pub struct AddressIndex {
     postals: Vec<String>,
     records: Vec<AddressRecord>,
 
-    /// Normalized word token → street ids (prefix-searchable via range scan).
     #[serde(skip)]
     street_tokens: BTreeMap<String, Vec<u32>>,
-    /// Normalized word token → municipality ids.
     #[serde(skip)]
     muni_tokens: BTreeMap<String, Vec<u32>>,
-    /// Street id → record ids.
     #[serde(skip)]
     street_records: Vec<Vec<u32>>,
-    /// Street id → distinct municipality ids across its records.
     #[serde(skip)]
     street_munis: Vec<Vec<u32>>,
-    /// Municipality id → street ids that have a record in it.
     #[serde(skip)]
     muni_streets: HashMap<u32, Vec<u32>>,
 
-    /// FST over the unique `street_tokens` keys, for length-gated fuzzy lookup of
-    /// misspelled street tokens. Rebuilt from the BTreeMap on load (so the
-    /// serialized layout is unchanged — no schema bump).
     #[serde(skip)]
     street_token_fst: Option<Set<Vec<u8>>>,
-    /// FST over the unique `muni_tokens` keys (fuzzy municipality lookup).
     #[serde(skip)]
     muni_token_fst: Option<Set<Vec<u8>>>,
 
-    /// Proximity/relevance tuning. Rebuilt from defaults on load (so the
-    /// serialized layout is unchanged) and overridden from config at serve time.
     #[serde(skip)]
     params: AddressSearchParams,
 }
 
-/// Lowercase, strip common French/Dutch/German accents, drop punctuation, and
-/// collapse whitespace. Used for both indexing and querying so "stupid matching"
-/// is accent- and case-insensitive.
+/// Lowercase, strip French/Dutch/German accents, drop punctuation, collapse
+/// whitespace. Used for both indexing and querying (accent/case-insensitive).
 pub fn normalize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = true;
@@ -229,19 +184,15 @@ pub fn normalize(s: &str) -> String {
     out
 }
 
-/// Recognized box-reference keywords (accent-folded, lowercased). A standalone
-/// keyword takes the following token as its value; an attached keyword (`bus3`,
-/// `bte3`, `boite3`) takes its alphanumeric suffix.
+/// Box-reference keywords (accent-folded, lowercased).
 const BOX_KEYWORDS: [&str; 3] = ["bus", "bte", "boite"];
 
-/// Maximum character length of a recognized box value. A real Belgian box value is
-/// short (`3`, `0023`, `B12`); a long alphabetic suffix (`laan`, `straat`) is never
-/// a box, so it gates keyword-prefixed street names out of the box grammar.
+/// Max length of a recognized box value; a long alphabetic suffix (`laan`,
+/// `straat`) is never a box, gating keyword-prefixed street names out of the grammar.
 const MAX_BOX_VALUE_LEN: usize = 5;
 
-/// Lowercase + accent-fold a single raw token *without* dropping the `/`, `:` and
-/// `.` punctuation the box grammar relies on (full [`normalize`] eats them). Mirrors
-/// the accent map of `normalize` so `boîte` folds to `boite`.
+/// Lowercase + accent-fold a raw token WITHOUT dropping the `/`, `:`, `.` the box
+/// grammar relies on (full [`normalize`] eats them).
 fn fold_box_token(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars().flat_map(|c| c.to_lowercase()) {
@@ -262,17 +213,13 @@ fn fold_box_token(s: &str) -> String {
     out
 }
 
-/// Strip the box value down to the searchable form: drop everything that is not
-/// ASCII alphanumeric (so `:3`, `/3`, `n°3` all reduce to `3`), keeping case-folded
-/// digits/letters.
+/// Strip the box value to ASCII alphanumeric only (so `:3`, `/3`, `n°3` → `3`).
 fn clean_box_value(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
 
-/// Whether `v` (already reduced via [`clean_box_value`]) has the shape of a real
-/// box value: short (≤ [`MAX_BOX_VALUE_LEN`]) and either all digits (`3`, `0023`)
-/// or a single leading letter optionally followed by digits (`A`, `B12`). A long
-/// alphabetic suffix (`laan`, `straat`, `instein`) is never a box value.
+/// Whether `v` has the shape of a real box value: ≤ [`MAX_BOX_VALUE_LEN`] and either
+/// all digits or a single leading letter then digits (`A`, `B12`).
 fn is_box_value(v: &str) -> bool {
     let len = v.chars().count();
     if len == 0 || len > MAX_BOX_VALUE_LEN {
@@ -286,16 +233,11 @@ fn is_box_value(v: &str) -> bool {
     first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_digit())
 }
 
-/// Extract at most ONE box reference (`16 bus N`, `16 bte N`, `16 bN`, `16 /N`,
-/// `16 boite N`, `16 bus: N`, …) from the raw query, returning the query with the
-/// box span removed and the normalized box value. A box reference is recognized
-/// only when BOTH hold: (1) POSITIONAL — it appears strictly after a numeric
-/// house-number token (a token whose first character is a digit), so a leading
-/// street word like "Buslaan", "boite" in "rue de la boite 5", or "b" in
-/// "avenue b 12" is never swallowed; and (2) SHAPE — its value is box-shaped per
-/// [`is_box_value`] (short, all-digits or a single letter then digits), so
-/// keyword-prefixed streets ("buslaan" → "laan", "bteinstein" → "instein") are
-/// rejected. A keyword with no box-shaped value is left untouched.
+/// Extract at most ONE box reference from the raw query, returning the query with
+/// the box span removed and the normalized box value. Recognized only when BOTH:
+/// (1) POSITIONAL — strictly after a numeric house-number token, so a leading street
+/// word ("Buslaan", "boite" in "rue de la boite 5", "b" in "avenue b 12") is never
+/// swallowed; and (2) SHAPE — box-shaped per [`is_box_value`].
 fn parse_box_reference(query: &str) -> (String, Option<String>) {
     let raw: Vec<&str> = query.split_whitespace().collect();
     let folded: Vec<String> = raw.iter().map(|t| fold_box_token(t)).collect();
@@ -354,7 +296,7 @@ fn parse_box_reference(query: &str) -> (String, Option<String>) {
     (query.to_string(), None)
 }
 
-/// Re-join `raw` tokens with the inclusive index span `from..=to` removed.
+/// Re-join `raw` tokens with the inclusive span `from..=to` removed.
 fn remove_indices(raw: &[&str], from: usize, to: usize) -> String {
     raw.iter()
         .enumerate()
@@ -364,11 +306,9 @@ fn remove_indices(raw: &[&str], from: usize, to: usize) -> String {
         .join(" ")
 }
 
-/// Whether a stored box `label` equals the query box value `q`, leading-zero /
-/// numeric-insensitively: BeST stores box labels zero-padded (`0003`) but users
-/// type `bus 3`. When both the normalized label and the query are all digits they
-/// compare as numbers (leading zeros stripped); otherwise it is a plain
-/// equality (so a non-numeric label like `A` keeps its exact behavior).
+/// Whether stored box `label` equals query box value `q`, leading-zero-insensitively:
+/// all-digit label/query compare as numbers (BeST stores `0003`, users type `3`);
+/// otherwise plain equality (a letter label like `A` stays exact).
 fn box_label_eq(label: &str, q: &str) -> bool {
     let l = normalize(label);
     if l == q {
@@ -378,10 +318,8 @@ fn box_label_eq(label: &str, q: &str) -> bool {
     numeric(&l) && numeric(q) && l.trim_start_matches('0') == q.trim_start_matches('0')
 }
 
-/// Component-wise median of a coordinate axis: sorts `vals` in place and returns the
-/// middle value (mean of the two middle values for an even count). Robust to a stray
-/// outlier that would drag an arithmetic mean off the street. `vals` is never empty
-/// at the call site (a group always has ≥ 1 matched building).
+/// Component-wise median of a coordinate axis (sorts `vals` in place); robust to a
+/// stray outlier that would drag an arithmetic mean off the street.
 fn median(vals: &mut [f64]) -> f64 {
     vals.sort_by(f64::total_cmp);
     let n = vals.len();
@@ -411,13 +349,12 @@ impl AddressIndex {
         self.streets.len()
     }
 
-    /// Override the proximity/relevance tuning (from `config.yaml` at serve time).
     pub fn set_search_params(&mut self, params: AddressSearchParams) {
         self.params = params;
     }
 
-    /// Rebuild every `#[serde(skip)]` lookup structure from the interned tables
-    /// and records. Called after construction and after deserialization.
+    /// Rebuild every `#[serde(skip)]` lookup structure from the interned tables and
+    /// records. Called after construction and after deserialization.
     pub fn rebuild_indexes(&mut self) {
         self.street_tokens.clear();
         self.muni_tokens.clear();
@@ -460,10 +397,9 @@ impl AddressIndex {
             Some(Set::from_iter(self.muni_tokens.keys()).expect("muni token FST"));
     }
 
-    /// Length-gated fuzzy lookup: stream the token FST for keys within `max_edits`
-    /// of `token`, keep only those whose first character equals the query token's
-    /// (prefix_length=1 prune), and fold their entity ids together. `fst` uses
-    /// standard Levenshtein (a transposition counts as 2 edits).
+    /// Fuzzy lookup: FST keys within `max_edits` of `token`, kept only when their
+    /// first character equals the query token's (prefix_length=1 prune). Standard
+    /// Levenshtein (a transposition counts as 2 edits).
     fn fuzzy_ids(
         fst: Option<&Set<Vec<u8>>>,
         map: &BTreeMap<String, Vec<u32>>,
@@ -501,12 +437,9 @@ impl AddressIndex {
         out
     }
 
-    /// Per word-token text factor in `(0, 1]` for one candidate street/record:
-    /// an exact alias token scores full (street 1.0, municipality
-    /// `STREET_MUNI_WEIGHT_RATIO`), a prefix-only token scores `prefix_token_weight`
-    /// of that, and a token matched only via the fuzzy fallback scores the lower
-    /// `fuzzy_token_weight`. Takes the best of the street/municipality match for
-    /// this token. Returns `None` when the token matches neither.
+    /// Per word-token text factor in `(0, 1]`: exact street 1.0 / municipality
+    /// `STREET_MUNI_WEIGHT_RATIO`, prefix scales by `prefix_token_weight`, fuzzy-only
+    /// by `fuzzy_token_weight`. Best of the street/municipality match; `None` if neither.
     #[allow(clippy::too_many_arguments)]
     fn token_factor(
         &self,
@@ -544,26 +477,15 @@ impl AddressIndex {
         best
     }
 
-    /// Search the index. The query is normalized then split into word tokens
-    /// (street / municipality names) and number tokens (house number / postcode).
-    /// A street matches when every word token prefix-matches one of its aliases
-    /// or one of its municipalities; number tokens then filter the house number
-    /// or postcode.
+    /// Search the index. The query is split into word tokens (street/municipality)
+    /// and number tokens (house number/postcode); a street matches when every word
+    /// token prefix-matches an alias or a municipality, then number tokens filter.
     ///
     /// When the exact/prefix pass covers fewer than `fuzzy_trigger_k` streets, a
-    /// length-gated, first-character-pruned fuzzy fallback widens the WORD tokens
-    /// (never number tokens) so misspelled streets still resolve; fuzzy-only token
-    /// matches score `fuzzy_token_weight` (< prefix < exact). A clean query that
-    /// already covers ≥ `fuzzy_trigger_k` streets skips fuzzy entirely, so its
-    /// results are unchanged.
-    ///
-    /// Candidates are ranked by `text_score * geo_decay` (higher first, then a
-    /// deterministic tie-break on record id). `text_score` is the mean per-token
-    /// factor (exact vs prefix vs fuzzy, street vs municipality) times the exact
-    /// house-number boost; `geo_decay` is an exponential distance falloff toward
-    /// `focus = (lat, lon)` (the map the user is viewing). `focus == None` ⇒
-    /// `geo_decay = 1.0`, reducing to pure deterministic text ranking. Returns up
-    /// to `limit` ranked hits.
+    /// fuzzy fallback widens the WORD tokens (never number tokens); otherwise results
+    /// are unchanged. Ranked by `text_score * geo_decay` (deterministic id tie-break),
+    /// where `text_score` is the mean per-token factor times the exact house-number
+    /// boost; `focus == None` ⇒ `geo_decay = 1.0` (pure text ranking).
     pub fn search(
         &self,
         query: &str,
@@ -743,13 +665,9 @@ impl AddressIndex {
         self.group_by_street(scored, limit)
     }
 
-    /// Street-level collapse (no number token in the query): one hit per
-    /// `(street, municipality)`, scored by the MAX of the group's building scores
-    /// (preserving proximity/fuzzy ranking) with a deterministic record-id
-    /// tie-break. The coordinate is the component-wise MEDIAN of the matched
-    /// buildings' coordinates rather than the arithmetic mean: the median is robust
-    /// to a stray out-of-range building (e.g. a mis-geocoded record) that would drag
-    /// a mean off the street, so a street query lands on a real on-street point.
+    /// Street-level collapse (no number token): one hit per `(street, municipality)`,
+    /// scored by the MAX of the group's building scores (deterministic id tie-break).
+    /// Coordinate is the component-wise MEDIAN (robust to a mis-geocoded outlier).
     fn group_by_street(&self, scored: Vec<(f64, u32)>, limit: usize) -> Vec<AddressHit> {
         let mut groups: HashMap<(u32, u32), (f64, u32, Vec<f64>, Vec<f64>)> = HashMap::new();
         for (score, rid) in scored {
@@ -789,7 +707,7 @@ impl AddressIndex {
             .collect()
     }
 
-    /// Building-level hit (number token, no box): `"<Street> <house>, <pc> <muni>"`.
+    /// Building-level hit (number token, no box).
     fn hit_building(&self, rid: u32) -> AddressHit {
         let r = &self.records[rid as usize];
         let street = self.streets[r.street as usize].display.clone();
@@ -808,9 +726,8 @@ impl AddressIndex {
         }
     }
 
-    /// Box-level hit: select the building's box whose label matches `box_token`
-    /// (exact, else prefix); label `"<Street> <house> bus <box>, <pc> <muni>"` with
-    /// the box's own coordinate. Falls back to the building when no box matches.
+    /// Box-level hit: the building's box matching `box_token` (exact, else prefix),
+    /// with the box's own coordinate; falls back to the building when none matches.
     fn hit_box(&self, rid: u32, box_token: &str) -> AddressHit {
         let r = &self.records[rid as usize];
         let exact = r.boxes.iter().find(|b| box_label_eq(&b.label, box_token));
@@ -842,9 +759,8 @@ impl AddressIndex {
     }
 }
 
-/// One building accumulated during ingestion before it is finalized into an
-/// [`AddressRecord`]: all raw-row coordinates (for the representative centroid and
-/// the divergence test) plus each box's label and own coordinate.
+/// One building accumulated during ingestion before finalization into an
+/// [`AddressRecord`]: raw-row coordinates plus each box's label and own coordinate.
 struct PendingBuilding {
     id: String,
     street: u32,
@@ -855,19 +771,15 @@ struct PendingBuilding {
     boxes: Vec<(String, f64, f64)>,
 }
 
-/// Default representative-coordinate divergence epsilon (meters). Box coordinates
-/// within this distance of the building centroid are collapsed to it; beyond it
-/// each box keeps its own coordinate. Overridden from `config.yaml`
-/// (`default_routing.address_box_coord_epsilon_m`) at build time.
+/// Default box-coordinate divergence epsilon (meters); overridden from `config.yaml`
+/// (`default_routing.address_box_coord_epsilon_m`).
 pub const DEFAULT_BOX_COORD_EPSILON_M: f64 = 5.0;
 
-/// Builder accumulating interned entities and records during ingestion, then
-/// producing a ready-to-query [`AddressIndex`]. Raw address rows are aggregated by
-/// `(street, house_number)` so the apartment/box rows BeST stores as separate
-/// addresses collapse into one building-level record. The municipality is folded
-/// into the key as well — a street id implies its municipality in the real feed, so
-/// this is a no-op there, but it keeps a building from merging across municipalities
-/// when test fixtures reuse one street id.
+/// Builder accumulating interned entities/records, then producing a queryable
+/// [`AddressIndex`]. Rows aggregate by `(street, municipality, house_number)` so
+/// BeST's separate apartment/box rows collapse into one building record. The
+/// municipality is in the key so a building never merges across municipalities when
+/// test fixtures reuse one street id.
 pub struct AddressIndexBuilder {
     streets: Vec<Named>,
     municipalities: Vec<Named>,
@@ -901,7 +813,6 @@ impl AddressIndexBuilder {
         Self::default()
     }
 
-    /// Override the representative-coordinate divergence epsilon (meters).
     pub fn set_box_coord_epsilon_m(&mut self, m: f64) {
         self.box_coord_epsilon_m = m;
     }
@@ -977,10 +888,9 @@ impl AddressIndexBuilder {
         }
     }
 
-    /// Finalize each pending building: representative coordinate = centroid of its
-    /// raw-row coordinates; if every coordinate is within `box_coord_epsilon_m` of
-    /// that centroid the box coordinates collapse to it, otherwise each box keeps
-    /// its own coordinate (the box labels are always retained).
+    /// Finalize each pending building: representative coordinate = centroid; if every
+    /// coordinate is within `box_coord_epsilon_m` of it the box coordinates collapse
+    /// to it, else each box keeps its own (labels always retained).
     pub fn finish(self) -> AddressIndex {
         let eps = self.box_coord_epsilon_m;
         let records = self
@@ -1123,8 +1033,6 @@ mod tests {
         assert_eq!(hits.len(), 1, "the limit truncates the two building hits to one");
     }
 
-    /// "Rue de la Loi 16" exists in both Brussels and Liège; ids B1/L1 let the
-    /// proximity and geo-floor tests assert ordering by focus point.
     fn two_munis() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi", "Wetstraat"]));
@@ -1166,9 +1074,6 @@ mod tests {
         assert_eq!(ids_a, vec!["B1", "L1"], "tie-break by record id is stable");
     }
 
-    /// Two records on the same street at identical coords (equal geo_decay), one
-    /// with the exact house number, one whose number only prefix-matches: the
-    /// exact-number boost must rank the exact one first.
     fn house_number_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi"]));
@@ -1187,8 +1092,6 @@ mod tests {
         assert_eq!(hits[0].id, "H16", "exact house number outranks prefix match");
     }
 
-    /// A typo of "wetstraat" ("wetstrat", one deletion) is NOT a prefix of any
-    /// alias, so it only resolves once the fuzzy fallback fires.
     #[test]
     fn typo_resolves_via_fuzzy() {
         let idx = sample();
@@ -1197,8 +1100,6 @@ mod tests {
         assert!(hits.iter().all(|h| h.street == "Rue de la Loi"));
     }
 
-    /// With the fuzzy fallback disabled (trigger_k = 0 ⇒ never fire), the same
-    /// deletion typo finds nothing, proving the typo resolves *only* via fuzzy.
     #[test]
     fn typo_needs_fuzzy_to_resolve() {
         let mut idx = sample();
@@ -1209,8 +1110,6 @@ mod tests {
         assert!(idx.search("wetstrat", 10, None).is_empty());
     }
 
-    /// A street whose single token is 17 chars long; a 2-edit typo of it resolves
-    /// because the ≥8-char gate allows 2 edits.
     fn long_token_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let s = b.intern_street(
@@ -1234,10 +1133,6 @@ mod tests {
         assert!(hits.iter().all(|h| h.street == "Wetenschapsstraat"));
     }
 
-    /// Five distinct "park*" streets share the prefix "park"; a clean "park" query
-    /// covers all five (≥ trigger_k = 5) so the fuzzy fallback never fires — the
-    /// 1-edit neighbour "parc" is therefore NOT pulled in. Raising trigger_k forces
-    /// fuzzy on, which then does include "parc", proving the prefix-first gate.
     fn prefix_first_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let bxl = b.intern_municipality("M1", named("Bruxelles", &["Bruxelles"]));
@@ -1293,8 +1188,6 @@ mod tests {
         );
     }
 
-    /// Tokens of length 2, 5, 7 and 8 on distinct streets with distinct first
-    /// letters, to probe the length gate independently of prefix matching.
     fn length_gate_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let bxl = b.intern_municipality("M1", named("Bruxelles", &["Bruxelles"]));
@@ -1374,9 +1267,6 @@ mod tests {
         );
     }
 
-    /// Two streets: "Wetstrat" (exact-matched by the query) and "Wetstraat"
-    /// (fuzzy-matched, 1 edit), at identical coords. The exact match must rank
-    /// above the fuzzy-only one (fuzzy_token_weight < prefix weight).
     fn ranking_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let a = b.intern_street("S1", named("Wetstrat", &["Wetstrat"]));
@@ -1397,9 +1287,8 @@ mod tests {
         assert_eq!(hits[1].id, "FZ", "the fuzzy-only match ranks below it");
     }
 
-    /// One building (Rue de la Loi 16) whose three apartment rows (bus 1/2/3) sit a
-    /// metre or so apart — distinct coordinates, all within the 5 m epsilon — so the
-    /// collapse must actively rewrite each box coordinate to the centroid.
+    /// Three apartment rows a metre apart, all within the 5 m epsilon, so the collapse
+    /// rewrites each box coordinate to the centroid.
     fn convergent_boxes() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi", "Wetstraat"]));
@@ -1411,8 +1300,7 @@ mod tests {
         b.finish()
     }
 
-    /// One building (Rue de la Loi 16) whose three boxes sit > epsilon apart, so
-    /// each box keeps its own coordinate and the building coordinate is the centroid.
+    /// Three boxes > epsilon apart, so each box keeps its own coordinate.
     fn divergent_boxes() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi", "Wetstraat"]));
@@ -1436,8 +1324,6 @@ mod tests {
         assert!(!hits[0].label.contains("bus"), "no box surfaced without a box token");
     }
 
-    /// A street with house numbers 16/100/200 in Bruxelles plus the same street in
-    /// Liège, to prove the no-number collapse and its per-municipality split.
     fn street_houses() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi", "Wetstraat"]));
@@ -1460,8 +1346,6 @@ mod tests {
         let bxl = hits.iter().find(|h| h.municipality == "Bruxelles").unwrap();
         assert_eq!(bxl.label, "Rue de la Loi, 1000 Bruxelles");
         assert!(bxl.house_number.is_empty(), "street-level carries no house number");
-        // Component-wise median of the matched buildings; for these three
-        // evenly-spaced points the median equals the mean (50.847).
         let median_lat = 50.847;
         assert!(
             (bxl.lat - median_lat).abs() < 1e-9,
@@ -1550,10 +1434,8 @@ mod tests {
         assert_eq!(hits[0].house_number, "16", "building-level hit, not street-level");
     }
 
-    /// Two "Parc *" streets the query "parc" matches; one has a building right at
-    /// the focus plus a far one, the other a single mid-distance building. With the
-    /// group score = MAX of members, the street holding the focus-adjacent building
-    /// must rank first — even though its mean (near + far) would lose to the other.
+    /// Group score = MAX of members: the street with a focus-adjacent building ranks
+    /// first even though its mean (near + far) would lose.
     fn street_group_proximity() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let royal = b.intern_street("S1", named("Parc Royal", &["Parc Royal"]));
@@ -1586,9 +1468,6 @@ mod tests {
         assert_eq!(hits[0].street, "Avenue Louise");
     }
 
-    /// Streets whose names begin with a box keyword (`bus`, `boite`, `bte`) or
-    /// contain the keyword as a real word, plus a disambiguating sibling street, so
-    /// the box parser must NOT eat the legitimate street/house tokens.
     fn eaten_token_fixture() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let bxl = b.intern_municipality("M1", named("Namur", &["Namur"]));
@@ -1644,8 +1523,6 @@ mod tests {
         assert_eq!(hits[0].house_number, "12");
     }
 
-    /// A building (Rue de la Loi 16) with a single zero-padded box label `0003`, to
-    /// prove the box select matches the user-typed `bus 3` numeric-insensitively.
     fn zero_pad_box() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi"]));
@@ -1668,8 +1545,6 @@ mod tests {
         }
     }
 
-    /// A building with a pure-letter box label `A` — a legitimate single-letter box
-    /// the shape gate must still accept.
     fn letter_box() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let loi = b.intern_street("S1", named("Rue de la Loi", &["Rue de la Loi"]));
@@ -1692,12 +1567,8 @@ mod tests {
         }
     }
 
-    /// A street whose buildings cluster near Libramont station (~49.921, 5.379) plus
-    /// one mis-geocoded outlier in northern France (~49.293, 2.307). This mirrors the
-    /// original bug where placeholder records dragged the street centroid to a border
-    /// point. Even without Part A's ingestion guard, the street-level collapse must
-    /// return a coordinate on the cluster (the median), NOT the arithmetic mean the
-    /// outlier would pull off toward the border.
+    /// Buildings clustered near Libramont plus one mis-geocoded outlier: the
+    /// street-level collapse must return the cluster (median), not the mean.
     fn outlier_street() -> AddressIndex {
         let mut b = AddressIndexBuilder::new();
         let gare = b.intern_street("S1", named("Rue de la Gare", &["Rue de la Gare"]));
@@ -1724,7 +1595,6 @@ mod tests {
                 *lon,
             );
         }
-        // Mis-geocoded outlier in northern France.
         b.push_record("GBAD".into(), gare, lib, pc, "99".into(), String::new(), 49.293, 2.307);
         b.finish()
     }
@@ -1735,14 +1605,12 @@ mod tests {
         let hits = idx.search("rue de la gare", 10, None);
         assert_eq!(hits.len(), 1, "one street-level hit");
         let h = &hits[0];
-        // The median lands on the station cluster, not the border-straddling mean.
         assert!(
             (h.lat - 49.921).abs() < 0.01 && (h.lon - 5.379).abs() < 0.01,
             "median must land on the cluster near the station, got {},{}",
             h.lat,
             h.lon
         );
-        // The arithmetic mean (~49.816, 4.867) would be far off — prove we are not it.
         let mean_lat = (49.920 + 49.921 + 49.921 + 49.922 + 49.920 + 49.293) / 6.0;
         assert!(
             (h.lat - mean_lat).abs() > 0.05,

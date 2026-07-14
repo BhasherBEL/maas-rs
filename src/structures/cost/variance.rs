@@ -1,12 +1,6 @@
 //! Time uncertainty. `edge_variance` is the single source of truth: it feeds both
-//! the always-on `Variance` front axis (via `edge_cost_vector`) and the post-hoc
-//! `[p50, p95]` bracket summed along a fixed path (via `annotate_path`). Edges are
-//! treated as independent, so variances add (the post-hoc bracket adds a
-//! correlated systematic term for long direct paths).
-//!
-//! OSM lacks signal cycle/red times and traffic volume, so the σ magnitudes are
-//! defaulted parameters (proxied from road class) held in `VarianceModel` and
-//! overridable from config.
+//! the always-on `Variance` front axis and the post-hoc `[p50, p95]` bracket. Edges
+//! are treated as independent, so variances add.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +10,6 @@ use crate::structures::{HighwayClass, StreetEdgeData};
 const Z_P95: f64 = 1.645;
 
 /// Variance-generating features classified once at ingest, packed as a bit set.
-/// A plain `u8` newtype (not `bitflags`) so it serializes trivially with the
-/// graph cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarGen(u8);
 
@@ -36,9 +28,7 @@ impl VarGen {
     }
 }
 
-/// Tunable σ (seconds) for each variance generator, proxied from road class
-/// because OSM does not carry signal timing or traffic volume. Serde-defaulted so
-/// a sparse config block keeps these values.
+/// Tunable σ (seconds) for each variance generator, proxied from road class.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VarianceModel {
@@ -52,8 +42,7 @@ pub struct VarianceModel {
     pub signal_delay_major: f64,
     pub signal_delay_secondary: f64,
     pub signal_delay_minor: f64,
-    /// σ (seconds) of the uncertainty added once at each dismount (a push run): how
-    /// long the stop+restart takes is far less predictable than riding.
+    /// σ (seconds) added once per dismount (push run).
     pub push_sigma: f64,
 }
 
@@ -76,7 +65,7 @@ impl Default for VarianceModel {
 }
 
 impl VarianceModel {
-    /// Total time variance (seconds²) contributed by an edge's generators.
+    /// Time variance (seconds²) contributed by an edge's generators.
     pub fn variance(&self, vg: VarGen, highway: HighwayClass) -> f64 {
         let mut var = 0.0;
         if vg.contains(VarGen::SIGNALIZED) {
@@ -119,10 +108,9 @@ fn is_stressful_class(h: HighwayClass) -> bool {
     )
 }
 
-/// Total time variance (seconds²) for one directed edge: crossings/signals/
-/// elevators (all modes), road-class exposure (all modes), and turns (bike only).
-/// The single source of truth shared by the front `Variance` axis and the
-/// post-hoc `[p50,p95]` bracket.
+/// Time variance (seconds²) for one directed edge: crossings/signals/elevators and
+/// road-class exposure (all modes), turns (bike only). Single source of truth for
+/// the `Variance` axis and the `[p50,p95]` bracket.
 pub fn edge_variance(
     mode: RoutingMode,
     e: &StreetEdgeData,
@@ -144,12 +132,9 @@ pub fn edge_variance(
     var
 }
 
-/// Expected (mean) time in seconds added to one directed edge by traffic signals
-/// (all modes). The bike turn-mean delay it formerly carried is now the
-/// physically-grounded corner slow-down in `BikeCost::speed_change_secs`, charged
-/// per-vertex by the fold (it needs the previous edge's length/cruise speed, which
-/// this per-edge signature lacks). The single source of truth for the signal part,
-/// shared by the front `Time` axis and the post-hoc `[p50,p95]` bracket's mean.
+/// Mean time (seconds) added to an edge by traffic signals only (the bike turn
+/// slow-down lives in `BikeCost::speed_change_secs`). Single source of truth for the
+/// signal part of the `Time` axis and the bracket mean.
 pub fn edge_time_penalty(e: &StreetEdgeData, model: &VarianceModel) -> f64 {
     let mut t = 0.0;
     if e.var_gen.contains(VarGen::SIGNALIZED) {
@@ -184,8 +169,7 @@ impl TimeMoments {
 }
 
 /// Leg structural role — drives access/egress percentile treatment at plan
-/// reconstruction. No longer affects the street search (the `Variance` axis is
-/// always on), so the two roles produce the same Pareto front.
+/// reconstruction. Does not affect the street search, so both roles share the front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LegRole {
     Neutral,
@@ -198,11 +182,9 @@ impl Default for LegRole {
     }
 }
 
-/// Per-edge `(mean, variance)` time in seconds. Mean = kinematic time at
-/// `speed_mps` plus the expected signal delay; variance accrues only from this
-/// edge's generator flags. The turn-delay component of the mean (bike only)
-/// requires turn geometry this signature lacks, so it is applied by the caller
-/// (`annotate_path`), which threads `incoming`/`this_dir`.
+/// Per-edge `(mean, variance)` time (seconds). Mean = kinematic time + signal delay;
+/// variance from generator flags. The bike turn-delay mean is applied by the caller
+/// (`annotate_path`), which has the turn geometry this signature lacks.
 pub fn edge_moments(e: &StreetEdgeData, speed_mps: f64, model: &VarianceModel) -> TimeMoments {
     let kinematic = (e.length as f64 / speed_mps.max(0.1)).round();
     let mean = kinematic + edge_time_penalty(e, model);
@@ -210,7 +192,6 @@ pub fn edge_moments(e: &StreetEdgeData, speed_mps: f64, model: &VarianceModel) -
     TimeMoments { mean, var }
 }
 
-/// Read this edge's generator flags, classified at ingest from endpoint nodes.
 fn var_gen(e: &StreetEdgeData) -> VarGen {
     e.var_gen
 }
@@ -364,9 +345,6 @@ mod tests {
 
     #[test]
     fn edge_time_penalty_is_signal_only_no_turn_term() {
-        // The turn-mean delay moved to the physically-grounded corner slow-down in
-        // `BikeCost::speed_change_secs`; `edge_time_penalty` now carries only signals,
-        // independent of any turn geometry.
         let model = VarianceModel::default();
         let mut signal = edge(HighwayClass::Residential, 60);
         signal.var_gen = VarGen::SIGNALIZED;

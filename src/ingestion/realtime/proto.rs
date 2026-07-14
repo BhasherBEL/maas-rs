@@ -1,4 +1,3 @@
-//! Generated GTFS-Realtime protobuf bindings (compiled from
-//! `proto/gtfs-realtime.proto` by `build.rs` via the vendored `protoc`).
+//! Generated GTFS-Realtime protobuf bindings (compiled by `build.rs`).
 #![allow(clippy::all)]
 include!(concat!(env!("OUT_DIR"), "/transit_realtime.rs"));

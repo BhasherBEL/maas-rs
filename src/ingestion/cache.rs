@@ -15,9 +15,76 @@ pub enum SourceLocation {
     Remote(String),
 }
 
-/// Resolve an ingestor's source to a local file path. Remote sources are
-/// downloaded into `cache_dir/<label>.zip`; an existing cache file is reused
-/// unless `force_download` is set.
+/// Expected on-disk format of a downloaded file, used to reject an endpoint that
+/// answered with an HTML error page under HTTP 200 before the bytes poison the
+/// cache under a name we would never re-download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagicKind {
+    /// GTFS / address zip: `PK\x03\x04`.
+    Zip,
+    /// OSM PBF: the `OSMHeader` literal appears within the leading blob.
+    OsmPbf,
+    /// DEM GeoTIFF: `II*\0` (little-endian) or `MM\0*` (big-endian).
+    GeoTiff,
+    /// No known signature; the magic check is skipped.
+    Any,
+}
+
+impl MagicKind {
+    pub fn of(input: &Ingestor) -> MagicKind {
+        match input {
+            Ingestor::OsmPbf(_) => MagicKind::OsmPbf,
+            Ingestor::GtfsGeneric(_) | Ingestor::GtfsStib(_) | Ingestor::GtfsSncb(_) => {
+                MagicKind::Zip
+            }
+            Ingestor::AddressBestAdd(_) => MagicKind::Zip,
+            Ingestor::DemBelgianLambert2008(_) => MagicKind::GeoTiff,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            MagicKind::Zip => "a zip archive",
+            MagicKind::OsmPbf => "an OSM PBF",
+            MagicKind::GeoTiff => "a GeoTIFF",
+            MagicKind::Any => "the expected format",
+        }
+    }
+
+    fn matches(self, head: &[u8]) -> bool {
+        match self {
+            MagicKind::Any => true,
+            MagicKind::Zip => head.starts_with(b"PK\x03\x04"),
+            MagicKind::GeoTiff => {
+                head.starts_with(b"II*\0") || head.starts_with(b"MM\0*")
+            }
+            // A PBF starts with a 4-byte big-endian blob-header length then a
+            // BlobHeader whose `type` field is the literal "OSMHeader", well
+            // inside 64 B.
+            MagicKind::OsmPbf => head
+                .windows(b"OSMHeader".len())
+                .take(64)
+                .any(|w| w == b"OSMHeader"),
+        }
+    }
+}
+
+/// Callers MUST delete the temp file on mismatch (never publish it to cache).
+fn validate_magic(head: &[u8], kind: MagicKind, label: &str) -> Result<(), String> {
+    if kind.matches(head) {
+        return Ok(());
+    }
+    Err(format!(
+        "download for '{label}' is not {} (got {} leading bytes {:02x?}); the endpoint \
+         likely returned an HTML error/redirect page under HTTP 200 rather than the file. \
+         Check the URL/credentials; nothing was cached.",
+        kind.describe(),
+        head.len(),
+        &head[..head.len().min(8)],
+    ))
+}
+
+/// An existing cache file is reused unless `force_download` is set.
 pub fn resolve_source(
     input: &Ingestor,
     cache_dir: &str,
@@ -28,18 +95,18 @@ pub fn resolve_source(
         SourceLocation::Remote(url) => {
             fs::create_dir_all(cache_dir)
                 .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
-            let dest = format!("{cache_dir}/{}.zip", input.label());
+            let dest = format!("{cache_dir}/{}", input.cache_filename());
             if Path::new(&dest).exists() && !force_download {
                 return Ok(dest);
             }
-            download(&url, input.headers(), &dest)?;
+            download(&url, input.label(), input.headers(), &dest, MagicKind::of(input))?;
             Ok(dest)
         }
     }
 }
 
-/// Public, on-demand download to `dest` (temp file + rename). Used by the age-gated
-/// address-feed refresh, which downloads outside the normal cache-reuse path.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub fn download_to(
     url: &str,
     headers: &HashMap<String, String>,
@@ -49,30 +116,98 @@ pub fn download_to(
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create cache dir '{}': {e}", parent.display()))?;
     }
-    download(url, headers, dest)
+    let label = Path::new(dest)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(dest);
+    download(url, label, headers, dest, MagicKind::Zip)
 }
 
-/// Download `url` (with interpolated headers) to `dest` via a temp file + rename.
-/// Neither the resolved URL nor header values are logged.
-fn download(url: &str, headers: &HashMap<String, String>, dest: &str) -> Result<(), String> {
+/// A ureq error's Display can embed the RESOLVED (secret-bearing) URL, which must
+/// never be logged.
+fn redact_ureq_error(e: &ureq::Error) -> String {
+    redact_url_in(&e.to_string())
+}
+
+/// Drop everything from the first `http(s)://` token onward so a resolved
+/// (secret-bearing) URL never reaches the log.
+fn redact_url_in(s: &str) -> String {
+    match s.find("http://").or_else(|| s.find("https://")) {
+        Some(i) => format!("{}<url redacted>", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// Temp file + rename, validating against `magic` BEFORE the atomic publish so an
+/// HTML/error page never poisons the cache. Neither the resolved URL nor header
+/// values (nor a leaked URL in a ureq error) are ever logged.
+fn download(
+    url: &str,
+    label: &str,
+    headers: &HashMap<String, String>,
+    dest: &str,
+    magic: MagicKind,
+) -> Result<(), String> {
     let resolved_url = interpolate(url)?;
-    let mut req = ureq::get(&resolved_url);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(DOWNLOAD_TIMEOUT)
+        .timeout_read(DOWNLOAD_TIMEOUT)
+        .build();
+    let mut req = agent.get(&resolved_url);
     for (k, v) in headers {
         req = req.set(k, &interpolate(v)?);
     }
+    tracing::info!("downloading '{label}' ({}) -> {dest}", redact_url(url));
     let resp = req
         .call()
-        .map_err(|e| format!("download failed for '{dest}': {e}"))?;
+        .map_err(|e| format!("download failed for '{label}': {}", redact_ureq_error(&e)))?;
     let tmp = format!("{dest}.tmp");
     let mut reader = resp.into_reader();
     let mut file = fs::File::create(&tmp).map_err(|e| format!("failed to create '{tmp}': {e}"))?;
     std::io::copy(&mut reader, &mut file).map_err(|e| format!("failed to write '{tmp}': {e}"))?;
+
+    if let Err(e) = validate_downloaded_magic(&tmp, magic, label) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
     fs::rename(&tmp, dest).map_err(|e| format!("failed to publish '{dest}': {e}"))?;
+    tracing::info!("downloaded '{label}' -> {dest}");
     Ok(())
 }
 
-/// Stable digest over a GTFS zip's *decompressed* entries (sorted by name),
-/// so re-zipping identical content with different packaging yields the same hash.
+/// Strip the query string so a literal `?key=...` (or a `${VAR}` inside one) never
+/// reaches the log.
+fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
+fn validate_downloaded_magic(tmp: &str, magic: MagicKind, label: &str) -> Result<(), String> {
+    if magic == MagicKind::Any {
+        return Ok(());
+    }
+    let mut f = fs::File::open(tmp).map_err(|e| format!("failed to reopen '{tmp}': {e}"))?;
+    let mut head = [0u8; 64];
+    let n = f
+        .read(&mut head)
+        .map_err(|e| format!("failed to read '{tmp}': {e}"))?;
+    validate_magic(&head[..n], magic, label)
+}
+
+/// Callers MUST pass the PRE-interpolation url form so `${VAR}`/`${file:}` secrets
+/// never enter the cache path.
+pub fn short_hash(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    let digest = hasher.finalize();
+    format!("{:x}", digest)[..8].to_string()
+}
+
+/// Digest over the zip's *decompressed* entries sorted by name, so re-zipping
+/// identical content with different packaging yields the same hash.
 pub fn gtfs_content_hash(zip_path: &str) -> Result<String, String> {
     let file = fs::File::open(zip_path).map_err(|e| format!("failed to open '{zip_path}': {e}"))?;
     let mut archive =
@@ -106,7 +241,6 @@ pub fn gtfs_content_hash(zip_path: &str) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Per-feed content hashes persisted next to the cache. Missing/corrupt → empty.
 pub fn load_feed_hashes(cache_dir: &str) -> BTreeMap<String, String> {
     let path = format!("{cache_dir}/feeds.yml");
     fs::read_to_string(&path)
@@ -123,9 +257,8 @@ pub fn save_feed_hashes(cache_dir: &str, hashes: &BTreeMap<String, String>) -> R
     fs::write(&path, s).map_err(|e| format!("write feed hashes: {e}"))
 }
 
-/// Wall-clock time of the last successful feed *check* (download + hash),
-/// regardless of whether the content changed. Used to cron-gate the startup
-/// freshness catch-up. Missing/corrupt → None.
+/// Time of the last feed *check* (download + hash), regardless of whether the
+/// content changed. Cron-gates the startup freshness catch-up.
 pub fn load_last_checked(cache_dir: &str) -> Option<DateTime<Local>> {
     let path = format!("{cache_dir}/last_checked");
     let s = fs::read_to_string(&path).ok()?;
@@ -139,27 +272,6 @@ pub fn save_last_checked(cache_dir: &str, when: DateTime<Local>) -> Result<(), S
         .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
     let path = format!("{cache_dir}/last_checked");
     fs::write(&path, when.to_rfc3339()).map_err(|e| format!("write last_checked: {e}"))
-}
-
-/// Sorted list of GTFS input labels that were active when the graph was last built.
-/// Missing file → empty vec (triggers rebuild on first run or after cache wipe).
-pub fn load_input_labels(cache_dir: &str) -> Vec<String> {
-    let path = format!("{cache_dir}/input_labels");
-    fs::read_to_string(&path)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub fn save_input_labels(cache_dir: &str, labels: &[String]) -> Result<(), String> {
-    fs::create_dir_all(cache_dir)
-        .map_err(|e| format!("failed to create cache dir '{cache_dir}': {e}"))?;
-    let path = format!("{cache_dir}/input_labels");
-    fs::write(&path, labels.join("\n")).map_err(|e| format!("write input_labels: {e}"))
 }
 
 #[cfg(test)]
@@ -217,6 +329,81 @@ mod tests {
         save_last_checked(cache, now).unwrap();
         let loaded = load_last_checked(cache).unwrap();
         assert_eq!(loaded.timestamp(), now.timestamp());
+    }
+
+    #[test]
+    fn magic_rejects_html_error_page() {
+        let html = b"<!DOCTYPE html><html><body>404 Not Found</body></html>";
+        let err = validate_magic(html, MagicKind::Zip, "luxembourg").unwrap_err();
+        assert!(err.contains("luxembourg"), "error names the source: {err}");
+        assert!(err.contains("HTML"), "error hints at an HTML page: {err}");
+    }
+
+    #[test]
+    fn magic_accepts_zip_signature() {
+        let zip = b"PK\x03\x04rest-of-zip";
+        assert!(validate_magic(zip, MagicKind::Zip, "gtfs").is_ok());
+    }
+
+    #[test]
+    fn magic_rejects_zip_for_non_zip_bytes() {
+        assert!(validate_magic(b"not a zip", MagicKind::Zip, "gtfs").is_err());
+    }
+
+    #[test]
+    fn magic_accepts_osm_pbf_header() {
+        // 4-byte big-endian length, then the "OSMHeader" literal.
+        let pbf = b"\x00\x00\x00\x0e\x0a\x09OSMHeader\x18";
+        assert!(validate_magic(pbf, MagicKind::OsmPbf, "osm").is_ok());
+    }
+
+    #[test]
+    fn magic_rejects_pbf_for_html() {
+        let html = b"<!DOCTYPE html><html>error</html>";
+        assert!(validate_magic(html, MagicKind::OsmPbf, "osm").is_err());
+    }
+
+    #[test]
+    fn magic_accepts_geotiff_both_endian() {
+        assert!(validate_magic(b"II*\0....", MagicKind::GeoTiff, "dem").is_ok());
+        assert!(validate_magic(b"MM\0*....", MagicKind::GeoTiff, "dem").is_ok());
+    }
+
+    #[test]
+    fn magic_rejects_geotiff_for_html() {
+        assert!(validate_magic(b"<html>", MagicKind::GeoTiff, "dem").is_err());
+    }
+
+    #[test]
+    fn magic_any_passes_anything() {
+        assert!(validate_magic(b"<html>", MagicKind::Any, "x").is_ok());
+    }
+
+    #[test]
+    fn redact_url_in_strips_resolved_url_with_key() {
+        let leaked =
+            "Failed to connect to https://data.example/gtfs.zip?apiKey=SECRET123: timed out";
+        let s = redact_url_in(leaked);
+        assert!(!s.contains("SECRET123"), "the key must not survive: {s}");
+        assert!(!s.contains("https://"), "no raw URL: {s}");
+        assert!(s.starts_with("Failed to connect to "), "keeps the prefix: {s}");
+    }
+
+    #[test]
+    fn redact_url_in_passes_url_free_error() {
+        assert_eq!(redact_url_in("connection reset"), "connection reset");
+    }
+
+    #[test]
+    fn redact_url_drops_query_string() {
+        assert_eq!(
+            redact_url("https://data.example/gtfs.zip?apiKey=SECRET"),
+            "https://data.example/gtfs.zip?<redacted>"
+        );
+        assert_eq!(
+            redact_url("https://data.example/gtfs.zip"),
+            "https://data.example/gtfs.zip"
+        );
     }
 
     #[test]

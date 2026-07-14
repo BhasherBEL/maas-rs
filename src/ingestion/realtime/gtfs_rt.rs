@@ -1,11 +1,3 @@
-//! Generic GTFS-Realtime trip-update feed (SNCB, TEC).
-//!
-//! These feeds carry an explicit delay per stop-time, keyed by GTFS string
-//! `trip_id` and `stop_sequence`, so no schedule join is needed: decode the
-//! protobuf and emit one [`TripDelay`] per stop-time update that carries a delay.
-//! Stop-time updates that give only an absolute predicted time (no delay) are
-//! skipped — turning those into delays needs a schedule join (see STIB).
-
 use std::collections::HashMap;
 
 use prost::Message;
@@ -45,8 +37,6 @@ impl RealtimeFeed for GtfsRtFeed {
     }
 }
 
-/// Extract the first available translation text from a `TranslatedString`,
-/// preferring English if present; otherwise returns the first entry.
 fn first_translation(ts: &crate::ingestion::realtime::proto::TranslatedString) -> Option<String> {
     if ts.translation.is_empty() {
         return None;
@@ -58,12 +48,6 @@ fn first_translation(ts: &crate::ingestion::realtime::proto::TranslatedString) -
         .map(|t| t.text.clone())
 }
 
-/// Decode a GTFS-RT `FeedMessage` into per-stop delays, CANCELED trip ids, and
-/// service alerts. Pure (no I/O), so it is unit-testable against a fixture protobuf.
-///
-/// Before this change, `entity.alert` was silently skipped via the
-/// `let Some(tu) = entity.trip_update else { continue }` guard. Now alerts are
-/// parsed in a second pass over the same entities.
 pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
     let feed = FeedMessage::decode(bytes).map_err(|e| format!("decoding GTFS-RT protobuf: {e}"))?;
 
@@ -80,9 +64,7 @@ pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
             let Some(trip_id) = tu.trip.trip_id.clone() else {
                 continue;
             };
-            // CANCELED and DELETED both mean the whole trip will not run; DELETED
-            // additionally asks consumers to hide it, but for routing purposes we
-            // treat it exactly like a cancellation (never boarded).
+            // CANCELED and DELETED both mean the trip will not run; treat alike.
             if tu.trip.schedule_relationship == Some(ScheduleRelationship::Canceled as i32)
                 || tu.trip.schedule_relationship == Some(ScheduleRelationship::Deleted as i32)
             {
@@ -93,14 +75,8 @@ pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
                 if stu.stop_id.is_none() && stu.stop_sequence.is_none() {
                     continue;
                 }
-                // Honour the stop-time schedule_relationship BEFORE recording an
-                // actual stop or a delay:
-                //   SKIPPED  → the trip no longer serves this stop. Record it as a
-                //              skip (partial cancellation) and emit neither a delay
-                //              nor an actual_stop (which would fabricate a platform
-                //              assignment at an un-served stop).
-                //   NO_DATA  → no prediction here; any event fields are meaningless,
-                //              so skip the update entirely.
+                // SKIPPED: stop no longer served; record the skip but emit no delay
+                // or actual_stop. NO_DATA: no prediction; ignore any event fields.
                 match stu.schedule_relationship {
                     Some(sr) if sr == StopRel::Skipped as i32 => {
                         if let Some(stop_id) = &stu.stop_id {
@@ -113,8 +89,6 @@ pub fn parse_trip_updates(bytes: &[u8]) -> Result<FeedUpdate, String> {
                     }
                     _ => {}
                 }
-                // Capture the actual RT stop_id unconditionally (not gated on delay)
-                // so platform assignments are recorded even for on-time stops.
                 if let Some(stop_id) = &stu.stop_id {
                     actual_stops.push(ActualStopId {
                         trip_id: trip_id.clone(),
@@ -232,8 +206,6 @@ mod tests {
             stop_sequence: Some(seq),
             stop_id: Some(format!("stop_{seq}")),
             schedule_relationship: Some(ScheduleRelationship::Skipped as i32),
-            // A malformed feed may even carry event fields on a SKIPPED stop; they
-            // must be ignored, never turned into a delay.
             arrival: Some(StopTimeEvent {
                 delay: Some(600),
                 ..Default::default()
@@ -274,7 +246,6 @@ mod tests {
             vec![stop_update(1, Some(60)), skipped_stop_update(2), stop_update(3, Some(180))],
         )]);
         let update = parse_trip_updates(&bytes).unwrap();
-        // The skipped stop (seq 2) produces neither a delay nor an actual_stop.
         assert_eq!(
             update.delays,
             vec![
@@ -383,7 +354,6 @@ mod tests {
             vec![stop_update(1, None), stop_update(5, Some(-30))],
         )]);
         let update = parse_trip_updates(&bytes).unwrap();
-        // Only the stop with a delay survives.
         assert_eq!(
             update.delays,
             vec![TripDelay {
@@ -511,7 +481,7 @@ mod tests {
 
     #[test]
     fn parses_alert_entity_into_service_alert() {
-        use crate::ingestion::realtime::{AlertEntitySelector, ServiceAlert};
+        use crate::ingestion::realtime::AlertEntitySelector;
 
         let bytes = encode_feed(vec![alert_entity(
             "alert_1",
